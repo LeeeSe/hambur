@@ -360,15 +360,25 @@ impl RuntimeEngine {
             "UpdateProvider" => self.execute_update_provider(command),
             "DeleteProvider" => self.execute_delete_provider(command),
             "RefreshProviderModels" => self.execute_refresh_provider_models(command),
-            "UpdateModelOverride" => self.execute_update_model_override(command),
+            "UpdateModelOverride" | "UpdateModelDetail" => {
+                self.execute_update_model_override(command)
+            }
             "UpdateModelGroup" => self.execute_update_model_group(command),
             "UpdateModelGroupMember" => self.execute_update_model_group_member(command),
             "SetDefaultModelGroup" => self.execute_set_default_model_group(command),
+            "DeleteModelGroup" => self.execute_delete_model_group(command),
+            "UpdateDefaultModelGroups" => self.execute_update_default_model_groups(command),
             "UpdateToolSettings"
             | "UpdateSkills"
             | "UpdateMemoryProjections"
             | "UpdateStartupTasks"
-            | "UpdateRootfsSettings" => self.execute_update_app_setting(command),
+            | "UpdateRootfsSettings"
+            | "UpdateAppSetting"
+            | "UpdateBrowserToolSettings"
+            | "UpdateSkillEnabled"
+            | "UpdateStartupTask"
+            | "DeleteStartupTask"
+            | "UpdateRootfsSetting" => self.execute_update_app_setting(command),
             "ImportAttachmentFromUri" => self.execute_import_attachment(command),
             "RemovePendingAttachment" => self.execute_remove_pending_attachment(command),
             "ClearPendingAttachments" => self.execute_clear_pending_attachments(command),
@@ -854,6 +864,86 @@ impl RuntimeEngine {
         self.finish_settings_command(command, result, "Default model group updated")
     }
 
+    fn execute_update_default_model_groups(&self, command: RuntimeCommand) -> RuntimeCommandAck {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return rejected_ack(
+                command.command_id,
+                command.idempotency_key,
+                HamburError::RuntimeClosed,
+            );
+        }
+
+        let payload = config_payload_value(&command.payload_json);
+        let primary_group_id = config_string(&payload, "primaryGroupId")
+            .if_blank(config_string(&payload, "primary_group_id"))
+            .if_blank(config_string(&payload, "primary"))
+            .if_blank(command.message_id.clone());
+        let secondary_group_id = config_string(&payload, "secondaryGroupId")
+            .if_blank(config_string(&payload, "secondary_group_id"))
+            .if_blank(config_string(&payload, "secondary"));
+        let result = self.tokio.block_on(async {
+            if !primary_group_id.trim().is_empty() {
+                self.database
+                    .set_default_model_group("primary", &primary_group_id)
+                    .await?;
+            }
+            if !secondary_group_id.trim().is_empty() {
+                self.database
+                    .set_default_model_group("secondary", &secondary_group_id)
+                    .await?;
+            }
+            self.database
+                .insert_config_audit(
+                    &command.command_id,
+                    "user",
+                    "UpdateDefaultModelGroups",
+                    "default_model_groups",
+                    "default_model_groups",
+                    "Default model groups updated",
+                    false,
+                    "",
+                )
+                .await?;
+            self.database.bootstrap_snapshot().await
+        });
+        self.finish_settings_command(command, result, "Default model groups updated")
+    }
+
+    fn execute_delete_model_group(&self, command: RuntimeCommand) -> RuntimeCommandAck {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return rejected_ack(
+                command.command_id,
+                command.idempotency_key,
+                HamburError::RuntimeClosed,
+            );
+        }
+        if let Err(error) = require_approval(&command, "delete-model-group") {
+            return rejected_ack(command.command_id, command.idempotency_key, error);
+        }
+        let payload = config_payload_value(&command.payload_json);
+        let group_id = command
+            .message_id
+            .clone()
+            .if_blank(config_string(&payload, "groupId"));
+        let result = self.tokio.block_on(async {
+            self.database.delete_model_group(&group_id).await?;
+            self.database
+                .insert_config_audit(
+                    &command.command_id,
+                    "user",
+                    "DeleteModelGroup",
+                    "model_group",
+                    &group_id,
+                    "Model group deleted after explicit approval",
+                    true,
+                    &approval_token_from_payload(&command.payload_json),
+                )
+                .await?;
+            self.database.bootstrap_snapshot().await
+        });
+        self.finish_settings_command(command, result, "Model group deleted")
+    }
+
     fn execute_update_app_setting(&self, command: RuntimeCommand) -> RuntimeCommandAck {
         if self.shutdown.load(Ordering::SeqCst) {
             return rejected_ack(
@@ -862,18 +952,33 @@ impl RuntimeEngine {
                 HamburError::RuntimeClosed,
             );
         }
-        let setting_key = setting_key_for_command(&command.kind);
-        if setting_requires_approval(setting_key)
-            && let Err(error) = require_approval(&command, setting_key)
+        let setting_key = match setting_key_for_command(&command) {
+            Ok(setting_key) => setting_key,
+            Err(error) => {
+                return rejected_ack(command.command_id, command.idempotency_key, error);
+            }
+        };
+        if setting_requires_approval(&setting_key)
+            && let Err(error) = require_approval(&command, &setting_key)
         {
             return rejected_ack(command.command_id, command.idempotency_key, error);
         }
+        let setting_value = setting_value_for_command(&command);
         let result = self.tokio.block_on(async {
-            let setting = self
-                .database
-                .upsert_app_setting(setting_key, &command.payload_json)
-                .await?;
+            let setting = if command.kind == "DeleteStartupTask" {
+                self.database.delete_app_setting(&setting_key).await?;
+                hambur_db::AppSettingRecord {
+                    key: setting_key.clone(),
+                    value: String::new(),
+                    updated_at_ms: now_ms(),
+                }
+            } else {
+                self.database
+                    .upsert_app_setting(&setting_key, &setting_value)
+                    .await?
+            };
             let approval_token = approval_token_from_payload(&command.payload_json);
+            let approval_required = setting_requires_approval(&setting.key);
             self.database
                 .insert_config_audit(
                     &command.command_id,
@@ -881,8 +986,8 @@ impl RuntimeEngine {
                     command.kind.as_str(),
                     "app_setting",
                     &setting.key,
-                    &format!("Setting '{}' updated", setting.key),
-                    setting_requires_approval(&setting.key),
+                    &setting_audit_summary(&command.kind, &setting.key),
+                    approval_required,
                     &approval_token,
                 )
                 .await?;
@@ -3030,7 +3135,7 @@ fn validate_command(command: &RuntimeCommand) -> HamburResult<()> {
             }
             Ok(())
         }
-        "UpdateModelOverride" => {
+        "UpdateModelOverride" | "UpdateModelDetail" => {
             if command.provider_id.is_empty()
                 && command.message_id.is_empty()
                 && config_payload_string(&command.payload_json, "providerId").is_empty()
@@ -3051,11 +3156,35 @@ fn validate_command(command: &RuntimeCommand) -> HamburResult<()> {
         "UpdateModelGroup" => Ok(()),
         "UpdateModelGroupMember" => Ok(()),
         "SetDefaultModelGroup" => Ok(()),
+        "UpdateDefaultModelGroups" => {
+            if command.payload_json.trim().is_empty() && command.message_id.is_empty() {
+                return Err(HamburError::InvalidCommand(
+                    "default model group payload must not be empty".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        "DeleteModelGroup" => {
+            if command.message_id.is_empty()
+                && config_payload_string(&command.payload_json, "groupId").is_empty()
+            {
+                return Err(HamburError::InvalidCommand(
+                    "group_id must not be empty".to_string(),
+                ));
+            }
+            Ok(())
+        }
         "UpdateToolSettings"
         | "UpdateSkills"
         | "UpdateMemoryProjections"
         | "UpdateStartupTasks"
-        | "UpdateRootfsSettings" => {
+        | "UpdateRootfsSettings"
+        | "UpdateAppSetting"
+        | "UpdateBrowserToolSettings"
+        | "UpdateSkillEnabled"
+        | "UpdateStartupTask"
+        | "DeleteStartupTask"
+        | "UpdateRootfsSetting" => {
             if command.payload_json.trim().is_empty() {
                 return Err(HamburError::InvalidCommand(
                     "setting payload_json must not be empty".to_string(),
@@ -3516,6 +3645,22 @@ fn config_string(value: &Value, key: &str) -> String {
         .to_string()
 }
 
+fn config_value_string(value: &Value, key: &str) -> String {
+    let Some(child) = value
+        .get(key)
+        .or_else(|| value.get(to_snake_key(key).as_str()))
+    else {
+        return String::new();
+    };
+    match child {
+        Value::String(text) => text.trim().to_string(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::Null => String::new(),
+        Value::Array(_) | Value::Object(_) => child.to_string(),
+    }
+}
+
 fn config_bool(value: &Value, key: &str, fallback: bool) -> bool {
     value
         .get(key)
@@ -3594,29 +3739,119 @@ fn approval_token_from_payload(payload_json: &str) -> String {
 
 fn require_approval(command: &RuntimeCommand, scope: &str) -> HamburResult<()> {
     let token = approval_token_from_payload(&command.payload_json);
-    let expected = format!("approve:{scope}");
-    if token == expected {
+    let expected = approval_tokens_for_scope(scope);
+    if expected.iter().any(|candidate| token == *candidate) {
         Ok(())
     } else {
         Err(HamburError::InvalidCommand(format!(
-            "{scope} requires approval token: {expected}"
+            "{scope} requires approval token: {}",
+            expected.join(" or ")
         )))
     }
 }
 
-fn setting_key_for_command(command_kind: &str) -> &'static str {
+fn approval_tokens_for_scope(scope: &str) -> Vec<String> {
+    let mut tokens = vec![format!("approve:{scope}")];
+    if scope.starts_with("rootfs_setting:") {
+        tokens.push("approve:rootfs_settings".to_string());
+    }
+    if scope.starts_with("startup_task:") {
+        tokens.push("approve:startup_tasks".to_string());
+    }
+    tokens
+}
+
+fn setting_key_for_command(command: &RuntimeCommand) -> HamburResult<String> {
+    let payload = config_payload_value(&command.payload_json);
+    let key = match command.kind.as_str() {
+        "UpdateToolSettings" => "tool_settings".to_string(),
+        "UpdateSkills" => "skills".to_string(),
+        "UpdateMemoryProjections" => "memory_projections".to_string(),
+        "UpdateStartupTasks" => "startup_tasks".to_string(),
+        "UpdateRootfsSettings" => "rootfs_settings".to_string(),
+        "UpdateBrowserToolSettings" => "browser_tool_settings".to_string(),
+        "UpdateAppSetting" => command
+            .chunk
+            .clone()
+            .if_blank(config_string(&payload, "settingKey"))
+            .if_blank(config_string(&payload, "key")),
+        "UpdateSkillEnabled" => {
+            let skill_id = command
+                .message_id
+                .clone()
+                .if_blank(config_string(&payload, "skillId"))
+                .if_blank(config_string(&payload, "skillPath"));
+            format!("skill_enabled:{skill_id}")
+        }
+        "UpdateStartupTask" | "DeleteStartupTask" => {
+            let task_id = command
+                .message_id
+                .clone()
+                .if_blank(config_string(&payload, "startupTaskId"))
+                .if_blank(config_string(&payload, "taskId"))
+                .if_blank(config_string(&payload, "id"));
+            format!("startup_task:{task_id}")
+        }
+        "UpdateRootfsSetting" => {
+            let rootfs_key = command
+                .chunk
+                .clone()
+                .if_blank(config_string(&payload, "settingKey"))
+                .if_blank(config_string(&payload, "key"));
+            format!("rootfs_setting:{rootfs_key}")
+        }
+        _ => {
+            return Err(HamburError::InvalidCommand(format!(
+                "unsupported setting command kind: {}",
+                command.kind
+            )));
+        }
+    };
+    if key.trim().is_empty()
+        || key.ends_with(':')
+        || matches!(
+            key.as_str(),
+            "skill_enabled:" | "startup_task:" | "rootfs_setting:"
+        )
+    {
+        return Err(HamburError::InvalidCommand(
+            "setting key must not be empty".to_string(),
+        ));
+    }
+    Ok(key)
+}
+
+fn setting_value_for_command(command: &RuntimeCommand) -> String {
+    let payload = config_payload_value(&command.payload_json);
+    match command.kind.as_str() {
+        "UpdateAppSetting" => command
+            .content
+            .clone()
+            .if_blank(config_value_string(&payload, "value"))
+            .if_blank(command.payload_json.clone()),
+        "UpdateSkillEnabled" => config_bool(&payload, "enabled", true).to_string(),
+        "DeleteStartupTask" => String::new(),
+        "UpdateRootfsSetting" => command
+            .content
+            .clone()
+            .if_blank(config_value_string(&payload, "value"))
+            .if_blank(command.payload_json.clone()),
+        _ => command.payload_json.clone(),
+    }
+}
+
+fn setting_audit_summary(command_kind: &str, setting_key: &str) -> String {
     match command_kind {
-        "UpdateToolSettings" => "tool_settings",
-        "UpdateSkills" => "skills",
-        "UpdateMemoryProjections" => "memory_projections",
-        "UpdateStartupTasks" => "startup_tasks",
-        "UpdateRootfsSettings" => "rootfs_settings",
-        _ => "tool_settings",
+        "DeleteStartupTask" => format!("Setting '{setting_key}' deleted"),
+        _ => format!("Setting '{setting_key}' updated"),
     }
 }
 
 fn setting_requires_approval(setting_key: &str) -> bool {
-    matches!(setting_key, "rootfs_settings" | "startup_tasks")
+    setting_key == "rootfs_settings"
+        || setting_key == "startup_tasks"
+        || setting_key.starts_with("startup_task:")
+        || setting_key.starts_with("rootfs_setting:")
 }
 
 trait IfBlank {
@@ -4795,6 +5030,189 @@ mod tests {
                 .settings
                 .iter()
                 .any(|setting| setting.key == "tool_settings" && setting.value.contains("browser"))
+        );
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
+    fn milestone6_global_settings_commands_match_architecture_contract() {
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+        configure_named_test_provider(&runtime, "provider_m6", "model-m6");
+
+        let group = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_m6_group".to_string(),
+            idempotency_key: "settings:m6:group".to_string(),
+            kind: "UpdateModelGroup".to_string(),
+            message_id: "grp_m6".to_string(),
+            title: "Milestone 6".to_string(),
+            payload_json: serde_json::json!({
+                "groupId": "grp_m6",
+                "name": "Milestone 6",
+                "routingStrategy": "load_balance",
+                "fallbackPolicy": "always"
+            })
+            .to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(group.accepted, "group rejected: {}", group.message);
+        let _ = runtime.next_event().expect("group event");
+
+        let default_groups = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_m6_defaults".to_string(),
+            idempotency_key: "settings:m6:defaults".to_string(),
+            kind: "UpdateDefaultModelGroups".to_string(),
+            payload_json: serde_json::json!({
+                "primaryGroupId": "grp_m6",
+                "secondaryGroupId": "grp_m6"
+            })
+            .to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(
+            default_groups.accepted,
+            "defaults rejected: {}",
+            default_groups.message
+        );
+        let _ = runtime.next_event().expect("defaults event");
+
+        let theme = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_m6_theme".to_string(),
+            idempotency_key: "settings:m6:theme".to_string(),
+            kind: "UpdateAppSetting".to_string(),
+            chunk: "themeMode".to_string(),
+            payload_json: serde_json::json!({"settingKey": "themeMode", "value": "dark"})
+                .to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(theme.accepted, "theme rejected: {}", theme.message);
+        let _ = runtime.next_event().expect("theme event");
+
+        let bad_theme = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_m6_bad_theme".to_string(),
+            idempotency_key: "settings:m6:bad-theme".to_string(),
+            kind: "UpdateAppSetting".to_string(),
+            chunk: "themeMode".to_string(),
+            payload_json: serde_json::json!({"value": "purple"}).to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(!bad_theme.accepted);
+        assert_eq!(bad_theme.rejection_code, "InvalidCommand");
+
+        let browser = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_m6_browser".to_string(),
+            idempotency_key: "settings:m6:browser".to_string(),
+            kind: "UpdateBrowserToolSettings".to_string(),
+            payload_json: serde_json::json!({
+                "acceptCookies": false,
+                "acceptThirdPartyCookies": false,
+                "maxFetchBytes": 250000,
+                "autoCloseMinutes": 30
+            })
+            .to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(browser.accepted, "browser rejected: {}", browser.message);
+        let _ = runtime.next_event().expect("browser event");
+
+        let bad_browser = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_m6_bad_browser".to_string(),
+            idempotency_key: "settings:m6:bad-browser".to_string(),
+            kind: "UpdateBrowserToolSettings".to_string(),
+            payload_json: serde_json::json!({
+                "acceptCookies": false,
+                "acceptThirdPartyCookies": true,
+                "maxFetchBytes": 250000
+            })
+            .to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(!bad_browser.accepted);
+        assert_eq!(bad_browser.rejection_code, "InvalidCommand");
+
+        let skill = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_m6_skill".to_string(),
+            idempotency_key: "settings:m6:skill".to_string(),
+            kind: "UpdateSkillEnabled".to_string(),
+            message_id: "skills/test".to_string(),
+            payload_json: serde_json::json!({"enabled": false}).to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(skill.accepted, "skill rejected: {}", skill.message);
+        let _ = runtime.next_event().expect("skill event");
+
+        let rootfs_without_approval = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_m6_rootfs_no_approval".to_string(),
+            idempotency_key: "settings:m6:rootfs:no-approval".to_string(),
+            kind: "UpdateRootfsSetting".to_string(),
+            chunk: "backend".to_string(),
+            payload_json: serde_json::json!({"value": "proot"}).to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(!rootfs_without_approval.accepted);
+        assert_eq!(rootfs_without_approval.rejection_code, "InvalidCommand");
+
+        let startup = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_m6_startup".to_string(),
+            idempotency_key: "settings:m6:startup".to_string(),
+            kind: "UpdateStartupTask".to_string(),
+            message_id: "task_m6".to_string(),
+            payload_json: serde_json::json!({
+                "id": "task_m6",
+                "name": "Warmup",
+                "script": "echo ready",
+                "enabled": true,
+                "approvalToken": "approve:startup_tasks"
+            })
+            .to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(startup.accepted, "startup rejected: {}", startup.message);
+        let _ = runtime.next_event().expect("startup event");
+
+        let snapshot = runtime.get_settings_snapshot();
+        assert!(
+            snapshot
+                .settings
+                .default_model_groups
+                .iter()
+                .any(|default| default.key == "secondary" && default.group_id == "grp_m6")
+        );
+        assert!(
+            snapshot
+                .settings
+                .settings
+                .iter()
+                .any(|setting| setting.key == "themeMode" && setting.value == "dark")
+        );
+        assert!(
+            snapshot
+                .settings
+                .settings
+                .iter()
+                .any(|setting| setting.key == "skill_enabled:skills-test"
+                    && setting.value == "false")
+        );
+        assert!(
+            snapshot
+                .settings
+                .settings
+                .iter()
+                .any(|setting| setting.key == "startup_task:task_m6")
+        );
+        assert!(
+            snapshot
+                .settings
+                .config_audits
+                .iter()
+                .any(|audit| audit.action == "UpdateStartupTask" && audit.approval_required)
         );
 
         let _ = fs::remove_dir_all(app_files_dir);

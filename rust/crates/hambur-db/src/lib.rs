@@ -2456,7 +2456,7 @@ impl HamburDatabase {
         value: &str,
     ) -> HamburResult<AppSettingRecord> {
         let key = normalize_app_setting_key(key)?;
-        let value = value.trim().chars().take(8000).collect::<String>();
+        let value = normalize_app_setting_value(&key, value)?;
         let now = now_ms();
         self.connection
             .execute(
@@ -2474,6 +2474,31 @@ impl HamburDatabase {
             value,
             updated_at_ms: now,
         })
+    }
+
+    pub async fn delete_model_group(&self, group_id: &str) -> HamburResult<()> {
+        let group_id = normalize_setting_id(group_id, "grp");
+        self.connection
+            .execute(
+                "DELETE FROM default_model_groups WHERE group_id = ?1",
+                params![group_id.clone()],
+            )
+            .await
+            .map_err(database_error)?;
+        self.connection
+            .execute("DELETE FROM model_groups WHERE id = ?1", params![group_id])
+            .await
+            .map_err(database_error)?;
+        Ok(())
+    }
+
+    pub async fn delete_app_setting(&self, key: &str) -> HamburResult<()> {
+        let key = normalize_app_setting_key(key)?;
+        self.connection
+            .execute("DELETE FROM app_settings WHERE key = ?1", params![key])
+            .await
+            .map_err(database_error)?;
+        Ok(())
     }
 
     pub async fn insert_config_audit(
@@ -3991,8 +4016,8 @@ fn normalize_setting_id(value: &str, prefix: &str) -> String {
 fn normalize_routing_strategy(value: &str) -> HamburResult<String> {
     let value = value.trim();
     match value {
-        "" | "fallback" => Ok("fallback".to_string()),
-        "round_robin" | "priority" => Ok(value.to_string()),
+        "" | "fallback" | "priority" => Ok("fallback".to_string()),
+        "load_balance" | "round_robin" => Ok("load_balance".to_string()),
         _ => Err(HamburError::InvalidCommand(format!(
             "invalid routing_strategy: {value}"
         ))),
@@ -4002,8 +4027,8 @@ fn normalize_routing_strategy(value: &str) -> HamburResult<String> {
 fn normalize_fallback_policy(value: &str) -> HamburResult<String> {
     let value = value.trim();
     match value {
-        "" | "default" => Ok("default".to_string()),
-        "never" | "always_before_output" => Ok(value.to_string()),
+        "" | "default" | "never" => Ok("default".to_string()),
+        "always" | "always_before_output" => Ok("always".to_string()),
         _ => Err(HamburError::InvalidCommand(format!(
             "invalid fallback_policy: {value}"
         ))),
@@ -4022,12 +4047,32 @@ fn normalize_default_group_key(value: &str) -> HamburResult<String> {
 
 fn normalize_app_setting_key(value: &str) -> HamburResult<String> {
     let key = value.trim();
+    if key.starts_with("skill_enabled:")
+        || key.starts_with("startup_task:")
+        || key.starts_with("rootfs_setting:")
+    {
+        return normalize_prefixed_setting_key(key);
+    }
+
     let allowed = [
+        "themeMode",
+        "fontScale",
+        "startupChatMode",
+        "lastSelectedSessionId",
+        "loggingEnabled",
+        "predictiveBackEnabled",
+        "fpsOverlayEnabled",
+        "rootfsBackend",
+        "webFetchBackend",
+        "viewImageScaleMode",
+        "defaultDeepThinkingEnabled",
+        "startupTasksEnabled",
         "tool_settings",
         "skills",
         "memory_projections",
         "startup_tasks",
         "rootfs_settings",
+        "browser_tool_settings",
     ];
     if allowed.contains(&key) {
         Ok(key.to_string())
@@ -4036,6 +4081,153 @@ fn normalize_app_setting_key(value: &str) -> HamburResult<String> {
             "invalid app setting key: {key}"
         )))
     }
+}
+
+fn normalize_prefixed_setting_key(key: &str) -> HamburResult<String> {
+    let mut parts = key.splitn(2, ':');
+    let prefix = parts.next().unwrap_or_default();
+    let id = parts.next().unwrap_or_default();
+    if id.trim().is_empty() {
+        return Err(HamburError::InvalidCommand(format!(
+            "invalid app setting key: {key}"
+        )));
+    }
+    let id = normalize_setting_key_suffix(id);
+    Ok(format!("{prefix}:{id}"))
+}
+
+fn normalize_setting_key_suffix(value: &str) -> String {
+    let mut output = String::new();
+    let mut previous_separator = false;
+    for ch in value.trim().chars() {
+        let next = if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.') {
+            ch
+        } else {
+            '-'
+        };
+        if next == '-' {
+            if !previous_separator {
+                output.push(next);
+            }
+            previous_separator = true;
+        } else {
+            output.push(next);
+            previous_separator = false;
+        }
+        if output.len() >= 120 {
+            break;
+        }
+    }
+    let output = output.trim_matches('-').to_string();
+    if output.is_empty() {
+        new_id("setting")
+    } else {
+        output
+    }
+}
+
+fn normalize_app_setting_value(key: &str, value: &str) -> HamburResult<String> {
+    let value = value.trim();
+    match key {
+        "themeMode" => normalize_enum_setting(key, value, &["system", "light", "dark"]),
+        "fontScale" => {
+            normalize_enum_setting(key, value, &["small", "default", "large", "extra_large"])
+        }
+        "startupChatMode" => normalize_enum_setting(key, value, &["new_chat", "last_chat"]),
+        "rootfsBackend" => normalize_enum_setting(key, value, &["chroot", "proot"]),
+        "webFetchBackend" => normalize_enum_setting(key, value, &["local", "tinyfish"]),
+        "viewImageScaleMode" => normalize_enum_setting(key, value, &["original", "resize_fit"]),
+        "loggingEnabled"
+        | "predictiveBackEnabled"
+        | "fpsOverlayEnabled"
+        | "defaultDeepThinkingEnabled"
+        | "startupTasksEnabled" => normalize_bool_setting(key, value),
+        "lastSelectedSessionId" => Ok(value.chars().take(160).collect()),
+        "browser_tool_settings" => normalize_browser_tool_settings(value),
+        key if key.starts_with("skill_enabled:") => normalize_bool_setting(key, value),
+        "tool_settings" | "skills" | "memory_projections" | "startup_tasks" | "rootfs_settings" => {
+            normalize_json_or_text_setting(value)
+        }
+        key if key.starts_with("startup_task:") || key.starts_with("rootfs_setting:") => {
+            normalize_json_or_text_setting(value)
+        }
+        _ => Ok(value.chars().take(8000).collect()),
+    }
+}
+
+fn normalize_enum_setting(key: &str, value: &str, allowed: &[&str]) -> HamburResult<String> {
+    if allowed.contains(&value) {
+        Ok(value.to_string())
+    } else {
+        Err(HamburError::InvalidCommand(format!(
+            "invalid {key} value: {value}"
+        )))
+    }
+}
+
+fn normalize_bool_setting(key: &str, value: &str) -> HamburResult<String> {
+    match value {
+        "true" | "false" => Ok(value.to_string()),
+        _ => Err(HamburError::InvalidCommand(format!(
+            "invalid {key} value: expected true or false"
+        ))),
+    }
+}
+
+fn normalize_json_or_text_setting(value: &str) -> HamburResult<String> {
+    if value.len() > 8000 {
+        return Err(HamburError::InvalidCommand(
+            "setting value must be at most 8000 characters".to_string(),
+        ));
+    }
+    if value.starts_with('{') || value.starts_with('[') {
+        serde_json::from_str::<serde_json::Value>(value).map_err(|error| {
+            HamburError::InvalidCommand(format!("setting value must be valid JSON: {error}"))
+        })?;
+    }
+    Ok(value.to_string())
+}
+
+fn normalize_browser_tool_settings(value: &str) -> HamburResult<String> {
+    let parsed = serde_json::from_str::<serde_json::Value>(value).map_err(|error| {
+        HamburError::InvalidCommand(format!("browser tool settings must be JSON: {error}"))
+    })?;
+    let max_fetch_bytes = parsed
+        .get("maxFetchBytes")
+        .or_else(|| parsed.get("max_fetch_bytes"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(1_000_000);
+    if !(250_000..=10_000_000).contains(&max_fetch_bytes) {
+        return Err(HamburError::InvalidCommand(
+            "browser maxFetchBytes must be between 250000 and 10000000".to_string(),
+        ));
+    }
+    let auto_close_minutes = parsed
+        .get("autoCloseMinutes")
+        .or_else(|| parsed.get("auto_close_minutes"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if auto_close_minutes > 240 {
+        return Err(HamburError::InvalidCommand(
+            "browser autoCloseMinutes must be between 0 and 240".to_string(),
+        ));
+    }
+    let accept_cookies = parsed
+        .get("acceptCookies")
+        .or_else(|| parsed.get("accept_cookies"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let accept_third_party = parsed
+        .get("acceptThirdPartyCookies")
+        .or_else(|| parsed.get("accept_third_party_cookies"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !accept_cookies && accept_third_party {
+        return Err(HamburError::InvalidCommand(
+            "browser acceptThirdPartyCookies must be false when acceptCookies is false".to_string(),
+        ));
+    }
+    normalize_json_or_text_setting(value)
 }
 
 fn normalize_role(role: &str) -> HamburResult<String> {

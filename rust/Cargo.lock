@@ -701,6 +701,7 @@ name = "hambur-db"
 version = "0.1.0"
 dependencies = [
  "hambur-core",
+ "serde_json",
  "tokio",
  "turso",
 ]

@@ -1,9 +1,25 @@
+# Gradle & Android Build Outputs
 .gradle/
 build/
+app/build/
+.cxx/
+.externalNativeBuild/
+
+# Kotlin compiler cache
+.kotlin/
+
+# Android Local Properties
 local.properties
 
-app/build/
+# JNI & Rust outputs
 app/src/main/jniLibs/
-
 rust/target/
 
+# IDEs and Editors
+.idea/
+*.iml
+.vscode/
+
+# OS metadata
+.DS_Store
+Thumbs.db

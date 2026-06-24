@@ -2,6 +2,8 @@ package com.hambur.chat.ui
 
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -16,11 +18,17 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.Stable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -28,62 +36,261 @@ import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.hambur.chat.uniffi.MarkdownBlockNodeDto
 import com.hambur.chat.uniffi.MarkdownInlineNodeDto
+
+private const val DestinationAnnotation = "hambur_destination"
+
+@Stable
+class MarkdownRenderCache(private val maxEntries: Int = 512) {
+    private data class AnnotatedStringKey(
+        val messageId: String,
+        val blockId: ULong,
+        val styleVersion: Int,
+    )
+
+    private data class AnnotatedStringEntry(
+        val contentFingerprint: Int,
+        val styleFingerprint: Int,
+        val annotatedString: AnnotatedString,
+    )
+
+    private val annotatedStrings = object :
+        LinkedHashMap<AnnotatedStringKey, AnnotatedStringEntry>(maxEntries, 0.75f, true) {
+        override fun removeEldestEntry(
+            eldest: MutableMap.MutableEntry<AnnotatedStringKey, AnnotatedStringEntry>,
+        ): Boolean = size > maxEntries
+    }
+
+    fun annotatedStringFor(
+        node: MarkdownBlockNodeDto,
+        style: MarkdownStyle,
+    ): AnnotatedString {
+        val key = AnnotatedStringKey(
+            messageId = node.messageId,
+            blockId = node.blockId,
+            styleVersion = style.styleVersion,
+        )
+        val contentFingerprint = node.contentFingerprint()
+        val styleFingerprint = style.visualFingerprint()
+        val cached = annotatedStrings[key]
+        if (
+            cached != null &&
+            cached.contentFingerprint == contentFingerprint &&
+            cached.styleFingerprint == styleFingerprint
+        ) {
+            return cached.annotatedString
+        }
+
+        val annotatedString = buildAnnotatedString {
+            appendInlineNodes(
+                inlines = node.inlines,
+                linkColor = style.linkColor,
+                inlineCodeBackground = style.inlineCodeBackground,
+            )
+        }
+        annotatedStrings[key] = AnnotatedStringEntry(
+            contentFingerprint = contentFingerprint,
+            styleFingerprint = styleFingerprint,
+            annotatedString = annotatedString,
+        )
+        return annotatedString
+    }
+
+    fun clear() {
+        annotatedStrings.clear()
+    }
+}
+
+@Composable
+fun rememberMarkdownRenderCache(maxEntries: Int = 512): MarkdownRenderCache {
+    return remember(maxEntries) { MarkdownRenderCache(maxEntries) }
+}
+
+@Stable
+data class MarkdownStyle(
+    val styleVersion: Int,
+    val paragraphTextStyle: TextStyle,
+    val heading1TextStyle: TextStyle,
+    val heading2TextStyle: TextStyle,
+    val headingTextStyle: TextStyle,
+    val labelTextStyle: TextStyle,
+    val codeTextStyle: TextStyle,
+    val smallTextStyle: TextStyle,
+    val linkColor: Color,
+    val inlineCodeBackground: Color,
+    val codeBlockColor: Color,
+    val blockSurfaceColor: Color,
+    val quoteRailColor: Color,
+    val outlineColor: Color,
+    val onSurfaceVariantColor: Color,
+    val cornerRadius: Dp,
+    val blockPadding: Dp,
+    val tableCellWidth: Dp,
+)
+
+@Composable
+fun rememberMarkdownStyle(styleVersion: Int = 1): MarkdownStyle {
+    val colors = MaterialTheme.colorScheme
+    val typography = MaterialTheme.typography
+    return remember(colors, typography, styleVersion) {
+        MarkdownStyle(
+            styleVersion = styleVersion,
+            paragraphTextStyle = typography.bodyMedium,
+            heading1TextStyle = typography.headlineSmall.copy(fontWeight = FontWeight.SemiBold),
+            heading2TextStyle = typography.titleLarge.copy(fontWeight = FontWeight.SemiBold),
+            headingTextStyle = typography.titleMedium.copy(fontWeight = FontWeight.SemiBold),
+            labelTextStyle = typography.labelSmall,
+            codeTextStyle = typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+            smallTextStyle = typography.bodySmall,
+            linkColor = colors.primary,
+            inlineCodeBackground = colors.surfaceVariant,
+            codeBlockColor = colors.surfaceVariant,
+            blockSurfaceColor = colors.surface,
+            quoteRailColor = colors.primary,
+            outlineColor = colors.outlineVariant,
+            onSurfaceVariantColor = colors.onSurfaceVariant,
+            cornerRadius = 8.dp,
+            blockPadding = 12.dp,
+            tableCellWidth = 132.dp,
+        )
+    }
+}
 
 @Composable
 fun MarkdownBlock(
     node: MarkdownBlockNodeDto,
     modifier: Modifier = Modifier,
+    style: MarkdownStyle? = null,
+    renderCache: MarkdownRenderCache? = null,
+    onOpenDestination: (String) -> Unit = {},
 ) {
+    val markdownStyle = style ?: rememberMarkdownStyle()
     when (node.nodeKind) {
         "Heading" -> MarkdownInlineText(
-            inlines = node.inlines,
-            style = when (node.level.toInt()) {
-                1 -> MaterialTheme.typography.headlineSmall
-                2 -> MaterialTheme.typography.titleLarge
-                else -> MaterialTheme.typography.titleMedium
-            }.copy(fontWeight = FontWeight.SemiBold),
+            node = node,
+            textStyle = markdownStyle.headingStyle(node.level.toInt()),
+            markdownStyle = markdownStyle,
+            renderCache = renderCache,
+            onOpenDestination = onOpenDestination,
             modifier = modifier.fillMaxWidth(),
         )
         "Paragraph" -> MarkdownInlineText(
-            inlines = node.inlines,
-            style = MaterialTheme.typography.bodyMedium,
+            node = node,
+            textStyle = markdownStyle.paragraphTextStyle,
+            markdownStyle = markdownStyle,
+            renderCache = renderCache,
+            onOpenDestination = onOpenDestination,
             modifier = modifier.fillMaxWidth(),
         )
-        "CodeBlock" -> MarkdownCodeBlock(node = node, modifier = modifier)
-        "BlockQuote" -> MarkdownBlockQuote(node = node, modifier = modifier)
-        "List" -> MarkdownList(node = node, modifier = modifier)
-        "Table" -> MarkdownTable(node = node, modifier = modifier)
+        "CodeBlock" -> MarkdownCodeBlock(
+            node = node,
+            markdownStyle = markdownStyle,
+            modifier = modifier,
+        )
+        "BlockQuote" -> MarkdownBlockQuote(
+            node = node,
+            markdownStyle = markdownStyle,
+            renderCache = renderCache,
+            onOpenDestination = onOpenDestination,
+            modifier = modifier,
+        )
+        "List" -> MarkdownList(node = node, markdownStyle = markdownStyle, modifier = modifier)
+        "Table" -> MarkdownTable(node = node, markdownStyle = markdownStyle, modifier = modifier)
         "ThematicBreak" -> HorizontalDivider(modifier = modifier.fillMaxWidth())
-        "HamburFileBlock" -> MarkdownFileBlock(node = node, modifier = modifier)
-        "HtmlBlock", "MathBlock" -> MarkdownPlainBlock(node = node, modifier = modifier)
-        else -> MarkdownPlainBlock(node = node, modifier = modifier)
+        "HamburFileBlock" -> MarkdownFileBlock(
+            node = node,
+            markdownStyle = markdownStyle,
+            onOpenDestination = onOpenDestination,
+            modifier = modifier,
+        )
+        "HtmlBlock", "MathBlock" -> MarkdownPlainBlock(
+            node = node,
+            markdownStyle = markdownStyle,
+            modifier = modifier,
+        )
+        else -> MarkdownPlainBlock(
+            node = node,
+            markdownStyle = markdownStyle,
+            modifier = modifier,
+        )
     }
+}
+
+private fun MarkdownStyle.headingStyle(level: Int): TextStyle {
+    return when (level) {
+        1 -> heading1TextStyle
+        2 -> heading2TextStyle
+        else -> headingTextStyle
+    }
+}
+
+private fun MarkdownStyle.visualFingerprint(): Int {
+    var result = styleVersion
+    result = 31 * result + paragraphTextStyle.hashCode()
+    result = 31 * result + heading1TextStyle.hashCode()
+    result = 31 * result + heading2TextStyle.hashCode()
+    result = 31 * result + headingTextStyle.hashCode()
+    result = 31 * result + codeTextStyle.hashCode()
+    result = 31 * result + linkColor.hashCode()
+    result = 31 * result + inlineCodeBackground.hashCode()
+    return result
+}
+
+private fun MarkdownBlockNodeDto.contentFingerprint(): Int {
+    var result = raw.hashCode()
+    result = 31 * result + text.hashCode()
+    result = 31 * result + inlines.hashCode()
+    return result
 }
 
 @Composable
 private fun MarkdownInlineText(
-    inlines: List<MarkdownInlineNodeDto>,
-    style: TextStyle,
+    node: MarkdownBlockNodeDto,
+    textStyle: TextStyle,
+    markdownStyle: MarkdownStyle,
+    renderCache: MarkdownRenderCache?,
+    onOpenDestination: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val colorScheme = MaterialTheme.colorScheme
-    val annotated = remember(inlines, colorScheme.primary, colorScheme.surfaceVariant) {
-        buildAnnotatedString {
+    val annotated = remember(
+        node.messageId,
+        node.blockId,
+        node.raw,
+        node.inlines,
+        markdownStyle.styleVersion,
+        markdownStyle.visualFingerprint(),
+        renderCache,
+    ) {
+        renderCache?.annotatedStringFor(node, markdownStyle) ?: buildAnnotatedString {
             appendInlineNodes(
-                inlines = inlines,
-                linkColor = colorScheme.primary,
-                inlineCodeBackground = colorScheme.surfaceVariant,
+                inlines = node.inlines,
+                linkColor = markdownStyle.linkColor,
+                inlineCodeBackground = markdownStyle.inlineCodeBackground,
             )
         }
     }
+    var layoutResult by remember(annotated) { mutableStateOf<TextLayoutResult?>(null) }
 
     Text(
         text = annotated,
-        style = style,
-        modifier = modifier,
+        style = textStyle,
+        onTextLayout = { layoutResult = it },
+        modifier = modifier.pointerInput(annotated, onOpenDestination) {
+            detectTapGestures { position ->
+                val offset = layoutResult?.getOffsetForPosition(position) ?: return@detectTapGestures
+                val destination = annotated
+                    .getStringAnnotations(DestinationAnnotation, offset, offset)
+                    .firstOrNull()
+                    ?.item
+                    .orEmpty()
+                if (destination.isNotBlank()) {
+                    onOpenDestination(destination)
+                }
+            }
+        },
     )
 }
 
@@ -115,44 +322,87 @@ private fun AnnotatedString.Builder.appendInlineNodes(
             ) {
                 appendInlineNodes(inline.children, linkColor, inlineCodeBackground)
             }
-            "Link" -> withStyle(
-                SpanStyle(
-                    color = linkColor,
-                    textDecoration = TextDecoration.Underline,
-                ),
-            ) {
-                appendInlineNodes(inline.children, linkColor, inlineCodeBackground)
-            }
-            "Image" -> append(inline.alt.ifBlank { inline.destination })
+            "Link" -> appendDestinationInline(inline, linkColor, inlineCodeBackground)
+            "Image" -> appendImageInline(inline, linkColor, inlineCodeBackground)
             else -> appendInlineNodes(inline.children, linkColor, inlineCodeBackground)
         }
     }
 }
 
+private fun AnnotatedString.Builder.appendDestinationInline(
+    inline: MarkdownInlineNodeDto,
+    linkColor: Color,
+    inlineCodeBackground: Color,
+) {
+    val destination = inline.destination
+    if (destination.isBlank()) {
+        appendInlineNodes(inline.children, linkColor, inlineCodeBackground)
+        return
+    }
+
+    pushStringAnnotation(DestinationAnnotation, destination)
+    withStyle(
+        SpanStyle(
+            color = linkColor,
+            textDecoration = TextDecoration.Underline,
+        ),
+    ) {
+        appendInlineNodes(inline.children, linkColor, inlineCodeBackground)
+    }
+    pop()
+}
+
+private fun AnnotatedString.Builder.appendImageInline(
+    inline: MarkdownInlineNodeDto,
+    linkColor: Color,
+    inlineCodeBackground: Color,
+) {
+    val label = inline.alt.ifBlank { inline.destination }
+    if (inline.destination.isBlank()) {
+        append(label)
+        return
+    }
+
+    pushStringAnnotation(DestinationAnnotation, inline.destination)
+    withStyle(
+        SpanStyle(
+            color = linkColor,
+            textDecoration = TextDecoration.Underline,
+        ),
+    ) {
+        append(label)
+        if (label.isBlank()) {
+            appendInlineNodes(inline.children, linkColor, inlineCodeBackground)
+        }
+    }
+    pop()
+}
+
 @Composable
 private fun MarkdownCodeBlock(
     node: MarkdownBlockNodeDto,
+    markdownStyle: MarkdownStyle,
     modifier: Modifier = Modifier,
 ) {
     Surface(
         modifier = modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(8.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant,
+        shape = RoundedCornerShape(markdownStyle.cornerRadius),
+        color = markdownStyle.codeBlockColor,
     ) {
         Column(
-            modifier = Modifier.padding(12.dp),
+            modifier = Modifier.padding(markdownStyle.blockPadding),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             if (node.language.isNotBlank()) {
                 Text(
                     text = node.language,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = markdownStyle.labelTextStyle,
+                    color = markdownStyle.onSurfaceVariantColor,
                 )
             }
             Text(
                 text = node.text,
-                style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                style = markdownStyle.codeTextStyle,
             )
         }
     }
@@ -161,6 +411,9 @@ private fun MarkdownCodeBlock(
 @Composable
 private fun MarkdownBlockQuote(
     node: MarkdownBlockNodeDto,
+    markdownStyle: MarkdownStyle,
+    renderCache: MarkdownRenderCache?,
+    onOpenDestination: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Row(
@@ -169,12 +422,15 @@ private fun MarkdownBlockQuote(
     ) {
         Surface(
             modifier = Modifier.width(3.dp),
-            color = MaterialTheme.colorScheme.primary,
+            color = markdownStyle.quoteRailColor,
             shape = RoundedCornerShape(2.dp),
         ) {}
         MarkdownInlineText(
-            inlines = node.inlines,
-            style = MaterialTheme.typography.bodyMedium,
+            node = node,
+            textStyle = markdownStyle.paragraphTextStyle,
+            markdownStyle = markdownStyle,
+            renderCache = renderCache,
+            onOpenDestination = onOpenDestination,
             modifier = Modifier.weight(1f),
         )
     }
@@ -183,6 +439,7 @@ private fun MarkdownBlockQuote(
 @Composable
 private fun MarkdownList(
     node: MarkdownBlockNodeDto,
+    markdownStyle: MarkdownStyle,
     modifier: Modifier = Modifier,
 ) {
     Column(
@@ -195,7 +452,7 @@ private fun MarkdownList(
             .forEach { line ->
                 Text(
                     text = line,
-                    style = MaterialTheme.typography.bodyMedium,
+                    style = markdownStyle.paragraphTextStyle,
                 )
             }
     }
@@ -204,6 +461,7 @@ private fun MarkdownList(
 @Composable
 private fun MarkdownTable(
     node: MarkdownBlockNodeDto,
+    markdownStyle: MarkdownStyle,
     modifier: Modifier = Modifier,
 ) {
     val rows = remember(node.tableHeader, node.tableRows) {
@@ -225,15 +483,15 @@ private fun MarkdownTable(
                     Text(
                         text = cell,
                         style = if (index == 0) {
-                            MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold)
+                            markdownStyle.labelTextStyle.copy(fontWeight = FontWeight.SemiBold)
                         } else {
-                            MaterialTheme.typography.bodySmall
+                            markdownStyle.smallTextStyle
                         },
                         modifier = Modifier
-                            .width(132.dp)
+                            .width(markdownStyle.tableCellWidth)
                             .border(
                                 width = 1.dp,
-                                color = MaterialTheme.colorScheme.outlineVariant,
+                                color = markdownStyle.outlineColor,
                             )
                             .padding(horizontal = 8.dp, vertical = 6.dp),
                     )
@@ -246,16 +504,25 @@ private fun MarkdownTable(
 @Composable
 private fun MarkdownFileBlock(
     node: MarkdownBlockNodeDto,
+    markdownStyle: MarkdownStyle,
+    onOpenDestination: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val clickableModifier = if (node.path.isNotBlank()) {
+        Modifier.clickable { onOpenDestination(node.path) }
+    } else {
+        Modifier
+    }
     Surface(
-        modifier = modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(8.dp),
-        color = MaterialTheme.colorScheme.surface,
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+        modifier = modifier
+            .fillMaxWidth()
+            .then(clickableModifier),
+        shape = RoundedCornerShape(markdownStyle.cornerRadius),
+        color = markdownStyle.blockSurfaceColor,
+        border = BorderStroke(1.dp, markdownStyle.outlineColor),
     ) {
         Column(
-            modifier = Modifier.padding(12.dp),
+            modifier = Modifier.padding(markdownStyle.blockPadding),
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
             Text(
@@ -265,8 +532,8 @@ private fun MarkdownFileBlock(
             )
             Text(
                 text = node.path,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = markdownStyle.smallTextStyle,
+                color = markdownStyle.onSurfaceVariantColor,
             )
         }
     }
@@ -275,11 +542,12 @@ private fun MarkdownFileBlock(
 @Composable
 private fun MarkdownPlainBlock(
     node: MarkdownBlockNodeDto,
+    markdownStyle: MarkdownStyle,
     modifier: Modifier = Modifier,
 ) {
     Text(
         text = node.text.ifBlank { node.raw.trim() },
-        style = MaterialTheme.typography.bodyMedium,
+        style = markdownStyle.paragraphTextStyle,
         modifier = modifier.fillMaxWidth(),
     )
 }

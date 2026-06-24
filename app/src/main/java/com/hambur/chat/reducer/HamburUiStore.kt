@@ -48,6 +48,7 @@ data class AppShellState(
     val markdownMessageId: String = "",
     val markdownBlocks: List<MarkdownBlockNodeDto> = emptyList(),
     val pendingMarkdownBlock: MarkdownBlockNodeDto? = null,
+    val activePreviewPath: String = "",
     val snapshotSequence: ULong = 0UL,
     val lastAppliedSequence: ULong = 0UL,
     val appliedEventIds: Set<String> = emptySet(),
@@ -60,7 +61,10 @@ class HamburUiStore(appFilesDir: String) {
     private val _state = MutableStateFlow(AppShellState())
     private val startupLock = Any()
     private val startupBuffer = mutableListOf<BackendEvent>()
+    private val markdownCoalesceLock = Any()
+    private val pendingMarkdownEvents = mutableListOf<BackendEvent>()
     private val commandCounter = AtomicLong()
+    private var markdownFlushScheduled = false
     private var baselineApplied = false
 
     val state: StateFlow<AppShellState> = _state.asStateFlow()
@@ -145,6 +149,17 @@ class HamburUiStore(appFilesDir: String) {
                 ),
             )
             applyRejectedAck(finalAck)
+        }
+    }
+
+    fun openMarkdownDestination(destination: String) {
+        if (destination.isBlank()) return
+        _state.update {
+            it.copy(
+                latestEventKind = "FilePreviewRoute",
+                footer = destination,
+                activePreviewPath = destination,
+            )
         }
     }
 
@@ -263,7 +278,54 @@ class HamburUiStore(appFilesDir: String) {
     }
 
     private fun applyEvent(event: BackendEvent) {
-        _state.update { it.reduce(event) }
+        if (event.kind == "MarkdownRenderUpdate") {
+            enqueueMarkdownEvent(event)
+            return
+        }
+        val markdownEvents = drainMarkdownEvents()
+        _state.update { state ->
+            markdownEvents.fold(state) { nextState, markdownEvent ->
+                nextState.reduce(markdownEvent)
+            }.reduce(event)
+        }
+    }
+
+    private fun enqueueMarkdownEvent(event: BackendEvent) {
+        val shouldSchedule = synchronized(markdownCoalesceLock) {
+            pendingMarkdownEvents.add(event)
+            if (markdownFlushScheduled) {
+                false
+            } else {
+                markdownFlushScheduled = true
+                true
+            }
+        }
+
+        if (shouldSchedule) {
+            scope.launch {
+                delay(16)
+                flushMarkdownEvents()
+            }
+        }
+    }
+
+    private fun flushMarkdownEvents() {
+        val events = drainMarkdownEvents()
+        if (events.isEmpty()) return
+        _state.update { state ->
+            events.fold(state) { nextState, event ->
+                nextState.reduce(event)
+            }
+        }
+    }
+
+    private fun drainMarkdownEvents(): List<BackendEvent> {
+        return synchronized(markdownCoalesceLock) {
+            markdownFlushScheduled = false
+            pendingMarkdownEvents
+                .sortedBy { it.sequence }
+                .also { pendingMarkdownEvents.clear() }
+        }
     }
 
     private fun applyRejectedAck(ack: CommandAck) {
@@ -324,6 +386,10 @@ private fun AppShellState.applyBaseline(
         },
         selectedSessionId = selectedSessionId,
         timelineItems = timelineItems.toUiTimelineItems(),
+        markdownMessageId = "",
+        markdownBlocks = emptyList(),
+        pendingMarkdownBlock = null,
+        activePreviewPath = "",
         snapshotSequence = baselineSequence,
         lastAppliedSequence = baselineSequence,
         appliedEventIds = emptySet(),
@@ -362,9 +428,12 @@ private fun AppShellState.reduce(event: BackendEvent): AppShellState {
         else -> footer
     }
 
+    val nextSelectedSessionId = snapshot.selectedSessionId
+    val sessionChanged = nextSelectedSessionId != selectedSessionId
     val markdownUpdate = event.markdownRenderUpdate
     val shouldApplyMarkdown = event.kind == "MarkdownRenderUpdate" &&
-        markdownUpdate.messageId.isNotBlank()
+        markdownUpdate.messageId.isNotBlank() &&
+        event.belongsToSelectedSession(nextSelectedSessionId)
     val baseMarkdownBlocks = if (shouldApplyMarkdown &&
         (markdownUpdate.reset || markdownMessageId != markdownUpdate.messageId)
     ) {
@@ -398,7 +467,7 @@ private fun AppShellState.reduce(event: BackendEvent): AppShellState {
                 latestPreview = it.latestPreview,
             )
         },
-        selectedSessionId = snapshot.selectedSessionId,
+        selectedSessionId = nextSelectedSessionId,
         timelineItems = snapshot.timelineItems.map {
             UiTimelineItem(
                 id = it.id,
@@ -409,17 +478,30 @@ private fun AppShellState.reduce(event: BackendEvent): AppShellState {
                 kind = it.kind,
             )
         },
-        markdownMessageId = if (shouldApplyMarkdown) markdownUpdate.messageId else markdownMessageId,
-        markdownBlocks = nextMarkdownBlocks,
-        pendingMarkdownBlock = if (shouldApplyMarkdown) {
-            markdownUpdate.pendingNode
-        } else {
-            pendingMarkdownBlock
+        markdownMessageId = when {
+            shouldApplyMarkdown -> markdownUpdate.messageId
+            sessionChanged -> ""
+            else -> markdownMessageId
         },
+        markdownBlocks = when {
+            shouldApplyMarkdown -> nextMarkdownBlocks
+            sessionChanged -> emptyList()
+            else -> markdownBlocks
+        },
+        pendingMarkdownBlock = when {
+            shouldApplyMarkdown -> markdownUpdate.pendingNode
+            sessionChanged -> null
+            else -> pendingMarkdownBlock
+        },
+        activePreviewPath = if (sessionChanged) "" else activePreviewPath,
         lastAppliedSequence = event.sequence,
         appliedEventIds = nextAppliedEventIds,
         activeTurnIds = updateActiveTurnIds(event),
     )
+}
+
+private fun BackendEvent.belongsToSelectedSession(selectedSessionId: String): Boolean {
+    return sessionId.isBlank() || selectedSessionId.isBlank() || sessionId == selectedSessionId
 }
 
 private fun AppShellState.isStaleTurnEvent(event: BackendEvent): Boolean {

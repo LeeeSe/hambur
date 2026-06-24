@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -26,12 +27,15 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -42,6 +46,7 @@ import com.hambur.chat.reducer.HamburUiStore
 import com.hambur.chat.reducer.UiSessionSummary
 import com.hambur.chat.reducer.UiTimelineItem
 import com.hambur.chat.uniffi.MarkdownBlockNodeDto
+import kotlinx.coroutines.flow.distinctUntilChanged
 
 @Composable
 fun AppShell(appFilesDir: String) {
@@ -107,9 +112,11 @@ fun AppShell(appFilesDir: String) {
                         items = state.timelineItems,
                         markdownBlocks = state.markdownBlocks,
                         pendingMarkdownBlock = state.pendingMarkdownBlock,
+                        activePreviewPath = state.activePreviewPath,
                         onRenderMarkdown = {
                             store.streamMarkdownPreview(state.selectedSessionId)
                         },
+                        onOpenDestination = store::openMarkdownDestination,
                     )
 
                     Text(
@@ -295,9 +302,13 @@ private fun TimelineSnapshot(
     items: List<UiTimelineItem>,
     markdownBlocks: List<MarkdownBlockNodeDto>,
     pendingMarkdownBlock: MarkdownBlockNodeDto?,
+    activePreviewPath: String,
     onRenderMarkdown: () -> Unit,
+    onOpenDestination: (String) -> Unit,
 ) {
-    val hasMarkdown = markdownBlocks.isNotEmpty() || pendingMarkdownBlock != null
+    val hasMarkdown = markdownBlocks.isNotEmpty() ||
+        pendingMarkdownBlock != null ||
+        activePreviewPath.isNotBlank()
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -342,16 +353,22 @@ private fun TimelineSnapshot(
                     )
                 } else {
                     MarkdownTimeline(
+                        selectedSessionId = selectedSessionId,
                         items = items,
                         markdownBlocks = markdownBlocks,
                         pendingMarkdownBlock = pendingMarkdownBlock,
+                        activePreviewPath = activePreviewPath,
+                        onOpenDestination = onOpenDestination,
                     )
                 }
             } else {
                 MarkdownTimeline(
+                    selectedSessionId = selectedSessionId,
                     items = items,
                     markdownBlocks = markdownBlocks,
                     pendingMarkdownBlock = pendingMarkdownBlock,
+                    activePreviewPath = activePreviewPath,
+                    onOpenDestination = onOpenDestination,
                 )
             }
         }
@@ -360,11 +377,51 @@ private fun TimelineSnapshot(
 
 @Composable
 private fun MarkdownTimeline(
+    selectedSessionId: String,
     items: List<UiTimelineItem>,
     markdownBlocks: List<MarkdownBlockNodeDto>,
     pendingMarkdownBlock: MarkdownBlockNodeDto?,
+    activePreviewPath: String,
+    onOpenDestination: (String) -> Unit,
 ) {
+    val listState = rememberLazyListState()
+    val markdownStyle = rememberMarkdownStyle()
+    val markdownRenderCache = rememberMarkdownRenderCache()
+    var followTail by remember(selectedSessionId) { mutableStateOf(true) }
+    val renderedItemCount = items.size +
+        markdownBlocks.size +
+        (if (pendingMarkdownBlock != null) 1 else 0) +
+        (if (activePreviewPath.isNotBlank()) 1 else 0)
+    val bottomAnchorIndex = renderedItemCount
+
+    LaunchedEffect(listState) {
+        snapshotFlow {
+            val layout = listState.layoutInfo
+            val total = layout.totalItemsCount
+            val lastVisible = layout.visibleItemsInfo.lastOrNull()?.index ?: 0
+            total == 0 || lastVisible >= total - 2
+        }
+            .distinctUntilChanged()
+            .collect { nearBottom ->
+                followTail = nearBottom
+            }
+    }
+
+    LaunchedEffect(
+        renderedItemCount,
+        pendingMarkdownBlock?.stableKey,
+        pendingMarkdownBlock?.raw,
+        pendingMarkdownBlock?.text,
+        followTail,
+    ) {
+        if (followTail) {
+            withFrameNanos { }
+            listState.scrollToItem(bottomAnchorIndex)
+        }
+    }
+
     LazyColumn(
+        state = listState,
         modifier = Modifier
             .fillMaxWidth()
             .heightIn(max = 260.dp)
@@ -387,6 +444,9 @@ private fun MarkdownTimeline(
             MarkdownBlock(
                 node = block,
                 modifier = Modifier.padding(horizontal = 14.dp),
+                style = markdownStyle,
+                renderCache = markdownRenderCache,
+                onOpenDestination = onOpenDestination,
             )
         }
 
@@ -398,8 +458,34 @@ private fun MarkdownTimeline(
                 MarkdownBlock(
                     node = pendingMarkdownBlock,
                     modifier = Modifier.padding(horizontal = 14.dp),
+                    style = markdownStyle,
+                    renderCache = markdownRenderCache,
+                    onOpenDestination = onOpenDestination,
                 )
             }
+        }
+
+        if (activePreviewPath.isNotBlank()) {
+            item(
+                key = "markdown-preview-route",
+                contentType = "preview-route",
+            ) {
+                Text(
+                    text = activePreviewPath,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 2.dp),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+
+        item(
+            key = "timeline-bottom-anchor",
+            contentType = "bottom-anchor",
+        ) {
+            Spacer(modifier = Modifier.height(1.dp))
         }
     }
 }

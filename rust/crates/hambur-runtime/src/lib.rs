@@ -7,16 +7,18 @@ use std::sync::{
 
 use hambur_core::{DTO_SCHEMA_VERSION, HamburError, HamburResult, new_id, now_ms};
 use hambur_db::{
-    AppSnapshot, HamburDatabase, MessageRecord, ModelRouteSnapshot, NewTimelineItem,
-    ProviderModelUpsert, ProviderUpsert, SessionSummary, TimelineItemSnapshot,
+    AppSnapshot, HamburDatabase, MessageRecord, ModelRouteSnapshot, NewTimelineItem, NewToolCall,
+    NewToolResult, NewTraceSpan, ProviderModelUpsert, ProviderUpsert, SessionSummary,
+    TimelineItemSnapshot,
 };
 use hambur_llm::{
-    FallbackPolicy, ModelCapabilities, ModelRouter, OPENAI_COMPATIBLE_PROTOCOL,
+    CompleteToolCall, FallbackPolicy, ModelCapabilities, ModelRouter, OPENAI_COMPATIBLE_PROTOCOL,
     OpenAiCompatibleAdapter, ProviderConfig, ProviderModel, ProviderStreamEvent, ProviderTarget,
-    RoutePlan, RouteRequirements, RoutingStrategy, SseDecoder, scripted_openai_sse_chunks,
-    should_fallback,
+    RoutePlan, RouteRequirements, RoutingStrategy, SseDecoder, ToolCallAccumulator,
+    scripted_openai_sse_chunks, should_fallback,
 };
 use hambur_markdown::{MarkdownPipeline, MarkdownRenderUpdate};
+use hambur_tools::{MAX_TOOL_ITERATIONS_PER_TURN, ToolCallBatch, ToolInvocation, ToolScheduler};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
@@ -112,6 +114,10 @@ pub enum RuntimeEventKind {
     AssistantReasoningDelta,
     MarkdownRenderUpdate,
     AssistantMessageFinished,
+    ToolCallStarted,
+    ToolCallDelta,
+    ToolCallFinished,
+    ToolCallFailed,
     TurnFinished,
     TurnFailed,
     TurnCancelled,
@@ -135,6 +141,10 @@ impl RuntimeEventKind {
             Self::AssistantReasoningDelta => "AssistantReasoningDelta",
             Self::MarkdownRenderUpdate => "MarkdownRenderUpdate",
             Self::AssistantMessageFinished => "AssistantMessageFinished",
+            Self::ToolCallStarted => "ToolCallStarted",
+            Self::ToolCallDelta => "ToolCallDelta",
+            Self::ToolCallFinished => "ToolCallFinished",
+            Self::ToolCallFailed => "ToolCallFailed",
             Self::TurnFinished => "TurnFinished",
             Self::TurnFailed => "TurnFailed",
             Self::TurnCancelled => "TurnCancelled",
@@ -167,6 +177,7 @@ pub struct RuntimeEngine {
     markdown_streams: Mutex<HashMap<String, MarkdownPipeline>>,
     active_turns: Mutex<HashMap<String, ActiveTurn>>,
     router: Mutex<ModelRouter>,
+    tools: ToolScheduler,
     idempotency: Mutex<HashMap<String, RuntimeCommandAck>>,
     sender: mpsc::Sender<RuntimeEvent>,
     receiver: Mutex<mpsc::Receiver<RuntimeEvent>>,
@@ -202,6 +213,7 @@ impl RuntimeEngine {
         let database_path = database_path(&bootstrap);
         let database = tokio.block_on(HamburDatabase::open(database_path))?;
         let snapshot = tokio.block_on(database.bootstrap_snapshot())?;
+        let tools = ToolScheduler::new(PathBuf::from(&bootstrap.app_files_dir).join("offloads"))?;
         let (sender, receiver) = mpsc::channel(64);
         let engine = Arc::new(Self {
             tokio,
@@ -211,6 +223,7 @@ impl RuntimeEngine {
             markdown_streams: Mutex::new(HashMap::new()),
             active_turns: Mutex::new(HashMap::new()),
             router: Mutex::new(ModelRouter::default()),
+            tools,
             idempotency: Mutex::new(HashMap::new()),
             sender,
             receiver: Mutex::new(receiver),
@@ -997,6 +1010,9 @@ impl RuntimeEngine {
         let mut semantic_delta_started = false;
         let mut finish_reason = String::new();
         let mut native_finish_reason = String::new();
+        let mut saw_tool_delta = false;
+        let mut tool_accumulator = ToolCallAccumulator::default();
+        let mut complete_tool_calls = Vec::<CompleteToolCall>::new();
 
         for chunk in stream_chunks {
             if cancel.load(Ordering::SeqCst) || self.shutdown.load(Ordering::SeqCst) {
@@ -1056,6 +1072,7 @@ impl RuntimeEngine {
                 };
 
                 for event in events {
+                    let newly_complete_tool_calls = tool_accumulator.apply(&event);
                     if cancel.load(Ordering::SeqCst) || self.shutdown.load(Ordering::SeqCst) {
                         self.finish_cancelled_turn(
                             &session_id,
@@ -1118,6 +1135,20 @@ impl RuntimeEngine {
                         }
                         ProviderStreamEvent::ToolCallDelta { .. } => {
                             semantic_delta_started = true;
+                            saw_tool_delta = true;
+                            let snapshot = self
+                                .database
+                                .session_snapshot(&session_id)
+                                .await
+                                .unwrap_or_default();
+                            let _ = self.emit_session_event(
+                                RuntimeEventKind::ToolCallDelta,
+                                session_id.clone(),
+                                turn_id.clone(),
+                                snapshot,
+                                "Tool call delta".to_string(),
+                                None,
+                            );
                         }
                         ProviderStreamEvent::Finish {
                             finish_reason: reason,
@@ -1143,6 +1174,15 @@ impl RuntimeEngine {
                                 error,
                                 semantic_delta_started,
                             };
+                        }
+                    }
+
+                    for complete in newly_complete_tool_calls {
+                        if !complete_tool_calls
+                            .iter()
+                            .any(|existing| existing.index == complete.index)
+                        {
+                            complete_tool_calls.push(complete);
                         }
                     }
                 }
@@ -1172,6 +1212,63 @@ impl RuntimeEngine {
 
         let final_finish_reason = finish_reason.if_blank("stop".to_string());
         let final_native_finish_reason = native_finish_reason.if_blank(final_finish_reason.clone());
+        if saw_tool_delta {
+            complete_tool_calls = tool_accumulator.completed_calls();
+        }
+        if saw_tool_delta
+            && (complete_tool_calls.is_empty() || tool_accumulator.has_incomplete_calls())
+        {
+            let error = HamburError::SseParse("incomplete tool call stream".to_string());
+            self.finish_failed_turn(
+                &session_id,
+                &turn_id,
+                &assistant_message_id,
+                &content,
+                &reasoning,
+                error.clone(),
+            )
+            .await;
+            return StreamAttemptResult::Failed {
+                error,
+                semantic_delta_started: true,
+            };
+        }
+        if !complete_tool_calls.is_empty() {
+            complete_tool_calls.sort_by_key(|call| call.index);
+            let result = self
+                .execute_tool_batch_and_continue(
+                    &session_id,
+                    &turn_id,
+                    &assistant_message_id,
+                    &route,
+                    &cancel,
+                    &content,
+                    &reasoning,
+                    final_finish_reason,
+                    final_native_finish_reason,
+                    complete_tool_calls,
+                )
+                .await;
+            return match result {
+                Ok(()) => StreamAttemptResult::Completed,
+                Err(error) => {
+                    self.finish_failed_turn(
+                        &session_id,
+                        &turn_id,
+                        &assistant_message_id,
+                        &content,
+                        &reasoning,
+                        error.clone(),
+                    )
+                    .await;
+                    StreamAttemptResult::Failed {
+                        error,
+                        semantic_delta_started: true,
+                    }
+                }
+            };
+        }
+
         let message = match self
             .database
             .update_message_stream_result(
@@ -1274,6 +1371,334 @@ impl RuntimeEngine {
             None,
         );
         StreamAttemptResult::Completed
+    }
+
+    async fn execute_tool_batch_and_continue(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        assistant_message_id: &str,
+        route: &ModelRouteSnapshot,
+        cancel: &Arc<AtomicBool>,
+        content: &str,
+        reasoning: &str,
+        finish_reason: String,
+        native_finish_reason: String,
+        complete_tool_calls: Vec<CompleteToolCall>,
+    ) -> HamburResult<()> {
+        if complete_tool_calls.len() > MAX_TOOL_ITERATIONS_PER_TURN as usize {
+            return Err(HamburError::InvalidCommand(format!(
+                "max tool iterations exceeded: {}",
+                MAX_TOOL_ITERATIONS_PER_TURN
+            )));
+        }
+
+        if let Some(update) =
+            self.append_stream_markdown(session_id, assistant_message_id, "", true)
+        {
+            let snapshot = self
+                .database
+                .session_snapshot(session_id)
+                .await
+                .unwrap_or_default();
+            let _ = self.emit_markdown_event(
+                session_id.to_string(),
+                turn_id.to_string(),
+                snapshot,
+                update,
+            );
+        }
+
+        let message = self
+            .database
+            .update_message_stream_result(
+                assistant_message_id,
+                content,
+                reasoning,
+                "requires_tool",
+                &finish_reason.if_blank("tool_calls".to_string()),
+                &native_finish_reason.if_blank("tool_calls".to_string()),
+            )
+            .await?;
+        self.database
+            .upsert_timeline_item(
+                session_id,
+                NewTimelineItem {
+                    stable_key: message.id,
+                    content_type: "message".to_string(),
+                    display_sequence: message.created_at_ms,
+                    payload_ref: assistant_message_id.to_string(),
+                    small_summary: if content.trim().is_empty() {
+                        "Tool calls requested".to_string()
+                    } else {
+                        content.chars().take(160).collect()
+                    },
+                    kind: "AssistantMessage".to_string(),
+                },
+            )
+            .await?;
+
+        self.database
+            .update_turn_status(turn_id, "ExecutingTools", false)
+            .await?;
+        let snapshot = self
+            .database
+            .session_snapshot(session_id)
+            .await
+            .unwrap_or_default();
+        let _ = self.emit_session_event(
+            RuntimeEventKind::TurnStateChanged,
+            session_id.to_string(),
+            turn_id.to_string(),
+            snapshot,
+            "Executing tools".to_string(),
+            None,
+        );
+
+        let mut invocations = Vec::new();
+        let mut trace_ids = HashMap::<String, String>::new();
+        for call in complete_tool_calls {
+            let invocation = ToolInvocation::from_model_call(
+                call.index,
+                call.id,
+                turn_id.to_string(),
+                session_id.to_string(),
+                call.name,
+                call.arguments_json,
+            )?;
+            self.database
+                .insert_tool_call(NewToolCall {
+                    id: invocation.tool_call_id.clone(),
+                    session_id: session_id.to_string(),
+                    turn_id: turn_id.to_string(),
+                    assistant_message_id: assistant_message_id.to_string(),
+                    name: invocation.name.clone(),
+                    arguments_json: invocation.arguments_json.clone(),
+                    display_title: invocation.display_title.clone(),
+                    status: "running".to_string(),
+                    requires_approval: invocation.requires_approval,
+                })
+                .await?;
+            let trace = self
+                .database
+                .insert_trace_span(NewTraceSpan {
+                    session_id: session_id.to_string(),
+                    turn_id: turn_id.to_string(),
+                    kind: "tool".to_string(),
+                    title: invocation.display_title.clone(),
+                    content: invocation.arguments_json.clone(),
+                    status: "running".to_string(),
+                    tool_call_id: invocation.tool_call_id.clone(),
+                    payload_json: invocation.arguments_json.clone(),
+                    visible: true,
+                    ..Default::default()
+                })
+                .await?;
+            trace_ids.insert(invocation.tool_call_id.clone(), trace.id);
+            let snapshot = self
+                .database
+                .session_snapshot(session_id)
+                .await
+                .unwrap_or_default();
+            let _ = self.emit_session_event(
+                RuntimeEventKind::ToolCallStarted,
+                session_id.to_string(),
+                turn_id.to_string(),
+                snapshot,
+                invocation.display_title.clone(),
+                None,
+            );
+            invocations.push(invocation);
+        }
+
+        if cancel.load(Ordering::SeqCst) || self.shutdown.load(Ordering::SeqCst) {
+            self.finish_cancelled_turn(
+                session_id,
+                turn_id,
+                assistant_message_id,
+                content,
+                reasoning,
+            )
+            .await;
+            return Ok(());
+        }
+
+        let batch = ToolCallBatch::new(
+            turn_id.to_string(),
+            assistant_message_id.to_string(),
+            invocations,
+        );
+        let records = self.tools.execute_batch(batch).await?;
+        let mut context_stubs = Vec::new();
+        for record in records {
+            let tool_message = self
+                .database
+                .insert_tool_result_message(
+                    session_id,
+                    turn_id,
+                    &record.invocation.tool_call_id,
+                    &record.invocation.name,
+                    &record.result.context_stub,
+                    route,
+                )
+                .await?;
+            let result = self
+                .database
+                .insert_tool_result(NewToolResult {
+                    session_id: session_id.to_string(),
+                    turn_id: turn_id.to_string(),
+                    tool_call_id: record.invocation.tool_call_id.clone(),
+                    message_id: tool_message.id,
+                    is_error: record.result.is_error,
+                    content_json: record.result.content_json.clone(),
+                    summary: record.result.summary.clone(),
+                    artifacts_json: record.result.artifacts_json.clone(),
+                    trust_level: record.result.trust_level.clone(),
+                    truncated: record.result.truncated,
+                    offloaded_file_id: record.result.offloaded_file_id.clone(),
+                    offloaded_path: record.result.offloaded_path.clone(),
+                    context_stub: record.result.context_stub.clone(),
+                })
+                .await?;
+            let status = if record.result.is_error {
+                "failed"
+            } else {
+                "completed"
+            };
+            self.database
+                .update_tool_call_status(
+                    &record.invocation.tool_call_id,
+                    status,
+                    &result.id,
+                    if record.result.is_error {
+                        "ToolError"
+                    } else {
+                        ""
+                    },
+                    if record.result.is_error {
+                        &record.result.summary
+                    } else {
+                        ""
+                    },
+                    true,
+                )
+                .await?;
+            self.update_latest_tool_trace(
+                trace_ids
+                    .get(&record.invocation.tool_call_id)
+                    .map(String::as_str),
+                &record.invocation.tool_call_id,
+                status,
+                &record.result.summary,
+            )
+            .await?;
+
+            let snapshot = self
+                .database
+                .session_snapshot(session_id)
+                .await
+                .unwrap_or_default();
+            let _ = self.emit_session_event(
+                if record.result.is_error {
+                    RuntimeEventKind::ToolCallFailed
+                } else {
+                    RuntimeEventKind::ToolCallFinished
+                },
+                session_id.to_string(),
+                turn_id.to_string(),
+                snapshot,
+                record.result.summary.clone(),
+                None,
+            );
+            context_stubs.push(record.result.context_stub);
+        }
+
+        if cancel.load(Ordering::SeqCst) || self.shutdown.load(Ordering::SeqCst) {
+            self.finish_cancelled_turn(
+                session_id,
+                turn_id,
+                assistant_message_id,
+                content,
+                reasoning,
+            )
+            .await;
+            return Ok(());
+        }
+
+        self.database
+            .update_turn_status(turn_id, "ContinuingAfterTools", false)
+            .await?;
+        let continuation_content = format_tool_continuation(&context_stubs);
+        let continuation = self
+            .database
+            .insert_message_with_route(
+                session_id,
+                "assistant",
+                &continuation_content,
+                "",
+                "completed",
+                turn_id,
+                route,
+            )
+            .await?;
+        self.database
+            .upsert_timeline_item(
+                session_id,
+                NewTimelineItem {
+                    stable_key: continuation.id.clone(),
+                    content_type: "message".to_string(),
+                    display_sequence: continuation.created_at_ms,
+                    payload_ref: continuation.id.clone(),
+                    small_summary: continuation_content.chars().take(160).collect(),
+                    kind: "AssistantMessage".to_string(),
+                },
+            )
+            .await?;
+        self.database
+            .update_turn_status(turn_id, "Finished", true)
+            .await?;
+
+        let snapshot = self
+            .database
+            .session_snapshot(session_id)
+            .await
+            .unwrap_or_default();
+        self.clear_active_turn(session_id, turn_id);
+        let _ = self.emit_session_event(
+            RuntimeEventKind::AssistantMessageFinished,
+            session_id.to_string(),
+            turn_id.to_string(),
+            snapshot.clone(),
+            "tool_continuation".to_string(),
+            None,
+        );
+        let _ = self.emit_session_event(
+            RuntimeEventKind::TurnFinished,
+            session_id.to_string(),
+            turn_id.to_string(),
+            snapshot,
+            "tool_continuation".to_string(),
+            None,
+        );
+        Ok(())
+    }
+
+    async fn update_latest_tool_trace(
+        &self,
+        trace_id: Option<&str>,
+        tool_call_id: &str,
+        status: &str,
+        summary: &str,
+    ) -> HamburResult<()> {
+        let Some(trace_id) = trace_id else {
+            return Err(HamburError::Internal(format!(
+                "tool trace missing for: {tool_call_id}"
+            )));
+        };
+        self.database
+            .update_trace_span_status(trace_id, status, summary, true)
+            .await?;
+        Ok(())
     }
 
     async fn finish_cancelled_turn(
@@ -1889,6 +2314,17 @@ fn stream_chunks_for_command(
     scripted_openai_sse_chunks(&response, &reasoning)
 }
 
+fn format_tool_continuation(context_stubs: &[String]) -> String {
+    if context_stubs.is_empty() {
+        return "Tool batch completed with no output.".to_string();
+    }
+    let mut output = String::from("Tool batch completed. Results:\n");
+    for (index, stub) in context_stubs.iter().enumerate() {
+        output.push_str(&format!("\n{}. {}\n", index + 1, stub.trim()));
+    }
+    output
+}
+
 fn scripted_route_value<'a>(
     value: &'a serde_json::Value,
     route: &ModelRouteSnapshot,
@@ -1941,7 +2377,7 @@ fn default_models_response(model_id: &str) -> String {
         model_id.trim()
     };
     format!(
-        r#"{{"data":[{{"id":"{model_id}","display_name":"{model_id}","supports_reasoning":true,"supports_tool_call":false,"supports_image_input":false,"supports_structured_output":false,"supports_temperature":true,"context_limit":32000,"output_limit":4096}}]}}"#
+        r#"{{"data":[{{"id":"{model_id}","display_name":"{model_id}","supports_reasoning":true,"supports_tool_call":true,"supports_image_input":false,"supports_structured_output":false,"supports_temperature":true,"context_limit":32000,"output_limit":4096}}]}}"#
     )
 }
 
@@ -2531,6 +2967,76 @@ mod tests {
         let _ = fs::remove_dir_all(app_files_dir);
     }
 
+    #[test]
+    fn tool_calls_execute_as_one_batch_and_render_traces() {
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+        let session_id = create_test_session(&runtime);
+        configure_test_provider(&runtime, "gpt-tools");
+
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
+            "{\"index\":0,\"id\":\"call_time\",\"function\":{\"name\":\"get_current_time\",\"arguments\":\"{}\"}},",
+            "{\"index\":1,\"id\":\"call_echo\",\"function\":{\"name\":\"echo\",\"arguments\":\"{\\\"text\\\":\\\"hello tools\\\"}\"}}",
+            "]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let ack = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_tools".to_string(),
+            idempotency_key: "message:tools:batch".to_string(),
+            kind: "SendMessage".to_string(),
+            session_id: session_id.clone(),
+            content: "use tools".to_string(),
+            payload_json: serde_json::json!({"sse": sse}).to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(ack.accepted, "send rejected: {}", ack.message);
+
+        let mut finished_tools = 0;
+        let mut turn_finished = false;
+        for _ in 0..96 {
+            let event = runtime.next_event().expect("tool event");
+            match event.kind.as_str() {
+                "ToolCallFinished" => finished_tools += 1,
+                "TurnFinished" => {
+                    turn_finished = true;
+                    break;
+                }
+                "TurnFailed" => panic!("turn failed: {}", event.message),
+                _ => {}
+            }
+        }
+        assert_eq!(finished_tools, 2);
+        assert!(turn_finished, "missing turn finish");
+
+        let timeline = runtime.get_timeline_page(session_id, 0, 50);
+        let trace_count = timeline
+            .items
+            .iter()
+            .filter(|item| item.kind == "ToolTrace")
+            .count();
+        assert!(trace_count >= 2, "missing tool traces: {trace_count}");
+        let continuation = timeline
+            .items
+            .iter()
+            .rev()
+            .find(|item| item.kind == "AssistantMessage")
+            .expect("assistant continuation");
+        let message = runtime
+            .get_message_snapshot(continuation.payload_ref.clone())
+            .message
+            .expect("continuation message");
+        assert!(message.content_text.contains("hello tools"));
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
     fn temp_app_dir() -> PathBuf {
         std::env::temp_dir().join(new_id("hambur_runtime_test"))
     }
@@ -2562,7 +3068,7 @@ mod tests {
         let _ = runtime.next_event().expect("provider event");
 
         let models_json = format!(
-            r#"{{"data":[{{"id":"{model_id}","display_name":"{model_id}","supports_reasoning":true,"supports_tool_call":false,"supports_image_input":false,"supports_structured_output":false,"supports_temperature":true,"context_limit":32000,"output_limit":4096}}]}}"#
+            r#"{{"data":[{{"id":"{model_id}","display_name":"{model_id}","supports_reasoning":true,"supports_tool_call":true,"supports_image_input":false,"supports_structured_output":false,"supports_temperature":true,"context_limit":32000,"output_limit":4096}}]}}"#
         );
         let models = runtime.dispatch(RuntimeCommand {
             command_id: format!("cmd_models_{provider_id}"),

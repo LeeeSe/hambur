@@ -118,6 +118,11 @@ pub struct TimelineItemDTO {
     pub payload_ref: String,
     pub small_summary: String,
     pub kind: String,
+    pub trace_title: String,
+    pub trace_content: String,
+    pub trace_status: String,
+    pub tool_call_id: String,
+    pub tool_name: String,
 }
 
 pub struct AppSnapshotDTO {
@@ -513,6 +518,11 @@ impl From<TimelineItemSnapshot> for TimelineItemDTO {
             payload_ref: value.payload_ref,
             small_summary: value.small_summary,
             kind: value.kind,
+            trace_title: value.trace_title,
+            trace_content: value.trace_content,
+            trace_status: value.trace_status,
+            tool_call_id: value.tool_call_id,
+            tool_name: value.tool_name,
         }
     }
 }

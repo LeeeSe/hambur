@@ -25,6 +25,11 @@ pub struct TimelineItemSnapshot {
     pub payload_ref: String,
     pub small_summary: String,
     pub kind: String,
+    pub trace_title: String,
+    pub trace_content: String,
+    pub trace_status: String,
+    pub tool_call_id: String,
+    pub tool_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +79,104 @@ pub struct NewTimelineItem {
     pub payload_ref: String,
     pub small_summary: String,
     pub kind: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NewTraceSpan {
+    pub session_id: String,
+    pub turn_id: String,
+    pub parent_span_id: String,
+    pub kind: String,
+    pub title: String,
+    pub content: String,
+    pub status: String,
+    pub tool_call_id: String,
+    pub payload_json: String,
+    pub visible: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TraceSpanRecord {
+    pub id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub parent_span_id: String,
+    pub kind: String,
+    pub title: String,
+    pub content: String,
+    pub status: String,
+    pub started_at_ms: u64,
+    pub ended_at_ms: u64,
+    pub tool_call_id: String,
+    pub payload_json: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NewToolCall {
+    pub id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub assistant_message_id: String,
+    pub name: String,
+    pub arguments_json: String,
+    pub display_title: String,
+    pub status: String,
+    pub requires_approval: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolCallRecord {
+    pub id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub assistant_message_id: String,
+    pub name: String,
+    pub arguments_json: String,
+    pub display_title: String,
+    pub status: String,
+    pub requires_approval: bool,
+    pub approval_status: String,
+    pub started_at_ms: u64,
+    pub ended_at_ms: u64,
+    pub result_id: String,
+    pub error_code: String,
+    pub error_message: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NewToolResult {
+    pub session_id: String,
+    pub turn_id: String,
+    pub tool_call_id: String,
+    pub message_id: String,
+    pub is_error: bool,
+    pub content_json: String,
+    pub summary: String,
+    pub artifacts_json: String,
+    pub trust_level: String,
+    pub truncated: bool,
+    pub offloaded_file_id: String,
+    pub offloaded_path: String,
+    pub context_stub: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolResultRecord {
+    pub id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub tool_call_id: String,
+    pub message_id: String,
+    pub is_error: bool,
+    pub content_json: String,
+    pub summary: String,
+    pub artifacts_json: String,
+    pub trust_level: String,
+    pub truncated: bool,
+    pub offloaded_file_id: String,
+    pub offloaded_path: String,
+    pub context_stub: String,
+    pub created_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -477,6 +580,329 @@ impl HamburDatabase {
         self.message_by_id(message_id)
             .await?
             .ok_or_else(|| HamburError::Internal(format!("message disappeared: {message_id}")))
+    }
+
+    pub async fn insert_tool_result_message(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        tool_call_id: &str,
+        tool_name: &str,
+        content_text: &str,
+        route: &ModelRouteSnapshot,
+    ) -> HamburResult<MessageRecord> {
+        self.ensure_session_exists(session_id).await?;
+
+        let id = new_id("msg");
+        let now = now_ms();
+        self.connection
+            .execute(
+                "INSERT INTO messages
+                    (
+                        id,
+                        session_id,
+                        turn_id,
+                        role,
+                        status,
+                        content_text,
+                        reasoning_content,
+                        created_at_ms,
+                        version_sequence,
+                        provider_id_snapshot,
+                        provider_name_snapshot,
+                        provider_protocol,
+                        model_id_snapshot,
+                        model_name_snapshot,
+                        model_group_id,
+                        finish_reason,
+                        native_finish_reason,
+                        tool_call_id,
+                        tool_name,
+                        tool_title
+                    )
+                 VALUES (?1, ?2, ?3, 'tool', 'completed', ?4, '', ?5, 1, ?6, ?7, ?8, ?9, ?10, ?11, 'tool_result', 'tool_result', ?12, ?13, ?13)",
+                params![
+                    id.clone(),
+                    session_id,
+                    turn_id,
+                    content_text,
+                    now as i64,
+                    route.provider_id.clone(),
+                    route.provider_name.clone(),
+                    route.provider_protocol.clone(),
+                    route.model_id.clone(),
+                    route.model_display_name.clone(),
+                    route.model_group_id.clone(),
+                    tool_call_id,
+                    tool_name,
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+        self.touch_session(session_id, now).await?;
+
+        self.message_by_id(&id)
+            .await?
+            .ok_or_else(|| HamburError::Internal(format!("tool message disappeared: {id}")))
+    }
+
+    pub async fn insert_trace_span(&self, input: NewTraceSpan) -> HamburResult<TraceSpanRecord> {
+        self.ensure_session_exists(&input.session_id).await?;
+        let id = new_id("trace");
+        let now = now_ms();
+        let status = normalize_status(&input.status)?;
+        self.connection
+            .execute(
+                "INSERT INTO trace_spans
+                    (
+                        id,
+                        session_id,
+                        turn_id,
+                        parent_span_id,
+                        kind,
+                        title,
+                        content,
+                        status,
+                        started_at_ms,
+                        ended_at_ms,
+                        tool_call_id,
+                        payload_json,
+                        visible
+                    )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11, ?12)",
+                params![
+                    id.clone(),
+                    input.session_id.clone(),
+                    input.turn_id,
+                    input.parent_span_id,
+                    input.kind,
+                    input.title,
+                    input.content,
+                    status,
+                    now as i64,
+                    input.tool_call_id,
+                    input.payload_json,
+                    input.visible,
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+
+        if input.visible {
+            let trace = self.trace_span_by_id(&id).await?;
+            self.upsert_timeline_item(
+                &input.session_id,
+                NewTimelineItem {
+                    stable_key: trace.id.clone(),
+                    content_type: "trace".to_string(),
+                    display_sequence: trace.started_at_ms,
+                    payload_ref: trace.id.clone(),
+                    small_summary: trace.title.clone(),
+                    kind: match trace.kind.as_str() {
+                        "tool" => "ToolTrace".to_string(),
+                        "error" => "ErrorTrace".to_string(),
+                        _ => "TraceSpan".to_string(),
+                    },
+                },
+            )
+            .await?;
+        }
+
+        self.trace_span_by_id(&id).await
+    }
+
+    pub async fn update_trace_span_status(
+        &self,
+        trace_id: &str,
+        status: &str,
+        content: &str,
+        ended: bool,
+    ) -> HamburResult<TraceSpanRecord> {
+        let status = normalize_status(status)?;
+        let now = now_ms();
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE trace_spans
+                 SET status = ?1,
+                     content = ?2,
+                     ended_at_ms = CASE WHEN ?3 THEN ?4 ELSE ended_at_ms END
+                 WHERE id = ?5",
+                params![status, content, ended, now as i64, trace_id],
+            )
+            .await
+            .map_err(database_error)?;
+        if changed == 0 {
+            return Err(HamburError::InvalidCommand(format!(
+                "trace span not found: {trace_id}"
+            )));
+        }
+        let trace = self.trace_span_by_id(trace_id).await?;
+        self.upsert_timeline_item(
+            &trace.session_id,
+            NewTimelineItem {
+                stable_key: trace.id.clone(),
+                content_type: "trace".to_string(),
+                display_sequence: trace.started_at_ms,
+                payload_ref: trace.id.clone(),
+                small_summary: trace.title.clone(),
+                kind: match trace.kind.as_str() {
+                    "tool" => "ToolTrace".to_string(),
+                    "error" => "ErrorTrace".to_string(),
+                    _ => "TraceSpan".to_string(),
+                },
+            },
+        )
+        .await?;
+        Ok(trace)
+    }
+
+    pub async fn insert_tool_call(&self, input: NewToolCall) -> HamburResult<ToolCallRecord> {
+        self.ensure_session_exists(&input.session_id).await?;
+        let id = if input.id.trim().is_empty() {
+            new_id("tool_call")
+        } else {
+            input.id
+        };
+        let now = now_ms();
+        let status = normalize_status(&input.status)?;
+        self.connection
+            .execute(
+                "INSERT INTO tool_calls
+                    (
+                        id,
+                        session_id,
+                        turn_id,
+                        assistant_message_id,
+                        name,
+                        arguments_json,
+                        display_title,
+                        status,
+                        requires_approval,
+                        approval_status,
+                        started_at_ms,
+                        ended_at_ms,
+                        result_id,
+                        error_code,
+                        error_message
+                    )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'not_required', ?10, NULL, '', '', '')
+                 ON CONFLICT(id) DO UPDATE SET
+                    status = excluded.status,
+                    display_title = excluded.display_title,
+                    arguments_json = excluded.arguments_json,
+                    requires_approval = excluded.requires_approval,
+                    started_at_ms = CASE
+                        WHEN tool_calls.started_at_ms = 0 THEN excluded.started_at_ms
+                        ELSE tool_calls.started_at_ms
+                    END",
+                params![
+                    id.clone(),
+                    input.session_id,
+                    input.turn_id,
+                    input.assistant_message_id,
+                    input.name,
+                    input.arguments_json,
+                    input.display_title,
+                    status,
+                    input.requires_approval,
+                    now as i64,
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+
+        self.tool_call_by_id(&id).await
+    }
+
+    pub async fn update_tool_call_status(
+        &self,
+        tool_call_id: &str,
+        status: &str,
+        result_id: &str,
+        error_code: &str,
+        error_message: &str,
+        ended: bool,
+    ) -> HamburResult<ToolCallRecord> {
+        let status = normalize_status(status)?;
+        let now = now_ms();
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE tool_calls
+                 SET status = ?1,
+                     result_id = ?2,
+                     error_code = ?3,
+                     error_message = ?4,
+                     ended_at_ms = CASE WHEN ?5 THEN ?6 ELSE ended_at_ms END
+                 WHERE id = ?7",
+                params![
+                    status,
+                    result_id,
+                    error_code,
+                    error_message,
+                    ended,
+                    now as i64,
+                    tool_call_id,
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+        if changed == 0 {
+            return Err(HamburError::InvalidCommand(format!(
+                "tool call not found: {tool_call_id}"
+            )));
+        }
+        self.tool_call_by_id(tool_call_id).await
+    }
+
+    pub async fn insert_tool_result(&self, input: NewToolResult) -> HamburResult<ToolResultRecord> {
+        self.ensure_session_exists(&input.session_id).await?;
+        let id = new_id("tool_result");
+        let now = now_ms();
+        self.connection
+            .execute(
+                "INSERT INTO tool_results
+                    (
+                        id,
+                        session_id,
+                        turn_id,
+                        tool_call_id,
+                        message_id,
+                        is_error,
+                        content_json,
+                        summary,
+                        artifacts_json,
+                        trust_level,
+                        truncated,
+                        offloaded_file_id,
+                        offloaded_path,
+                        context_stub,
+                        created_at_ms
+                    )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                params![
+                    id.clone(),
+                    input.session_id,
+                    input.turn_id,
+                    input.tool_call_id,
+                    input.message_id,
+                    input.is_error,
+                    input.content_json,
+                    input.summary,
+                    input.artifacts_json,
+                    input.trust_level,
+                    input.truncated,
+                    input.offloaded_file_id,
+                    input.offloaded_path,
+                    input.context_stub,
+                    now as i64,
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+
+        self.tool_result_by_id(&id).await
     }
 
     pub async fn upsert_timeline_item(
@@ -1271,7 +1697,10 @@ impl HamburDatabase {
                     model_name_snapshot TEXT NOT NULL DEFAULT '',
                     model_group_id TEXT NOT NULL DEFAULT '',
                     finish_reason TEXT NOT NULL DEFAULT '',
-                    native_finish_reason TEXT NOT NULL DEFAULT ''
+                    native_finish_reason TEXT NOT NULL DEFAULT '',
+                    tool_call_id TEXT NOT NULL DEFAULT '',
+                    tool_name TEXT NOT NULL DEFAULT '',
+                    tool_title TEXT NOT NULL DEFAULT ''
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_messages_session_order
@@ -1314,6 +1743,67 @@ impl HamburDatabase {
 
                 CREATE INDEX IF NOT EXISTS idx_turns_session_updated
                     ON turns(session_id, updated_at_ms DESC, id);
+
+                CREATE TABLE IF NOT EXISTS trace_spans (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    turn_id TEXT NOT NULL,
+                    parent_span_id TEXT NOT NULL DEFAULT '',
+                    kind TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    started_at_ms INTEGER NOT NULL,
+                    ended_at_ms INTEGER,
+                    tool_call_id TEXT NOT NULL DEFAULT '',
+                    payload_json TEXT NOT NULL DEFAULT '',
+                    visible INTEGER NOT NULL DEFAULT 1
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_trace_spans_session_started
+                    ON trace_spans(session_id, started_at_ms, id);
+
+                CREATE TABLE IF NOT EXISTS tool_calls (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    turn_id TEXT NOT NULL,
+                    assistant_message_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    arguments_json TEXT NOT NULL,
+                    display_title TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    requires_approval INTEGER NOT NULL,
+                    approval_status TEXT NOT NULL,
+                    started_at_ms INTEGER NOT NULL,
+                    ended_at_ms INTEGER,
+                    result_id TEXT NOT NULL DEFAULT '',
+                    error_code TEXT NOT NULL DEFAULT '',
+                    error_message TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_tool_calls_turn_started
+                    ON tool_calls(turn_id, started_at_ms, id);
+
+                CREATE TABLE IF NOT EXISTS tool_results (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    turn_id TEXT NOT NULL,
+                    tool_call_id TEXT NOT NULL REFERENCES tool_calls(id) ON DELETE CASCADE,
+                    message_id TEXT NOT NULL,
+                    is_error INTEGER NOT NULL,
+                    content_json TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    artifacts_json TEXT NOT NULL,
+                    trust_level TEXT NOT NULL,
+                    truncated INTEGER NOT NULL,
+                    offloaded_file_id TEXT NOT NULL DEFAULT '',
+                    offloaded_path TEXT NOT NULL DEFAULT '',
+                    context_stub TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_tool_results_tool_call
+                    ON tool_results(tool_call_id, created_at_ms, id);
 
                 CREATE TABLE IF NOT EXISTS providers (
                     id TEXT PRIMARY KEY NOT NULL,
@@ -1412,6 +1902,12 @@ impl HamburDatabase {
             "TEXT NOT NULL DEFAULT ''",
         )
         .await?;
+        self.add_column_if_missing("messages", "tool_call_id", "TEXT NOT NULL DEFAULT ''")
+            .await?;
+        self.add_column_if_missing("messages", "tool_name", "TEXT NOT NULL DEFAULT ''")
+            .await?;
+        self.add_column_if_missing("messages", "tool_title", "TEXT NOT NULL DEFAULT ''")
+            .await?;
         self.add_column_if_missing("turns", "selected_provider_id", "TEXT NOT NULL DEFAULT ''")
             .await?;
         self.add_column_if_missing(
@@ -1555,17 +2051,24 @@ impl HamburDatabase {
             .query(
                 "
                 SELECT
-                    id,
-                    stable_key,
-                    content_type,
-                    display_sequence,
-                    version_sequence,
-                    payload_ref,
-                    small_summary,
-                    kind
-                FROM timeline_items
-                WHERE session_id = ?1
-                ORDER BY display_sequence ASC, id ASC
+                    ti.id,
+                    ti.stable_key,
+                    ti.content_type,
+                    ti.display_sequence,
+                    ti.version_sequence,
+                    ti.payload_ref,
+                    ti.small_summary,
+                    ti.kind,
+                    COALESCE(ts.title, ''),
+                    COALESCE(ts.content, ''),
+                    COALESCE(ts.status, ''),
+                    COALESCE(ts.tool_call_id, ''),
+                    COALESCE(tc.name, '')
+                FROM timeline_items ti
+                LEFT JOIN trace_spans ts ON ti.content_type = 'trace' AND ts.id = ti.payload_ref
+                LEFT JOIN tool_calls tc ON tc.id = ts.tool_call_id
+                WHERE ti.session_id = ?1
+                ORDER BY ti.display_sequence ASC, ti.id ASC
                 ",
                 params![session_id],
             )
@@ -1583,6 +2086,11 @@ impl HamburDatabase {
                 payload_ref: row.get::<String>(5).map_err(database_error)?,
                 small_summary: row.get::<String>(6).map_err(database_error)?,
                 kind: row.get::<String>(7).map_err(database_error)?,
+                trace_title: row.get::<String>(8).map_err(database_error)?,
+                trace_content: row.get::<String>(9).map_err(database_error)?,
+                trace_status: row.get::<String>(10).map_err(database_error)?,
+                tool_call_id: row.get::<String>(11).map_err(database_error)?,
+                tool_name: row.get::<String>(12).map_err(database_error)?,
             });
         }
 
@@ -1602,17 +2110,24 @@ impl HamburDatabase {
                 .query(
                     "
                     SELECT
-                        id,
-                        stable_key,
-                        content_type,
-                        display_sequence,
-                        version_sequence,
-                        payload_ref,
-                        small_summary,
-                        kind
-                    FROM timeline_items
-                    WHERE session_id = ?1
-                    ORDER BY display_sequence DESC, id DESC
+                        ti.id,
+                        ti.stable_key,
+                        ti.content_type,
+                        ti.display_sequence,
+                        ti.version_sequence,
+                        ti.payload_ref,
+                        ti.small_summary,
+                        ti.kind,
+                        COALESCE(ts.title, ''),
+                        COALESCE(ts.content, ''),
+                        COALESCE(ts.status, ''),
+                        COALESCE(ts.tool_call_id, ''),
+                        COALESCE(tc.name, '')
+                    FROM timeline_items ti
+                    LEFT JOIN trace_spans ts ON ti.content_type = 'trace' AND ts.id = ti.payload_ref
+                    LEFT JOIN tool_calls tc ON tc.id = ts.tool_call_id
+                    WHERE ti.session_id = ?1
+                    ORDER BY ti.display_sequence DESC, ti.id DESC
                     LIMIT ?2
                     ",
                     params![session_id, fetch_limit as i64],
@@ -1624,18 +2139,25 @@ impl HamburDatabase {
                 .query(
                     "
                     SELECT
-                        id,
-                        stable_key,
-                        content_type,
-                        display_sequence,
-                        version_sequence,
-                        payload_ref,
-                        small_summary,
-                        kind
-                    FROM timeline_items
-                    WHERE session_id = ?1
-                      AND display_sequence < ?2
-                    ORDER BY display_sequence DESC, id DESC
+                        ti.id,
+                        ti.stable_key,
+                        ti.content_type,
+                        ti.display_sequence,
+                        ti.version_sequence,
+                        ti.payload_ref,
+                        ti.small_summary,
+                        ti.kind,
+                        COALESCE(ts.title, ''),
+                        COALESCE(ts.content, ''),
+                        COALESCE(ts.status, ''),
+                        COALESCE(ts.tool_call_id, ''),
+                        COALESCE(tc.name, '')
+                    FROM timeline_items ti
+                    LEFT JOIN trace_spans ts ON ti.content_type = 'trace' AND ts.id = ti.payload_ref
+                    LEFT JOIN tool_calls tc ON tc.id = ts.tool_call_id
+                    WHERE ti.session_id = ?1
+                      AND ti.display_sequence < ?2
+                    ORDER BY ti.display_sequence DESC, ti.id DESC
                     LIMIT ?3
                     ",
                     params![session_id, before_cursor as i64, fetch_limit as i64],
@@ -1799,16 +2321,23 @@ impl HamburDatabase {
             .query(
                 "
                 SELECT
-                    id,
-                    stable_key,
-                    content_type,
-                    display_sequence,
-                    version_sequence,
-                    payload_ref,
-                    small_summary,
-                    kind
-                FROM timeline_items
-                WHERE session_id = ?1 AND stable_key = ?2
+                    ti.id,
+                    ti.stable_key,
+                    ti.content_type,
+                    ti.display_sequence,
+                    ti.version_sequence,
+                    ti.payload_ref,
+                    ti.small_summary,
+                    ti.kind,
+                    COALESCE(ts.title, ''),
+                    COALESCE(ts.content, ''),
+                    COALESCE(ts.status, ''),
+                    COALESCE(ts.tool_call_id, ''),
+                    COALESCE(tc.name, '')
+                FROM timeline_items ti
+                LEFT JOIN trace_spans ts ON ti.content_type = 'trace' AND ts.id = ti.payload_ref
+                LEFT JOIN tool_calls tc ON tc.id = ts.tool_call_id
+                WHERE ti.session_id = ?1 AND ti.stable_key = ?2
                 LIMIT 1
                 ",
                 params![session_id, stable_key],
@@ -1919,6 +2448,117 @@ impl HamburDatabase {
             error_code: row.get::<String>(12).map_err(database_error)?,
             error_message: row.get::<String>(13).map_err(database_error)?,
         })
+    }
+
+    async fn trace_span_by_id(&self, trace_id: &str) -> HamburResult<TraceSpanRecord> {
+        let mut rows = self
+            .connection
+            .query(
+                "
+                SELECT
+                    id,
+                    session_id,
+                    turn_id,
+                    parent_span_id,
+                    kind,
+                    title,
+                    content,
+                    status,
+                    started_at_ms,
+                    ended_at_ms,
+                    tool_call_id,
+                    payload_json
+                FROM trace_spans
+                WHERE id = ?1
+                LIMIT 1
+                ",
+                params![trace_id],
+            )
+            .await
+            .map_err(database_error)?;
+
+        let Some(row) = rows.next().await.map_err(database_error)? else {
+            return Err(HamburError::InvalidCommand(format!(
+                "trace span not found: {trace_id}"
+            )));
+        };
+        trace_span_from_row(&row)
+    }
+
+    async fn tool_call_by_id(&self, tool_call_id: &str) -> HamburResult<ToolCallRecord> {
+        let mut rows = self
+            .connection
+            .query(
+                "
+                SELECT
+                    id,
+                    session_id,
+                    turn_id,
+                    assistant_message_id,
+                    name,
+                    arguments_json,
+                    display_title,
+                    status,
+                    requires_approval,
+                    approval_status,
+                    started_at_ms,
+                    ended_at_ms,
+                    result_id,
+                    error_code,
+                    error_message
+                FROM tool_calls
+                WHERE id = ?1
+                LIMIT 1
+                ",
+                params![tool_call_id],
+            )
+            .await
+            .map_err(database_error)?;
+
+        let Some(row) = rows.next().await.map_err(database_error)? else {
+            return Err(HamburError::InvalidCommand(format!(
+                "tool call not found: {tool_call_id}"
+            )));
+        };
+        tool_call_from_row(&row)
+    }
+
+    async fn tool_result_by_id(&self, result_id: &str) -> HamburResult<ToolResultRecord> {
+        let mut rows = self
+            .connection
+            .query(
+                "
+                SELECT
+                    id,
+                    session_id,
+                    turn_id,
+                    tool_call_id,
+                    message_id,
+                    is_error,
+                    content_json,
+                    summary,
+                    artifacts_json,
+                    trust_level,
+                    truncated,
+                    offloaded_file_id,
+                    offloaded_path,
+                    context_stub,
+                    created_at_ms
+                FROM tool_results
+                WHERE id = ?1
+                LIMIT 1
+                ",
+                params![result_id],
+            )
+            .await
+            .map_err(database_error)?;
+
+        let Some(row) = rows.next().await.map_err(database_error)? else {
+            return Err(HamburError::InvalidCommand(format!(
+                "tool result not found: {result_id}"
+            )));
+        };
+        tool_result_from_row(&row)
     }
 }
 
@@ -2092,6 +2732,11 @@ fn timeline_item_from_row(row: &Row) -> HamburResult<TimelineItemSnapshot> {
         payload_ref: row.get::<String>(5).map_err(database_error)?,
         small_summary: row.get::<String>(6).map_err(database_error)?,
         kind: row.get::<String>(7).map_err(database_error)?,
+        trace_title: row.get::<String>(8).map_err(database_error)?,
+        trace_content: row.get::<String>(9).map_err(database_error)?,
+        trace_status: row.get::<String>(10).map_err(database_error)?,
+        tool_call_id: row.get::<String>(11).map_err(database_error)?,
+        tool_name: row.get::<String>(12).map_err(database_error)?,
     })
 }
 
@@ -2117,6 +2762,71 @@ fn message_from_row(row: &Row) -> HamburResult<MessageRecord> {
     })
 }
 
+fn trace_span_from_row(row: &Row) -> HamburResult<TraceSpanRecord> {
+    Ok(TraceSpanRecord {
+        id: row.get::<String>(0).map_err(database_error)?,
+        session_id: row.get::<String>(1).map_err(database_error)?,
+        turn_id: row.get::<String>(2).map_err(database_error)?,
+        parent_span_id: row.get::<String>(3).map_err(database_error)?,
+        kind: row.get::<String>(4).map_err(database_error)?,
+        title: row.get::<String>(5).map_err(database_error)?,
+        content: row.get::<String>(6).map_err(database_error)?,
+        status: row.get::<String>(7).map_err(database_error)?,
+        started_at_ms: unsigned_ms(row.get::<i64>(8).map_err(database_error)?),
+        ended_at_ms: row
+            .get::<Option<i64>>(9)
+            .map_err(database_error)?
+            .map(unsigned_ms)
+            .unwrap_or_default(),
+        tool_call_id: row.get::<String>(10).map_err(database_error)?,
+        payload_json: row.get::<String>(11).map_err(database_error)?,
+    })
+}
+
+fn tool_call_from_row(row: &Row) -> HamburResult<ToolCallRecord> {
+    Ok(ToolCallRecord {
+        id: row.get::<String>(0).map_err(database_error)?,
+        session_id: row.get::<String>(1).map_err(database_error)?,
+        turn_id: row.get::<String>(2).map_err(database_error)?,
+        assistant_message_id: row.get::<String>(3).map_err(database_error)?,
+        name: row.get::<String>(4).map_err(database_error)?,
+        arguments_json: row.get::<String>(5).map_err(database_error)?,
+        display_title: row.get::<String>(6).map_err(database_error)?,
+        status: row.get::<String>(7).map_err(database_error)?,
+        requires_approval: sql_bool(row.get::<i64>(8).map_err(database_error)?),
+        approval_status: row.get::<String>(9).map_err(database_error)?,
+        started_at_ms: unsigned_ms(row.get::<i64>(10).map_err(database_error)?),
+        ended_at_ms: row
+            .get::<Option<i64>>(11)
+            .map_err(database_error)?
+            .map(unsigned_ms)
+            .unwrap_or_default(),
+        result_id: row.get::<String>(12).map_err(database_error)?,
+        error_code: row.get::<String>(13).map_err(database_error)?,
+        error_message: row.get::<String>(14).map_err(database_error)?,
+    })
+}
+
+fn tool_result_from_row(row: &Row) -> HamburResult<ToolResultRecord> {
+    Ok(ToolResultRecord {
+        id: row.get::<String>(0).map_err(database_error)?,
+        session_id: row.get::<String>(1).map_err(database_error)?,
+        turn_id: row.get::<String>(2).map_err(database_error)?,
+        tool_call_id: row.get::<String>(3).map_err(database_error)?,
+        message_id: row.get::<String>(4).map_err(database_error)?,
+        is_error: sql_bool(row.get::<i64>(5).map_err(database_error)?),
+        content_json: row.get::<String>(6).map_err(database_error)?,
+        summary: row.get::<String>(7).map_err(database_error)?,
+        artifacts_json: row.get::<String>(8).map_err(database_error)?,
+        trust_level: row.get::<String>(9).map_err(database_error)?,
+        truncated: sql_bool(row.get::<i64>(10).map_err(database_error)?),
+        offloaded_file_id: row.get::<String>(11).map_err(database_error)?,
+        offloaded_path: row.get::<String>(12).map_err(database_error)?,
+        context_stub: row.get::<String>(13).map_err(database_error)?,
+        created_at_ms: unsigned_ms(row.get::<i64>(14).map_err(database_error)?),
+    })
+}
+
 fn database_error(error: turso::Error) -> HamburError {
     HamburError::Internal(format!("turso: {error}"))
 }
@@ -2128,7 +2838,10 @@ mod tests {
     use hambur_core::new_id;
     use tokio::runtime::Runtime;
 
-    use super::{HamburDatabase, NewTimelineItem};
+    use super::{
+        HamburDatabase, ModelRouteSnapshot, NewTimelineItem, NewToolCall, NewToolResult,
+        NewTraceSpan,
+    };
 
     #[test]
     fn sessions_survive_restart_and_delete_from_snapshot() {
@@ -2332,6 +3045,125 @@ mod tests {
                 .await
                 .expect("message snapshot");
             assert_eq!(snapshot.expect("message").content_text, "hello snapshot");
+        });
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn trace_spans_and_tool_results_render_through_timeline() {
+        let path = temp_database_path();
+        let runtime = Runtime::new().expect("tokio runtime");
+
+        runtime.block_on(async {
+            let database = HamburDatabase::open(&path).await.expect("open database");
+            let created = database
+                .create_session("Tools")
+                .await
+                .expect("create session");
+            let session_id = created.selected_session_id;
+            let route = ModelRouteSnapshot {
+                provider_id: "provider".to_string(),
+                provider_name: "Provider".to_string(),
+                provider_protocol: "OpenAiCompatible".to_string(),
+                model_id: "model".to_string(),
+                model_display_name: "Model".to_string(),
+                model_group_id: "grp".to_string(),
+                ..Default::default()
+            };
+            let turn = database
+                .create_turn_with_route(&session_id, "ExecutingTools", &route)
+                .await
+                .expect("turn");
+            let assistant = database
+                .insert_message_with_route(
+                    &session_id,
+                    "assistant",
+                    "",
+                    "",
+                    "streaming",
+                    &turn.id,
+                    &route,
+                )
+                .await
+                .expect("assistant");
+            let tool_call = database
+                .insert_tool_call(NewToolCall {
+                    id: "call_1".to_string(),
+                    session_id: session_id.clone(),
+                    turn_id: turn.id.clone(),
+                    assistant_message_id: assistant.id.clone(),
+                    name: "echo".to_string(),
+                    arguments_json: r#"{"text":"hello"}"#.to_string(),
+                    display_title: "Echo".to_string(),
+                    status: "running".to_string(),
+                    requires_approval: false,
+                })
+                .await
+                .expect("tool call");
+            let trace = database
+                .insert_trace_span(NewTraceSpan {
+                    session_id: session_id.clone(),
+                    turn_id: turn.id.clone(),
+                    kind: "tool".to_string(),
+                    title: "Echo".to_string(),
+                    content: "running".to_string(),
+                    status: "running".to_string(),
+                    tool_call_id: tool_call.id.clone(),
+                    visible: true,
+                    ..Default::default()
+                })
+                .await
+                .expect("trace");
+            database
+                .update_trace_span_status(&trace.id, "completed", "hello", true)
+                .await
+                .expect("complete trace");
+            let tool_message = database
+                .insert_tool_result_message(
+                    &session_id,
+                    &turn.id,
+                    &tool_call.id,
+                    "echo",
+                    "hello",
+                    &route,
+                )
+                .await
+                .expect("tool message");
+            let result = database
+                .insert_tool_result(NewToolResult {
+                    session_id: session_id.clone(),
+                    turn_id: turn.id.clone(),
+                    tool_call_id: tool_call.id.clone(),
+                    message_id: tool_message.id,
+                    is_error: false,
+                    content_json: r#"{"text":"hello"}"#.to_string(),
+                    summary: "hello".to_string(),
+                    artifacts_json: "[]".to_string(),
+                    trust_level: "trusted".to_string(),
+                    context_stub: "hello".to_string(),
+                    ..Default::default()
+                })
+                .await
+                .expect("tool result");
+            database
+                .update_tool_call_status(&tool_call.id, "completed", &result.id, "", "", true)
+                .await
+                .expect("complete tool call");
+
+            let page = database
+                .timeline_page(&session_id, 0, 20)
+                .await
+                .expect("timeline");
+            let trace_item = page
+                .items
+                .iter()
+                .find(|item| item.kind == "ToolTrace")
+                .expect("trace item");
+            assert_eq!(trace_item.trace_title, "Echo");
+            assert_eq!(trace_item.trace_status, "completed");
+            assert_eq!(trace_item.tool_call_id, "call_1");
+            assert_eq!(trace_item.tool_name, "echo");
         });
 
         let _ = fs::remove_file(path);

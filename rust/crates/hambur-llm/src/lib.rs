@@ -649,10 +649,7 @@ impl ToolCallAccumulator {
         if call.completed {
             return Vec::new();
         }
-        if call.id.is_empty() || call.name.is_empty() {
-            return Vec::new();
-        }
-        if serde_json::from_str::<Value>(&call.arguments).is_err() {
+        if !call.is_executable() {
             return Vec::new();
         }
 
@@ -664,6 +661,31 @@ impl ToolCallAccumulator {
             arguments_json: call.arguments.clone(),
         }]
     }
+
+    pub fn completed_calls(&self) -> Vec<CompleteToolCall> {
+        let mut calls = self
+            .calls
+            .iter()
+            .filter_map(|(index, call)| {
+                if call.is_executable() {
+                    Some(CompleteToolCall {
+                        index: *index,
+                        id: call.id.clone(),
+                        name: call.name.clone(),
+                        arguments_json: call.arguments.clone(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        calls.sort_by_key(|call| call.index);
+        calls
+    }
+
+    pub fn has_incomplete_calls(&self) -> bool {
+        self.calls.values().any(|call| !call.is_executable())
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -672,6 +694,14 @@ struct PartialToolCall {
     name: String,
     arguments: String,
     completed: bool,
+}
+
+impl PartialToolCall {
+    fn is_executable(&self) -> bool {
+        !self.id.is_empty()
+            && !self.name.is_empty()
+            && serde_json::from_str::<Value>(&self.arguments).is_ok()
+    }
 }
 
 pub fn scripted_openai_sse_chunks(content: &str, reasoning: &str) -> Vec<Vec<u8>> {

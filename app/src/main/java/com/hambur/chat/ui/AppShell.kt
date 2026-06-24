@@ -554,6 +554,11 @@ private fun MarkdownTimeline(
 
 @Composable
 private fun TimelineItemRow(item: UiTimelineItem) {
+    if (item.contentType == "trace" || item.kind.contains("Trace")) {
+        ToolTraceRow(item = item)
+        return
+    }
+
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -576,5 +581,67 @@ private fun TimelineItemRow(item: UiTimelineItem) {
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f),
         )
+    }
+}
+
+@Composable
+private fun ToolTraceRow(item: UiTimelineItem) {
+    val statusColor = when (item.traceStatus) {
+        "completed" -> MaterialTheme.colorScheme.primary
+        "failed" -> MaterialTheme.colorScheme.error
+        "running" -> MaterialTheme.colorScheme.tertiary
+        else -> MaterialTheme.colorScheme.secondary
+    }
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 14.dp, vertical = 4.dp),
+        shape = RoundedCornerShape(8.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(5.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = item.toolName.ifBlank { "tool" },
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.secondary,
+                    modifier = Modifier.width(88.dp),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = item.traceTitle.ifBlank { item.smallSummary },
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.weight(1f),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = item.traceStatus.ifBlank { item.kind },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = statusColor,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            if (item.traceContent.isNotBlank()) {
+                Text(
+                    text = item.traceContent,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
     }
 }

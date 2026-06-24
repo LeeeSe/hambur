@@ -747,6 +747,7 @@ dependencies = [
  "hambur-db",
  "hambur-llm",
  "hambur-markdown",
+ "hambur-tools",
  "serde_json",
  "tokio",
 ]
@@ -763,6 +764,9 @@ name = "hambur-tools"
 version = "0.1.0"
 dependencies = [
  "hambur-core",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

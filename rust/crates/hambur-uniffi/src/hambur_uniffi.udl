@@ -107,6 +107,11 @@ dictionary TimelineItemDTO {
     string payload_ref;
     string small_summary;
     string kind;
+    string trace_title;
+    string trace_content;
+    string trace_status;
+    string tool_call_id;
+    string tool_name;
 };
 
 dictionary AppSnapshotDTO {

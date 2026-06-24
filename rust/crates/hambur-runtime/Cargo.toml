@@ -10,5 +10,6 @@ hambur-core.workspace = true
 hambur-db.workspace = true
 hambur-llm.workspace = true
 hambur-markdown.workspace = true
+hambur-tools.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

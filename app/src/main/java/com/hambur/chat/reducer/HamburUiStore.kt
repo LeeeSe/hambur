@@ -36,6 +36,11 @@ data class UiTimelineItem(
     val versionSequence: ULong,
     val smallSummary: String,
     val kind: String,
+    val traceTitle: String = "",
+    val traceContent: String = "",
+    val traceStatus: String = "",
+    val toolCallId: String = "",
+    val toolName: String = "",
 )
 
 data class AppShellState(
@@ -393,7 +398,7 @@ class HamburUiStore(appFilesDir: String) {
         if (!providerAck.accepted) return
 
         val modelsJson = """
-            {"data":[{"id":"hambur-openai-compatible-text","display_name":"OpenAI Compatible Text","supports_reasoning":true,"supports_tool_call":false,"supports_image_input":false,"supports_structured_output":false,"supports_temperature":true,"context_limit":32000,"output_limit":4096}]}
+            {"data":[{"id":"hambur-openai-compatible-text","display_name":"OpenAI Compatible Text","supports_reasoning":true,"supports_tool_call":true,"supports_image_input":false,"supports_structured_output":false,"supports_temperature":true,"context_limit":32000,"output_limit":4096}]}
         """.trimIndent()
         val modelsAck = runtime.dispatch(
             backendCommand(
@@ -501,6 +506,7 @@ private fun AppShellState.reduce(event: BackendEvent): AppShellState {
         "ModelsUpdated",
         "MessageUpserted",
         "AssistantMessageFinished",
+        "ToolCallFinished",
         "TurnFinished",
         "TurnCancelled" -> "Ready"
         "TurnStarted",
@@ -508,7 +514,10 @@ private fun AppShellState.reduce(event: BackendEvent): AppShellState {
         "AssistantMessageStarted",
         "AssistantContentDelta",
         "AssistantReasoningDelta",
+        "ToolCallStarted",
+        "ToolCallDelta",
         "MarkdownRenderUpdate" -> "Streaming"
+        "ToolCallFailed",
         "TurnFailed" -> "Error"
         "RuntimeClosed" -> "Closed"
         "RuntimeError" -> "Error"
@@ -525,6 +534,10 @@ private fun AppShellState.reduce(event: BackendEvent): AppShellState {
         event.kind == "AssistantMessageStarted" -> "Assistant streaming"
         event.kind == "AssistantReasoningDelta" -> "Reasoning streamed"
         event.kind == "AssistantContentDelta" -> "Content streamed"
+        event.kind == "ToolCallStarted" -> event.message.ifBlank { "Tool started" }
+        event.kind == "ToolCallDelta" -> "Tool call streamed"
+        event.kind == "ToolCallFinished" -> event.message.ifBlank { "Tool finished" }
+        event.kind == "ToolCallFailed" -> event.message.ifBlank { "Tool failed" }
         event.kind == "AssistantMessageFinished" -> "Assistant finished"
         event.kind == "TurnFinished" -> "Turn finished"
         event.kind == "TurnCancelled" -> "Turn cancelled"
@@ -580,6 +593,11 @@ private fun AppShellState.reduce(event: BackendEvent): AppShellState {
                 versionSequence = it.versionSequence,
                 smallSummary = it.smallSummary,
                 kind = it.kind,
+                traceTitle = it.traceTitle,
+                traceContent = it.traceContent,
+                traceStatus = it.traceStatus,
+                toolCallId = it.toolCallId,
+                toolName = it.toolName,
             )
         },
         markdownMessageId = when {
@@ -650,6 +668,11 @@ private fun List<TimelineItemDto>.toUiTimelineItems(): List<UiTimelineItem> {
             versionSequence = it.versionSequence,
             smallSummary = it.smallSummary,
             kind = it.kind,
+            traceTitle = it.traceTitle,
+            traceContent = it.traceContent,
+            traceStatus = it.traceStatus,
+            toolCallId = it.toolCallId,
+            toolName = it.toolName,
         )
     }
 }

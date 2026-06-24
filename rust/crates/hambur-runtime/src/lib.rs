@@ -11,6 +11,8 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration as StdDuration, Instant};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use hambur_core::{DTO_SCHEMA_VERSION, HamburError, HamburResult, new_id, now_ms};
 use hambur_db::{
     AppSnapshot, AttachmentRecord, HamburDatabase, MessageRecord, ModelRouteSnapshot,
@@ -3443,11 +3445,32 @@ impl RuntimeEngine {
                 let payload_json = result.payload_json;
                 let error_code = result.error_code;
                 let message = result.message;
-                let content = if payload_json.trim().is_empty() {
+                let mut content = if payload_json.trim().is_empty() {
                     message
                 } else {
                     payload_json
                 };
+                if !is_error {
+                    match self
+                        .materialize_browser_artifacts(
+                            session_id,
+                            &invocation.tool_call_id,
+                            &content,
+                        )
+                        .await
+                    {
+                        Ok(materialized) => {
+                            content = materialized;
+                        }
+                        Err(error) => {
+                            return ToolResult::failed(
+                                &invocation.tool_call_id,
+                                &invocation.name,
+                                error.to_string(),
+                            );
+                        }
+                    }
+                }
                 let summary = if is_error {
                     error_code
                         .clone()
@@ -3506,6 +3529,63 @@ impl RuntimeEngine {
                 )
             }
         }
+    }
+
+    async fn materialize_browser_artifacts(
+        &self,
+        session_id: &str,
+        tool_call_id: &str,
+        content: &str,
+    ) -> HamburResult<String> {
+        let Ok(mut value) = serde_json::from_str::<Value>(content) else {
+            return Ok(content.to_string());
+        };
+        let Some(base64_value) = value.get("base64").and_then(Value::as_str) else {
+            return Ok(content.to_string());
+        };
+        if base64_value.trim().is_empty() {
+            return Ok(content.to_string());
+        }
+        let bytes = BASE64_STANDARD
+            .decode(base64_value.as_bytes())
+            .map_err(|error| {
+                HamburError::InvalidCommand(format!("browser artifact base64: {error}"))
+            })?;
+        let mime_type = value
+            .get("mimeType")
+            .and_then(Value::as_str)
+            .unwrap_or("image/png")
+            .to_string();
+        let extension = match mime_type.as_str() {
+            "image/jpeg" => "jpg",
+            "image/webp" => "webp",
+            _ => "png",
+        };
+        let reserved = self.filestore.reserve_cache_image(session_id, extension)?;
+        fs::write(&reserved.host_path, &bytes)
+            .map_err(|error| HamburError::Internal(format!("write browser artifact: {error}")))?;
+        self.database
+            .upsert_file_record(NewFileRecord {
+                id: reserved.file_id.clone(),
+                scope: "session".to_string(),
+                session_id: session_id.to_string(),
+                relative_path: reserved.relative_path.clone(),
+                sandbox_path: reserved.sandbox_path.clone(),
+                mime_type: mime_type.clone(),
+                byte_size: bytes.len() as u64,
+                sha256: String::new(),
+                retention_policy: "delete_with_session".to_string(),
+            })
+            .await?;
+        if let Some(object) = value.as_object_mut() {
+            object.remove("base64");
+            object.insert("fileId".to_string(), json!(reserved.file_id));
+            object.insert("sandboxPath".to_string(), json!(reserved.sandbox_path));
+            object.insert("relativePath".to_string(), json!(reserved.relative_path));
+            object.insert("toolCallId".to_string(), json!(tool_call_id));
+            object.insert("materialized".to_string(), json!(true));
+        }
+        Ok(value.to_string())
     }
 
     async fn execute_web_tool(&self, invocation: ToolInvocation) -> ToolExecutionRecord {
@@ -5947,6 +6027,7 @@ mod tests {
     use hambur_core::{new_id, now_ms};
     use hambur_sandbox::SandboxAccess;
     use hambur_tools::ToolInvocation;
+    use serde_json::Value;
     use tokio::sync::oneshot;
 
     use super::{
@@ -7390,6 +7471,57 @@ mod tests {
             .expect("message");
         assert!(message.content_text.contains("Example Domain"));
         assert!(message.content_text.contains("<untrusted_tool_result"));
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
+    fn milestone7_browser_screenshot_payload_materializes_to_filestore() {
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+        let session_id = create_test_session(&runtime);
+        let content = serde_json::json!({
+            "url": "https://example.test",
+            "mimeType": "image/png",
+            "width": 1,
+            "height": 1,
+            "byteSize": 3,
+            "base64": "AQID"
+        })
+        .to_string();
+        let materialized = runtime
+            .tokio
+            .block_on(runtime.materialize_browser_artifacts(
+                &session_id,
+                "call_browser_screenshot",
+                &content,
+            ))
+            .expect("materialize screenshot");
+        assert!(!materialized.contains("AQID"));
+        assert!(materialized.contains("sandboxPath"));
+        let value = serde_json::from_str::<Value>(&materialized).expect("json");
+        let file_id = value
+            .get("fileId")
+            .and_then(Value::as_str)
+            .expect("file id");
+        let file = runtime
+            .tokio
+            .block_on(runtime.database.file_by_id(file_id))
+            .expect("file record");
+        assert_eq!(file.session_id, session_id);
+        assert_eq!(file.mime_type, "image/png");
+        assert_eq!(file.byte_size, 3);
+        let host_path = runtime
+            .filestore
+            .host_path_for_relative(&file.relative_path)
+            .expect("host path");
+        assert_eq!(fs::read(host_path).expect("read artifact"), vec![1, 2, 3]);
 
         let _ = fs::remove_dir_all(app_files_dir);
     }

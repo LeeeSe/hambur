@@ -744,6 +744,7 @@ dependencies = [
 name = "hambur-runtime"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "hambur-core",
  "hambur-db",
  "hambur-filestore",

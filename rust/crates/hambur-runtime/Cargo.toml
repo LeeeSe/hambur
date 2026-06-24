@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+base64.workspace = true
 hambur-core.workspace = true
 hambur-db.workspace = true
 hambur-filestore.workspace = true

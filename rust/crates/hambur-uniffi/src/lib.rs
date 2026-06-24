@@ -36,6 +36,12 @@ pub struct BackendCommand {
     pub title: String,
     pub message_id: String,
     pub chunk: String,
+    pub content: String,
+    pub reasoning: String,
+    pub provider_id: String,
+    pub model_id: String,
+    pub source_message_id: String,
+    pub payload_json: String,
     pub finalize: bool,
 }
 
@@ -148,8 +154,19 @@ pub struct MessageDTO {
     pub session_id: String,
     pub role: String,
     pub content_text: String,
+    pub reasoning_content: String,
+    pub status: String,
+    pub turn_id: String,
     pub created_at_ms: u64,
     pub version_sequence: u64,
+    pub provider_id_snapshot: String,
+    pub provider_name_snapshot: String,
+    pub provider_protocol: String,
+    pub model_id_snapshot: String,
+    pub model_name_snapshot: String,
+    pub model_group_id: String,
+    pub finish_reason: String,
+    pub native_finish_reason: String,
 }
 
 pub struct MessageSnapshotDTO {
@@ -198,9 +215,7 @@ impl BackendRuntime {
     }
 
     pub fn get_session_list_snapshot(&self, limit: u32, offset: u32) -> SessionListSnapshotDTO {
-        self.engine
-            .get_session_list_snapshot(limit, offset)
-            .into()
+        self.engine.get_session_list_snapshot(limit, offset).into()
     }
 
     pub fn get_session_snapshot(&self, session_id: String) -> SessionSnapshotDTO {
@@ -288,6 +303,12 @@ impl From<BackendCommand> for RuntimeCommand {
             title: value.title,
             message_id: value.message_id,
             chunk: value.chunk,
+            content: value.content,
+            reasoning: value.reasoning,
+            provider_id: value.provider_id,
+            model_id: value.model_id,
+            source_message_id: value.source_message_id,
+            payload_json: value.payload_json,
             finalize: value.finalize,
         }
     }
@@ -503,8 +524,19 @@ impl From<MessageRecord> for MessageDTO {
             session_id: value.session_id,
             role: value.role,
             content_text: value.content_text,
+            reasoning_content: value.reasoning_content,
+            status: value.status,
+            turn_id: value.turn_id,
             created_at_ms: value.created_at_ms,
             version_sequence: value.version_sequence,
+            provider_id_snapshot: value.provider_id_snapshot,
+            provider_name_snapshot: value.provider_name_snapshot,
+            provider_protocol: value.provider_protocol,
+            model_id_snapshot: value.model_id_snapshot,
+            model_name_snapshot: value.model_name_snapshot,
+            model_group_id: value.model_group_id,
+            finish_reason: value.finish_reason,
+            native_finish_reason: value.native_finish_reason,
         }
     }
 }

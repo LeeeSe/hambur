@@ -53,6 +53,7 @@ fun AppShell(appFilesDir: String) {
     val store = remember(appFilesDir) { HamburUiStore(appFilesDir) }
     val state by store.state.collectAsState()
     var draftTitle by rememberSaveable { mutableStateOf("") }
+    var draftMessage by rememberSaveable { mutableStateOf("") }
 
     DisposableEffect(store) {
         onDispose { store.shutdown() }
@@ -107,6 +108,20 @@ fun AppShell(appFilesDir: String) {
                         modifier = Modifier.weight(1f),
                     )
 
+                    ChatComposer(
+                        message = draftMessage,
+                        enabled = state.selectedSessionId.isNotBlank(),
+                        streaming = state.activeTurnIds.containsKey(state.selectedSessionId),
+                        onMessageChange = { draftMessage = it },
+                        onSend = {
+                            store.sendMessage(state.selectedSessionId, draftMessage)
+                            draftMessage = ""
+                        },
+                        onStop = {
+                            store.cancelActiveTurn(state.selectedSessionId)
+                        },
+                    )
+
                     TimelineSnapshot(
                         selectedSessionId = state.selectedSessionId,
                         items = state.timelineItems,
@@ -127,6 +142,53 @@ fun AppShell(appFilesDir: String) {
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ChatComposer(
+    message: String,
+    enabled: Boolean,
+    streaming: Boolean,
+    onMessageChange: (String) -> Unit,
+    onSend: () -> Unit,
+    onStop: () -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        OutlinedTextField(
+            value = message,
+            onValueChange = onMessageChange,
+            modifier = Modifier.weight(1f),
+            minLines = 1,
+            maxLines = 3,
+            label = { Text("Message") },
+            enabled = enabled && !streaming,
+        )
+        if (streaming) {
+            Button(
+                onClick = onStop,
+                enabled = enabled,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.tertiary,
+                ),
+            ) {
+                Text("Stop")
+            }
+        } else {
+            Button(
+                onClick = onSend,
+                enabled = enabled && message.isNotBlank(),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.primary,
+                ),
+            ) {
+                Text("Send")
             }
         }
     }

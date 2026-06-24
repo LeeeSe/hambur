@@ -7,4 +7,5 @@ publish.workspace = true
 
 [dependencies]
 hambur-core.workspace = true
-
+serde.workspace = true
+serde_json.workspace = true

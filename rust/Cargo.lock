@@ -717,6 +717,8 @@ name = "hambur-llm"
 version = "0.1.0"
 dependencies = [
  "hambur-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -743,7 +745,9 @@ version = "0.1.0"
 dependencies = [
  "hambur-core",
  "hambur-db",
+ "hambur-llm",
  "hambur-markdown",
+ "serde_json",
  "tokio",
 ]
 

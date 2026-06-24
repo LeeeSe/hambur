@@ -25,6 +25,12 @@ dictionary BackendCommand {
     string title;
     string message_id;
     string chunk;
+    string content;
+    string reasoning;
+    string provider_id;
+    string model_id;
+    string source_message_id;
+    string payload_json;
     boolean finalize;
 };
 
@@ -137,8 +143,19 @@ dictionary MessageDTO {
     string session_id;
     string role;
     string content_text;
+    string reasoning_content;
+    string status;
+    string turn_id;
     u64 created_at_ms;
     u64 version_sequence;
+    string provider_id_snapshot;
+    string provider_name_snapshot;
+    string provider_protocol;
+    string model_id_snapshot;
+    string model_name_snapshot;
+    string model_group_id;
+    string finish_reason;
+    string native_finish_reason;
 };
 
 dictionary MessageSnapshotDTO {

@@ -66,6 +66,7 @@ class HamburUiStore(appFilesDir: String) {
     private val commandCounter = AtomicLong()
     private var markdownFlushScheduled = false
     private var baselineApplied = false
+    private var defaultProviderConfigured = false
 
     val state: StateFlow<AppShellState> = _state.asStateFlow()
 
@@ -149,6 +150,41 @@ class HamburUiStore(appFilesDir: String) {
                 ),
             )
             applyRejectedAck(finalAck)
+        }
+    }
+
+    fun sendMessage(sessionId: String, content: String) {
+        if (sessionId.isBlank() || content.isBlank()) return
+
+        scope.launch {
+            ensureDefaultTextProvider()
+            val ack = runtime.dispatch(
+                backendCommand(
+                    kind = "SendMessage",
+                    idempotencyKey = "message:${System.currentTimeMillis()}:${nextCommandOrdinal()}",
+                    sessionId = sessionId,
+                    content = content,
+                    reasoning = "Routing through the configured OpenAI-compatible text provider.",
+                ),
+            )
+            applyRejectedAck(ack)
+        }
+    }
+
+    fun cancelActiveTurn(sessionId: String) {
+        if (sessionId.isBlank()) return
+        val turnId = _state.value.activeTurnIds[sessionId].orEmpty()
+        if (turnId.isBlank()) return
+
+        runCommand {
+            runtime.dispatch(
+                backendCommand(
+                    kind = "CancelTurn",
+                    idempotencyKey = "$turnId:cancel",
+                    sessionId = sessionId,
+                    turnId = turnId,
+                ),
+            )
         }
     }
 
@@ -339,6 +375,39 @@ class HamburUiStore(appFilesDir: String) {
         }
     }
 
+    private suspend fun ensureDefaultTextProvider() {
+        if (defaultProviderConfigured) return
+
+        val providerId = "provider-openai-compatible-default"
+        val providerAck = runtime.dispatch(
+            backendCommand(
+                kind = "UpdateProvider",
+                idempotencyKey = "$providerId:update:default",
+                providerId = providerId,
+                title = "OpenAI Compatible",
+                chunk = "https://api.openai.com/v1",
+                payloadJson = "android-secret://providers/default-openai-compatible",
+            ),
+        )
+        applyRejectedAck(providerAck)
+        if (!providerAck.accepted) return
+
+        val modelsJson = """
+            {"data":[{"id":"hambur-openai-compatible-text","display_name":"OpenAI Compatible Text","supports_reasoning":true,"supports_tool_call":false,"supports_image_input":false,"supports_structured_output":false,"supports_temperature":true,"context_limit":32000,"output_limit":4096}]}
+        """.trimIndent()
+        val modelsAck = runtime.dispatch(
+            backendCommand(
+                kind = "RefreshProviderModels",
+                idempotencyKey = "$providerId:refresh:default",
+                providerId = providerId,
+                modelId = "hambur-openai-compatible-text",
+                payloadJson = modelsJson,
+            ),
+        )
+        applyRejectedAck(modelsAck)
+        defaultProviderConfigured = modelsAck.accepted
+    }
+
     private fun backendCommand(
         kind: String,
         idempotencyKey: String,
@@ -347,6 +416,12 @@ class HamburUiStore(appFilesDir: String) {
         title: String = "",
         messageId: String = "",
         chunk: String = "",
+        content: String = "",
+        reasoning: String = "",
+        providerId: String = "",
+        modelId: String = "",
+        sourceMessageId: String = "",
+        payloadJson: String = "",
         finalize: Boolean = false,
     ): BackendCommand {
         return BackendCommand(
@@ -359,6 +434,12 @@ class HamburUiStore(appFilesDir: String) {
             title = title,
             messageId = messageId,
             chunk = chunk,
+            content = content,
+            reasoning = reasoning,
+            providerId = providerId,
+            modelId = modelId,
+            sourceMessageId = sourceMessageId,
+            payloadJson = payloadJson,
             finalize = finalize,
         )
     }
@@ -413,7 +494,22 @@ private fun AppShellState.reduce(event: BackendEvent): AppShellState {
 
     val snapshot = event.snapshot
     val status = when (event.kind) {
-        "RuntimeReady", "SessionCreated", "SessionOpened", "SessionDeleted" -> "Ready"
+        "RuntimeReady",
+        "SessionCreated",
+        "SessionOpened",
+        "SessionDeleted",
+        "ModelsUpdated",
+        "MessageUpserted",
+        "AssistantMessageFinished",
+        "TurnFinished",
+        "TurnCancelled" -> "Ready"
+        "TurnStarted",
+        "TurnStateChanged",
+        "AssistantMessageStarted",
+        "AssistantContentDelta",
+        "AssistantReasoningDelta",
+        "MarkdownRenderUpdate" -> "Streaming"
+        "TurnFailed" -> "Error"
         "RuntimeClosed" -> "Closed"
         "RuntimeError" -> "Error"
         else -> runtimeStatus
@@ -424,6 +520,14 @@ private fun AppShellState.reduce(event: BackendEvent): AppShellState {
         event.kind == "SessionCreated" -> "Session created"
         event.kind == "SessionOpened" -> "Session opened"
         event.kind == "SessionDeleted" -> "Session deleted"
+        event.kind == "ModelsUpdated" -> event.message.ifBlank { "Models updated" }
+        event.kind == "TurnStarted" -> "Turn started"
+        event.kind == "AssistantMessageStarted" -> "Assistant streaming"
+        event.kind == "AssistantReasoningDelta" -> "Reasoning streamed"
+        event.kind == "AssistantContentDelta" -> "Content streamed"
+        event.kind == "AssistantMessageFinished" -> "Assistant finished"
+        event.kind == "TurnFinished" -> "Turn finished"
+        event.kind == "TurnCancelled" -> "Turn cancelled"
         event.kind == "RuntimeClosed" -> "Runtime closed"
         else -> footer
     }

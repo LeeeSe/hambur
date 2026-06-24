@@ -33,8 +33,19 @@ pub struct MessageRecord {
     pub session_id: String,
     pub role: String,
     pub content_text: String,
+    pub reasoning_content: String,
+    pub status: String,
+    pub turn_id: String,
     pub created_at_ms: u64,
     pub version_sequence: u64,
+    pub provider_id_snapshot: String,
+    pub provider_name_snapshot: String,
+    pub provider_protocol: String,
+    pub model_id_snapshot: String,
+    pub model_name_snapshot: String,
+    pub model_group_id: String,
+    pub finish_reason: String,
+    pub native_finish_reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +56,14 @@ pub struct TurnRecord {
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub finished_at_ms: u64,
+    pub selected_provider_id: String,
+    pub selected_provider_name: String,
+    pub provider_protocol: String,
+    pub selected_model_id: String,
+    pub selected_model_name: String,
+    pub model_group_id: String,
+    pub error_code: String,
+    pub error_message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +74,93 @@ pub struct NewTimelineItem {
     pub payload_ref: String,
     pub small_summary: String,
     pub kind: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderUpsert {
+    pub id: String,
+    pub name: String,
+    pub icon_name: String,
+    pub api_type: String,
+    pub base_url: String,
+    pub secret_ref: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderRecord {
+    pub id: String,
+    pub name: String,
+    pub icon_name: String,
+    pub api_type: String,
+    pub base_url: String,
+    pub secret_ref: String,
+    pub enabled: bool,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderModelUpsert {
+    pub model_id: String,
+    pub display_name: String,
+    pub supports_tool_call: bool,
+    pub supports_reasoning: bool,
+    pub supports_image_input: bool,
+    pub supports_structured_output: bool,
+    pub supports_temperature: bool,
+    pub context_limit: u32,
+    pub output_limit: u32,
+    pub reasoning_field: String,
+    pub metadata_json: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderModelRecord {
+    pub id: String,
+    pub provider_id: String,
+    pub model_id: String,
+    pub display_name: String,
+    pub supports_tool_call: bool,
+    pub supports_reasoning: bool,
+    pub supports_image_input: bool,
+    pub supports_structured_output: bool,
+    pub supports_temperature: bool,
+    pub context_limit: u32,
+    pub output_limit: u32,
+    pub reasoning_field: String,
+    pub metadata_json: String,
+    pub synced_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelRouteSnapshot {
+    pub provider_id: String,
+    pub provider_name: String,
+    pub provider_protocol: String,
+    pub base_url: String,
+    pub secret_ref: String,
+    pub model_id: String,
+    pub model_display_name: String,
+    pub model_group_id: String,
+    pub model_group_name: String,
+    pub routing_strategy: String,
+    pub fallback_policy: String,
+    pub position: u32,
+    pub supports_tool_call: bool,
+    pub supports_reasoning: bool,
+    pub supports_image_input: bool,
+    pub supports_structured_output: bool,
+    pub supports_temperature: bool,
+    pub context_limit: u32,
+    pub output_limit: u32,
+    pub reasoning_field: String,
+}
+
+impl ModelRouteSnapshot {
+    pub fn empty() -> Self {
+        Self::default()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -193,9 +299,184 @@ impl HamburDatabase {
             session_id: session_id.to_string(),
             role,
             content_text: content_text.to_string(),
+            reasoning_content: String::new(),
+            status: "completed".to_string(),
+            turn_id: String::new(),
             created_at_ms: now,
             version_sequence: 1,
+            provider_id_snapshot: String::new(),
+            provider_name_snapshot: String::new(),
+            provider_protocol: String::new(),
+            model_id_snapshot: String::new(),
+            model_name_snapshot: String::new(),
+            model_group_id: String::new(),
+            finish_reason: String::new(),
+            native_finish_reason: String::new(),
         })
+    }
+
+    pub async fn insert_message_with_route(
+        &self,
+        session_id: &str,
+        role: &str,
+        content_text: &str,
+        reasoning_content: &str,
+        status: &str,
+        turn_id: &str,
+        route: &ModelRouteSnapshot,
+    ) -> HamburResult<MessageRecord> {
+        self.ensure_session_exists(session_id).await?;
+
+        let id = new_id("msg");
+        let now = now_ms();
+        let role = normalize_role(role)?;
+        let status = normalize_status(status)?;
+        self.connection
+            .execute(
+                "INSERT INTO messages
+                    (
+                        id,
+                        session_id,
+                        turn_id,
+                        role,
+                        status,
+                        content_text,
+                        reasoning_content,
+                        created_at_ms,
+                        version_sequence,
+                        provider_id_snapshot,
+                        provider_name_snapshot,
+                        provider_protocol,
+                        model_id_snapshot,
+                        model_name_snapshot,
+                        model_group_id,
+                        finish_reason,
+                        native_finish_reason
+                    )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11, ?12, ?13, ?14, '', '')",
+                params![
+                    id.clone(),
+                    session_id,
+                    turn_id,
+                    role.clone(),
+                    status.clone(),
+                    content_text,
+                    reasoning_content,
+                    now as i64,
+                    route.provider_id.clone(),
+                    route.provider_name.clone(),
+                    route.provider_protocol.clone(),
+                    route.model_id.clone(),
+                    route.model_display_name.clone(),
+                    route.model_group_id.clone()
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+        self.touch_session(session_id, now).await?;
+
+        Ok(MessageRecord {
+            id,
+            session_id: session_id.to_string(),
+            role,
+            content_text: content_text.to_string(),
+            reasoning_content: reasoning_content.to_string(),
+            status,
+            turn_id: turn_id.to_string(),
+            created_at_ms: now,
+            version_sequence: 1,
+            provider_id_snapshot: route.provider_id.clone(),
+            provider_name_snapshot: route.provider_name.clone(),
+            provider_protocol: route.provider_protocol.clone(),
+            model_id_snapshot: route.model_id.clone(),
+            model_name_snapshot: route.model_display_name.clone(),
+            model_group_id: route.model_group_id.clone(),
+            finish_reason: String::new(),
+            native_finish_reason: String::new(),
+        })
+    }
+
+    pub async fn update_message_stream_result(
+        &self,
+        message_id: &str,
+        content_text: &str,
+        reasoning_content: &str,
+        status: &str,
+        finish_reason: &str,
+        native_finish_reason: &str,
+    ) -> HamburResult<MessageRecord> {
+        let status = normalize_status(status)?;
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE messages
+                 SET content_text = ?1,
+                     reasoning_content = ?2,
+                     status = ?3,
+                     finish_reason = ?4,
+                     native_finish_reason = ?5,
+                     version_sequence = version_sequence + 1
+                 WHERE id = ?6",
+                params![
+                    content_text,
+                    reasoning_content,
+                    status,
+                    finish_reason,
+                    native_finish_reason,
+                    message_id
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+
+        if changed == 0 {
+            return Err(HamburError::InvalidCommand(format!(
+                "message not found: {message_id}"
+            )));
+        }
+        self.message_by_id(message_id)
+            .await?
+            .ok_or_else(|| HamburError::Internal(format!("message disappeared: {message_id}")))
+    }
+
+    pub async fn update_message_route_snapshot(
+        &self,
+        message_id: &str,
+        route: &ModelRouteSnapshot,
+    ) -> HamburResult<MessageRecord> {
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE messages
+                 SET provider_id_snapshot = ?1,
+                     provider_name_snapshot = ?2,
+                     provider_protocol = ?3,
+                     model_id_snapshot = ?4,
+                     model_name_snapshot = ?5,
+                     model_group_id = ?6,
+                     version_sequence = version_sequence + 1
+                 WHERE id = ?7",
+                params![
+                    route.provider_id.clone(),
+                    route.provider_name.clone(),
+                    route.provider_protocol.clone(),
+                    route.model_id.clone(),
+                    route.model_display_name.clone(),
+                    route.model_group_id.clone(),
+                    message_id,
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+
+        if changed == 0 {
+            return Err(HamburError::InvalidCommand(format!(
+                "message not found: {message_id}"
+            )));
+        }
+        self.message_by_id(message_id)
+            .await?
+            .ok_or_else(|| HamburError::Internal(format!("message disappeared: {message_id}")))
     }
 
     pub async fn upsert_timeline_item(
@@ -260,7 +541,8 @@ impl HamburDatabase {
             .map_err(database_error)?;
         self.touch_session(session_id, now).await?;
 
-        self.timeline_item_by_stable_key(session_id, &stable_key).await
+        self.timeline_item_by_stable_key(session_id, &stable_key)
+            .await
     }
 
     pub async fn create_turn(&self, session_id: &str, status: &str) -> HamburResult<TurnRecord> {
@@ -287,6 +569,80 @@ impl HamburDatabase {
             created_at_ms: now,
             updated_at_ms: now,
             finished_at_ms: 0,
+            selected_provider_id: String::new(),
+            selected_provider_name: String::new(),
+            provider_protocol: String::new(),
+            selected_model_id: String::new(),
+            selected_model_name: String::new(),
+            model_group_id: String::new(),
+            error_code: String::new(),
+            error_message: String::new(),
+        })
+    }
+
+    pub async fn create_turn_with_route(
+        &self,
+        session_id: &str,
+        status: &str,
+        route: &ModelRouteSnapshot,
+    ) -> HamburResult<TurnRecord> {
+        self.ensure_session_exists(session_id).await?;
+
+        let id = new_id("turn");
+        let now = now_ms();
+        let status = normalize_status(status)?;
+        self.connection
+            .execute(
+                "INSERT INTO turns
+                    (
+                        id,
+                        session_id,
+                        status,
+                        created_at_ms,
+                        updated_at_ms,
+                        finished_at_ms,
+                        selected_provider_id,
+                        selected_provider_name,
+                        provider_protocol,
+                        selected_model_id,
+                        selected_model_name,
+                        model_group_id,
+                        error_code,
+                        error_message
+                    )
+                 VALUES (?1, ?2, ?3, ?4, ?4, NULL, ?5, ?6, ?7, ?8, ?9, ?10, '', '')",
+                params![
+                    id.clone(),
+                    session_id,
+                    status.clone(),
+                    now as i64,
+                    route.provider_id.clone(),
+                    route.provider_name.clone(),
+                    route.provider_protocol.clone(),
+                    route.model_id.clone(),
+                    route.model_display_name.clone(),
+                    route.model_group_id.clone()
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+        self.touch_session(session_id, now).await?;
+
+        Ok(TurnRecord {
+            id,
+            session_id: session_id.to_string(),
+            status,
+            created_at_ms: now,
+            updated_at_ms: now,
+            finished_at_ms: 0,
+            selected_provider_id: route.provider_id.clone(),
+            selected_provider_name: route.provider_name.clone(),
+            provider_protocol: route.provider_protocol.clone(),
+            selected_model_id: route.model_id.clone(),
+            selected_model_name: route.model_display_name.clone(),
+            model_group_id: route.model_group_id.clone(),
+            error_code: String::new(),
+            error_message: String::new(),
         })
     }
 
@@ -320,16 +676,85 @@ impl HamburDatabase {
         self.turn_by_id(turn_id).await
     }
 
+    pub async fn update_turn_route_snapshot(
+        &self,
+        turn_id: &str,
+        route: &ModelRouteSnapshot,
+    ) -> HamburResult<TurnRecord> {
+        let now = now_ms();
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE turns
+                 SET updated_at_ms = ?1,
+                     selected_provider_id = ?2,
+                     selected_provider_name = ?3,
+                     provider_protocol = ?4,
+                     selected_model_id = ?5,
+                     selected_model_name = ?6,
+                     model_group_id = ?7
+                 WHERE id = ?8",
+                params![
+                    now as i64,
+                    route.provider_id.clone(),
+                    route.provider_name.clone(),
+                    route.provider_protocol.clone(),
+                    route.model_id.clone(),
+                    route.model_display_name.clone(),
+                    route.model_group_id.clone(),
+                    turn_id,
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+
+        if changed == 0 {
+            return Err(HamburError::InvalidCommand(format!(
+                "turn not found: {turn_id}"
+            )));
+        }
+        self.turn_by_id(turn_id).await
+    }
+
+    pub async fn fail_turn(
+        &self,
+        turn_id: &str,
+        status: &str,
+        error_code: &str,
+        error_message: &str,
+    ) -> HamburResult<TurnRecord> {
+        let status = normalize_status(status)?;
+        let now = now_ms();
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE turns
+                 SET status = ?1,
+                     updated_at_ms = ?2,
+                     finished_at_ms = ?2,
+                     error_code = ?3,
+                     error_message = ?4
+                 WHERE id = ?5",
+                params![status, now as i64, error_code, error_message, turn_id],
+            )
+            .await
+            .map_err(database_error)?;
+
+        if changed == 0 {
+            return Err(HamburError::InvalidCommand(format!(
+                "turn not found: {turn_id}"
+            )));
+        }
+
+        self.turn_by_id(turn_id).await
+    }
+
     pub async fn session_snapshot(&self, session_id: &str) -> HamburResult<AppSnapshot> {
         self.ensure_session_exists(session_id).await?;
         self.snapshot_for_selected(Some(session_id)).await
     }
 
-    pub async fn session_list(
-        &self,
-        limit: u32,
-        offset: u32,
-    ) -> HamburResult<Vec<SessionSummary>> {
+    pub async fn session_list(&self, limit: u32, offset: u32) -> HamburResult<Vec<SessionSummary>> {
         self.list_sessions_page(limit, offset).await
     }
 
@@ -356,6 +781,68 @@ impl HamburDatabase {
             ));
         }
         self.message_by_id(message_id).await
+    }
+
+    pub async fn source_user_message_for(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> HamburResult<MessageRecord> {
+        self.ensure_session_exists(session_id).await?;
+        let source = self.message_snapshot(message_id).await?.ok_or_else(|| {
+            HamburError::InvalidCommand(format!("message not found: {message_id}"))
+        })?;
+
+        if source.session_id != session_id {
+            return Err(HamburError::InvalidCommand(format!(
+                "message does not belong to session: {message_id}"
+            )));
+        }
+        if source.role == "user" {
+            return Ok(source);
+        }
+
+        let mut rows = self
+            .connection
+            .query(
+                "
+                SELECT
+                    id,
+                    session_id,
+                    role,
+                    content_text,
+                    reasoning_content,
+                    status,
+                    turn_id,
+                    created_at_ms,
+                    version_sequence,
+                    provider_id_snapshot,
+                    provider_name_snapshot,
+                    provider_protocol,
+                    model_id_snapshot,
+                    model_name_snapshot,
+                    model_group_id,
+                    finish_reason,
+                    native_finish_reason
+                FROM messages
+                WHERE session_id = ?1
+                  AND role = 'user'
+                  AND created_at_ms <= ?2
+                ORDER BY created_at_ms DESC, id DESC
+                LIMIT 1
+                ",
+                params![session_id, source.created_at_ms as i64],
+            )
+            .await
+            .map_err(database_error)?;
+
+        let Some(row) = rows.next().await.map_err(database_error)? else {
+            return Err(HamburError::InvalidCommand(format!(
+                "source user message not found for: {message_id}"
+            )));
+        };
+
+        message_from_row(&row)
     }
 
     pub async fn search_sessions(
@@ -409,6 +896,341 @@ impl HamburDatabase {
         Ok(sessions)
     }
 
+    pub async fn upsert_provider(&self, input: ProviderUpsert) -> HamburResult<ProviderRecord> {
+        let provider_id = normalize_provider_id(&input.id);
+        let name = normalize_title(&input.name);
+        let icon_name = input.icon_name.trim().chars().take(80).collect::<String>();
+        let api_type = input.api_type.trim();
+        if api_type != "OpenAiCompatible" {
+            return Err(HamburError::InvalidCommand(format!(
+                "unsupported provider api_type: {api_type}"
+            )));
+        }
+        let base_url = normalize_base_url(&input.base_url)?;
+        let secret_ref = normalize_secret_ref(&input.secret_ref)?;
+        let now = now_ms();
+
+        self.connection
+            .execute(
+                "INSERT INTO providers
+                    (id, name, icon_name, api_type, base_url, secret_ref, enabled, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+                 ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    icon_name = excluded.icon_name,
+                    api_type = excluded.api_type,
+                    base_url = excluded.base_url,
+                    secret_ref = excluded.secret_ref,
+                    enabled = excluded.enabled,
+                    updated_at_ms = excluded.updated_at_ms",
+                params![
+                    provider_id.clone(),
+                    name,
+                    icon_name,
+                    api_type,
+                    base_url,
+                    secret_ref,
+                    input.enabled,
+                    now as i64
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+
+        self.provider_by_id(&provider_id).await
+    }
+
+    pub async fn provider_by_id(&self, provider_id: &str) -> HamburResult<ProviderRecord> {
+        let mut rows = self
+            .connection
+            .query(
+                "
+                SELECT id, name, icon_name, api_type, base_url, secret_ref, enabled, created_at_ms, updated_at_ms
+                FROM providers
+                WHERE id = ?1
+                LIMIT 1
+                ",
+                params![provider_id],
+            )
+            .await
+            .map_err(database_error)?;
+
+        let Some(row) = rows.next().await.map_err(database_error)? else {
+            return Err(HamburError::ProviderUnavailable(format!(
+                "provider not found: {provider_id}"
+            )));
+        };
+        provider_record_from_row(&row)
+    }
+
+    pub async fn replace_provider_models(
+        &self,
+        provider_id: &str,
+        models: Vec<ProviderModelUpsert>,
+    ) -> HamburResult<Vec<ProviderModelRecord>> {
+        self.provider_by_id(provider_id).await?;
+        if models.is_empty() {
+            return Err(HamburError::InvalidCommand(
+                "model refresh returned no usable models".to_string(),
+            ));
+        }
+
+        self.connection
+            .execute(
+                "DELETE FROM provider_models WHERE provider_id = ?1",
+                params![provider_id],
+            )
+            .await
+            .map_err(database_error)?;
+
+        let now = now_ms();
+        for model in models {
+            let model_id = model.model_id.trim();
+            if model_id.is_empty() {
+                continue;
+            }
+            let display_name = if model.display_name.trim().is_empty() {
+                model_id.to_string()
+            } else {
+                model.display_name.trim().chars().take(160).collect()
+            };
+            let row_id = new_id("pmod");
+            self.connection
+                .execute(
+                    "INSERT INTO provider_models
+                        (
+                            id,
+                            provider_id,
+                            model_id,
+                            display_name,
+                            supports_tool_call,
+                            supports_reasoning,
+                            supports_image_input,
+                            supports_structured_output,
+                            supports_temperature,
+                            context_limit,
+                            output_limit,
+                            reasoning_field,
+                            metadata_json,
+                            synced_at_ms
+                        )
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    params![
+                        row_id,
+                        provider_id,
+                        model_id,
+                        display_name,
+                        model.supports_tool_call,
+                        model.supports_reasoning,
+                        model.supports_image_input,
+                        model.supports_structured_output,
+                        model.supports_temperature,
+                        model.context_limit.max(1) as i64,
+                        model.output_limit.max(1) as i64,
+                        model.reasoning_field,
+                        model.metadata_json,
+                        now as i64
+                    ],
+                )
+                .await
+                .map_err(database_error)?;
+        }
+
+        let saved = self.provider_models(provider_id).await?;
+        if let Some(first) = saved.first() {
+            self.ensure_default_model_groups(provider_id, &first.model_id)
+                .await?;
+        }
+        Ok(saved)
+    }
+
+    pub async fn provider_models(
+        &self,
+        provider_id: &str,
+    ) -> HamburResult<Vec<ProviderModelRecord>> {
+        let mut rows = self
+            .connection
+            .query(
+                "
+                SELECT
+                    id,
+                    provider_id,
+                    model_id,
+                    display_name,
+                    supports_tool_call,
+                    supports_reasoning,
+                    supports_image_input,
+                    supports_structured_output,
+                    supports_temperature,
+                    context_limit,
+                    output_limit,
+                    reasoning_field,
+                    metadata_json,
+                    synced_at_ms
+                FROM provider_models
+                WHERE provider_id = ?1
+                ORDER BY model_id ASC
+                ",
+                params![provider_id],
+            )
+            .await
+            .map_err(database_error)?;
+
+        let mut models = Vec::new();
+        while let Some(row) = rows.next().await.map_err(database_error)? {
+            models.push(provider_model_from_row(&row)?);
+        }
+        Ok(models)
+    }
+
+    pub async fn ensure_default_model_groups(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+    ) -> HamburResult<()> {
+        let now = now_ms();
+        for (group_id, name, default_key) in [
+            ("grp_primary_chat", "Primary Chat", "primary"),
+            (
+                "grp_secondary_background",
+                "Secondary Background",
+                "secondary",
+            ),
+        ] {
+            self.connection
+                .execute(
+                    "INSERT INTO model_groups
+                        (id, name, routing_strategy, fallback_policy, created_at_ms, updated_at_ms)
+                     VALUES (?1, ?2, 'fallback', 'default', ?3, ?3)
+                     ON CONFLICT(id) DO UPDATE SET updated_at_ms = excluded.updated_at_ms",
+                    params![group_id, name, now as i64],
+                )
+                .await
+                .map_err(database_error)?;
+            self.connection
+                .execute(
+                    "INSERT INTO default_model_groups (key, group_id, updated_at_ms)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(key) DO UPDATE SET
+                        group_id = excluded.group_id,
+                        updated_at_ms = excluded.updated_at_ms",
+                    params![default_key, group_id, now as i64],
+                )
+                .await
+                .map_err(database_error)?;
+        }
+
+        self.connection
+            .execute(
+                "INSERT INTO model_group_members
+                    (id, group_id, provider_id, model_id, position, enabled)
+                 VALUES (?1, 'grp_primary_chat', ?2, ?3, 0, 1)
+                 ON CONFLICT(group_id, provider_id, model_id) DO UPDATE SET enabled = 1",
+                params![new_id("mgm"), provider_id, model_id],
+            )
+            .await
+            .map_err(database_error)?;
+        Ok(())
+    }
+
+    pub async fn primary_chat_route(&self) -> HamburResult<Vec<ModelRouteSnapshot>> {
+        let mut rows = self
+            .connection
+            .query(
+                "
+                SELECT
+                    p.id,
+                    p.name,
+                    p.api_type,
+                    p.base_url,
+                    p.secret_ref,
+                    pm.model_id,
+                    pm.display_name,
+                    mg.id,
+                    mg.name,
+                    mg.routing_strategy,
+                    mg.fallback_policy,
+                    mgm.position,
+                    pm.supports_tool_call,
+                    pm.supports_reasoning,
+                    pm.supports_image_input,
+                    pm.supports_structured_output,
+                    pm.supports_temperature,
+                    pm.context_limit,
+                    pm.output_limit,
+                    pm.reasoning_field
+                FROM default_model_groups d
+                JOIN model_groups mg ON mg.id = d.group_id
+                JOIN model_group_members mgm ON mgm.group_id = mg.id
+                JOIN providers p ON p.id = mgm.provider_id
+                JOIN provider_models pm ON pm.provider_id = p.id AND pm.model_id = mgm.model_id
+                WHERE d.key = 'primary'
+                  AND p.enabled = 1
+                  AND mgm.enabled = 1
+                ORDER BY mgm.position ASC, p.id ASC, pm.model_id ASC
+                ",
+                (),
+            )
+            .await
+            .map_err(database_error)?;
+
+        let mut targets = Vec::new();
+        while let Some(row) = rows.next().await.map_err(database_error)? {
+            targets.push(model_route_from_row(&row)?);
+        }
+
+        if targets.is_empty() {
+            let fallback = self.first_enabled_model_route().await?;
+            targets.extend(fallback);
+        }
+        Ok(targets)
+    }
+
+    async fn first_enabled_model_route(&self) -> HamburResult<Vec<ModelRouteSnapshot>> {
+        let mut rows = self
+            .connection
+            .query(
+                "
+                SELECT
+                    p.id,
+                    p.name,
+                    p.api_type,
+                    p.base_url,
+                    p.secret_ref,
+                    pm.model_id,
+                    pm.display_name,
+                    'grp_primary_chat',
+                    'Primary Chat',
+                    'fallback',
+                    'default',
+                    0,
+                    pm.supports_tool_call,
+                    pm.supports_reasoning,
+                    pm.supports_image_input,
+                    pm.supports_structured_output,
+                    pm.supports_temperature,
+                    pm.context_limit,
+                    pm.output_limit,
+                    pm.reasoning_field
+                FROM providers p
+                JOIN provider_models pm ON pm.provider_id = p.id
+                WHERE p.enabled = 1
+                ORDER BY p.updated_at_ms DESC, pm.model_id ASC
+                LIMIT 1
+                ",
+                (),
+            )
+            .await
+            .map_err(database_error)?;
+
+        let Some(row) = rows.next().await.map_err(database_error)? else {
+            return Err(HamburError::ProviderUnavailable(
+                "no enabled provider model is configured".to_string(),
+            ));
+        };
+        Ok(vec![model_route_from_row(&row)?])
+    }
+
     async fn migrate(&self) -> HamburResult<()> {
         self.connection
             .execute_batch(
@@ -435,10 +1257,21 @@ impl HamburDatabase {
                 CREATE TABLE IF NOT EXISTS messages (
                     id TEXT PRIMARY KEY NOT NULL,
                     session_id TEXT NOT NULL REFERENCES sessions(id),
+                    turn_id TEXT NOT NULL DEFAULT '',
                     role TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'completed',
                     content_text TEXT NOT NULL,
+                    reasoning_content TEXT NOT NULL DEFAULT '',
                     created_at_ms INTEGER NOT NULL,
-                    version_sequence INTEGER NOT NULL DEFAULT 1
+                    version_sequence INTEGER NOT NULL DEFAULT 1,
+                    provider_id_snapshot TEXT NOT NULL DEFAULT '',
+                    provider_name_snapshot TEXT NOT NULL DEFAULT '',
+                    provider_protocol TEXT NOT NULL DEFAULT '',
+                    model_id_snapshot TEXT NOT NULL DEFAULT '',
+                    model_name_snapshot TEXT NOT NULL DEFAULT '',
+                    model_group_id TEXT NOT NULL DEFAULT '',
+                    finish_reason TEXT NOT NULL DEFAULT '',
+                    native_finish_reason TEXT NOT NULL DEFAULT ''
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_messages_session_order
@@ -468,14 +1301,165 @@ impl HamburDatabase {
                     status TEXT NOT NULL,
                     created_at_ms INTEGER NOT NULL,
                     updated_at_ms INTEGER NOT NULL,
-                    finished_at_ms INTEGER
+                    finished_at_ms INTEGER,
+                    selected_provider_id TEXT NOT NULL DEFAULT '',
+                    selected_provider_name TEXT NOT NULL DEFAULT '',
+                    provider_protocol TEXT NOT NULL DEFAULT '',
+                    selected_model_id TEXT NOT NULL DEFAULT '',
+                    selected_model_name TEXT NOT NULL DEFAULT '',
+                    model_group_id TEXT NOT NULL DEFAULT '',
+                    error_code TEXT NOT NULL DEFAULT '',
+                    error_message TEXT NOT NULL DEFAULT ''
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_turns_session_updated
                     ON turns(session_id, updated_at_ms DESC, id);
+
+                CREATE TABLE IF NOT EXISTS providers (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    name TEXT NOT NULL,
+                    icon_name TEXT NOT NULL,
+                    api_type TEXT NOT NULL,
+                    base_url TEXT NOT NULL,
+                    secret_ref TEXT NOT NULL,
+                    enabled INTEGER NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS provider_models (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+                    model_id TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    supports_tool_call INTEGER NOT NULL,
+                    supports_reasoning INTEGER NOT NULL,
+                    supports_image_input INTEGER NOT NULL,
+                    supports_structured_output INTEGER NOT NULL,
+                    supports_temperature INTEGER NOT NULL,
+                    context_limit INTEGER NOT NULL,
+                    output_limit INTEGER NOT NULL,
+                    reasoning_field TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL,
+                    synced_at_ms INTEGER NOT NULL,
+                    UNIQUE(provider_id, model_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS model_groups (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    name TEXT NOT NULL,
+                    routing_strategy TEXT NOT NULL,
+                    fallback_policy TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS model_group_members (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    group_id TEXT NOT NULL REFERENCES model_groups(id) ON DELETE CASCADE,
+                    provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+                    model_id TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    enabled INTEGER NOT NULL,
+                    UNIQUE(group_id, provider_id, model_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS default_model_groups (
+                    key TEXT PRIMARY KEY NOT NULL,
+                    group_id TEXT NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
+                );
                 ",
             )
             .await
+            .map_err(database_error)?;
+
+        self.add_column_if_missing("messages", "turn_id", "TEXT NOT NULL DEFAULT ''")
+            .await?;
+        self.add_column_if_missing("messages", "status", "TEXT NOT NULL DEFAULT 'completed'")
+            .await?;
+        self.add_column_if_missing("messages", "reasoning_content", "TEXT NOT NULL DEFAULT ''")
+            .await?;
+        self.add_column_if_missing(
+            "messages",
+            "provider_id_snapshot",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+        .await?;
+        self.add_column_if_missing(
+            "messages",
+            "provider_name_snapshot",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+        .await?;
+        self.add_column_if_missing("messages", "provider_protocol", "TEXT NOT NULL DEFAULT ''")
+            .await?;
+        self.add_column_if_missing("messages", "model_id_snapshot", "TEXT NOT NULL DEFAULT ''")
+            .await?;
+        self.add_column_if_missing(
+            "messages",
+            "model_name_snapshot",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+        .await?;
+        self.add_column_if_missing("messages", "model_group_id", "TEXT NOT NULL DEFAULT ''")
+            .await?;
+        self.add_column_if_missing("messages", "finish_reason", "TEXT NOT NULL DEFAULT ''")
+            .await?;
+        self.add_column_if_missing(
+            "messages",
+            "native_finish_reason",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+        .await?;
+        self.add_column_if_missing("turns", "selected_provider_id", "TEXT NOT NULL DEFAULT ''")
+            .await?;
+        self.add_column_if_missing(
+            "turns",
+            "selected_provider_name",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+        .await?;
+        self.add_column_if_missing("turns", "provider_protocol", "TEXT NOT NULL DEFAULT ''")
+            .await?;
+        self.add_column_if_missing("turns", "selected_model_id", "TEXT NOT NULL DEFAULT ''")
+            .await?;
+        self.add_column_if_missing("turns", "selected_model_name", "TEXT NOT NULL DEFAULT ''")
+            .await?;
+        self.add_column_if_missing("turns", "model_group_id", "TEXT NOT NULL DEFAULT ''")
+            .await?;
+        self.add_column_if_missing("turns", "error_code", "TEXT NOT NULL DEFAULT ''")
+            .await?;
+        self.add_column_if_missing("turns", "error_message", "TEXT NOT NULL DEFAULT ''")
+            .await?;
+
+        Ok(())
+    }
+
+    async fn add_column_if_missing(
+        &self,
+        table: &str,
+        column: &str,
+        definition: &str,
+    ) -> HamburResult<()> {
+        let pragma = format!("PRAGMA table_info({table})");
+        let mut rows = self
+            .connection
+            .query(pragma.as_str(), ())
+            .await
+            .map_err(database_error)?;
+        while let Some(row) = rows.next().await.map_err(database_error)? {
+            let name = row.get::<String>(1).map_err(database_error)?;
+            if name == column {
+                return Ok(());
+            }
+        }
+
+        let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {definition}");
+        self.connection
+            .execute(sql.as_str(), ())
+            .await
+            .map(|_| ())
             .map_err(database_error)
     }
 
@@ -489,9 +1473,9 @@ impl HamburDatabase {
             Some(session_id) if sessions.iter().any(|session| session.id == session_id) => {
                 session_id.to_string()
             }
-            _ if active_session_id
-                .as_ref()
-                .is_some_and(|session_id| sessions.iter().any(|session| session.id == *session_id)) =>
+            _ if active_session_id.as_ref().is_some_and(|session_id| {
+                sessions.iter().any(|session| session.id == *session_id)
+            }) =>
             {
                 active_session_id.unwrap_or_default()
             }
@@ -846,7 +1830,24 @@ impl HamburDatabase {
             .connection
             .query(
                 "
-                SELECT id, session_id, role, content_text, created_at_ms, version_sequence
+                SELECT
+                    id,
+                    session_id,
+                    role,
+                    content_text,
+                    reasoning_content,
+                    status,
+                    turn_id,
+                    created_at_ms,
+                    version_sequence,
+                    provider_id_snapshot,
+                    provider_name_snapshot,
+                    provider_protocol,
+                    model_id_snapshot,
+                    model_name_snapshot,
+                    model_group_id,
+                    finish_reason,
+                    native_finish_reason
                 FROM messages
                 WHERE id = ?1
                 LIMIT 1
@@ -860,14 +1861,7 @@ impl HamburDatabase {
             return Ok(None);
         };
 
-        Ok(Some(MessageRecord {
-            id: row.get::<String>(0).map_err(database_error)?,
-            session_id: row.get::<String>(1).map_err(database_error)?,
-            role: row.get::<String>(2).map_err(database_error)?,
-            content_text: row.get::<String>(3).map_err(database_error)?,
-            created_at_ms: unsigned_ms(row.get::<i64>(4).map_err(database_error)?),
-            version_sequence: unsigned_ms(row.get::<i64>(5).map_err(database_error)?),
-        }))
+        Ok(Some(message_from_row(&row)?))
     }
 
     async fn turn_by_id(&self, turn_id: &str) -> HamburResult<TurnRecord> {
@@ -875,7 +1869,21 @@ impl HamburDatabase {
             .connection
             .query(
                 "
-                SELECT id, session_id, status, created_at_ms, updated_at_ms, finished_at_ms
+                SELECT
+                    id,
+                    session_id,
+                    status,
+                    created_at_ms,
+                    updated_at_ms,
+                    finished_at_ms,
+                    selected_provider_id,
+                    selected_provider_name,
+                    provider_protocol,
+                    selected_model_id,
+                    selected_model_name,
+                    model_group_id,
+                    error_code,
+                    error_message
                 FROM turns
                 WHERE id = ?1
                 LIMIT 1
@@ -902,6 +1910,14 @@ impl HamburDatabase {
                 .map_err(database_error)?
                 .map(unsigned_ms)
                 .unwrap_or_default(),
+            selected_provider_id: row.get::<String>(6).map_err(database_error)?,
+            selected_provider_name: row.get::<String>(7).map_err(database_error)?,
+            provider_protocol: row.get::<String>(8).map_err(database_error)?,
+            selected_model_id: row.get::<String>(9).map_err(database_error)?,
+            selected_model_name: row.get::<String>(10).map_err(database_error)?,
+            model_group_id: row.get::<String>(11).map_err(database_error)?,
+            error_code: row.get::<String>(12).map_err(database_error)?,
+            error_message: row.get::<String>(13).map_err(database_error)?,
         })
     }
 }
@@ -948,6 +1964,55 @@ fn clamp_limit(value: u32, min: u32, max: u32) -> u32 {
     value.clamp(min, max)
 }
 
+fn normalize_provider_id(id: &str) -> String {
+    let id = id.trim();
+    if id.is_empty() {
+        new_id("provider")
+    } else {
+        id.chars().take(120).collect()
+    }
+}
+
+fn normalize_base_url(base_url: &str) -> HamburResult<String> {
+    let base_url = base_url.trim().trim_end_matches('/');
+    if base_url.is_empty() {
+        return Err(HamburError::InvalidCommand(
+            "provider base_url must not be empty".to_string(),
+        ));
+    }
+    if !(base_url.starts_with("https://") || base_url.starts_with("http://")) {
+        return Err(HamburError::InvalidCommand(
+            "provider base_url must be http or https".to_string(),
+        ));
+    }
+    Ok(base_url.chars().take(512).collect())
+}
+
+fn normalize_secret_ref(secret_ref: &str) -> HamburResult<String> {
+    let secret_ref = secret_ref.trim();
+    if secret_ref.is_empty() {
+        return Err(HamburError::InvalidCommand(
+            "provider secret_ref must not be empty".to_string(),
+        ));
+    }
+    let lower = secret_ref.to_ascii_lowercase();
+    if secret_ref.starts_with("sk-")
+        || lower.starts_with("bearer ")
+        || lower.contains("api_key=")
+        || lower.contains("apikey=")
+    {
+        return Err(HamburError::InvalidCommand(
+            "provider secret_ref must reference Android Secret Store, not a raw API key"
+                .to_string(),
+        ));
+    }
+    Ok(secret_ref.chars().take(256).collect())
+}
+
+fn sql_bool(value: i64) -> bool {
+    value != 0
+}
+
 fn session_summary_from_row(row: &Row) -> HamburResult<SessionSummary> {
     Ok(SessionSummary {
         id: row.get::<String>(0).map_err(database_error)?,
@@ -956,6 +2021,64 @@ fn session_summary_from_row(row: &Row) -> HamburResult<SessionSummary> {
         updated_at_ms: unsigned_ms(row.get::<i64>(3).map_err(database_error)?),
         message_count: unsigned_count(row.get::<i64>(4).map_err(database_error)?),
         latest_preview: row.get::<String>(5).map_err(database_error)?,
+    })
+}
+
+fn provider_record_from_row(row: &Row) -> HamburResult<ProviderRecord> {
+    Ok(ProviderRecord {
+        id: row.get::<String>(0).map_err(database_error)?,
+        name: row.get::<String>(1).map_err(database_error)?,
+        icon_name: row.get::<String>(2).map_err(database_error)?,
+        api_type: row.get::<String>(3).map_err(database_error)?,
+        base_url: row.get::<String>(4).map_err(database_error)?,
+        secret_ref: row.get::<String>(5).map_err(database_error)?,
+        enabled: sql_bool(row.get::<i64>(6).map_err(database_error)?),
+        created_at_ms: unsigned_ms(row.get::<i64>(7).map_err(database_error)?),
+        updated_at_ms: unsigned_ms(row.get::<i64>(8).map_err(database_error)?),
+    })
+}
+
+fn provider_model_from_row(row: &Row) -> HamburResult<ProviderModelRecord> {
+    Ok(ProviderModelRecord {
+        id: row.get::<String>(0).map_err(database_error)?,
+        provider_id: row.get::<String>(1).map_err(database_error)?,
+        model_id: row.get::<String>(2).map_err(database_error)?,
+        display_name: row.get::<String>(3).map_err(database_error)?,
+        supports_tool_call: sql_bool(row.get::<i64>(4).map_err(database_error)?),
+        supports_reasoning: sql_bool(row.get::<i64>(5).map_err(database_error)?),
+        supports_image_input: sql_bool(row.get::<i64>(6).map_err(database_error)?),
+        supports_structured_output: sql_bool(row.get::<i64>(7).map_err(database_error)?),
+        supports_temperature: sql_bool(row.get::<i64>(8).map_err(database_error)?),
+        context_limit: unsigned_count(row.get::<i64>(9).map_err(database_error)?),
+        output_limit: unsigned_count(row.get::<i64>(10).map_err(database_error)?),
+        reasoning_field: row.get::<String>(11).map_err(database_error)?,
+        metadata_json: row.get::<String>(12).map_err(database_error)?,
+        synced_at_ms: unsigned_ms(row.get::<i64>(13).map_err(database_error)?),
+    })
+}
+
+fn model_route_from_row(row: &Row) -> HamburResult<ModelRouteSnapshot> {
+    Ok(ModelRouteSnapshot {
+        provider_id: row.get::<String>(0).map_err(database_error)?,
+        provider_name: row.get::<String>(1).map_err(database_error)?,
+        provider_protocol: row.get::<String>(2).map_err(database_error)?,
+        base_url: row.get::<String>(3).map_err(database_error)?,
+        secret_ref: row.get::<String>(4).map_err(database_error)?,
+        model_id: row.get::<String>(5).map_err(database_error)?,
+        model_display_name: row.get::<String>(6).map_err(database_error)?,
+        model_group_id: row.get::<String>(7).map_err(database_error)?,
+        model_group_name: row.get::<String>(8).map_err(database_error)?,
+        routing_strategy: row.get::<String>(9).map_err(database_error)?,
+        fallback_policy: row.get::<String>(10).map_err(database_error)?,
+        position: unsigned_count(row.get::<i64>(11).map_err(database_error)?),
+        supports_tool_call: sql_bool(row.get::<i64>(12).map_err(database_error)?),
+        supports_reasoning: sql_bool(row.get::<i64>(13).map_err(database_error)?),
+        supports_image_input: sql_bool(row.get::<i64>(14).map_err(database_error)?),
+        supports_structured_output: sql_bool(row.get::<i64>(15).map_err(database_error)?),
+        supports_temperature: sql_bool(row.get::<i64>(16).map_err(database_error)?),
+        context_limit: unsigned_count(row.get::<i64>(17).map_err(database_error)?),
+        output_limit: unsigned_count(row.get::<i64>(18).map_err(database_error)?),
+        reasoning_field: row.get::<String>(19).map_err(database_error)?,
     })
 }
 
@@ -969,6 +2092,28 @@ fn timeline_item_from_row(row: &Row) -> HamburResult<TimelineItemSnapshot> {
         payload_ref: row.get::<String>(5).map_err(database_error)?,
         small_summary: row.get::<String>(6).map_err(database_error)?,
         kind: row.get::<String>(7).map_err(database_error)?,
+    })
+}
+
+fn message_from_row(row: &Row) -> HamburResult<MessageRecord> {
+    Ok(MessageRecord {
+        id: row.get::<String>(0).map_err(database_error)?,
+        session_id: row.get::<String>(1).map_err(database_error)?,
+        role: row.get::<String>(2).map_err(database_error)?,
+        content_text: row.get::<String>(3).map_err(database_error)?,
+        reasoning_content: row.get::<String>(4).map_err(database_error)?,
+        status: row.get::<String>(5).map_err(database_error)?,
+        turn_id: row.get::<String>(6).map_err(database_error)?,
+        created_at_ms: unsigned_ms(row.get::<i64>(7).map_err(database_error)?),
+        version_sequence: unsigned_ms(row.get::<i64>(8).map_err(database_error)?),
+        provider_id_snapshot: row.get::<String>(9).map_err(database_error)?,
+        provider_name_snapshot: row.get::<String>(10).map_err(database_error)?,
+        provider_protocol: row.get::<String>(11).map_err(database_error)?,
+        model_id_snapshot: row.get::<String>(12).map_err(database_error)?,
+        model_name_snapshot: row.get::<String>(13).map_err(database_error)?,
+        model_group_id: row.get::<String>(14).map_err(database_error)?,
+        finish_reason: row.get::<String>(15).map_err(database_error)?,
+        native_finish_reason: row.get::<String>(16).map_err(database_error)?,
     })
 }
 
@@ -1038,10 +2183,7 @@ mod tests {
                 .expect("create second");
             assert_eq!(second.selected_session_id, second.sessions[0].id);
 
-            let opened_first = database
-                .open_session(&first_id)
-                .await
-                .expect("open first");
+            let opened_first = database.open_session(&first_id).await.expect("open first");
             assert_eq!(opened_first.selected_session_id, first_id);
             drop(database);
 
@@ -1167,10 +2309,7 @@ mod tests {
                     .expect("upsert timeline item");
             }
 
-            let sessions = database
-                .session_list(10, 0)
-                .await
-                .expect("session list");
+            let sessions = database.session_list(10, 0).await.expect("session list");
             assert_eq!(sessions.len(), 1);
             assert_eq!(sessions[0].title, "Searchable Chat");
 

@@ -1,4 +1,4 @@
-package com.hambur.chat.ui
+package com.hambur.chat.ui.markdown
 
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.border

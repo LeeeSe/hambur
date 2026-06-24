@@ -40,6 +40,15 @@ class AndroidPlatformAdapter(
         secretStore.put(secretRef, value)
     }
 
+    fun getOrCreateSharedWebView(): WebView {
+        return browserView()
+    }
+
+    fun closeSharedWebView() {
+        sharedWebView?.destroy()
+        sharedWebView = null
+    }
+
     suspend fun handle(request: PlatformRequestDto): PlatformResult {
         return when (request.kind) {
             "BrowserAction" -> handleBrowserAction(request)

@@ -9,6 +9,7 @@ import com.hambur.chat.uniffi.CommandAck
 import com.hambur.chat.uniffi.ConfigAuditDto
 import com.hambur.chat.uniffi.DefaultModelGroupDto
 import com.hambur.chat.uniffi.MarkdownBlockNodeDto
+import com.hambur.chat.uniffi.MessageDto
 import com.hambur.chat.uniffi.ModelGroupDto
 import com.hambur.chat.uniffi.ModelGroupMemberDto
 import com.hambur.chat.uniffi.ProviderModelDto
@@ -45,6 +46,7 @@ data class UiTimelineItem(
     val stableKey: String,
     val contentType: String,
     val versionSequence: ULong,
+    val payloadRef: String,
     val smallSummary: String,
     val kind: String,
     val traceTitle: String = "",
@@ -52,6 +54,21 @@ data class UiTimelineItem(
     val traceStatus: String = "",
     val toolCallId: String = "",
     val toolName: String = "",
+)
+
+data class UiMessageSnapshot(
+    val id: String,
+    val sessionId: String,
+    val role: String,
+    val contentText: String,
+    val reasoningContent: String,
+    val status: String,
+    val turnId: String,
+    val providerName: String,
+    val modelName: String,
+    val finishReason: String,
+    val nativeFinishReason: String,
+    val versionSequence: ULong,
 )
 
 data class UiPendingAttachment(
@@ -129,13 +146,14 @@ data class UiSharedBrowserState(
     val lastText: String = "",
 )
 
-data class AppShellState(
+data class HamburUiState(
     val runtimeStatus: String = "Starting",
     val latestEventKind: String = "Waiting",
     val footer: String = "Rust runtime owns backend state",
     val sessions: List<UiSessionSummary> = emptyList(),
     val selectedSessionId: String = "",
     val timelineItems: List<UiTimelineItem> = emptyList(),
+    val messagesById: Map<String, UiMessageSnapshot> = emptyMap(),
     val pendingAttachments: List<UiPendingAttachment> = emptyList(),
     val providers: List<UiProviderSettings> = emptyList(),
     val providerModels: List<UiProviderModelSettings> = emptyList(),
@@ -148,6 +166,8 @@ data class AppShellState(
     val markdownMessageId: String = "",
     val markdownBlocks: List<MarkdownBlockNodeDto> = emptyList(),
     val pendingMarkdownBlock: MarkdownBlockNodeDto? = null,
+    val markdownBlocksByMessageId: Map<String, List<MarkdownBlockNodeDto>> = emptyMap(),
+    val pendingMarkdownByMessageId: Map<String, MarkdownBlockNodeDto> = emptyMap(),
     val activePreviewPath: String = "",
     val snapshotSequence: ULong = 0UL,
     val lastAppliedSequence: ULong = 0UL,
@@ -161,7 +181,7 @@ class HamburUiStore(
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val runtime = createRuntime(AppBootstrapConfig(appFilesDir = appFilesDir))
-    private val _state = MutableStateFlow(AppShellState())
+    private val _state = MutableStateFlow(HamburUiState())
     private val startupLock = Any()
     private val startupBuffer = mutableListOf<BackendEvent>()
     private val markdownCoalesceLock = Any()
@@ -171,7 +191,7 @@ class HamburUiStore(
     private var baselineApplied = false
     private var defaultProviderConfigured = false
 
-    val state: StateFlow<AppShellState> = _state.asStateFlow()
+    val state: StateFlow<HamburUiState> = _state.asStateFlow()
 
     init {
         scope.launch { collectBackendEvents() }
@@ -400,6 +420,124 @@ class HamburUiStore(
         }
     }
 
+    fun saveRawAppSetting(key: String, value: String, approved: Boolean = false) {
+        if (key.isBlank() || value.isBlank()) return
+        val payload = """{"settingKey":"${key.jsonEscaped()}","value":${value.jsonValueOrString()}}"""
+            .withApprovalToken("approve:$key", approved)
+        runCommand {
+            runtime.dispatch(
+                backendCommand(
+                    kind = "UpdateAppSetting",
+                    idempotencyKey = "app-setting-raw:$key:${nextCommandOrdinal()}",
+                    chunk = key,
+                    content = value,
+                    payloadJson = payload,
+                ),
+            )
+        }
+    }
+
+    fun saveBrowserToolSettings(value: String) {
+        if (value.isBlank()) return
+        runCommand {
+            runtime.dispatch(
+                backendCommand(
+                    kind = "UpdateBrowserToolSettings",
+                    idempotencyKey = "browser-tool-settings:${nextCommandOrdinal()}",
+                    payloadJson = value,
+                ),
+            )
+        }
+    }
+
+    fun setSkillEnabled(skillId: String, enabled: Boolean) {
+        if (skillId.isBlank()) return
+        val payload = """{"skillId":"${skillId.jsonEscaped()}","enabled":$enabled}"""
+        runCommand {
+            runtime.dispatch(
+                backendCommand(
+                    kind = "UpdateSkillEnabled",
+                    idempotencyKey = "skill:$skillId:enabled:$enabled:${nextCommandOrdinal()}",
+                    messageId = skillId,
+                    payloadJson = payload,
+                ),
+            )
+        }
+    }
+
+    fun saveStartupTask(taskId: String, payloadJson: String, approved: Boolean) {
+        if (taskId.isBlank() || payloadJson.isBlank()) return
+        val payload = payloadJson.withApprovalToken("approve:startup_tasks", approved)
+        runCommand {
+            runtime.dispatch(
+                backendCommand(
+                    kind = "UpdateStartupTask",
+                    idempotencyKey = "startup-task:$taskId:update:${nextCommandOrdinal()}",
+                    messageId = taskId,
+                    payloadJson = payload,
+                ),
+            )
+        }
+    }
+
+    fun deleteStartupTask(taskId: String, approved: Boolean) {
+        if (taskId.isBlank()) return
+        val payload = """{"taskId":"${taskId.jsonEscaped()}"}"""
+            .withApprovalToken("approve:startup_tasks", approved)
+        runCommand {
+            runtime.dispatch(
+                backendCommand(
+                    kind = "DeleteStartupTask",
+                    idempotencyKey = "startup-task:$taskId:delete:${nextCommandOrdinal()}",
+                    messageId = taskId,
+                    payloadJson = payload,
+                ),
+            )
+        }
+    }
+
+    fun saveRootfsSetting(key: String, value: String, approved: Boolean) {
+        if (key.isBlank() || value.isBlank()) return
+        val payload = """{"settingKey":"${key.jsonEscaped()}","value":${value.jsonValueOrString()}}"""
+            .withApprovalToken("approve:rootfs_setting:$key", approved)
+        runCommand {
+            runtime.dispatch(
+                backendCommand(
+                    kind = "UpdateRootfsSetting",
+                    idempotencyKey = "rootfs-setting:$key:update:${nextCommandOrdinal()}",
+                    chunk = key,
+                    content = value,
+                    payloadJson = payload,
+                ),
+            )
+        }
+    }
+
+    fun runRootfsWarmup(sessionId: String) {
+        runCommand {
+            runtime.dispatch(
+                backendCommand(
+                    kind = "RunRootfsWarmup",
+                    idempotencyKey = "rootfs:warmup:${nextCommandOrdinal()}",
+                    sessionId = sessionId,
+                ),
+            )
+        }
+    }
+
+    fun resetRootfs(approved: Boolean) {
+        val payload = """{"approvalToken":"approve:rootfs_reset"}""".takeIf { approved }.orEmpty()
+        runCommand {
+            runtime.dispatch(
+                backendCommand(
+                    kind = "ResetRootfs",
+                    idempotencyKey = "rootfs:reset:${nextCommandOrdinal()}",
+                    payloadJson = payload,
+                ),
+            )
+        }
+    }
+
     fun streamMarkdownPreview(sessionId: String) {
         if (sessionId.isBlank()) return
 
@@ -440,6 +578,36 @@ class HamburUiStore(
         }
     }
 
+    fun renderMarkdownText(sessionId: String, messageId: String, markdown: String) {
+        if (sessionId.isBlank() || messageId.isBlank() || markdown.isBlank()) return
+        scope.launch {
+            val chunks = markdown.chunked(4096)
+            chunks.forEachIndexed { index, chunk ->
+                val ack = runtime.dispatch(
+                    backendCommand(
+                        kind = "AppendMarkdownDelta",
+                        idempotencyKey = "markdown-render:$messageId:$index:${markdown.hashCode()}",
+                        sessionId = sessionId,
+                        messageId = messageId,
+                        chunk = chunk,
+                    ),
+                )
+                applyRejectedAck(ack)
+                if (!ack.accepted) return@launch
+            }
+            val finalAck = runtime.dispatch(
+                backendCommand(
+                    kind = "AppendMarkdownDelta",
+                    idempotencyKey = "markdown-render:$messageId:final:${markdown.hashCode()}",
+                    sessionId = sessionId,
+                    messageId = messageId,
+                    finalize = true,
+                ),
+            )
+            applyRejectedAck(finalAck)
+        }
+    }
+
     fun sendMessage(sessionId: String, content: String) {
         if (sessionId.isBlank()) return
         val attachmentIds = _state.value.pendingAttachments.map { it.id }
@@ -460,6 +628,55 @@ class HamburUiStore(
                     content = content,
                     reasoning = "Routing through the configured OpenAI-compatible text provider.",
                     payloadJson = payload,
+                ),
+            )
+            applyRejectedAck(ack)
+        }
+    }
+
+    fun regenerateMessage(sessionId: String, sourceMessageId: String) {
+        if (sessionId.isBlank() || sourceMessageId.isBlank()) return
+        scope.launch {
+            ensureDefaultTextProvider()
+            val ack = runtime.dispatch(
+                backendCommand(
+                    kind = "RegenerateMessage",
+                    idempotencyKey = "message:$sourceMessageId:regenerate:${nextCommandOrdinal()}",
+                    sessionId = sessionId,
+                    sourceMessageId = sourceMessageId,
+                ),
+            )
+            applyRejectedAck(ack)
+        }
+    }
+
+    fun retryMessage(sessionId: String, sourceMessageId: String) {
+        if (sessionId.isBlank() || sourceMessageId.isBlank()) return
+        scope.launch {
+            ensureDefaultTextProvider()
+            val ack = runtime.dispatch(
+                backendCommand(
+                    kind = "RetryTurn",
+                    idempotencyKey = "message:$sourceMessageId:retry:${nextCommandOrdinal()}",
+                    sessionId = sessionId,
+                    sourceMessageId = sourceMessageId,
+                ),
+            )
+            applyRejectedAck(ack)
+        }
+    }
+
+    fun editMessage(sessionId: String, sourceMessageId: String, content: String) {
+        if (sessionId.isBlank() || sourceMessageId.isBlank() || content.isBlank()) return
+        scope.launch {
+            ensureDefaultTextProvider()
+            val ack = runtime.dispatch(
+                backendCommand(
+                    kind = "EditMessage",
+                    idempotencyKey = "message:$sourceMessageId:edit:${nextCommandOrdinal()}",
+                    sessionId = sessionId,
+                    sourceMessageId = sourceMessageId,
+                    content = content,
                 ),
             )
             applyRejectedAck(ack)
@@ -503,6 +720,19 @@ class HamburUiStore(
                     idempotencyKey = "$attachmentId:remove",
                     sessionId = sessionId,
                     messageId = attachmentId,
+                ),
+            )
+        }
+    }
+
+    fun clearPendingAttachments(sessionId: String) {
+        if (sessionId.isBlank()) return
+        runCommand {
+            runtime.dispatch(
+                backendCommand(
+                    kind = "ClearPendingAttachments",
+                    idempotencyKey = "$sessionId:clear-pending-attachments:${nextCommandOrdinal()}",
+                    sessionId = sessionId,
                 ),
             )
         }
@@ -636,6 +866,7 @@ class HamburUiStore(
         }
 
         bufferedEvents.forEach(::applyEvent)
+        refreshVisibleMessageSnapshots()
     }
 
     private fun runCommand(block: () -> CommandAck) {
@@ -670,6 +901,17 @@ class HamburUiStore(
         }
         if (event.kind == "SettingsChanged" || event.kind == "ModelsUpdated") {
             refreshSettingsSnapshot()
+        }
+        when (event.kind) {
+            "SessionCreated",
+            "SessionOpened",
+            "MessageUpserted",
+            "AssistantMessageStarted",
+            "AssistantContentDelta",
+            "AssistantMessageFinished",
+            "TurnFinished",
+            "TurnFailed",
+            "TurnCancelled" -> refreshVisibleMessageSnapshots()
         }
     }
 
@@ -791,6 +1033,35 @@ class HamburUiStore(
         }
     }
 
+    private fun refreshVisibleMessageSnapshots() {
+        val current = _state.value
+        val messageItems = current.timelineItems
+            .asSequence()
+            .filter { it.contentType == "message" && it.payloadRef.isNotBlank() }
+            .filter { item ->
+                val cached = current.messagesById[item.payloadRef]
+                cached == null || cached.versionSequence < item.versionSequence
+            }
+            .map { it.payloadRef }
+            .distinct()
+            .toList()
+        if (messageItems.isEmpty()) return
+
+        scope.launch {
+            val loaded = messageItems.mapNotNull { messageId ->
+                runCatching {
+                    runtime.getMessageSnapshot(messageId).message?.toUiMessageSnapshot()
+                }.getOrNull()
+            }
+            if (loaded.isEmpty()) return@launch
+            _state.update { state ->
+                state.copy(
+                    messagesById = state.messagesById + loaded.associateBy { it.id },
+                )
+            }
+        }
+    }
+
     private suspend fun ensureDefaultTextProvider() {
         if (defaultProviderConfigured) return
 
@@ -863,13 +1134,13 @@ class HamburUiStore(
     private fun nextCommandOrdinal(): Long = commandCounter.incrementAndGet()
 }
 
-private fun AppShellState.applyBaseline(
+private fun HamburUiState.applyBaseline(
     snapshot: SessionListSnapshotDto,
     selectedSessionId: String,
     timelineItems: List<TimelineItemDto>,
     settingsSnapshot: SettingsSnapshotDto?,
     baselineSequence: ULong,
-): AppShellState {
+): HamburUiState {
     return copy(
         runtimeStatus = "Ready",
         latestEventKind = "SnapshotBaseline",
@@ -884,6 +1155,7 @@ private fun AppShellState.applyBaseline(
         },
         selectedSessionId = selectedSessionId,
         timelineItems = timelineItems.toUiTimelineItems(),
+        messagesById = emptyMap(),
         providers = settingsSnapshot?.providers?.toUiProviders().orEmpty(),
         providerModels = settingsSnapshot?.providerModels?.toUiProviderModels().orEmpty(),
         modelGroups = settingsSnapshot?.modelGroups?.toUiModelGroups().orEmpty(),
@@ -894,6 +1166,8 @@ private fun AppShellState.applyBaseline(
         markdownMessageId = "",
         markdownBlocks = emptyList(),
         pendingMarkdownBlock = null,
+        markdownBlocksByMessageId = emptyMap(),
+        pendingMarkdownByMessageId = emptyMap(),
         activePreviewPath = "",
         pendingAttachments = emptyList(),
         snapshotSequence = baselineSequence,
@@ -903,7 +1177,7 @@ private fun AppShellState.applyBaseline(
     )
 }
 
-private fun AppShellState.applySettingsSnapshot(snapshot: SettingsSnapshotDto): AppShellState {
+private fun HamburUiState.applySettingsSnapshot(snapshot: SettingsSnapshotDto): HamburUiState {
     return copy(
         providers = snapshot.providers.toUiProviders(),
         providerModels = snapshot.providerModels.toUiProviderModels(),
@@ -915,7 +1189,7 @@ private fun AppShellState.applySettingsSnapshot(snapshot: SettingsSnapshotDto): 
     )
 }
 
-private fun AppShellState.reduce(event: BackendEvent): AppShellState {
+private fun HamburUiState.reduce(event: BackendEvent): HamburUiState {
     if (event.eventId in appliedEventIds || event.sequence <= lastAppliedSequence) {
         return this
     }
@@ -991,12 +1265,11 @@ private fun AppShellState.reduce(event: BackendEvent): AppShellState {
     val shouldApplyMarkdown = event.kind == "MarkdownRenderUpdate" &&
         markdownUpdate.messageId.isNotBlank() &&
         event.belongsToSelectedSession(nextSelectedSessionId)
-    val baseMarkdownBlocks = if (shouldApplyMarkdown &&
-        (markdownUpdate.reset || markdownMessageId != markdownUpdate.messageId)
-    ) {
+    val currentMessageBlocks = markdownBlocksByMessageId[markdownUpdate.messageId].orEmpty()
+    val baseMarkdownBlocks = if (shouldApplyMarkdown && markdownUpdate.reset) {
         emptyList()
     } else {
-        markdownBlocks
+        currentMessageBlocks
     }
     val nextMarkdownBlocks = if (shouldApplyMarkdown) {
         val invalidatedIds = markdownUpdate.invalidatedBlockIds.toSet()
@@ -1009,7 +1282,26 @@ private fun AppShellState.reduce(event: BackendEvent): AppShellState {
         retained.addAll(markdownUpdate.committedNodes)
         retained.sortedBy { it.blockId }
     } else {
-        markdownBlocks
+        currentMessageBlocks
+    }
+    val nextMarkdownBlocksByMessageId = if (shouldApplyMarkdown) {
+        markdownBlocksByMessageId + (markdownUpdate.messageId to nextMarkdownBlocks)
+    } else if (sessionChanged) {
+        emptyMap()
+    } else {
+        markdownBlocksByMessageId
+    }
+    val nextPendingMarkdownByMessageId = if (shouldApplyMarkdown) {
+        val pendingNode = markdownUpdate.pendingNode
+        if (pendingNode == null) {
+            pendingMarkdownByMessageId - markdownUpdate.messageId
+        } else {
+            pendingMarkdownByMessageId + (markdownUpdate.messageId to pendingNode)
+        }
+    } else if (sessionChanged) {
+        emptyMap()
+    } else {
+        pendingMarkdownByMessageId
     }
 
     return copy(
@@ -1031,6 +1323,7 @@ private fun AppShellState.reduce(event: BackendEvent): AppShellState {
                 stableKey = it.stableKey,
                 contentType = it.contentType,
                 versionSequence = it.versionSequence,
+                payloadRef = it.payloadRef,
                 smallSummary = it.smallSummary,
                 kind = it.kind,
                 traceTitle = it.traceTitle,
@@ -1040,6 +1333,7 @@ private fun AppShellState.reduce(event: BackendEvent): AppShellState {
                 toolName = it.toolName,
             )
         },
+        messagesById = if (sessionChanged) emptyMap() else messagesById,
         pendingAttachments = snapshot.pendingAttachments.toUiPendingAttachments(),
         markdownMessageId = when {
             shouldApplyMarkdown -> markdownUpdate.messageId
@@ -1056,6 +1350,8 @@ private fun AppShellState.reduce(event: BackendEvent): AppShellState {
             sessionChanged -> null
             else -> pendingMarkdownBlock
         },
+        markdownBlocksByMessageId = nextMarkdownBlocksByMessageId,
+        pendingMarkdownByMessageId = nextPendingMarkdownByMessageId,
         activePreviewPath = if (sessionChanged) "" else activePreviewPath,
         sharedBrowser = sharedBrowser,
         lastAppliedSequence = event.sequence,
@@ -1068,7 +1364,7 @@ private fun BackendEvent.belongsToSelectedSession(selectedSessionId: String): Bo
     return sessionId.isBlank() || selectedSessionId.isBlank() || sessionId == selectedSessionId
 }
 
-private fun AppShellState.isStaleTurnEvent(event: BackendEvent): Boolean {
+private fun HamburUiState.isStaleTurnEvent(event: BackendEvent): Boolean {
     if (event.sessionId.isBlank() || event.turnId.isBlank() || event.kind == "TurnStarted") {
         return false
     }
@@ -1076,7 +1372,7 @@ private fun AppShellState.isStaleTurnEvent(event: BackendEvent): Boolean {
     return activeTurnId != event.turnId
 }
 
-private fun AppShellState.updateActiveTurnIds(event: BackendEvent): Map<String, String> {
+private fun HamburUiState.updateActiveTurnIds(event: BackendEvent): Map<String, String> {
     if (event.sessionId.isBlank() || event.turnId.isBlank()) return activeTurnIds
     return when (event.kind) {
         "TurnStarted" -> activeTurnIds + (event.sessionId to event.turnId)
@@ -1091,7 +1387,7 @@ private fun AppShellState.updateActiveTurnIds(event: BackendEvent): Map<String, 
     }
 }
 
-private fun AppShellState.rememberEventId(eventId: String): Set<String> {
+private fun HamburUiState.rememberEventId(eventId: String): Set<String> {
     if (eventId.isBlank()) return appliedEventIds
     val next = appliedEventIds + eventId
     return if (next.size > 512) {
@@ -1108,6 +1404,7 @@ private fun List<TimelineItemDto>.toUiTimelineItems(): List<UiTimelineItem> {
             stableKey = it.stableKey,
             contentType = it.contentType,
             versionSequence = it.versionSequence,
+            payloadRef = it.payloadRef,
             smallSummary = it.smallSummary,
             kind = it.kind,
             traceTitle = it.traceTitle,
@@ -1117,6 +1414,23 @@ private fun List<TimelineItemDto>.toUiTimelineItems(): List<UiTimelineItem> {
             toolName = it.toolName,
         )
     }
+}
+
+private fun MessageDto.toUiMessageSnapshot(): UiMessageSnapshot {
+    return UiMessageSnapshot(
+        id = id,
+        sessionId = sessionId,
+        role = role,
+        contentText = contentText,
+        reasoningContent = reasoningContent,
+        status = status,
+        turnId = turnId,
+        providerName = providerNameSnapshot,
+        modelName = modelNameSnapshot,
+        finishReason = finishReason,
+        nativeFinishReason = nativeFinishReason,
+        versionSequence = versionSequence,
+    )
 }
 
 private fun List<AttachmentDto>.toUiPendingAttachments(): List<UiPendingAttachment> {

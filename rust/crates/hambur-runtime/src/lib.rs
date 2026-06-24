@@ -1,10 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::{
     Arc, Mutex, Weak,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
+use std::thread;
+use std::time::{Duration as StdDuration, Instant};
 
 use hambur_core::{DTO_SCHEMA_VERSION, HamburError, HamburResult, new_id, now_ms};
 use hambur_db::{
@@ -2785,6 +2788,54 @@ impl RuntimeEngine {
                 error.to_string(),
             );
         }
+        if invocation.name == "process" {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                "process background sessions are not attached yet",
+            );
+        }
+        if arguments
+            .get("background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                "terminal background execution requires process sessions",
+            );
+        }
+        let command = arguments
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if command.is_empty() {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                "terminal command must not be empty",
+            );
+        }
+        let cwd = arguments
+            .get("cwd")
+            .and_then(Value::as_str)
+            .unwrap_or("/var/hambur/workspace");
+        let cwd = match self
+            .sandbox
+            .resolve(&invocation.session_id, cwd, SandboxAccess::Read)
+        {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                return ToolResult::failed(
+                    &invocation.tool_call_id,
+                    &invocation.name,
+                    error.to_string(),
+                );
+            }
+        };
+        let _ = fs::create_dir_all(&cwd.host_path);
         let status = self.sandbox.rootfs_status();
         if !status.available {
             return ToolResult::failed(
@@ -2793,34 +2844,13 @@ impl RuntimeEngine {
                 format!("ToolUnavailable({})", status.reason),
             );
         }
-        let cwd = arguments
-            .get("cwd")
-            .and_then(Value::as_str)
-            .unwrap_or("/var/hambur/workspace");
-        if let Err(error) = self
-            .sandbox
-            .resolve(&invocation.session_id, cwd, SandboxAccess::Read)
-        {
-            return ToolResult::failed(
-                &invocation.tool_call_id,
-                &invocation.name,
-                error.to_string(),
-            );
-        }
 
-        let raw = RawToolOutput {
-            tool_call_id: invocation.tool_call_id.clone(),
-            tool_name: invocation.name.clone(),
-            is_error: true,
-            content: format!(
-                "{} execution backend is not attached in this runtime slice",
-                invocation.name
-            ),
-            summary: "Sandbox execution backend unavailable".to_string(),
-            trust_level: "untrusted".to_string(),
-            command_or_url: arguments.to_string(),
-            status: "ToolUnavailable".to_string(),
-        };
+        let timeout_ms = arguments
+            .get("timeout_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(30_000)
+            .clamp(1_000, 300_000);
+        let raw = run_terminal_command(invocation, command, &cwd.host_path, timeout_ms);
         self.tools.normalize_raw(raw).unwrap_or_else(|error| {
             ToolResult::failed(
                 &invocation.tool_call_id,
@@ -4111,6 +4141,128 @@ fn format_synthetic_view_image_message(context_stubs: &[String]) -> String {
             "Synthetic multimodal continuation for view_image.\n{}",
             image_parts.join("\n")
         )
+    }
+}
+
+fn run_terminal_command(
+    invocation: &ToolInvocation,
+    command: &str,
+    cwd: &std::path::Path,
+    timeout_ms: u64,
+) -> RawToolOutput {
+    let shell = if cfg!(target_os = "android") {
+        "/system/bin/sh"
+    } else {
+        "/bin/sh"
+    };
+    let mut child = match Command::new(shell)
+        .arg("-lc")
+        .arg(command)
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            return RawToolOutput {
+                tool_call_id: invocation.tool_call_id.clone(),
+                tool_name: invocation.name.clone(),
+                is_error: true,
+                content: error.to_string(),
+                summary: "terminal execution failed".to_string(),
+                trust_level: "untrusted".to_string(),
+                command_or_url: command.to_string(),
+                status: "spawn_failed".to_string(),
+            };
+        }
+    };
+    let deadline = Instant::now() + StdDuration::from_millis(timeout_ms);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => break,
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(StdDuration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return RawToolOutput {
+                    tool_call_id: invocation.tool_call_id.clone(),
+                    tool_name: invocation.name.clone(),
+                    is_error: true,
+                    content: json!({
+                        "command": command,
+                        "cwd": cwd.to_string_lossy(),
+                        "timeoutMs": timeout_ms,
+                        "timedOut": true
+                    })
+                    .to_string(),
+                    summary: "terminal timed out".to_string(),
+                    trust_level: "untrusted".to_string(),
+                    command_or_url: command.to_string(),
+                    status: "timeout".to_string(),
+                };
+            }
+            Err(error) => {
+                let _ = child.kill();
+                return RawToolOutput {
+                    tool_call_id: invocation.tool_call_id.clone(),
+                    tool_name: invocation.name.clone(),
+                    is_error: true,
+                    content: error.to_string(),
+                    summary: "terminal wait failed".to_string(),
+                    trust_level: "untrusted".to_string(),
+                    command_or_url: command.to_string(),
+                    status: "wait_failed".to_string(),
+                };
+            }
+        }
+    }
+
+    match child.wait_with_output() {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let exit_code = output.status.code().unwrap_or(-1);
+            let content = json!({
+                "command": command,
+                "cwd": cwd.to_string_lossy(),
+                "timeoutMs": timeout_ms,
+                "exitCode": exit_code,
+                "stdout": stdout,
+                "stderr": stderr
+            })
+            .to_string();
+            RawToolOutput {
+                tool_call_id: invocation.tool_call_id.clone(),
+                tool_name: invocation.name.clone(),
+                is_error: !output.status.success(),
+                summary: if output.status.success() {
+                    format!(
+                        "terminal exited 0 (stdout {} bytes, stderr {} bytes)",
+                        output.stdout.len(),
+                        output.stderr.len()
+                    )
+                } else {
+                    format!("terminal exited {exit_code}")
+                },
+                content,
+                trust_level: "untrusted".to_string(),
+                command_or_url: command.to_string(),
+                status: exit_code.to_string(),
+            }
+        }
+        Err(error) => RawToolOutput {
+            tool_call_id: invocation.tool_call_id.clone(),
+            tool_name: invocation.name.clone(),
+            is_error: true,
+            content: error.to_string(),
+            summary: "terminal execution failed".to_string(),
+            trust_level: "untrusted".to_string(),
+            command_or_url: command.to_string(),
+            status: "spawn_failed".to_string(),
+        },
     }
 }
 
@@ -5964,6 +6116,57 @@ mod tests {
             kind: "SendMessage".to_string(),
             session_id: session_id.clone(),
             content: "delegate submit".to_string(),
+            payload_json: serde_json::json!({"sse": sse}).to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(send.accepted, "send rejected: {}", send.message);
+        wait_for_event(&runtime, "TurnFinished");
+
+        let timeline = runtime.get_timeline_page(session_id, 0, 50);
+        let continuation = timeline
+            .items
+            .iter()
+            .rev()
+            .find(|item| item.kind == "AssistantMessage")
+            .expect("assistant continuation");
+        let message = runtime
+            .get_message_snapshot(continuation.payload_ref.clone())
+            .message
+            .expect("message");
+        assert!(
+            message
+                .content_text
+                .contains("sandbox path must not escape")
+        );
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
+    fn milestone7_terminal_uses_sandbox_path_policy_before_execution() {
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+        let session_id = create_test_session(&runtime);
+        configure_test_provider(&runtime, "gpt-terminal");
+
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
+            "{\"index\":0,\"id\":\"call_terminal\",\"function\":{\"name\":\"terminal\",\"arguments\":\"{\\\"command\\\":\\\"echo no\\\",\\\"cwd\\\":\\\"/var/hambur/workspace/../memory\\\"}\"}}",
+            "]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let send = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_m7_terminal_escape".to_string(),
+            idempotency_key: "message:m7:terminal-escape".to_string(),
+            kind: "SendMessage".to_string(),
+            session_id: session_id.clone(),
+            content: "run terminal".to_string(),
             payload_json: serde_json::json!({"sse": sse}).to_string(),
             ..RuntimeCommand::default()
         });

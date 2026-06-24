@@ -17,6 +17,8 @@ import com.hambur.chat.uniffi.SessionListSnapshotDto
 import com.hambur.chat.uniffi.SettingsSnapshotDto
 import com.hambur.chat.uniffi.TimelineItemDto
 import com.hambur.chat.uniffi.createRuntime
+import com.hambur.chat.platform.AndroidPlatformAdapter
+import com.hambur.chat.platform.PlatformResult
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -29,6 +31,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import org.json.JSONObject
 
 data class UiSessionSummary(
     val id: String,
@@ -117,6 +120,15 @@ data class UiConfigAudit(
     val createdAtMs: ULong,
 )
 
+data class UiSharedBrowserState(
+    val active: Boolean = false,
+    val requestId: String = "",
+    val action: String = "",
+    val url: String = "",
+    val status: String = "Idle",
+    val lastText: String = "",
+)
+
 data class AppShellState(
     val runtimeStatus: String = "Starting",
     val latestEventKind: String = "Waiting",
@@ -132,6 +144,7 @@ data class AppShellState(
     val defaultModelGroups: List<UiDefaultModelGroupSettings> = emptyList(),
     val appSettings: List<UiAppSetting> = emptyList(),
     val configAudits: List<UiConfigAudit> = emptyList(),
+    val sharedBrowser: UiSharedBrowserState = UiSharedBrowserState(),
     val markdownMessageId: String = "",
     val markdownBlocks: List<MarkdownBlockNodeDto> = emptyList(),
     val pendingMarkdownBlock: MarkdownBlockNodeDto? = null,
@@ -142,7 +155,10 @@ data class AppShellState(
     val activeTurnIds: Map<String, String> = emptyMap(),
 )
 
-class HamburUiStore(appFilesDir: String) {
+class HamburUiStore(
+    appFilesDir: String,
+    private val platformAdapter: AndroidPlatformAdapter,
+) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val runtime = createRuntime(AppBootstrapConfig(appFilesDir = appFilesDir))
     private val _state = MutableStateFlow(AppShellState())
@@ -625,6 +641,9 @@ class HamburUiStore(appFilesDir: String) {
     }
 
     private fun applyEvent(event: BackendEvent) {
+        if (event.kind == "PlatformRequest") {
+            handlePlatformRequest(event)
+        }
         if (event.kind == "MarkdownRenderUpdate") {
             enqueueMarkdownEvent(event)
             return
@@ -638,6 +657,66 @@ class HamburUiStore(appFilesDir: String) {
         if (event.kind == "SettingsChanged" || event.kind == "ModelsUpdated") {
             refreshSettingsSnapshot()
         }
+    }
+
+    private fun handlePlatformRequest(event: BackendEvent) {
+        val request = event.platformRequest
+        if (request.requestId.isBlank()) return
+        val action = request.payloadJson.jsonStringAt("action", "action")
+        val url = request.payloadJson.jsonStringAt("action", "url")
+        _state.update {
+            it.copy(
+                sharedBrowser = UiSharedBrowserState(
+                    active = true,
+                    requestId = request.requestId,
+                    action = action.ifBlank { request.kind },
+                    url = url,
+                    status = "Running",
+                ),
+            )
+        }
+
+        scope.launch {
+            val result = runCatching {
+                platformAdapter.handle(request)
+            }.getOrElse { error ->
+                PlatformResult(
+                    requestId = request.requestId,
+                    isError = true,
+                    errorCode = "PlatformAdapterFailed",
+                    message = error.message ?: "Platform adapter failed",
+                )
+            }
+            submitPlatformResult(result)
+            _state.update {
+                it.copy(
+                    sharedBrowser = it.sharedBrowser.copy(
+                        active = false,
+                        status = if (result.isError) {
+                            result.errorCode.ifBlank { "Failed" }
+                        } else {
+                            "Completed"
+                        },
+                        lastText = result.payloadJson.take(240).ifBlank { result.message },
+                    ),
+                )
+            }
+        }
+    }
+
+    private fun submitPlatformResult(result: PlatformResult) {
+        val payload = """
+            {"requestId":"${result.requestId.jsonEscaped()}","isError":${result.isError},"payloadJson":${result.payloadJson.jsonValueOrString()},"errorCode":"${result.errorCode.jsonEscaped()}","message":"${result.message.jsonEscaped()}"}
+        """.trimIndent()
+        val ack = runtime.dispatch(
+            backendCommand(
+                kind = "SubmitPlatformResult",
+                idempotencyKey = "platform:${result.requestId}:result",
+                messageId = result.requestId,
+                payloadJson = payload,
+            ),
+        )
+        applyRejectedAck(ack)
     }
 
     private fun enqueueMarkdownEvent(event: BackendEvent) {
@@ -964,6 +1043,7 @@ private fun AppShellState.reduce(event: BackendEvent): AppShellState {
             else -> pendingMarkdownBlock
         },
         activePreviewPath = if (sessionChanged) "" else activePreviewPath,
+        sharedBrowser = sharedBrowser,
         lastAppliedSequence = event.sequence,
         appliedEventIds = nextAppliedEventIds,
         activeTurnIds = updateActiveTurnIds(event),
@@ -1151,6 +1231,30 @@ private fun String.withApprovalToken(token: String, approved: Boolean): String {
         }
     }
     return """{"value":"${trimmed.jsonEscaped()}","approvalToken":"${token.jsonEscaped()}"}"""
+}
+
+private fun String.jsonValueOrString(): String {
+    val trimmed = trim()
+    return if (
+        trimmed.startsWith("{") ||
+        trimmed.startsWith("[") ||
+        trimmed == "true" ||
+        trimmed == "false" ||
+        trimmed == "null"
+    ) {
+        trimmed
+    } else {
+        "\"${trimmed.jsonEscaped()}\""
+    }
+}
+
+private fun String.jsonStringAt(parent: String, key: String): String {
+    return runCatching {
+        JSONObject(this)
+            .optJSONObject(parent)
+            ?.optString(key)
+            .orEmpty()
+    }.getOrDefault("")
 }
 
 private fun attachmentPayloadJson(attachmentIds: List<String>): String {

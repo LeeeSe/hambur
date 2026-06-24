@@ -44,7 +44,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.hambur.chat.platform.AndroidPlatformAdapter
 import com.hambur.chat.reducer.HamburUiStore
+import com.hambur.chat.reducer.UiSharedBrowserState
 import com.hambur.chat.reducer.UiAppSetting
 import com.hambur.chat.reducer.UiConfigAudit
 import com.hambur.chat.reducer.UiDefaultModelGroupSettings
@@ -59,8 +61,16 @@ import com.hambur.chat.uniffi.MarkdownBlockNodeDto
 import kotlinx.coroutines.flow.distinctUntilChanged
 
 @Composable
-fun AppShell(appFilesDir: String) {
-    val store = remember(appFilesDir) { HamburUiStore(appFilesDir) }
+fun AppShell(
+    appFilesDir: String,
+    platformAdapter: AndroidPlatformAdapter,
+) {
+    val store = remember(appFilesDir, platformAdapter) {
+        HamburUiStore(
+            appFilesDir = appFilesDir,
+            platformAdapter = platformAdapter,
+        )
+    }
     val state by store.state.collectAsState()
     var draftTitle by rememberSaveable { mutableStateOf("") }
     var draftMessage by rememberSaveable { mutableStateOf("") }
@@ -163,6 +173,8 @@ fun AppShell(appFilesDir: String) {
                         onSetDefaultModelGroup = store::setDefaultModelGroup,
                         onSaveAppSetting = store::saveAppSetting,
                     )
+
+                    SharedBrowserPanel(sharedBrowser = state.sharedBrowser)
 
                     TimelineSnapshot(
                         selectedSessionId = state.selectedSessionId,
@@ -385,6 +397,57 @@ private fun SettingsPanel(
             }
             item {
                 ConfigAuditSection(configAudits = configAudits)
+            }
+        }
+    }
+}
+
+@Composable
+private fun SharedBrowserPanel(sharedBrowser: UiSharedBrowserState) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(8.dp),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+        color = MaterialTheme.colorScheme.surface,
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "Shared browser",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    text = sharedBrowser.status,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = if (sharedBrowser.active) {
+                        MaterialTheme.colorScheme.primary
+                    } else {
+                        MaterialTheme.colorScheme.secondary
+                    },
+                )
+            }
+            if (sharedBrowser.requestId.isNotBlank()) {
+                SettingsSummaryRow(
+                    label = sharedBrowser.action.ifBlank { "BrowserAction" },
+                    value = sharedBrowser.url.ifBlank { sharedBrowser.requestId },
+                )
+            }
+            if (sharedBrowser.lastText.isNotBlank()) {
+                Text(
+                    text = sharedBrowser.lastText,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
             }
         }
     }

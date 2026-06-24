@@ -1,0 +1,40 @@
+[workspace]
+members = [
+    "crates/hambur-core",
+    "crates/hambur-runtime",
+    "crates/hambur-uniffi",
+    "crates/hambur-db",
+    "crates/hambur-llm",
+    "crates/hambur-markdown",
+    "crates/hambur-tools",
+    "crates/hambur-sandbox",
+    "crates/hambur-filestore",
+    "crates/hambur-platform",
+    "crates/hambur-config",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "UNLICENSED"
+publish = false
+
+[workspace.dependencies]
+hambur-core = { path = "crates/hambur-core" }
+hambur-runtime = { path = "crates/hambur-runtime" }
+hambur-db = { path = "crates/hambur-db" }
+hambur-llm = { path = "crates/hambur-llm" }
+hambur-markdown = { path = "crates/hambur-markdown" }
+hambur-tools = { path = "crates/hambur-tools" }
+hambur-sandbox = { path = "crates/hambur-sandbox" }
+hambur-filestore = { path = "crates/hambur-filestore" }
+hambur-platform = { path = "crates/hambur-platform" }
+hambur-config = { path = "crates/hambur-config" }
+
+tokio = { version = "1.49.0", features = ["rt-multi-thread", "sync", "time"] }
+uuid = { version = "1.19.0", features = ["v4"] }
+thiserror = "2.0.17"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+uniffi = { version = "0.31.2", features = ["build"] }
+

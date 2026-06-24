@@ -1,0 +1,37 @@
+namespace hambur_uniffi {
+    BackendRuntime create_runtime(AppBootstrapConfig config);
+};
+
+dictionary AppBootstrapConfig {
+    string app_files_dir;
+};
+
+dictionary CommandAck {
+    string command_id;
+    string idempotency_key;
+    boolean accepted;
+    boolean duplicate;
+    string rejection_code;
+    string message;
+};
+
+dictionary BackendEvent {
+    string event_id;
+    u32 schema_version;
+    u64 sequence;
+    u64 created_at_ms;
+    string kind;
+    string session_id;
+    string turn_id;
+};
+
+enum BackendCommand {
+    "Initialize",
+    "Shutdown",
+};
+
+interface BackendRuntime {
+    CommandAck dispatch(BackendCommand command);
+    BackendEvent? next_event();
+    void shutdown();
+};

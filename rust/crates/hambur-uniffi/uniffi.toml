@@ -1,0 +1,4 @@
+[bindings.kotlin]
+package_name = "com.hambur.chat.uniffi"
+cdylib_name = "hambur_uniffi"
+android = true

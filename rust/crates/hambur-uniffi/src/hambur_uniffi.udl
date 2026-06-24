@@ -15,6 +15,19 @@ dictionary CommandAck {
     string message;
 };
 
+dictionary BackendCommand {
+    string command_id;
+    string idempotency_key;
+    u64 created_at_ms;
+    string kind;
+    string session_id;
+    string turn_id;
+    string title;
+    string message_id;
+    string chunk;
+    boolean finalize;
+};
+
 dictionary BackendEvent {
     string event_id;
     u32 schema_version;
@@ -23,15 +36,135 @@ dictionary BackendEvent {
     string kind;
     string session_id;
     string turn_id;
+    AppSnapshotDTO snapshot;
+    MarkdownRenderUpdateDTO markdown_render_update;
+    string error_code;
+    string message;
 };
 
-enum BackendCommand {
-    "Initialize",
-    "Shutdown",
+dictionary MarkdownInlineNodeDTO {
+    string kind;
+    string text;
+    string destination;
+    string title;
+    string alt;
+    sequence<MarkdownInlineNodeDTO> children;
+};
+
+dictionary MarkdownTableRowDTO {
+    sequence<string> cells;
+};
+
+dictionary MarkdownBlockNodeDTO {
+    string message_id;
+    u64 block_id;
+    string stable_key;
+    string source_kind;
+    string node_kind;
+    boolean committed;
+    u8 level;
+    sequence<MarkdownInlineNodeDTO> inlines;
+    string language;
+    string text;
+    string raw;
+    string children_json;
+    string items_json;
+    sequence<string> table_header;
+    sequence<MarkdownTableRowDTO> table_rows;
+    string path;
+    string file_kind;
+};
+
+dictionary MarkdownRenderUpdateDTO {
+    string message_id;
+    boolean reset;
+    sequence<MarkdownBlockNodeDTO> committed_nodes;
+    MarkdownBlockNodeDTO? pending_node;
+    sequence<u64> invalidated_block_ids;
+};
+
+dictionary SessionSummaryDTO {
+    string id;
+    string title;
+    u64 created_at_ms;
+    u64 updated_at_ms;
+    u32 message_count;
+    string latest_preview;
+};
+
+dictionary TimelineItemDTO {
+    string id;
+    string stable_key;
+    string content_type;
+    u64 display_sequence;
+    u64 version_sequence;
+    string payload_ref;
+    string small_summary;
+    string kind;
+};
+
+dictionary AppSnapshotDTO {
+    sequence<SessionSummaryDTO> sessions;
+    string selected_session_id;
+    sequence<TimelineItemDTO> timeline_items;
+};
+
+dictionary SessionListSnapshotDTO {
+    u64 snapshot_sequence;
+    u64 created_at_ms;
+    sequence<SessionSummaryDTO> sessions;
+    string selected_session_id;
+};
+
+dictionary SessionSnapshotDTO {
+    u64 snapshot_sequence;
+    u64 created_at_ms;
+    SessionSummaryDTO? session;
+    sequence<TimelineItemDTO> timeline_items;
+};
+
+dictionary TimelinePageDTO {
+    u64 snapshot_sequence;
+    u64 created_at_ms;
+    string session_id;
+    sequence<TimelineItemDTO> items;
+    u64 next_before_cursor;
+    boolean has_more;
+};
+
+dictionary MessageDTO {
+    string id;
+    string session_id;
+    string role;
+    string content_text;
+    u64 created_at_ms;
+    u64 version_sequence;
+};
+
+dictionary MessageSnapshotDTO {
+    u64 snapshot_sequence;
+    u64 created_at_ms;
+    MessageDTO? message;
+};
+
+dictionary SearchSnapshotDTO {
+    u64 snapshot_sequence;
+    u64 created_at_ms;
+    string query;
+    sequence<SessionSummaryDTO> sessions;
 };
 
 interface BackendRuntime {
     CommandAck dispatch(BackendCommand command);
     BackendEvent? next_event();
+    SessionListSnapshotDTO get_session_list_snapshot(u32 limit, u32 offset);
+    SessionSnapshotDTO get_session_snapshot(string session_id);
+    TimelinePageDTO get_timeline_page(string session_id, u64 before_cursor, u32 limit);
+    MessageSnapshotDTO get_message_snapshot(string message_id);
+    SearchSnapshotDTO search_sessions(string query, u32 limit);
+    CommandAck create_session(string title);
+    CommandAck open_session(string session_id);
+    CommandAck delete_session(string session_id);
+    CommandAck append_markdown_delta(string session_id, string message_id, string chunk, boolean finalize);
     void shutdown();
 };

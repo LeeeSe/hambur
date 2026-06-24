@@ -7,4 +7,8 @@ publish.workspace = true
 
 [dependencies]
 hambur-core.workspace = true
+turso.workspace = true
 
+[dev-dependencies]
+tokio.workspace = true
+hambur-core.workspace = true

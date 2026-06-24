@@ -12,9 +12,10 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 hambur-core.workspace = true
+hambur-db.workspace = true
+hambur-markdown.workspace = true
 hambur-runtime.workspace = true
 uniffi.workspace = true
 
 [build-dependencies]
 uniffi.workspace = true
-

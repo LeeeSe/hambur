@@ -19,7 +19,7 @@ impl ErrorCode {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum HamburError {
     #[error("invalid command: {0}")]
     InvalidCommand(String),

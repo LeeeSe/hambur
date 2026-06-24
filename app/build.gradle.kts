@@ -72,6 +72,13 @@ android {
             useLegacyPackaging = false
         }
     }
+
+    buildTypes {
+        getByName("release") {
+            isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("debug")
+        }
+    }
 }
 
 kotlin {
@@ -143,12 +150,38 @@ tasks.register<Exec>("buildRustDebug") {
     )
 }
 
+tasks.register<Exec>("buildRustRelease") {
+    description = "Builds the Rust UniFFI cdylib for Android release packaging."
+    inputs.dir(rustDir)
+    outputs.dir(generatedJniLibsDir)
+    workingDir = rustDir.asFile
+    environment("ANDROID_HOME", androidSdkDir.get())
+    environment("ANDROID_NDK_HOME", androidNdkHome.get())
+    commandLine(
+        "cargo",
+        "ndk",
+        "-t",
+        "arm64-v8a",
+        "-o",
+        generatedJniLibsDir.get().asFile.absolutePath,
+        "build",
+        "-p",
+        "hambur-uniffi",
+        "--release"
+    )
+}
+
 tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
     dependsOn("generateUniFfiKotlinBindings")
 }
 
+val isRelease = gradle.startParameter.taskNames.any { it.contains("Release", ignoreCase = true) }
 tasks.named("preBuild") {
-    dependsOn("buildRustDebug")
+    if (isRelease) {
+        dependsOn("buildRustRelease")
+    } else {
+        dependsOn("buildRustDebug")
+    }
 }
 
 dependencies {

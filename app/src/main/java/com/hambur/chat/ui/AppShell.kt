@@ -20,6 +20,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -326,7 +327,7 @@ private fun SettingsPanel(
     defaultModelGroups: List<UiDefaultModelGroupSettings>,
     appSettings: List<UiAppSetting>,
     configAudits: List<UiConfigAudit>,
-    onSaveProvider: (String, String, String, String, Boolean) -> Unit,
+    onSaveProvider: (String, String, String, String, String, Boolean) -> Unit,
     onDeleteProvider: (String, Boolean) -> Unit,
     onRefreshModels: (String, String) -> Unit,
     onSaveModelOverride: (String, String, String, Boolean, Boolean, Boolean, UInt, UInt) -> Unit,
@@ -457,7 +458,7 @@ private fun SharedBrowserPanel(sharedBrowser: UiSharedBrowserState) {
 private fun ProviderSettingsSection(
     providers: List<UiProviderSettings>,
     providerModels: List<UiProviderModelSettings>,
-    onSaveProvider: (String, String, String, String, Boolean) -> Unit,
+    onSaveProvider: (String, String, String, String, String, Boolean) -> Unit,
     onDeleteProvider: (String, Boolean) -> Unit,
     onRefreshModels: (String, String) -> Unit,
     onSaveModelOverride: (String, String, String, Boolean, Boolean, Boolean, UInt, UInt) -> Unit,
@@ -466,9 +467,33 @@ private fun ProviderSettingsSection(
     var name by rememberSaveable { mutableStateOf("OpenAI Compatible") }
     var baseUrl by rememberSaveable { mutableStateOf("https://api.openai.com/v1") }
     var secretRef by rememberSaveable { mutableStateOf("android-secret://providers/default-openai-compatible") }
+    var apiKey by rememberSaveable { mutableStateOf("") }
     var enabled by rememberSaveable { mutableStateOf(true) }
     var modelId by rememberSaveable { mutableStateOf("hambur-openai-compatible-text") }
-    var deleteApproved by rememberSaveable { mutableStateOf(false) }
+    var pendingDeleteProviderId by rememberSaveable { mutableStateOf("") }
+
+    if (pendingDeleteProviderId.isNotBlank()) {
+        AlertDialog(
+            onDismissRequest = { pendingDeleteProviderId = "" },
+            title = { Text("Delete provider") },
+            text = { Text("This removes the provider configuration and requires explicit approval.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onDeleteProvider(pendingDeleteProviderId, true)
+                        pendingDeleteProviderId = ""
+                    },
+                ) {
+                    Text("Delete")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDeleteProviderId = "" }) {
+                    Text("Cancel")
+                }
+            },
+        )
+    }
 
     SettingsSurface {
         Text(
@@ -510,26 +535,29 @@ private fun ProviderSettingsSection(
             singleLine = true,
             label = { Text("Secret ref") },
         )
+        OutlinedTextField(
+            value = apiKey,
+            onValueChange = { apiKey = it },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            label = { Text("API key") },
+        )
         Row(verticalAlignment = Alignment.CenterVertically) {
             Checkbox(checked = enabled, onCheckedChange = { enabled = it })
             Text("Enabled", style = MaterialTheme.typography.bodySmall)
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(
-                onClick = { onSaveProvider(providerId, name, baseUrl, secretRef, enabled) },
+                onClick = { onSaveProvider(providerId, name, baseUrl, secretRef, apiKey, enabled) },
                 enabled = baseUrl.isNotBlank() && secretRef.isNotBlank(),
             ) {
                 Text("Save")
             }
             TextButton(
-                onClick = { onDeleteProvider(providerId, deleteApproved) },
-                enabled = providerId.isNotBlank() && deleteApproved,
+                onClick = { pendingDeleteProviderId = providerId },
+                enabled = providerId.isNotBlank(),
             ) {
                 Text("Delete")
-            }
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Checkbox(checked = deleteApproved, onCheckedChange = { deleteApproved = it })
-                Text("Approve", style = MaterialTheme.typography.bodySmall)
             }
         }
         Row(
@@ -689,7 +717,35 @@ private fun AppSettingsSection(
 ) {
     var key by rememberSaveable { mutableStateOf("tool_settings") }
     var value by rememberSaveable { mutableStateOf("""{"enabled":true}""") }
-    var approved by rememberSaveable { mutableStateOf(false) }
+    var pendingApproval by rememberSaveable { mutableStateOf(false) }
+    val requiresApproval = key == "startup_tasks" ||
+        key == "rootfs_settings" ||
+        key.startsWith("startup_task:") ||
+        key.startsWith("rootfs_setting:")
+
+    if (pendingApproval) {
+        AlertDialog(
+            onDismissRequest = { pendingApproval = false },
+            title = { Text("Approve setting") },
+            text = { Text("This setting changes startup or rootfs behavior and requires explicit approval.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onSaveAppSetting(key, value, true)
+                        pendingApproval = false
+                    },
+                ) {
+                    Text("Approve")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingApproval = false }) {
+                    Text("Cancel")
+                }
+            },
+        )
+    }
+
     SettingsSurface {
         Text(
             text = "Tools, skills, memory, startup, rootfs",
@@ -719,13 +775,22 @@ private fun AppSettingsSection(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Button(
-                onClick = { onSaveAppSetting(key, value, approved) },
+                onClick = {
+                    if (requiresApproval) {
+                        pendingApproval = true
+                    } else {
+                        onSaveAppSetting(key, value, false)
+                    }
+                },
                 enabled = key.isNotBlank() && value.isNotBlank(),
             ) {
                 Text("Save setting")
             }
-            Checkbox(checked = approved, onCheckedChange = { approved = it })
-            Text("Approve dangerous", style = MaterialTheme.typography.bodySmall)
+            Text(
+                text = if (requiresApproval) "Approval required" else "No approval required",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     }
 }

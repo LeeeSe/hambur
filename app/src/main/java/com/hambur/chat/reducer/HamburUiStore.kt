@@ -221,9 +221,23 @@ class HamburUiStore(
         name: String,
         baseUrl: String,
         secretRef: String,
+        apiKey: String,
         enabled: Boolean,
     ) {
         if (baseUrl.isBlank() || secretRef.isBlank()) return
+        if (apiKey.isNotBlank() && secretRef.startsWith("android-secret://")) {
+            runCatching {
+                platformAdapter.saveSecret(secretRef, apiKey)
+            }.onFailure { error ->
+                _state.update {
+                    it.copy(
+                        latestEventKind = "SecretStoreFailed",
+                        footer = error.message ?: "Secret store failed",
+                    )
+                }
+                return
+            }
+        }
         val payload = """
             {"secretRef":"${secretRef.jsonEscaped()}","enabled":$enabled,"iconName":"sparkles"}
         """.trimIndent()

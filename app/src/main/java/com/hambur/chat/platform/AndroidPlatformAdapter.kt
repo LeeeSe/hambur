@@ -33,16 +33,48 @@ class AndroidPlatformAdapter(
     private val appContext: Context,
 ) {
     private val browserMutex = Mutex()
+    private val secretStore = AndroidSecretStore(appContext)
     private var sharedWebView: WebView? = null
+
+    fun saveSecret(secretRef: String, value: String) {
+        secretStore.put(secretRef, value)
+    }
 
     suspend fun handle(request: PlatformRequestDto): PlatformResult {
         return when (request.kind) {
             "BrowserAction" -> handleBrowserAction(request)
+            "ResolveSecret" -> handleResolveSecret(request)
             else -> PlatformResult(
                 requestId = request.requestId,
                 isError = true,
                 errorCode = "UnsupportedPlatformRequest",
                 message = "Unsupported platform request kind: ${request.kind}",
+            )
+        }
+    }
+
+    private fun handleResolveSecret(request: PlatformRequestDto): PlatformResult {
+        return runCatching {
+            val payload = JSONObject(request.payloadJson)
+            val secretRef = payload.optString("secretRef")
+            val value = secretStore.get(secretRef)
+                ?: return PlatformResult(
+                    requestId = request.requestId,
+                    isError = true,
+                    errorCode = "SecretNotFound",
+                    message = "Secret ref is not available",
+                )
+            PlatformResult(
+                requestId = request.requestId,
+                isError = false,
+                payloadJson = JSONObject().put("apiKey", value).toString(),
+            )
+        }.getOrElse { error ->
+            PlatformResult(
+                requestId = request.requestId,
+                isError = true,
+                errorCode = "ResolveSecretFailed",
+                message = error.message ?: "ResolveSecret failed",
             )
         }
     }

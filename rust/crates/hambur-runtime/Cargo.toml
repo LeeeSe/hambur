@@ -14,5 +14,6 @@ hambur-llm.workspace = true
 hambur-markdown.workspace = true
 hambur-sandbox.workspace = true
 hambur-tools.workspace = true
+reqwest.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

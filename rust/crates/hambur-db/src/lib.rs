@@ -2508,6 +2508,7 @@ impl HamburDatabase {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_config_audit(
         &self,
         command_id: &str,

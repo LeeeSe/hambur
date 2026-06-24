@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{
@@ -22,10 +21,10 @@ use hambur_db::{
 };
 use hambur_filestore::FileStore;
 use hambur_llm::{
-    CompleteToolCall, FallbackPolicy, ModelCapabilities, ModelRouter, OPENAI_COMPATIBLE_PROTOCOL,
-    OpenAiCompatibleAdapter, ProviderConfig, ProviderModel, ProviderStreamEvent, ProviderTarget,
-    RoutePlan, RouteRequirements, RoutingStrategy, SseDecoder, ToolCallAccumulator,
-    scripted_openai_sse_chunks, should_fallback,
+    CompleteToolCall, FallbackPolicy, ModelCapabilities, ModelMessage, ModelRequest, ModelRouter,
+    OPENAI_COMPATIBLE_PROTOCOL, OpenAiCompatibleAdapter, ProviderConfig, ProviderModel,
+    ProviderStreamEvent, ProviderTarget, ReasoningMode, RoutePlan, RouteRequirements,
+    RoutingStrategy, SseDecoder, ToolCallAccumulator, scripted_openai_sse_chunks, should_fallback,
 };
 use hambur_markdown::{MarkdownPipeline, MarkdownRenderUpdate};
 use hambur_sandbox::{SandboxAccess, SandboxService};
@@ -33,6 +32,7 @@ use hambur_tools::{
     MAX_TOOL_ITERATIONS_PER_TURN, RawToolOutput, ToolCallBatch, ToolExecutionRecord,
     ToolInvocation, ToolResult, ToolScheduler,
 };
+use reqwest::StatusCode;
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, oneshot};
@@ -289,7 +289,7 @@ struct PreparedDelegateTurn {
     route_candidates: Vec<ModelRouteSnapshot>,
     fallback_policy: FallbackPolicy,
     cancel: Arc<AtomicBool>,
-    stream_chunks_by_route: Vec<Vec<Vec<u8>>>,
+    stream_sources_by_route: Vec<RouteStreamSource>,
 }
 
 struct BackgroundProcessSession {
@@ -352,6 +352,25 @@ enum StreamAttemptResult {
         error: HamburError,
         semantic_delta_started: bool,
     },
+}
+
+#[derive(Debug, Clone)]
+enum RouteStreamSource {
+    Scripted(Vec<Vec<u8>>),
+    Provider(ModelRequest),
+}
+
+#[derive(Debug, Default)]
+struct StreamAttemptState {
+    decoder: SseDecoder,
+    content: String,
+    reasoning: String,
+    semantic_delta_started: bool,
+    finish_reason: String,
+    native_finish_reason: String,
+    saw_tool_delta: bool,
+    tool_accumulator: ToolCallAccumulator,
+    complete_tool_calls: Vec<CompleteToolCall>,
 }
 
 impl RuntimeEngine {
@@ -1578,9 +1597,9 @@ impl RuntimeEngine {
             );
         };
         let fallback_policy = plan.fallback_policy;
-        let stream_chunks_by_route = route_snapshots
+        let stream_sources_by_route = route_snapshots
             .iter()
-            .map(|route| stream_chunks_for_command(&command, &content, route))
+            .map(|route| stream_source_for_command(&command, &content, route))
             .collect::<Vec<_>>();
         let handle = self.tokio.handle().clone();
         handle.spawn(async move {
@@ -1592,7 +1611,7 @@ impl RuntimeEngine {
                     route_snapshots,
                     fallback_policy,
                     cancel,
-                    stream_chunks_by_route,
+                    stream_sources_by_route,
                 )
                 .await;
         });
@@ -1795,6 +1814,105 @@ impl RuntimeEngine {
         accepted_ack(command.command_id, command.idempotency_key)
     }
 
+    async fn resolve_provider_api_key(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        route: &ModelRouteSnapshot,
+        cancel: &Arc<AtomicBool>,
+    ) -> HamburResult<String> {
+        if cancel.load(Ordering::SeqCst) || self.shutdown.load(Ordering::SeqCst) {
+            return Err(HamburError::Cancelled);
+        }
+        let secret_ref = route.secret_ref.trim();
+        if let Some(env_name) = secret_ref.strip_prefix("env://") {
+            let value = std::env::var(env_name).map_err(|_| {
+                HamburError::ProviderUnavailable(format!(
+                    "provider secret env var is not available: {env_name}"
+                ))
+            })?;
+            if value.trim().is_empty() {
+                return Err(HamburError::ProviderUnavailable(format!(
+                    "provider secret env var is empty: {env_name}"
+                )));
+            }
+            return Ok(value);
+        }
+        if !secret_ref.starts_with("android-secret://") {
+            return Err(HamburError::ProviderUnavailable(
+                "unsupported provider secret_ref".to_string(),
+            ));
+        }
+
+        let request_id = new_id("platform_req");
+        let timeout_ms = 30_000;
+        let request = PlatformRequest {
+            request_id: request_id.clone(),
+            session_id: session_id.to_string(),
+            turn_id: turn_id.to_string(),
+            kind: "ResolveSecret".to_string(),
+            payload_json: json!({
+                "secretRef": secret_ref,
+                "providerId": route.provider_id
+            })
+            .to_string(),
+            timeout_ms,
+            cancellable: true,
+        };
+        let (sender, receiver) = oneshot::channel();
+        if let Ok(mut requests) = self.platform_requests.lock() {
+            requests.insert(request_id.clone(), sender);
+        } else {
+            return Err(HamburError::Internal(
+                "platform request registry unavailable".to_string(),
+            ));
+        }
+        let snapshot = self
+            .database
+            .session_snapshot(session_id)
+            .await
+            .unwrap_or_default();
+        if let Err(error) = self.emit_platform_request_event(request, snapshot) {
+            let _ = self
+                .platform_requests
+                .lock()
+                .ok()
+                .and_then(|mut requests| requests.remove(&request_id));
+            return Err(error);
+        }
+        let result = match timeout(Duration::from_millis(timeout_ms), receiver).await {
+            Ok(Ok(result)) => result,
+            _ => {
+                let _ = self
+                    .platform_requests
+                    .lock()
+                    .ok()
+                    .and_then(|mut requests| requests.remove(&request_id));
+                return Err(HamburError::ProviderUnavailable(
+                    "ResolveSecret platform request timed out".to_string(),
+                ));
+            }
+        };
+        if result.is_error {
+            return Err(HamburError::ProviderUnavailable(
+                result
+                    .message
+                    .if_blank(result.error_code)
+                    .if_blank("ResolveSecret failed".to_string()),
+            ));
+        }
+        let value = config_payload_value(&result.payload_json);
+        let api_key = config_string(&value, "apiKey")
+            .if_blank(config_string(&value, "secret"))
+            .if_blank(config_string(&value, "value"));
+        if api_key.trim().is_empty() {
+            return Err(HamburError::ProviderUnavailable(
+                "ResolveSecret returned an empty secret".to_string(),
+            ));
+        }
+        Ok(api_key)
+    }
+
     fn execute_rootfs_lifecycle(&self, command: RuntimeCommand) -> RuntimeCommandAck {
         if self.shutdown.load(Ordering::SeqCst) {
             return rejected_ack(
@@ -1803,8 +1921,28 @@ impl RuntimeEngine {
                 HamburError::RuntimeClosed,
             );
         }
+        if command.kind == "ResetRootfs"
+            && let Err(error) = require_approval(&command, "rootfs_reset")
+        {
+            return rejected_ack(command.command_id, command.idempotency_key, error);
+        }
 
         let status = self.sandbox.rootfs_status();
+        if command.kind == "ResetRootfs" {
+            let _ = fs::remove_dir_all(self.sandbox.root());
+            if let Err(error) = fs::create_dir_all(self.sandbox.root()) {
+                return rejected_ack(
+                    command.command_id,
+                    command.idempotency_key,
+                    HamburError::Internal(format!("recreate sandbox root: {error}")),
+                );
+            }
+        }
+        if !command.session_id.trim().is_empty()
+            && let Err(error) = self.sandbox.prepare_session(&command.session_id)
+        {
+            return rejected_ack(command.command_id, command.idempotency_key, error);
+        }
         let snapshot = self
             .tokio
             .block_on(self.database.bootstrap_snapshot())
@@ -1814,7 +1952,8 @@ impl RuntimeEngine {
             "backend": status.backend,
             "abi": status.abi,
             "reason": status.reason,
-            "action": command.kind
+            "action": command.kind,
+            "sessionPrepared": !command.session_id.trim().is_empty()
         })
         .to_string();
         let _ = self.emit_session_event(
@@ -1837,7 +1976,7 @@ impl RuntimeEngine {
         routes: Vec<ModelRouteSnapshot>,
         fallback_policy: FallbackPolicy,
         cancel: Arc<AtomicBool>,
-        stream_chunks_by_route: Vec<Vec<Vec<u8>>>,
+        stream_sources_by_route: Vec<RouteStreamSource>,
     ) {
         let target_count = routes.len();
         let route_candidates = routes.clone();
@@ -1893,10 +2032,10 @@ impl RuntimeEngine {
                 );
             }
 
-            let stream_chunks = stream_chunks_by_route
+            let stream_source = stream_sources_by_route
                 .get(attempt_index)
                 .cloned()
-                .unwrap_or_default();
+                .unwrap_or_else(|| provider_stream_source(&session_id, &turn_id, "", &route));
             match self
                 .clone()
                 .run_chat_stream_attempt(
@@ -1906,7 +2045,7 @@ impl RuntimeEngine {
                     route,
                     route_candidates.clone(),
                     cancel.clone(),
-                    stream_chunks,
+                    stream_source,
                 )
                 .await
             {
@@ -1957,200 +2096,127 @@ impl RuntimeEngine {
         route: ModelRouteSnapshot,
         route_candidates: Vec<ModelRouteSnapshot>,
         cancel: Arc<AtomicBool>,
-        stream_chunks: Vec<Vec<u8>>,
+        stream_source: RouteStreamSource,
     ) -> StreamAttemptResult {
-        let mut decoder = SseDecoder::default();
-        let mut content = String::new();
-        let mut reasoning = String::new();
-        let mut semantic_delta_started = false;
-        let mut finish_reason = String::new();
-        let mut native_finish_reason = String::new();
-        let mut saw_tool_delta = false;
-        let mut tool_accumulator = ToolCallAccumulator::default();
-        let mut complete_tool_calls = Vec::<CompleteToolCall>::new();
-
-        for chunk in stream_chunks {
-            if cancel.load(Ordering::SeqCst) || self.shutdown.load(Ordering::SeqCst) {
-                self.finish_cancelled_turn(
-                    &session_id,
-                    &turn_id,
-                    &assistant_message_id,
-                    &content,
-                    &reasoning,
-                )
-                .await;
-                return StreamAttemptResult::Cancelled;
-            }
-
-            sleep(Duration::from_millis(24)).await;
-            let payloads = match decoder.push(&chunk) {
-                Ok(payloads) => payloads,
-                Err(error) => {
-                    if semantic_delta_started {
-                        self.finish_failed_turn(
+        let mut state = StreamAttemptState::default();
+        match stream_source {
+            RouteStreamSource::Scripted(stream_chunks) => {
+                for chunk in stream_chunks {
+                    if let Some(result) = self
+                        .clone()
+                        .process_stream_chunk(
+                            &mut state,
                             &session_id,
                             &turn_id,
                             &assistant_message_id,
-                            &content,
-                            &reasoning,
-                            error.clone(),
+                            &cancel,
+                            &chunk,
+                            true,
                         )
-                        .await;
+                        .await
+                    {
+                        return result;
                     }
-                    return StreamAttemptResult::Failed {
-                        error,
-                        semantic_delta_started,
-                    };
                 }
-            };
-
-            for payload in payloads {
-                let events = match OpenAiCompatibleAdapter::parse_stream_payload(&payload) {
-                    Ok(events) => events,
+            }
+            RouteStreamSource::Provider(request) => {
+                let api_key = match self
+                    .resolve_provider_api_key(&session_id, &turn_id, &route, &cancel)
+                    .await
+                {
+                    Ok(api_key) => api_key,
                     Err(error) => {
-                        if semantic_delta_started {
-                            self.finish_failed_turn(
-                                &session_id,
-                                &turn_id,
-                                &assistant_message_id,
-                                &content,
-                                &reasoning,
-                                error.clone(),
-                            )
-                            .await;
-                        }
                         return StreamAttemptResult::Failed {
                             error,
-                            semantic_delta_started,
+                            semantic_delta_started: false,
                         };
                     }
                 };
-
-                for event in events {
-                    let newly_complete_tool_calls = tool_accumulator.apply(&event);
+                let target = provider_target_from_route(route.clone());
+                let spec = match OpenAiCompatibleAdapter::build_stream_request(
+                    &request, &target, &api_key,
+                ) {
+                    Ok(spec) => spec,
+                    Err(error) => {
+                        return StreamAttemptResult::Failed {
+                            error,
+                            semantic_delta_started: false,
+                        };
+                    }
+                };
+                let mut response = match reqwest_stream(spec).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        return StreamAttemptResult::Failed {
+                            error,
+                            semantic_delta_started: false,
+                        };
+                    }
+                };
+                loop {
                     if cancel.load(Ordering::SeqCst) || self.shutdown.load(Ordering::SeqCst) {
                         self.finish_cancelled_turn(
                             &session_id,
                             &turn_id,
                             &assistant_message_id,
-                            &content,
-                            &reasoning,
+                            &state.content,
+                            &state.reasoning,
                         )
                         .await;
                         return StreamAttemptResult::Cancelled;
                     }
-
-                    match event {
-                        ProviderStreamEvent::ContentDelta(delta) => {
-                            semantic_delta_started = true;
-                            content.push_str(&delta);
-                            let snapshot = self
-                                .database
-                                .session_snapshot(&session_id)
-                                .await
-                                .unwrap_or_default();
-                            let _ = self.emit_session_event(
-                                RuntimeEventKind::AssistantContentDelta,
-                                session_id.clone(),
-                                turn_id.clone(),
-                                snapshot.clone(),
-                                delta.clone(),
-                                None,
-                            );
-                            if let Some(update) = self.append_stream_markdown(
-                                &session_id,
-                                &assistant_message_id,
-                                &delta,
-                                false,
-                            ) {
-                                let _ = self.emit_markdown_event(
-                                    session_id.clone(),
-                                    turn_id.clone(),
-                                    snapshot,
-                                    update,
-                                );
-                            }
-                        }
-                        ProviderStreamEvent::ReasoningDelta(delta) => {
-                            semantic_delta_started = true;
-                            reasoning.push_str(&delta);
-                            let snapshot = self
-                                .database
-                                .session_snapshot(&session_id)
-                                .await
-                                .unwrap_or_default();
-                            let _ = self.emit_session_event(
-                                RuntimeEventKind::AssistantReasoningDelta,
-                                session_id.clone(),
-                                turn_id.clone(),
-                                snapshot,
-                                delta,
-                                None,
-                            );
-                        }
-                        ProviderStreamEvent::ToolCallDelta { .. } => {
-                            semantic_delta_started = true;
-                            saw_tool_delta = true;
-                            let snapshot = self
-                                .database
-                                .session_snapshot(&session_id)
-                                .await
-                                .unwrap_or_default();
-                            let _ = self.emit_session_event(
-                                RuntimeEventKind::ToolCallDelta,
-                                session_id.clone(),
-                                turn_id.clone(),
-                                snapshot,
-                                "Tool call delta".to_string(),
-                                None,
-                            );
-                        }
-                        ProviderStreamEvent::Finish {
-                            finish_reason: reason,
-                            native_finish_reason: native,
-                        } => {
-                            finish_reason = reason;
-                            native_finish_reason = native;
-                        }
-                        ProviderStreamEvent::Error { code, message } => {
-                            let error = stream_error_from_provider(code, message);
-                            if semantic_delta_started {
+                    let chunk = match response.chunk().await {
+                        Ok(chunk) => chunk,
+                        Err(error) => {
+                            let mapped = HamburError::ProviderUnavailable(format!(
+                                "NetworkError: provider stream read failed: {error}"
+                            ));
+                            if state.semantic_delta_started {
                                 self.finish_failed_turn(
                                     &session_id,
                                     &turn_id,
                                     &assistant_message_id,
-                                    &content,
-                                    &reasoning,
-                                    error.clone(),
+                                    &state.content,
+                                    &state.reasoning,
+                                    mapped.clone(),
                                 )
                                 .await;
                             }
                             return StreamAttemptResult::Failed {
-                                error,
-                                semantic_delta_started,
+                                error: mapped,
+                                semantic_delta_started: state.semantic_delta_started,
                             };
                         }
-                    }
-
-                    for complete in newly_complete_tool_calls {
-                        if !complete_tool_calls
-                            .iter()
-                            .any(|existing| existing.index == complete.index)
-                        {
-                            complete_tool_calls.push(complete);
-                        }
+                    };
+                    let Some(chunk) = chunk else {
+                        break;
+                    };
+                    if let Some(result) = self
+                        .clone()
+                        .process_stream_chunk(
+                            &mut state,
+                            &session_id,
+                            &turn_id,
+                            &assistant_message_id,
+                            &cancel,
+                            chunk.as_ref(),
+                            false,
+                        )
+                        .await
+                    {
+                        return result;
                     }
                 }
             }
         }
 
-        if !semantic_delta_started {
+        if !state.semantic_delta_started {
             return StreamAttemptResult::Failed {
                 error: HamburError::ProviderUnavailable(format!(
                     "provider {} produced no semantic output",
                     route.provider_id
                 )),
-                semantic_delta_started,
+                semantic_delta_started: state.semantic_delta_started,
             };
         }
 
@@ -2165,21 +2231,24 @@ impl RuntimeEngine {
             let _ = self.emit_markdown_event(session_id.clone(), turn_id.clone(), snapshot, update);
         }
 
-        let final_finish_reason = finish_reason.if_blank("stop".to_string());
-        let final_native_finish_reason = native_finish_reason.if_blank(final_finish_reason.clone());
-        if saw_tool_delta {
-            complete_tool_calls = tool_accumulator.completed_calls();
+        let final_finish_reason = state.finish_reason.if_blank("stop".to_string());
+        let final_native_finish_reason = state
+            .native_finish_reason
+            .if_blank(final_finish_reason.clone());
+        if state.saw_tool_delta {
+            state.complete_tool_calls = state.tool_accumulator.completed_calls();
         }
-        if saw_tool_delta
-            && (complete_tool_calls.is_empty() || tool_accumulator.has_incomplete_calls())
+        if state.saw_tool_delta
+            && (state.complete_tool_calls.is_empty()
+                || state.tool_accumulator.has_incomplete_calls())
         {
             let error = HamburError::SseParse("incomplete tool call stream".to_string());
             self.finish_failed_turn(
                 &session_id,
                 &turn_id,
                 &assistant_message_id,
-                &content,
-                &reasoning,
+                &state.content,
+                &state.reasoning,
                 error.clone(),
             )
             .await;
@@ -2188,8 +2257,8 @@ impl RuntimeEngine {
                 semantic_delta_started: true,
             };
         }
-        if !complete_tool_calls.is_empty() {
-            complete_tool_calls.sort_by_key(|call| call.index);
+        if !state.complete_tool_calls.is_empty() {
+            state.complete_tool_calls.sort_by_key(|call| call.index);
             let result = self
                 .execute_tool_batch_and_continue(
                     &session_id,
@@ -2198,11 +2267,11 @@ impl RuntimeEngine {
                     &route,
                     &route_candidates,
                     &cancel,
-                    &content,
-                    &reasoning,
+                    &state.content,
+                    &state.reasoning,
                     final_finish_reason,
                     final_native_finish_reason,
-                    complete_tool_calls,
+                    state.complete_tool_calls,
                 )
                 .await;
             return match result {
@@ -2212,8 +2281,8 @@ impl RuntimeEngine {
                         &session_id,
                         &turn_id,
                         &assistant_message_id,
-                        &content,
-                        &reasoning,
+                        &state.content,
+                        &state.reasoning,
                         error.clone(),
                     )
                     .await;
@@ -2229,8 +2298,8 @@ impl RuntimeEngine {
             .database
             .update_message_stream_result(
                 &assistant_message_id,
-                &content,
-                &reasoning,
+                &state.content,
+                &state.reasoning,
                 "completed",
                 &final_finish_reason,
                 &final_native_finish_reason,
@@ -2243,8 +2312,8 @@ impl RuntimeEngine {
                     &session_id,
                     &turn_id,
                     &assistant_message_id,
-                    &content,
-                    &reasoning,
+                    &state.content,
+                    &state.reasoning,
                     error.clone(),
                 )
                 .await;
@@ -2274,8 +2343,8 @@ impl RuntimeEngine {
                 &session_id,
                 &turn_id,
                 &assistant_message_id,
-                &content,
-                &reasoning,
+                &state.content,
+                &state.reasoning,
                 error.clone(),
             )
             .await;
@@ -2293,8 +2362,8 @@ impl RuntimeEngine {
                 &session_id,
                 &turn_id,
                 &assistant_message_id,
-                &content,
-                &reasoning,
+                &state.content,
+                &state.reasoning,
                 error.clone(),
             )
             .await;
@@ -2327,6 +2396,195 @@ impl RuntimeEngine {
             None,
         );
         StreamAttemptResult::Completed
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn process_stream_chunk(
+        self: Arc<Self>,
+        state: &mut StreamAttemptState,
+        session_id: &str,
+        turn_id: &str,
+        assistant_message_id: &str,
+        cancel: &Arc<AtomicBool>,
+        chunk: &[u8],
+        delay_scripted_chunk: bool,
+    ) -> Option<StreamAttemptResult> {
+        if cancel.load(Ordering::SeqCst) || self.shutdown.load(Ordering::SeqCst) {
+            self.finish_cancelled_turn(
+                session_id,
+                turn_id,
+                assistant_message_id,
+                &state.content,
+                &state.reasoning,
+            )
+            .await;
+            return Some(StreamAttemptResult::Cancelled);
+        }
+
+        if delay_scripted_chunk {
+            sleep(Duration::from_millis(24)).await;
+        }
+        let payloads = match state.decoder.push(chunk) {
+            Ok(payloads) => payloads,
+            Err(error) => {
+                if state.semantic_delta_started {
+                    self.finish_failed_turn(
+                        session_id,
+                        turn_id,
+                        assistant_message_id,
+                        &state.content,
+                        &state.reasoning,
+                        error.clone(),
+                    )
+                    .await;
+                }
+                return Some(StreamAttemptResult::Failed {
+                    error,
+                    semantic_delta_started: state.semantic_delta_started,
+                });
+            }
+        };
+
+        for payload in payloads {
+            let events = match OpenAiCompatibleAdapter::parse_stream_payload(&payload) {
+                Ok(events) => events,
+                Err(error) => {
+                    if state.semantic_delta_started {
+                        self.finish_failed_turn(
+                            session_id,
+                            turn_id,
+                            assistant_message_id,
+                            &state.content,
+                            &state.reasoning,
+                            error.clone(),
+                        )
+                        .await;
+                    }
+                    return Some(StreamAttemptResult::Failed {
+                        error,
+                        semantic_delta_started: state.semantic_delta_started,
+                    });
+                }
+            };
+
+            for event in events {
+                let newly_complete_tool_calls = state.tool_accumulator.apply(&event);
+                if cancel.load(Ordering::SeqCst) || self.shutdown.load(Ordering::SeqCst) {
+                    self.finish_cancelled_turn(
+                        session_id,
+                        turn_id,
+                        assistant_message_id,
+                        &state.content,
+                        &state.reasoning,
+                    )
+                    .await;
+                    return Some(StreamAttemptResult::Cancelled);
+                }
+
+                match event {
+                    ProviderStreamEvent::ContentDelta(delta) => {
+                        state.semantic_delta_started = true;
+                        state.content.push_str(&delta);
+                        let snapshot = self
+                            .database
+                            .session_snapshot(session_id)
+                            .await
+                            .unwrap_or_default();
+                        let _ = self.emit_session_event(
+                            RuntimeEventKind::AssistantContentDelta,
+                            session_id.to_string(),
+                            turn_id.to_string(),
+                            snapshot.clone(),
+                            delta.clone(),
+                            None,
+                        );
+                        if let Some(update) = self.append_stream_markdown(
+                            session_id,
+                            assistant_message_id,
+                            &delta,
+                            false,
+                        ) {
+                            let _ = self.emit_markdown_event(
+                                session_id.to_string(),
+                                turn_id.to_string(),
+                                snapshot,
+                                update,
+                            );
+                        }
+                    }
+                    ProviderStreamEvent::ReasoningDelta(delta) => {
+                        state.semantic_delta_started = true;
+                        state.reasoning.push_str(&delta);
+                        let snapshot = self
+                            .database
+                            .session_snapshot(session_id)
+                            .await
+                            .unwrap_or_default();
+                        let _ = self.emit_session_event(
+                            RuntimeEventKind::AssistantReasoningDelta,
+                            session_id.to_string(),
+                            turn_id.to_string(),
+                            snapshot,
+                            delta,
+                            None,
+                        );
+                    }
+                    ProviderStreamEvent::ToolCallDelta { .. } => {
+                        state.semantic_delta_started = true;
+                        state.saw_tool_delta = true;
+                        let snapshot = self
+                            .database
+                            .session_snapshot(session_id)
+                            .await
+                            .unwrap_or_default();
+                        let _ = self.emit_session_event(
+                            RuntimeEventKind::ToolCallDelta,
+                            session_id.to_string(),
+                            turn_id.to_string(),
+                            snapshot,
+                            "Tool call delta".to_string(),
+                            None,
+                        );
+                    }
+                    ProviderStreamEvent::Finish {
+                        finish_reason,
+                        native_finish_reason,
+                    } => {
+                        state.finish_reason = finish_reason;
+                        state.native_finish_reason = native_finish_reason;
+                    }
+                    ProviderStreamEvent::Error { code, message } => {
+                        let error = stream_error_from_provider(code, message);
+                        if state.semantic_delta_started {
+                            self.finish_failed_turn(
+                                session_id,
+                                turn_id,
+                                assistant_message_id,
+                                &state.content,
+                                &state.reasoning,
+                                error.clone(),
+                            )
+                            .await;
+                        }
+                        return Some(StreamAttemptResult::Failed {
+                            error,
+                            semantic_delta_started: state.semantic_delta_started,
+                        });
+                    }
+                }
+
+                for complete in newly_complete_tool_calls {
+                    if !state
+                        .complete_tool_calls
+                        .iter()
+                        .any(|existing| existing.index == complete.index)
+                    {
+                        state.complete_tool_calls.push(complete);
+                    }
+                }
+            }
+        }
+        None
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3830,14 +4088,14 @@ impl RuntimeEngine {
                         ),
                     );
                 }
-                if let Some(parent) = parent_path.host_path.parent() {
-                    if let Err(error) = fs::create_dir_all(parent) {
-                        return ToolResult::failed(
-                            &invocation.tool_call_id,
-                            &invocation.name,
-                            format!("create delegate artifact directory: {error}"),
-                        );
-                    }
+                if let Some(parent) = parent_path.host_path.parent()
+                    && let Err(error) = fs::create_dir_all(parent)
+                {
+                    return ToolResult::failed(
+                        &invocation.tool_call_id,
+                        &invocation.name,
+                        format!("create delegate artifact directory: {error}"),
+                    );
                 }
                 if let Err(error) = fs::copy(&child_path.host_path, &parent_path.host_path) {
                     return ToolResult::failed(
@@ -4099,6 +4357,7 @@ impl RuntimeEngine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn prepare_delegate_child_turn(
         &self,
         parent_session_id: &str,
@@ -4216,9 +4475,9 @@ impl RuntimeEngine {
             payload_json,
             ..RuntimeCommand::default()
         };
-        let stream_chunks_by_route = route_candidates
+        let stream_sources_by_route = route_candidates
             .iter()
-            .map(|candidate| stream_chunks_for_command(&stream_command, &child_content, candidate))
+            .map(|candidate| stream_source_for_command(&stream_command, &child_content, candidate))
             .collect::<Vec<_>>();
         Ok(PreparedDelegateTurn {
             turn_id: turn.id,
@@ -4226,7 +4485,7 @@ impl RuntimeEngine {
             route_candidates,
             fallback_policy,
             cancel,
-            stream_chunks_by_route,
+            stream_sources_by_route,
         })
     }
 
@@ -4248,7 +4507,7 @@ impl RuntimeEngine {
                     prepared.route_candidates,
                     prepared.fallback_policy,
                     prepared.cancel,
-                    prepared.stream_chunks_by_route,
+                    prepared.stream_sources_by_route,
                 )
                 .await;
         });
@@ -4994,7 +5253,8 @@ fn validate_command(command: &RuntimeCommand) -> HamburResult<()> {
             }
             Ok(())
         }
-        "RunRootfsWarmup" | "ResetRootfs" => Ok(()),
+        "RunRootfsWarmup" => Ok(()),
+        "ResetRootfs" => require_approval(command, "rootfs_reset"),
         "AppendMarkdownDelta" | "MarkdownRenderUpdate" => {
             require_session_id(command)?;
             if command.message_id.is_empty() {
@@ -5091,19 +5351,19 @@ fn route_snapshot_from_target(target: &ProviderTarget) -> ModelRouteSnapshot {
     }
 }
 
-fn stream_chunks_for_command(
+fn stream_source_for_command(
     command: &RuntimeCommand,
     content: &str,
     route: &ModelRouteSnapshot,
-) -> Vec<Vec<u8>> {
+) -> RouteStreamSource {
     let payload = command.payload_json.trim();
     if payload.starts_with("data:") {
-        return split_scripted_sse(payload);
+        return RouteStreamSource::Scripted(split_scripted_sse(payload));
     }
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
         if let Some(route_value) = scripted_route_value(&value, route) {
             if let Some(sse) = route_value.get("sse").and_then(serde_json::Value::as_str) {
-                return split_scripted_sse(sse);
+                return RouteStreamSource::Scripted(split_scripted_sse(sse));
             }
             let response = route_value
                 .get("content")
@@ -5113,28 +5373,95 @@ fn stream_chunks_for_command(
                 .get("reasoning")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or(command.reasoning.as_str());
-            return scripted_openai_sse_chunks(response, reasoning);
+            return RouteStreamSource::Scripted(scripted_openai_sse_chunks(response, reasoning));
         }
         if let Some(sse) = value.get("sse").and_then(serde_json::Value::as_str) {
-            return split_scripted_sse(sse);
+            return RouteStreamSource::Scripted(split_scripted_sse(sse));
         }
-        let response = value
-            .get("content")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_else(|| content.trim());
-        let reasoning = value
-            .get("reasoning")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or(command.reasoning.as_str());
-        return scripted_openai_sse_chunks(response, reasoning);
+        if value.get("content").is_some() || value.get("reasoning").is_some() {
+            let response = value
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| content.trim());
+            let reasoning = value
+                .get("reasoning")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(command.reasoning.as_str());
+            return RouteStreamSource::Scripted(scripted_openai_sse_chunks(response, reasoning));
+        }
     }
 
-    let response = format!("Echo: {}", content.trim());
-    let reasoning = command.reasoning.clone().if_blank(format!(
-        "Selected {} through {}.",
-        route.model_display_name, route.provider_name
-    ));
-    scripted_openai_sse_chunks(&response, &reasoning)
+    provider_stream_source(&command.session_id, &command.turn_id, content, route)
+}
+
+fn provider_stream_source(
+    session_id: &str,
+    turn_id: &str,
+    content: &str,
+    route: &ModelRouteSnapshot,
+) -> RouteStreamSource {
+    RouteStreamSource::Provider(ModelRequest {
+        request_id: new_id("llm_req"),
+        session_id: session_id.to_string(),
+        turn_id: turn_id.to_string(),
+        purpose: "chat".to_string(),
+        stream: true,
+        system_blocks: vec!["You are Hambur, a concise assistant.".to_string()],
+        messages: vec![ModelMessage {
+            role: "user".to_string(),
+            content: content.to_string(),
+        }],
+        reasoning_mode: if route.supports_reasoning {
+            ReasoningMode::Enabled
+        } else {
+            ReasoningMode::Disabled
+        },
+        max_output_tokens: route.output_limit,
+        temperature: Some(0.7),
+    })
+}
+
+async fn reqwest_stream(spec: hambur_llm::HttpRequestSpec) -> HamburResult<reqwest::Response> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|error| {
+            HamburError::ProviderUnavailable(format!("NetworkError: build HTTP client: {error}"))
+        })?;
+    let method = reqwest::Method::from_bytes(spec.method.as_bytes()).map_err(|error| {
+        HamburError::ProviderUnavailable(format!("NetworkError: invalid HTTP method: {error}"))
+    })?;
+    let mut request = client.request(method, &spec.url);
+    for (name, value) in spec.headers {
+        request = request.header(name, value);
+    }
+    let response = request.body(spec.body_json).send().await.map_err(|error| {
+        if error.is_timeout() {
+            HamburError::ProviderUnavailable(format!("NetworkTimeout: {error}"))
+        } else {
+            HamburError::ProviderUnavailable(format!("NetworkError: {error}"))
+        }
+    })?;
+    let status = response.status();
+    if status.is_success() {
+        Ok(response)
+    } else {
+        Err(map_provider_http_status(status))
+    }
+}
+
+fn map_provider_http_status(status: StatusCode) -> HamburError {
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        HamburError::ProviderUnavailable(format!("Http429: HTTP {}", status.as_u16()))
+    } else if status.is_server_error() {
+        HamburError::ProviderUnavailable(format!("Http5xx: HTTP {}", status.as_u16()))
+    } else {
+        HamburError::ProviderUnavailable(format!(
+            "Http{}: HTTP {}",
+            status.as_u16(),
+            status.as_u16()
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -5520,7 +5847,11 @@ fn run_web_fetch(invocation: &ToolInvocation, arguments: &Value) -> RawToolOutpu
     let mut fetched = Vec::new();
     let mut errors = Vec::new();
     for url in urls {
-        match fetch_http_url(&url, max_bytes) {
+        let fetch_url = url.clone();
+        let result = thread::spawn(move || fetch_http_url(&fetch_url, max_bytes))
+            .join()
+            .unwrap_or_else(|_| Err("web_fetch worker panicked".to_string()));
+        match result {
             Ok(value) => fetched.push(value),
             Err(error) => errors.push(json!({
                 "url": url,
@@ -5547,43 +5878,29 @@ fn run_web_fetch(invocation: &ToolInvocation, arguments: &Value) -> RawToolOutpu
 }
 
 fn fetch_http_url(url: &str, max_bytes: usize) -> Result<Value, String> {
-    let parsed = parse_http_url(url)?;
-    let mut stream = TcpStream::connect((&*parsed.host, parsed.port))
-        .map_err(|error| format!("connect failed: {error}"))?;
-    stream
-        .set_read_timeout(Some(StdDuration::from_secs(20)))
-        .map_err(|error| format!("set read timeout failed: {error}"))?;
-    stream
-        .set_write_timeout(Some(StdDuration::from_secs(20)))
-        .map_err(|error| format!("set write timeout failed: {error}"))?;
-    let request = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Hambur/0.1\r\nAccept: text/*, application/json;q=0.9, */*;q=0.1\r\nConnection: close\r\n\r\n",
-        parsed.path, parsed.host
-    );
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|error| format!("write request failed: {error}"))?;
-    let mut response = Vec::new();
-    let mut buffer = [0u8; 8192];
-    while response.len() < max_bytes {
-        let read = stream
-            .read(&mut buffer)
-            .map_err(|error| format!("read response failed: {error}"))?;
-        if read == 0 {
-            break;
-        }
-        let remaining = max_bytes - response.len();
-        response.extend_from_slice(&buffer[..read.min(remaining)]);
-    }
-    let truncated = response.len() >= max_bytes;
-    let text = String::from_utf8_lossy(&response).to_string();
-    let (headers, body) = split_http_response(&text);
-    let status = headers
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse::<u16>().ok())
-        .unwrap_or_default();
+    validate_web_fetch_url(url)?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(StdDuration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+        .map_err(|error| format!("build web client failed: {error}"))?;
+    let mut response = client
+        .get(url)
+        .header(
+            reqwest::header::ACCEPT,
+            "text/*, application/json;q=0.9, */*;q=0.1",
+        )
+        .header(reqwest::header::USER_AGENT, "Hambur/0.1")
+        .send()
+        .map_err(|error| format!("fetch failed: {error}"))?;
+    let status = response.status().as_u16();
+    let headers = response_headers_json(response.headers());
+    let mut bytes = Vec::new();
+    response
+        .copy_to(&mut LimitedWrite::new(&mut bytes, max_bytes))
+        .map_err(|error| format!("read response failed: {error}"))?;
+    let truncated = bytes.len() >= max_bytes;
+    let body = String::from_utf8_lossy(&bytes).to_string();
     Ok(json!({
         "url": url,
         "status": status,
@@ -5593,45 +5910,55 @@ fn fetch_http_url(url: &str, max_bytes: usize) -> Result<Value, String> {
     }))
 }
 
-#[derive(Debug)]
-struct ParsedHttpUrl {
-    host: String,
-    port: u16,
-    path: String,
-}
-
-fn parse_http_url(url: &str) -> Result<ParsedHttpUrl, String> {
-    let Some(rest) = url.strip_prefix("http://") else {
-        if url.starts_with("https://") {
-            return Err(
-                "HTTPS web_fetch requires a configured TLS-capable web provider".to_string(),
-            );
-        }
+fn validate_web_fetch_url(url: &str) -> Result<(), String> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err("web_fetch URL must start with http:// or https://".to_string());
-    };
-    let (authority, path) = rest
-        .split_once('/')
-        .map(|(authority, path)| (authority, format!("/{path}")))
-        .unwrap_or((rest, "/".to_string()));
-    let (host, port) = authority
-        .rsplit_once(':')
-        .and_then(|(host, port)| port.parse::<u16>().ok().map(|port| (host, port)))
-        .unwrap_or((authority, 80));
-    if host.trim().is_empty() {
+    }
+    let parsed = reqwest::Url::parse(url).map_err(|error| format!("invalid URL: {error}"))?;
+    if parsed.host_str().unwrap_or_default().trim().is_empty() {
         return Err("web_fetch host must not be empty".to_string());
     }
-    Ok(ParsedHttpUrl {
-        host: host.to_string(),
-        port,
-        path,
-    })
+    Ok(())
 }
 
-fn split_http_response(response: &str) -> (String, String) {
-    response
-        .split_once("\r\n\r\n")
-        .map(|(headers, body)| (headers.to_string(), body.to_string()))
-        .unwrap_or_else(|| (String::new(), response.to_string()))
+fn response_headers_json(headers: &reqwest::header::HeaderMap) -> Value {
+    let values = headers
+        .iter()
+        .map(|(name, value)| {
+            json!({
+                "name": name.as_str(),
+                "value": value.to_str().unwrap_or_default()
+            })
+        })
+        .collect::<Vec<_>>();
+    Value::Array(values)
+}
+
+struct LimitedWrite<'a> {
+    target: &'a mut Vec<u8>,
+    limit: usize,
+}
+
+impl<'a> LimitedWrite<'a> {
+    fn new(target: &'a mut Vec<u8>, limit: usize) -> Self {
+        Self { target, limit }
+    }
+}
+
+impl Write for LimitedWrite<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.target.len() >= self.limit {
+            return Ok(buf.len());
+        }
+        let remaining = self.limit - self.target.len();
+        let take = remaining.min(buf.len());
+        self.target.extend_from_slice(&buf[..take]);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn normalize_image_detail(detail: &str) -> &'static str {
@@ -5855,7 +6182,7 @@ fn approval_token_from_payload(payload_json: &str) -> String {
 fn require_approval(command: &RuntimeCommand, scope: &str) -> HamburResult<()> {
     let token = approval_token_from_payload(&command.payload_json);
     let expected = approval_tokens_for_scope(scope);
-    if expected.iter().any(|candidate| token == *candidate) {
+    if expected.contains(&token) {
         Ok(())
     } else {
         Err(HamburError::InvalidCommand(format!(
@@ -6033,7 +6360,7 @@ mod tests {
     use super::{
         AppBootstrap, BackgroundProcessSession, DelegateTaskState, NewTraceSpan,
         ProcessOutputBuffer, RuntimeCommand, RuntimeEngine, platform_shell,
-        spawn_process_pipe_reader,
+        spawn_process_pipe_reader, validate_web_fetch_url,
     };
 
     #[test]
@@ -6237,6 +6564,94 @@ mod tests {
         assert_eq!(message.model_id_snapshot, "gpt-test");
         assert_eq!(message.status, "completed");
         assert_eq!(finished.session_id, message.session_id);
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
+    fn send_message_streams_from_real_openai_compatible_http_provider() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider server");
+        let addr = listener.local_addr().expect("local addr");
+        let captured_request = Arc::new(Mutex::new(String::new()));
+        let captured = captured_request.clone();
+        let server = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 1024];
+                loop {
+                    let read = stream.read(&mut buffer).expect("read provider request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if String::from_utf8_lossy(&request).contains("\r\n\r\n") {
+                        break;
+                    }
+                }
+                let text = String::from_utf8_lossy(&request).to_string();
+                *captured.lock().expect("capture request") = text;
+                let body = concat!(
+                    "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"real reasoning\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"real provider answer\"}}]}\n\n",
+                    "data: [DONE]\n\n"
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:X}\r\n{}\r\n0\r\n\r\n",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write provider response");
+            }
+        });
+
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+        let session_id = create_test_session(&runtime);
+        configure_http_test_provider(
+            &runtime,
+            "provider_http",
+            "gpt-real",
+            &format!("http://{addr}/v1"),
+        );
+
+        let ack = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_real_provider".to_string(),
+            idempotency_key: "message:real-provider:http".to_string(),
+            kind: "SendMessage".to_string(),
+            session_id: session_id.clone(),
+            content: "use real HTTP".to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(ack.accepted, "send rejected: {}", ack.message);
+        wait_for_session_event(&runtime, "TurnFinished", &session_id);
+        server.join().expect("provider server");
+
+        let request = captured_request.lock().expect("captured request").clone();
+        assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
+        assert!(request.contains("authorization: Bearer test-api-key"));
+        assert!(request.contains("content-type: application/json"));
+
+        let timeline = runtime.get_timeline_page(session_id, 0, 20);
+        let assistant = timeline
+            .items
+            .iter()
+            .find(|item| item.kind == "AssistantMessage")
+            .expect("assistant timeline item");
+        let message = runtime
+            .get_message_snapshot(assistant.payload_ref.clone())
+            .message
+            .expect("assistant message snapshot");
+        assert_eq!(message.content_text, "real provider answer");
+        assert_eq!(message.reasoning_content, "real reasoning");
+        assert_eq!(message.provider_id_snapshot, "provider_http");
+        assert_eq!(message.model_id_snapshot, "gpt-real");
 
         let _ = fs::remove_dir_all(app_files_dir);
     }
@@ -7035,6 +7450,65 @@ mod tests {
                 .iter()
                 .any(|audit| audit.action == "DeleteProvider" && audit.approval_required)
         );
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
+    fn reset_rootfs_requires_approval_and_cleans_sandbox_root() {
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+        let session_id = create_test_session(&runtime);
+        let workspace = runtime
+            .sandbox
+            .resolve(
+                &session_id,
+                "/var/hambur/workspace/rootfs-marker.txt",
+                SandboxAccess::Write,
+            )
+            .expect("workspace path");
+        if let Some(parent) = workspace.host_path.parent() {
+            fs::create_dir_all(parent).expect("workspace parent");
+        }
+        fs::write(&workspace.host_path, "stale").expect("write marker");
+        assert!(workspace.host_path.exists());
+
+        let rejected = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_reset_rootfs_rejected".to_string(),
+            idempotency_key: "rootfs:reset:rejected".to_string(),
+            kind: "ResetRootfs".to_string(),
+            session_id: session_id.clone(),
+            ..RuntimeCommand::default()
+        });
+        assert!(!rejected.accepted);
+        assert_eq!(rejected.rejection_code, "InvalidCommand");
+
+        let accepted = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_reset_rootfs_approved".to_string(),
+            idempotency_key: "rootfs:reset:approved".to_string(),
+            kind: "ResetRootfs".to_string(),
+            session_id: session_id.clone(),
+            payload_json: serde_json::json!({
+                "approvalToken": "approve:rootfs_reset"
+            })
+            .to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(accepted.accepted, "reset rejected: {}", accepted.message);
+        let event = wait_for_session_event_result(&runtime, "TurnStateChanged", &session_id);
+        assert!(event.message.contains("\"action\":\"ResetRootfs\""));
+        assert!(!workspace.host_path.exists());
+        let prepared = runtime
+            .sandbox
+            .resolve(&session_id, "/var/hambur/workspace", SandboxAccess::Read)
+            .expect("prepared workspace");
+        assert!(prepared.host_path.exists());
 
         let _ = fs::remove_dir_all(app_files_dir);
     }
@@ -7950,6 +8424,13 @@ mod tests {
         let _ = fs::remove_dir_all(app_files_dir);
     }
 
+    #[test]
+    fn milestone7_web_fetch_accepts_https_urls_for_tls_provider_client() {
+        assert!(validate_web_fetch_url("https://example.test/path").is_ok());
+        assert!(validate_web_fetch_url("http://example.test/path").is_ok());
+        assert!(validate_web_fetch_url("file:///tmp/nope").is_err());
+    }
+
     fn temp_app_dir() -> PathBuf {
         std::env::temp_dir().join(new_id("hambur_runtime_test"))
     }
@@ -8013,6 +8494,54 @@ mod tests {
         let _ = runtime.next_event().expect("models event");
     }
 
+    fn configure_http_test_provider(
+        runtime: &RuntimeEngine,
+        provider_id: &str,
+        model_id: &str,
+        base_url: &str,
+    ) {
+        // Tests use env:// so the database still stores only a secret reference.
+        unsafe {
+            std::env::set_var("HAMBUR_TEST_OPENAI_KEY", "test-api-key");
+        }
+        let provider = runtime.dispatch(RuntimeCommand {
+            command_id: format!("cmd_provider_http_{provider_id}"),
+            idempotency_key: format!("{provider_id}:http-provider:test"),
+            kind: "UpdateProvider".to_string(),
+            provider_id: provider_id.to_string(),
+            title: format!("HTTP Provider {provider_id}"),
+            chunk: base_url.to_string(),
+            payload_json: "env://HAMBUR_TEST_OPENAI_KEY".to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(provider.accepted, "provider rejected: {}", provider.message);
+        let _ = runtime.next_event().expect("provider event");
+
+        let models = runtime.dispatch(RuntimeCommand {
+            command_id: format!("cmd_models_http_{provider_id}"),
+            idempotency_key: format!("{provider_id}:http-models:test"),
+            kind: "RefreshProviderModels".to_string(),
+            provider_id: provider_id.to_string(),
+            payload_json: serde_json::json!({
+                "data": [{
+                    "id": model_id,
+                    "display_name": model_id,
+                    "supports_reasoning": true,
+                    "supports_tool_call": true,
+                    "supports_image_input": false,
+                    "supports_structured_output": false,
+                    "supports_temperature": true,
+                    "context_limit": 32000,
+                    "output_limit": 4096
+                }]
+            })
+            .to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(models.accepted, "models rejected: {}", models.message);
+        let _ = runtime.next_event().expect("models event");
+    }
+
     fn wait_for_event(runtime: &RuntimeEngine, kind: &str) {
         for _ in 0..64 {
             let event = runtime.next_event().expect("runtime event");
@@ -8028,6 +8557,20 @@ mod tests {
             let event = runtime.next_event().expect("runtime event");
             if event.kind.as_str() == kind && event.session_id == session_id {
                 return;
+            }
+        }
+        panic!("missing event: {kind} for session {session_id}");
+    }
+
+    fn wait_for_session_event_result(
+        runtime: &RuntimeEngine,
+        kind: &str,
+        session_id: &str,
+    ) -> super::RuntimeEvent {
+        for _ in 0..128 {
+            let event = runtime.next_event().expect("runtime event");
+            if event.kind.as_str() == kind && event.session_id == session_id {
+                return event;
             }
         }
         panic!("missing event: {kind} for session {session_id}");

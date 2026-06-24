@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -2648,6 +2650,9 @@ impl RuntimeEngine {
                             .await,
                     );
                 }
+                "web_fetch" | "web_search" => {
+                    records.push(self.execute_web_tool(invocation).await);
+                }
                 "delegate_task" | "submit_delegate_result" => {
                     records.push(self.execute_delegate_tool(session_id, invocation).await);
                 }
@@ -3021,6 +3026,74 @@ impl RuntimeEngine {
                 )
             }
         }
+    }
+
+    async fn execute_web_tool(&self, invocation: ToolInvocation) -> ToolExecutionRecord {
+        let started_at_ms = now_ms();
+        let result = match invocation.arguments_value() {
+            Ok(arguments) => self.resolve_web_tool_result(&invocation, &arguments),
+            Err(error) => ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                error.to_string(),
+            ),
+        };
+        ToolExecutionRecord {
+            invocation,
+            result,
+            started_at_ms,
+            ended_at_ms: now_ms(),
+        }
+    }
+
+    fn resolve_web_tool_result(
+        &self,
+        invocation: &ToolInvocation,
+        arguments: &Value,
+    ) -> ToolResult {
+        if let Err(error) = self
+            .tools
+            .schemas()
+            .validate_arguments(&invocation.name, arguments)
+        {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                error.to_string(),
+            );
+        }
+
+        let raw = match invocation.name.as_str() {
+            "web_fetch" => run_web_fetch(invocation, arguments),
+            "web_search" => RawToolOutput {
+                tool_call_id: invocation.tool_call_id.clone(),
+                tool_name: invocation.name.clone(),
+                is_error: true,
+                content: "web_search requires a configured search provider".to_string(),
+                summary: "Web search provider unavailable".to_string(),
+                trust_level: "untrusted".to_string(),
+                command_or_url: arguments.to_string(),
+                status: "ProviderUnavailable".to_string(),
+            },
+            _ => RawToolOutput {
+                tool_call_id: invocation.tool_call_id.clone(),
+                tool_name: invocation.name.clone(),
+                is_error: true,
+                content: format!("unknown web tool: {}", invocation.name),
+                summary: "Unknown web tool".to_string(),
+                trust_level: "trusted".to_string(),
+                command_or_url: arguments.to_string(),
+                status: "InvalidCommand".to_string(),
+            },
+        };
+
+        self.tools.normalize_raw(raw).unwrap_or_else(|error| {
+            ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                error.to_string(),
+            )
+        })
     }
 
     async fn execute_delegate_tool(
@@ -4266,6 +4339,162 @@ fn run_terminal_command(
     }
 }
 
+fn run_web_fetch(invocation: &ToolInvocation, arguments: &Value) -> RawToolOutput {
+    let urls = arguments
+        .get("urls")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|value| value.as_str().map(str::to_string))
+        .collect::<Vec<_>>();
+    if urls.is_empty() {
+        return RawToolOutput {
+            tool_call_id: invocation.tool_call_id.clone(),
+            tool_name: invocation.name.clone(),
+            is_error: true,
+            content: "web_fetch urls must not be empty".to_string(),
+            summary: "No URLs to fetch".to_string(),
+            trust_level: "trusted".to_string(),
+            command_or_url: arguments.to_string(),
+            status: "InvalidCommand".to_string(),
+        };
+    }
+    if urls.len() > 5 {
+        return RawToolOutput {
+            tool_call_id: invocation.tool_call_id.clone(),
+            tool_name: invocation.name.clone(),
+            is_error: true,
+            content: "web_fetch supports at most 5 URLs per call".to_string(),
+            summary: "Too many URLs".to_string(),
+            trust_level: "trusted".to_string(),
+            command_or_url: arguments.to_string(),
+            status: "InvalidCommand".to_string(),
+        };
+    }
+    let max_bytes = arguments
+        .get("max_bytes")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(1_000_000)
+        .clamp(1_024, 10_000_000);
+    let mut fetched = Vec::new();
+    let mut errors = Vec::new();
+    for url in urls {
+        match fetch_http_url(&url, max_bytes) {
+            Ok(value) => fetched.push(value),
+            Err(error) => errors.push(json!({
+                "url": url,
+                "error": error
+            })),
+        }
+    }
+    let fetched_count = fetched.len();
+    let error_count = errors.len();
+    let content = json!({
+        "fetched": fetched,
+        "errors": errors
+    });
+    RawToolOutput {
+        tool_call_id: invocation.tool_call_id.clone(),
+        tool_name: invocation.name.clone(),
+        is_error: error_count > 0 && fetched_count == 0,
+        content: content.to_string(),
+        summary: format!("Fetched {fetched_count} URLs, {error_count} failed"),
+        trust_level: "untrusted".to_string(),
+        command_or_url: arguments.to_string(),
+        status: if error_count == 0 { "ok" } else { "partial" }.to_string(),
+    }
+}
+
+fn fetch_http_url(url: &str, max_bytes: usize) -> Result<Value, String> {
+    let parsed = parse_http_url(url)?;
+    let mut stream = TcpStream::connect((&*parsed.host, parsed.port))
+        .map_err(|error| format!("connect failed: {error}"))?;
+    stream
+        .set_read_timeout(Some(StdDuration::from_secs(20)))
+        .map_err(|error| format!("set read timeout failed: {error}"))?;
+    stream
+        .set_write_timeout(Some(StdDuration::from_secs(20)))
+        .map_err(|error| format!("set write timeout failed: {error}"))?;
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Hambur/0.1\r\nAccept: text/*, application/json;q=0.9, */*;q=0.1\r\nConnection: close\r\n\r\n",
+        parsed.path, parsed.host
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| format!("write request failed: {error}"))?;
+    let mut response = Vec::new();
+    let mut buffer = [0u8; 8192];
+    while response.len() < max_bytes {
+        let read = stream
+            .read(&mut buffer)
+            .map_err(|error| format!("read response failed: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        let remaining = max_bytes - response.len();
+        response.extend_from_slice(&buffer[..read.min(remaining)]);
+    }
+    let truncated = response.len() >= max_bytes;
+    let text = String::from_utf8_lossy(&response).to_string();
+    let (headers, body) = split_http_response(&text);
+    let status = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or_default();
+    Ok(json!({
+        "url": url,
+        "status": status,
+        "headers": headers,
+        "text": body,
+        "truncated": truncated
+    }))
+}
+
+#[derive(Debug)]
+struct ParsedHttpUrl {
+    host: String,
+    port: u16,
+    path: String,
+}
+
+fn parse_http_url(url: &str) -> Result<ParsedHttpUrl, String> {
+    let Some(rest) = url.strip_prefix("http://") else {
+        if url.starts_with("https://") {
+            return Err(
+                "HTTPS web_fetch requires a configured TLS-capable web provider".to_string(),
+            );
+        }
+        return Err("web_fetch URL must start with http:// or https://".to_string());
+    };
+    let (authority, path) = rest
+        .split_once('/')
+        .map(|(authority, path)| (authority, format!("/{path}")))
+        .unwrap_or((rest, "/".to_string()));
+    let (host, port) = authority
+        .rsplit_once(':')
+        .and_then(|(host, port)| port.parse::<u16>().ok().map(|port| (host, port)))
+        .unwrap_or((authority, 80));
+    if host.trim().is_empty() {
+        return Err("web_fetch host must not be empty".to_string());
+    }
+    Ok(ParsedHttpUrl {
+        host: host.to_string(),
+        port,
+        path,
+    })
+}
+
+fn split_http_response(response: &str) -> (String, String) {
+    response
+        .split_once("\r\n\r\n")
+        .map(|(headers, body)| (headers.to_string(), body.to_string()))
+        .unwrap_or_else(|| (String::new(), response.to_string()))
+}
+
 fn normalize_image_detail(detail: &str) -> &'static str {
     match detail {
         "low" => "low",
@@ -4646,7 +4875,13 @@ fn rejected_ack(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{
+        fs,
+        io::{Read, Write},
+        net::TcpListener,
+        path::PathBuf,
+        thread,
+    };
 
     use hambur_core::new_id;
 
@@ -6189,6 +6424,70 @@ mod tests {
                 .content_text
                 .contains("sandbox path must not escape")
         );
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
+    fn milestone7_web_fetch_returns_untrusted_http_content() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let server = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request);
+                let body = "hello from local web";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+        let session_id = create_test_session(&runtime);
+        configure_test_provider(&runtime, "gpt-web");
+
+        let url = format!("http://{addr}/page");
+        let sse = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_web_fetch\",\"function\":{{\"name\":\"web_fetch\",\"arguments\":\"{{\\\"urls\\\":[\\\"{}\\\"]}}\"}}}}]}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n",
+            url
+        );
+        let send = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_m7_web_fetch".to_string(),
+            idempotency_key: "message:m7:web-fetch".to_string(),
+            kind: "SendMessage".to_string(),
+            session_id: session_id.clone(),
+            content: "fetch local web".to_string(),
+            payload_json: serde_json::json!({"sse": sse}).to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(send.accepted, "send rejected: {}", send.message);
+        wait_for_event(&runtime, "TurnFinished");
+        server.join().expect("server thread");
+
+        let timeline = runtime.get_timeline_page(session_id, 0, 50);
+        let continuation = timeline
+            .items
+            .iter()
+            .rev()
+            .find(|item| item.kind == "AssistantMessage")
+            .expect("assistant continuation");
+        let message = runtime
+            .get_message_snapshot(continuation.payload_ref.clone())
+            .message
+            .expect("message");
+        assert!(message.content_text.contains("hello from local web"));
+        assert!(message.content_text.contains("<untrusted_tool_result"));
 
         let _ = fs::remove_dir_all(app_files_dir);
     }

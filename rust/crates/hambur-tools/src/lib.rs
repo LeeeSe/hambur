@@ -48,7 +48,6 @@ impl ToolSchemaCompiler {
                     "query": {"type": "string"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 20}
                 },
-                "required": ["query"],
                 "additionalProperties": false
             }),
         })?;

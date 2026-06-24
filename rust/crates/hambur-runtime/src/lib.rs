@@ -21,14 +21,15 @@ use hambur_llm::{
     scripted_openai_sse_chunks, should_fallback,
 };
 use hambur_markdown::{MarkdownPipeline, MarkdownRenderUpdate};
+use hambur_sandbox::{SandboxAccess, SandboxService};
 use hambur_tools::{
-    MAX_TOOL_ITERATIONS_PER_TURN, ToolCallBatch, ToolExecutionRecord, ToolInvocation, ToolResult,
-    ToolScheduler,
+    MAX_TOOL_ITERATIONS_PER_TURN, RawToolOutput, ToolCallBatch, ToolExecutionRecord,
+    ToolInvocation, ToolResult, ToolScheduler,
 };
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
-use tokio::sync::mpsc;
-use tokio::time::{Duration, sleep};
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::{Duration, sleep, timeout};
 
 #[derive(Debug, Clone)]
 pub struct AppBootstrap {
@@ -53,6 +54,17 @@ pub struct RuntimeCommand {
     pub source_message_id: String,
     pub payload_json: String,
     pub finalize: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PlatformRequest {
+    pub request_id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub kind: String,
+    pub payload_json: String,
+    pub timeout_ms: u64,
+    pub cancellable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +144,9 @@ pub enum RuntimeEventKind {
     ToolCallDelta,
     ToolCallFinished,
     ToolCallFailed,
+    PlatformRequest,
+    PlatformRequestCancelled,
+    PlatformRequestTimedOut,
     AttachmentImported,
     PendingAttachmentRemoved,
     PendingAttachmentsCleaned,
@@ -163,6 +178,9 @@ impl RuntimeEventKind {
             Self::ToolCallDelta => "ToolCallDelta",
             Self::ToolCallFinished => "ToolCallFinished",
             Self::ToolCallFailed => "ToolCallFailed",
+            Self::PlatformRequest => "PlatformRequest",
+            Self::PlatformRequestCancelled => "PlatformRequestCancelled",
+            Self::PlatformRequestTimedOut => "PlatformRequestTimedOut",
             Self::AttachmentImported => "AttachmentImported",
             Self::PendingAttachmentRemoved => "PendingAttachmentRemoved",
             Self::PendingAttachmentsCleaned => "PendingAttachmentsCleaned",
@@ -187,6 +205,7 @@ pub struct RuntimeEvent {
     pub turn_id: String,
     pub snapshot: AppSnapshot,
     pub markdown_render_update: MarkdownRenderUpdate,
+    pub platform_request: PlatformRequest,
     pub error_code: String,
     pub message: String,
 }
@@ -197,8 +216,10 @@ pub struct RuntimeEngine {
     bootstrap: AppBootstrap,
     database: HamburDatabase,
     filestore: FileStore,
+    sandbox: SandboxService,
     markdown_streams: Mutex<HashMap<String, MarkdownPipeline>>,
     active_turns: Mutex<HashMap<String, ActiveTurn>>,
+    platform_requests: Mutex<HashMap<String, oneshot::Sender<PlatformResultPayload>>>,
     router: Mutex<ModelRouter>,
     tools: ToolScheduler,
     idempotency: Mutex<HashMap<String, RuntimeCommandAck>>,
@@ -212,6 +233,14 @@ pub struct RuntimeEngine {
 struct ActiveTurn {
     turn_id: String,
     cancel: Arc<AtomicBool>,
+}
+
+#[derive(Debug)]
+struct PlatformResultPayload {
+    is_error: bool,
+    payload_json: String,
+    error_code: String,
+    message: String,
 }
 
 enum StreamAttemptResult {
@@ -236,6 +265,7 @@ impl RuntimeEngine {
         let database_path = database_path(&bootstrap);
         let database = tokio.block_on(HamburDatabase::open(database_path))?;
         let filestore = FileStore::new(&bootstrap.app_files_dir)?;
+        let sandbox = SandboxService::new(&bootstrap.app_files_dir)?;
         let jobs = tokio.block_on(database.cleanup_pending_attachments(0))?;
         for job in jobs {
             let _ = filestore.delete_relative_if_exists(&job.relative_path);
@@ -250,8 +280,10 @@ impl RuntimeEngine {
             bootstrap,
             database,
             filestore,
+            sandbox,
             markdown_streams: Mutex::new(HashMap::new()),
             active_turns: Mutex::new(HashMap::new()),
+            platform_requests: Mutex::new(HashMap::new()),
             router: Mutex::new(ModelRouter::default()),
             tools,
             idempotency: Mutex::new(HashMap::new()),
@@ -387,6 +419,8 @@ impl RuntimeEngine {
             "RegenerateMessage" => self.execute_send_message(command, "RegenerateMessage"),
             "EditMessage" => self.execute_send_message(command, "EditMessage"),
             "CancelTurn" => self.execute_cancel_turn(command),
+            "SubmitPlatformResult" => self.execute_submit_platform_result(command),
+            "RunRootfsWarmup" | "ResetRootfs" => self.execute_rootfs_lifecycle(command),
             "AppendMarkdownDelta" | "MarkdownRenderUpdate" => {
                 self.execute_append_markdown_delta(command)
             }
@@ -1621,6 +1655,73 @@ impl RuntimeEngine {
         accepted_ack(command.command_id, command.idempotency_key)
     }
 
+    fn execute_submit_platform_result(&self, command: RuntimeCommand) -> RuntimeCommandAck {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return rejected_ack(
+                command.command_id,
+                command.idempotency_key,
+                HamburError::RuntimeClosed,
+            );
+        }
+
+        let payload = config_payload_value(&command.payload_json);
+        let request_id = command
+            .message_id
+            .clone()
+            .if_blank(config_string(&payload, "requestId"))
+            .if_blank(config_string(&payload, "request_id"));
+        let Some(sender) = self
+            .platform_requests
+            .lock()
+            .ok()
+            .and_then(|mut requests| requests.remove(&request_id))
+        else {
+            return accepted_ack(command.command_id, command.idempotency_key);
+        };
+
+        let result = PlatformResultPayload {
+            is_error: config_bool(&payload, "isError", false),
+            payload_json: config_value_string(&payload, "payloadJson"),
+            error_code: config_string(&payload, "errorCode"),
+            message: config_string(&payload, "message"),
+        };
+        let _ = sender.send(result);
+        accepted_ack(command.command_id, command.idempotency_key)
+    }
+
+    fn execute_rootfs_lifecycle(&self, command: RuntimeCommand) -> RuntimeCommandAck {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return rejected_ack(
+                command.command_id,
+                command.idempotency_key,
+                HamburError::RuntimeClosed,
+            );
+        }
+
+        let status = self.sandbox.rootfs_status();
+        let snapshot = self
+            .tokio
+            .block_on(self.database.bootstrap_snapshot())
+            .unwrap_or_default();
+        let message = json!({
+            "available": status.available,
+            "backend": status.backend,
+            "abi": status.abi,
+            "reason": status.reason,
+            "action": command.kind
+        })
+        .to_string();
+        let _ = self.emit_session_event(
+            RuntimeEventKind::TurnStateChanged,
+            command.session_id,
+            command.turn_id,
+            snapshot,
+            message,
+            None,
+        );
+        accepted_ack(command.command_id, command.idempotency_key)
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn run_chat_turn(
         self: Arc<Self>,
@@ -2520,13 +2621,36 @@ impl RuntimeEngine {
         let mut regular = Vec::new();
         let mut records = Vec::new();
         for invocation in invocations {
-            if invocation.name == "view_image" {
-                records.push(
-                    self.execute_view_image_tool(session_id, route, route_candidates, invocation)
+            match invocation.name.as_str() {
+                "view_image" => {
+                    records.push(
+                        self.execute_view_image_tool(
+                            session_id,
+                            route,
+                            route_candidates,
+                            invocation,
+                        )
                         .await,
-                );
-            } else {
-                regular.push(invocation);
+                    );
+                }
+                "session_search" => {
+                    records.push(self.execute_session_search_tool(invocation).await);
+                }
+                "terminal" | "process" => {
+                    records.push(self.execute_sandbox_tool(invocation).await);
+                }
+                "browser_use" => {
+                    records.push(
+                        self.execute_browser_tool(session_id, turn_id, invocation)
+                            .await,
+                    );
+                }
+                "delegate_task" | "submit_delegate_result" => {
+                    records.push(self.execute_delegate_tool(session_id, invocation).await);
+                }
+                _ => {
+                    regular.push(invocation);
+                }
             }
         }
 
@@ -2540,6 +2664,433 @@ impl RuntimeEngine {
         }
         records.sort_by_key(|record| record.invocation.index);
         Ok(records)
+    }
+
+    async fn execute_session_search_tool(&self, invocation: ToolInvocation) -> ToolExecutionRecord {
+        let started_at_ms = now_ms();
+        let result = match invocation.arguments_value() {
+            Ok(arguments) => {
+                self.resolve_session_search_result(&invocation, &arguments)
+                    .await
+            }
+            Err(error) => ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                error.to_string(),
+            ),
+        };
+        ToolExecutionRecord {
+            invocation,
+            result,
+            started_at_ms,
+            ended_at_ms: now_ms(),
+        }
+    }
+
+    async fn resolve_session_search_result(
+        &self,
+        invocation: &ToolInvocation,
+        arguments: &Value,
+    ) -> ToolResult {
+        if let Err(error) = self
+            .tools
+            .schemas()
+            .validate_arguments(&invocation.name, arguments)
+        {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                error.to_string(),
+            );
+        }
+        let query = arguments
+            .get("query")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        let limit = arguments
+            .get("limit")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(5)
+            .clamp(1, 20);
+        let sessions = self
+            .database
+            .search_sessions(query, limit)
+            .await
+            .unwrap_or_default();
+        let matches = sessions
+            .iter()
+            .map(|session| {
+                json!({
+                    "sessionId": session.id,
+                    "title": session.title,
+                    "latestPreview": session.latest_preview,
+                    "messageCount": session.message_count,
+                    "updatedAtMs": session.updated_at_ms
+                })
+            })
+            .collect::<Vec<_>>();
+        let content = json!({
+            "query": query,
+            "limit": limit,
+            "matches": matches
+        });
+        ToolResult {
+            tool_call_id: invocation.tool_call_id.clone(),
+            tool_name: invocation.name.clone(),
+            is_error: false,
+            content_json: content.to_string(),
+            summary: format!("Session search returned {} matches", sessions.len()),
+            artifacts_json: "[]".to_string(),
+            trust_level: "trusted".to_string(),
+            truncated: false,
+            offloaded_file_id: String::new(),
+            offloaded_path: String::new(),
+            context_stub: content.to_string(),
+        }
+    }
+
+    async fn execute_sandbox_tool(&self, invocation: ToolInvocation) -> ToolExecutionRecord {
+        let started_at_ms = now_ms();
+        let result = match invocation.arguments_value() {
+            Ok(arguments) => self.resolve_sandbox_tool_result(&invocation, &arguments),
+            Err(error) => ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                error.to_string(),
+            ),
+        };
+        ToolExecutionRecord {
+            invocation,
+            result,
+            started_at_ms,
+            ended_at_ms: now_ms(),
+        }
+    }
+
+    fn resolve_sandbox_tool_result(
+        &self,
+        invocation: &ToolInvocation,
+        arguments: &Value,
+    ) -> ToolResult {
+        if let Err(error) = self
+            .tools
+            .schemas()
+            .validate_arguments(&invocation.name, arguments)
+        {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                error.to_string(),
+            );
+        }
+        let status = self.sandbox.rootfs_status();
+        if !status.available {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                format!("ToolUnavailable({})", status.reason),
+            );
+        }
+        let cwd = arguments
+            .get("cwd")
+            .and_then(Value::as_str)
+            .unwrap_or("/var/hambur/workspace");
+        if let Err(error) = self
+            .sandbox
+            .resolve(&invocation.session_id, cwd, SandboxAccess::Read)
+        {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                error.to_string(),
+            );
+        }
+
+        let raw = RawToolOutput {
+            tool_call_id: invocation.tool_call_id.clone(),
+            tool_name: invocation.name.clone(),
+            is_error: true,
+            content: format!(
+                "{} execution backend is not attached in this runtime slice",
+                invocation.name
+            ),
+            summary: "Sandbox execution backend unavailable".to_string(),
+            trust_level: "untrusted".to_string(),
+            command_or_url: arguments.to_string(),
+            status: "ToolUnavailable".to_string(),
+        };
+        self.tools.normalize_raw(raw).unwrap_or_else(|error| {
+            ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                error.to_string(),
+            )
+        })
+    }
+
+    async fn execute_browser_tool(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        invocation: ToolInvocation,
+    ) -> ToolExecutionRecord {
+        let started_at_ms = now_ms();
+        let result = match invocation.arguments_value() {
+            Ok(arguments) => {
+                self.resolve_browser_tool_result(session_id, turn_id, &invocation, &arguments)
+                    .await
+            }
+            Err(error) => ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                error.to_string(),
+            ),
+        };
+        ToolExecutionRecord {
+            invocation,
+            result,
+            started_at_ms,
+            ended_at_ms: now_ms(),
+        }
+    }
+
+    async fn resolve_browser_tool_result(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        invocation: &ToolInvocation,
+        arguments: &Value,
+    ) -> ToolResult {
+        if let Err(error) = self
+            .tools
+            .schemas()
+            .validate_arguments(&invocation.name, arguments)
+        {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                error.to_string(),
+            );
+        }
+
+        let request_id = new_id("platform_req");
+        let timeout_ms = arguments
+            .get("timeout_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(60_000)
+            .clamp(1_000, 120_000);
+        let request = PlatformRequest {
+            request_id: request_id.clone(),
+            session_id: session_id.to_string(),
+            turn_id: turn_id.to_string(),
+            kind: "BrowserAction".to_string(),
+            payload_json: json!({
+                "toolCallId": invocation.tool_call_id,
+                "action": arguments
+            })
+            .to_string(),
+            timeout_ms,
+            cancellable: true,
+        };
+        let (sender, receiver) = oneshot::channel();
+        if let Ok(mut requests) = self.platform_requests.lock() {
+            requests.insert(request_id.clone(), sender);
+        } else {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                "platform request registry unavailable",
+            );
+        }
+        let snapshot = self
+            .database
+            .session_snapshot(session_id)
+            .await
+            .unwrap_or_default();
+        if let Err(error) = self.emit_platform_request_event(request, snapshot) {
+            let _ = self
+                .platform_requests
+                .lock()
+                .ok()
+                .and_then(|mut requests| requests.remove(&request_id));
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                error.to_string(),
+            );
+        }
+
+        match timeout(Duration::from_millis(timeout_ms), receiver).await {
+            Ok(Ok(result)) => {
+                let is_error = result.is_error;
+                let payload_json = result.payload_json;
+                let error_code = result.error_code;
+                let message = result.message;
+                let content = if payload_json.trim().is_empty() {
+                    message
+                } else {
+                    payload_json
+                };
+                let summary = if is_error {
+                    error_code
+                        .clone()
+                        .if_blank("Browser action failed".to_string())
+                } else {
+                    "Browser action completed".to_string()
+                };
+                let status = if is_error {
+                    error_code
+                } else {
+                    "ok".to_string()
+                };
+                let raw = RawToolOutput {
+                    tool_call_id: invocation.tool_call_id.clone(),
+                    tool_name: invocation.name.clone(),
+                    is_error,
+                    content,
+                    summary,
+                    trust_level: "untrusted".to_string(),
+                    command_or_url: arguments.to_string(),
+                    status,
+                };
+                self.tools.normalize_raw(raw).unwrap_or_else(|error| {
+                    ToolResult::failed(
+                        &invocation.tool_call_id,
+                        &invocation.name,
+                        error.to_string(),
+                    )
+                })
+            }
+            _ => {
+                let _ = self
+                    .platform_requests
+                    .lock()
+                    .ok()
+                    .and_then(|mut requests| requests.remove(&request_id));
+                let snapshot = self
+                    .database
+                    .session_snapshot(session_id)
+                    .await
+                    .unwrap_or_default();
+                let _ = self.emit_session_event(
+                    RuntimeEventKind::PlatformRequestTimedOut,
+                    session_id.to_string(),
+                    turn_id.to_string(),
+                    snapshot,
+                    request_id,
+                    Some(&HamburError::InvalidCommand(
+                        "PlatformRequestTimeout".to_string(),
+                    )),
+                );
+                ToolResult::failed(
+                    &invocation.tool_call_id,
+                    &invocation.name,
+                    "PlatformRequestTimeout",
+                )
+            }
+        }
+    }
+
+    async fn execute_delegate_tool(
+        &self,
+        session_id: &str,
+        invocation: ToolInvocation,
+    ) -> ToolExecutionRecord {
+        let started_at_ms = now_ms();
+        let result = match invocation.arguments_value() {
+            Ok(arguments) => self.resolve_delegate_result(session_id, &invocation, &arguments),
+            Err(error) => ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                error.to_string(),
+            ),
+        };
+        ToolExecutionRecord {
+            invocation,
+            result,
+            started_at_ms,
+            ended_at_ms: now_ms(),
+        }
+    }
+
+    fn resolve_delegate_result(
+        &self,
+        session_id: &str,
+        invocation: &ToolInvocation,
+        arguments: &Value,
+    ) -> ToolResult {
+        if let Err(error) = self
+            .tools
+            .schemas()
+            .validate_arguments(&invocation.name, arguments)
+        {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                error.to_string(),
+            );
+        }
+        if invocation.name == "submit_delegate_result" {
+            for path in arguments
+                .get("artifact_paths")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                if let Err(error) = self.sandbox.resolve(session_id, path, SandboxAccess::Read) {
+                    return ToolResult::failed(
+                        &invocation.tool_call_id,
+                        &invocation.name,
+                        error.to_string(),
+                    );
+                }
+            }
+            let content = json!({
+                "summary": arguments.get("summary").and_then(Value::as_str).unwrap_or_default(),
+                "findings": arguments.get("findings").cloned().unwrap_or_else(|| json!([])),
+                "changedFiles": arguments.get("changed_files").or_else(|| arguments.get("changedFiles")).cloned().unwrap_or_else(|| json!([])),
+                "artifactPaths": arguments.get("artifact_paths").or_else(|| arguments.get("artifactPaths")).cloned().unwrap_or_else(|| json!([])),
+                "risks": arguments.get("risks").cloned().unwrap_or_else(|| json!([])),
+                "nextSteps": arguments.get("next_steps").or_else(|| arguments.get("nextSteps")).cloned().unwrap_or_else(|| json!([]))
+            });
+            return ToolResult {
+                tool_call_id: invocation.tool_call_id.clone(),
+                tool_name: invocation.name.clone(),
+                is_error: false,
+                content_json: content.to_string(),
+                summary: "Delegate result submitted".to_string(),
+                artifacts_json: "[]".to_string(),
+                trust_level: "trusted".to_string(),
+                truncated: false,
+                offloaded_file_id: String::new(),
+                offloaded_path: String::new(),
+                context_stub: content.to_string(),
+            };
+        }
+
+        let delegate_session_id = new_id("delegate_session");
+        let content = json!({
+            "delegateSessionId": delegate_session_id,
+            "status": "awaiting_submit_delegate_result",
+            "task": arguments.get("task").and_then(Value::as_str).unwrap_or_default(),
+            "delegateTaskDisabledInChild": true
+        });
+        ToolResult {
+            tool_call_id: invocation.tool_call_id.clone(),
+            tool_name: invocation.name.clone(),
+            is_error: false,
+            content_json: content.to_string(),
+            summary: "Delegate session created".to_string(),
+            artifacts_json: "[]".to_string(),
+            trust_level: "trusted".to_string(),
+            truncated: false,
+            offloaded_file_id: String::new(),
+            offloaded_path: String::new(),
+            context_stub: content.to_string(),
+        }
     }
 
     async fn execute_view_image_tool(
@@ -2949,6 +3500,7 @@ impl RuntimeEngine {
             turn_id: String::new(),
             snapshot,
             markdown_render_update: MarkdownRenderUpdate::default(),
+            platform_request: PlatformRequest::default(),
             error_code,
             message,
         };
@@ -2987,6 +3539,7 @@ impl RuntimeEngine {
             turn_id,
             snapshot,
             markdown_render_update: MarkdownRenderUpdate::default(),
+            platform_request: PlatformRequest::default(),
             error_code,
             message: error_message,
         };
@@ -3057,6 +3610,37 @@ impl RuntimeEngine {
             turn_id,
             snapshot,
             markdown_render_update,
+            platform_request: PlatformRequest::default(),
+            error_code: String::new(),
+            message: String::new(),
+        };
+
+        self.sender
+            .try_send(event)
+            .map_err(|error| HamburError::Internal(format!("event queue: {error}")))
+    }
+
+    fn emit_platform_request_event(
+        &self,
+        request: PlatformRequest,
+        snapshot: AppSnapshot,
+    ) -> HamburResult<()> {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return Err(HamburError::RuntimeClosed);
+        }
+
+        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
+        let event = RuntimeEvent {
+            event_id: new_id("evt"),
+            schema_version: DTO_SCHEMA_VERSION,
+            sequence,
+            created_at_ms: now_ms(),
+            kind: RuntimeEventKind::PlatformRequest,
+            session_id: request.session_id.clone(),
+            turn_id: request.turn_id.clone(),
+            snapshot,
+            markdown_render_update: MarkdownRenderUpdate::default(),
+            platform_request: request,
             error_code: String::new(),
             message: String::new(),
         };
@@ -3239,6 +3823,17 @@ fn validate_command(command: &RuntimeCommand) -> HamburResult<()> {
             }
             Ok(())
         }
+        "SubmitPlatformResult" => {
+            if command.message_id.is_empty()
+                && config_payload_string(&command.payload_json, "requestId").is_empty()
+            {
+                return Err(HamburError::InvalidCommand(
+                    "request_id must not be empty".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        "RunRootfsWarmup" | "ResetRootfs" => Ok(()),
         "AppendMarkdownDelta" | "MarkdownRenderUpdate" => {
             require_session_id(command)?;
             if command.message_id.is_empty() {
@@ -5213,6 +5808,183 @@ mod tests {
                 .config_audits
                 .iter()
                 .any(|audit| audit.action == "UpdateStartupTask" && audit.approval_required)
+        );
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
+    fn milestone7_session_search_tool_uses_database_matches() {
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+        let alpha = runtime.create_session("Alpha Project".to_string());
+        assert!(alpha.accepted);
+        let _ = runtime.next_event().expect("alpha event");
+        let beta = runtime.create_session("Beta Research".to_string());
+        assert!(beta.accepted);
+        let _ = runtime.next_event().expect("beta event");
+        configure_test_provider(&runtime, "gpt-tools");
+
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
+            "{\"index\":0,\"id\":\"call_search\",\"function\":{\"name\":\"session_search\",\"arguments\":\"{\\\"query\\\":\\\"Alpha\\\",\\\"limit\\\":5}\"}}",
+            "]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let send = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_m7_session_search".to_string(),
+            idempotency_key: "message:m7:session-search".to_string(),
+            kind: "SendMessage".to_string(),
+            session_id: runtime.get_session_list_snapshot(10, 0).selected_session_id,
+            content: "search old sessions".to_string(),
+            payload_json: serde_json::json!({"sse": sse}).to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(send.accepted, "send rejected: {}", send.message);
+        wait_for_event(&runtime, "TurnFinished");
+
+        let snapshot = runtime.get_session_list_snapshot(10, 0);
+        let selected = snapshot.selected_session_id;
+        let timeline = runtime.get_timeline_page(selected, 0, 50);
+        let continuation = timeline
+            .items
+            .iter()
+            .rev()
+            .find(|item| item.kind == "AssistantMessage")
+            .expect("assistant continuation");
+        let message = runtime
+            .get_message_snapshot(continuation.payload_ref.clone())
+            .message
+            .expect("message");
+        assert!(message.content_text.contains("Alpha Project"));
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
+    fn milestone7_browser_use_waits_for_submit_platform_result() {
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+        let session_id = create_test_session(&runtime);
+        configure_test_provider(&runtime, "gpt-browser");
+
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
+            "{\"index\":0,\"id\":\"call_browser\",\"function\":{\"name\":\"browser_use\",\"arguments\":\"{\\\"action\\\":\\\"get_text\\\",\\\"url\\\":\\\"https://example.test\\\",\\\"timeout_ms\\\":5000}\"}}",
+            "]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let send = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_m7_browser".to_string(),
+            idempotency_key: "message:m7:browser".to_string(),
+            kind: "SendMessage".to_string(),
+            session_id: session_id.clone(),
+            content: "read page".to_string(),
+            payload_json: serde_json::json!({"sse": sse}).to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(send.accepted, "send rejected: {}", send.message);
+
+        let platform_request = loop {
+            let event = runtime.next_event().expect("event");
+            if event.kind.as_str() == "PlatformRequest" {
+                break event.platform_request;
+            }
+        };
+        assert_eq!(platform_request.kind, "BrowserAction");
+        assert_eq!(platform_request.session_id, session_id);
+        assert!(platform_request.payload_json.contains("call_browser"));
+
+        let submit = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_m7_submit_browser".to_string(),
+            idempotency_key: "platform:m7:browser:result".to_string(),
+            kind: "SubmitPlatformResult".to_string(),
+            message_id: platform_request.request_id,
+            payload_json: serde_json::json!({
+                "payloadJson": {"text": "Example Domain", "url": "https://example.test"},
+                "isError": false
+            })
+            .to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(submit.accepted);
+        wait_for_event(&runtime, "TurnFinished");
+
+        let timeline = runtime.get_timeline_page(session_id, 0, 50);
+        let continuation = timeline
+            .items
+            .iter()
+            .rev()
+            .find(|item| item.kind == "AssistantMessage")
+            .expect("assistant continuation");
+        let message = runtime
+            .get_message_snapshot(continuation.payload_ref.clone())
+            .message
+            .expect("message");
+        assert!(message.content_text.contains("Example Domain"));
+        assert!(message.content_text.contains("<untrusted_tool_result"));
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
+    fn milestone7_delegate_submit_rejects_artifact_path_escape() {
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+        let session_id = create_test_session(&runtime);
+        configure_test_provider(&runtime, "gpt-delegate");
+
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
+            "{\"index\":0,\"id\":\"call_delegate_submit\",\"function\":{\"name\":\"submit_delegate_result\",\"arguments\":\"{\\\"summary\\\":\\\"done\\\",\\\"artifact_paths\\\":[\\\"/var/hambur/workspace/../memory/MEMORY.md\\\"]}\"}}",
+            "]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let send = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_m7_delegate_escape".to_string(),
+            idempotency_key: "message:m7:delegate-escape".to_string(),
+            kind: "SendMessage".to_string(),
+            session_id: session_id.clone(),
+            content: "delegate submit".to_string(),
+            payload_json: serde_json::json!({"sse": sse}).to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(send.accepted, "send rejected: {}", send.message);
+        wait_for_event(&runtime, "TurnFinished");
+
+        let timeline = runtime.get_timeline_page(session_id, 0, 50);
+        let continuation = timeline
+            .items
+            .iter()
+            .rev()
+            .find(|item| item.kind == "AssistantMessage")
+            .expect("assistant continuation");
+        let message = runtime
+            .get_message_snapshot(continuation.payload_ref.clone())
+            .message
+            .expect("message");
+        assert!(
+            message
+                .content_text
+                .contains("sandbox path must not escape")
         );
 
         let _ = fs::remove_dir_all(app_files_dir);

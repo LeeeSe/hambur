@@ -77,6 +77,146 @@ impl ToolSchemaCompiler {
                 "additionalProperties": false
             }),
         })?;
+        compiler.register(ToolSchema {
+            name: "terminal".to_string(),
+            description: "Run a foreground terminal command inside the Hambur sandbox.".to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "cwd": {"type": "string"},
+                    "timeout_ms": {"type": "integer", "minimum": 1000, "maximum": 300000},
+                    "background": {"type": "boolean"}
+                },
+                "required": ["command"],
+                "additionalProperties": false
+            }),
+        })?;
+        compiler.register(ToolSchema {
+            name: "process".to_string(),
+            description: "Manage a sandbox-scoped background process session.".to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "poll", "log", "wait", "kill", "write", "submit", "close"]
+                    },
+                    "process_session_id": {"type": "string"},
+                    "input": {"type": "string"},
+                    "timeout_ms": {"type": "integer", "minimum": 1000, "maximum": 300000}
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+        })?;
+        compiler.register(ToolSchema {
+            name: "web_search".to_string(),
+            description: "Search the web using the configured Hambur web provider.".to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 10},
+                    "fetch_content": {"type": "boolean"}
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+        })?;
+        compiler.register(ToolSchema {
+            name: "web_fetch".to_string(),
+            description: "Fetch up to five URLs through the configured Hambur web provider."
+                .to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "properties": {
+                    "urls": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "maxItems": 5
+                    },
+                    "max_bytes": {"type": "integer", "minimum": 1024, "maximum": 10000000}
+                },
+                "required": ["urls"],
+                "additionalProperties": false
+            }),
+        })?;
+        compiler.register(ToolSchema {
+            name: "browser_use".to_string(),
+            description: "Schedule an Android WebView browser action through a platform request."
+                .to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "navigate",
+                            "screenshot",
+                            "click",
+                            "type",
+                            "get_text",
+                            "scroll",
+                            "get_page_info",
+                            "execute_js",
+                            "find_elements",
+                            "hover",
+                            "get_readable",
+                            "get_backbone",
+                            "fetch",
+                            "get_cookies",
+                            "scroll_and_collect",
+                            "wait_for_dom_stable"
+                        ]
+                    },
+                    "url": {"type": "string"},
+                    "selector": {"type": "string"},
+                    "text": {"type": "string"},
+                    "script": {"type": "string"},
+                    "timeout_ms": {"type": "integer", "minimum": 1000, "maximum": 120000}
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+        })?;
+        compiler.register(ToolSchema {
+            name: "delegate_task".to_string(),
+            description: "Create an isolated Hambur delegate session for a bounded subtask."
+                .to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string"},
+                    "toolsets": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 8
+                    },
+                    "timeout_ms": {"type": "integer", "minimum": 1000, "maximum": 600000}
+                },
+                "required": ["task"],
+                "additionalProperties": false
+            }),
+        })?;
+        compiler.register(ToolSchema {
+            name: "submit_delegate_result".to_string(),
+            description: "Submit the structured result from a delegate session.".to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string"},
+                    "findings": {"type": "array", "items": {"type": "string"}},
+                    "changed_files": {"type": "array", "items": {"type": "string"}},
+                    "artifact_paths": {"type": "array", "items": {"type": "string"}},
+                    "risks": {"type": "array", "items": {"type": "string"}},
+                    "next_steps": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["summary"],
+                "additionalProperties": false
+            }),
+        })?;
         Ok(compiler)
     }
 
@@ -420,6 +560,10 @@ impl ToolScheduler {
         self
     }
 
+    pub fn normalize_raw(&self, raw: RawToolOutput) -> HamburResult<ToolResult> {
+        self.normalizer.normalize(raw)
+    }
+
     pub async fn execute_batch(
         &self,
         batch: ToolCallBatch,
@@ -597,6 +741,49 @@ fn run_builtin_tool(invocation: &ToolInvocation, arguments: &Value) -> RawToolOu
             command_or_url: invocation.arguments_json.clone(),
             status: "CapabilityMismatch".to_string(),
         },
+        "terminal" | "process" => RawToolOutput {
+            tool_call_id: invocation.tool_call_id.clone(),
+            tool_name: invocation.name.clone(),
+            is_error: true,
+            content: format!(
+                "{} requires the runtime SandboxService and rootfs lifecycle",
+                invocation.name
+            ),
+            summary: "Sandbox tool unavailable".to_string(),
+            trust_level: "trusted".to_string(),
+            command_or_url: invocation.arguments_json.clone(),
+            status: "ToolUnavailable".to_string(),
+        },
+        "browser_use" => RawToolOutput {
+            tool_call_id: invocation.tool_call_id.clone(),
+            tool_name: invocation.name.clone(),
+            is_error: true,
+            content: "browser_use requires an Android platform BrowserAction request".to_string(),
+            summary: "Browser platform adapter unavailable".to_string(),
+            trust_level: "trusted".to_string(),
+            command_or_url: invocation.arguments_json.clone(),
+            status: "PlatformRequestUnavailable".to_string(),
+        },
+        "web_search" | "web_fetch" => RawToolOutput {
+            tool_call_id: invocation.tool_call_id.clone(),
+            tool_name: invocation.name.clone(),
+            is_error: true,
+            content: "web tools require configured provider credentials".to_string(),
+            summary: "Web provider unavailable".to_string(),
+            trust_level: "untrusted".to_string(),
+            command_or_url: invocation.arguments_json.clone(),
+            status: "ProviderUnavailable".to_string(),
+        },
+        "delegate_task" | "submit_delegate_result" => RawToolOutput {
+            tool_call_id: invocation.tool_call_id.clone(),
+            tool_name: invocation.name.clone(),
+            is_error: true,
+            content: format!("{} requires DelegateAgentService", invocation.name),
+            summary: "Delegate service unavailable".to_string(),
+            trust_level: "trusted".to_string(),
+            command_or_url: invocation.arguments_json.clone(),
+            status: "ToolUnavailable".to_string(),
+        },
         _ => RawToolOutput {
             tool_call_id: invocation.tool_call_id.clone(),
             tool_name: invocation.name.clone(),
@@ -646,13 +833,71 @@ fn display_title(name: &str, arguments_json: &str) -> String {
                 format!("View image: {path}")
             }
         }
+        "terminal" => "Run terminal command".to_string(),
+        "process" => {
+            let action = serde_json::from_str::<Value>(arguments_json)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("action")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            if action.is_empty() {
+                "Process control".to_string()
+            } else {
+                format!("Process: {action}")
+            }
+        }
+        "web_search" => {
+            let query = serde_json::from_str::<Value>(arguments_json)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("query")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            if query.is_empty() {
+                "Search web".to_string()
+            } else {
+                format!("Search web: {query}")
+            }
+        }
+        "web_fetch" => "Fetch web URLs".to_string(),
+        "browser_use" => {
+            let action = serde_json::from_str::<Value>(arguments_json)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("action")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            if action.is_empty() {
+                "Use browser".to_string()
+            } else {
+                format!("Browser: {action}")
+            }
+        }
+        "delegate_task" => "Delegate task".to_string(),
+        "submit_delegate_result" => "Submit delegate result".to_string(),
         _ => name.replace('_', " "),
     }
 }
 
 fn risk_level(name: &str) -> String {
     match name {
-        "write_file" | "patch" | "terminal" | "process" | "hambur_config" => "high",
+        "write_file"
+        | "patch"
+        | "terminal"
+        | "process"
+        | "hambur_config"
+        | "delegate_task"
+        | "submit_delegate_result" => "high",
         "web_search" | "web_fetch" | "browser_use" => "medium",
         _ => "low",
     }
@@ -667,6 +912,7 @@ fn timeout_ms(name: &str) -> u64 {
     match name {
         "terminal" | "process" => 120_000,
         "web_search" | "web_fetch" | "browser_use" => 60_000,
+        "delegate_task" => 600_000,
         _ => 30_000,
     }
 }
@@ -678,6 +924,7 @@ fn is_parallel_tool(name: &str) -> bool {
             | "web_fetch"
             | "read_file"
             | "search_files"
+            | "terminal"
             | "session_search"
             | "skills_list"
             | "skill_view"
@@ -767,6 +1014,12 @@ mod tests {
         let value: Value = serde_json::from_str(&json).expect("tools json");
         assert!(value.as_array().expect("array").len() >= 2);
         assert!(json.contains("get_current_time"));
+        assert!(json.contains("terminal"));
+        assert!(json.contains("browser_use"));
+        assert!(json.contains("delegate_task"));
+        assert!(json.contains("submit_delegate_result"));
+        assert!(json.contains("web_search"));
+        assert!(json.contains("web_fetch"));
     }
 
     #[test]

@@ -10,7 +10,7 @@ use hambur_markdown::{
     MarkdownBlockNode, MarkdownInlineNode, MarkdownRenderUpdate, MarkdownTableRow,
 };
 use hambur_runtime::{
-    AppBootstrap, RuntimeCommand, RuntimeCommandAck, RuntimeEngine, RuntimeEvent,
+    AppBootstrap, PlatformRequest, RuntimeCommand, RuntimeCommandAck, RuntimeEngine, RuntimeEvent,
     RuntimeMessageSnapshot, RuntimeSearchSnapshot, RuntimeSessionListSnapshot,
     RuntimeSessionSnapshot, RuntimeSettingsSnapshot, RuntimeTimelinePage,
 };
@@ -59,8 +59,19 @@ pub struct BackendEvent {
     pub turn_id: String,
     pub snapshot: AppSnapshotDTO,
     pub markdown_render_update: MarkdownRenderUpdateDTO,
+    pub platform_request: PlatformRequestDTO,
     pub error_code: String,
     pub message: String,
+}
+
+pub struct PlatformRequestDTO {
+    pub request_id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub kind: String,
+    pub payload_json: String,
+    pub timeout_ms: u64,
+    pub cancellable: bool,
 }
 
 pub struct MarkdownInlineNodeDTO {
@@ -446,8 +457,23 @@ impl From<RuntimeEvent> for BackendEvent {
             turn_id: value.turn_id,
             snapshot: value.snapshot.into(),
             markdown_render_update: value.markdown_render_update.into(),
+            platform_request: value.platform_request.into(),
             error_code: value.error_code,
             message: value.message,
+        }
+    }
+}
+
+impl From<PlatformRequest> for PlatformRequestDTO {
+    fn from(value: PlatformRequest) -> Self {
+        Self {
+            request_id: value.request_id,
+            session_id: value.session_id,
+            turn_id: value.turn_id,
+            kind: value.kind,
+            payload_json: value.payload_json,
+            timeout_ms: value.timeout_ms,
+            cancellable: value.cancellable,
         }
     }
 }

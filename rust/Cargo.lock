@@ -749,6 +749,7 @@ dependencies = [
  "hambur-filestore",
  "hambur-llm",
  "hambur-markdown",
+ "hambur-sandbox",
  "hambur-tools",
  "serde_json",
  "tokio",

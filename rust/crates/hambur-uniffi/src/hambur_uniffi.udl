@@ -44,8 +44,19 @@ dictionary BackendEvent {
     string turn_id;
     AppSnapshotDTO snapshot;
     MarkdownRenderUpdateDTO markdown_render_update;
+    PlatformRequestDTO platform_request;
     string error_code;
     string message;
+};
+
+dictionary PlatformRequestDTO {
+    string request_id;
+    string session_id;
+    string turn_id;
+    string kind;
+    string payload_json;
+    u64 timeout_ms;
+    boolean cancellable;
 };
 
 dictionary MarkdownInlineNodeDTO {

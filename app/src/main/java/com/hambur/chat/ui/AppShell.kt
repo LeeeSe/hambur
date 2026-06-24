@@ -4,6 +4,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.heightIn
@@ -18,6 +19,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -43,7 +45,14 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.hambur.chat.reducer.HamburUiStore
+import com.hambur.chat.reducer.UiAppSetting
+import com.hambur.chat.reducer.UiConfigAudit
+import com.hambur.chat.reducer.UiDefaultModelGroupSettings
+import com.hambur.chat.reducer.UiModelGroupMemberSettings
+import com.hambur.chat.reducer.UiModelGroupSettings
 import com.hambur.chat.reducer.UiPendingAttachment
+import com.hambur.chat.reducer.UiProviderModelSettings
+import com.hambur.chat.reducer.UiProviderSettings
 import com.hambur.chat.reducer.UiSessionSummary
 import com.hambur.chat.reducer.UiTimelineItem
 import com.hambur.chat.uniffi.MarkdownBlockNodeDto
@@ -55,6 +64,7 @@ fun AppShell(appFilesDir: String) {
     val state by store.state.collectAsState()
     var draftTitle by rememberSaveable { mutableStateOf("") }
     var draftMessage by rememberSaveable { mutableStateOf("") }
+    var showSettings by rememberSaveable { mutableStateOf(false) }
 
     DisposableEffect(store) {
         onDispose { store.shutdown() }
@@ -132,6 +142,26 @@ fun AppShell(appFilesDir: String) {
                         onRemoveAttachment = { attachmentId ->
                             store.removePendingAttachment(state.selectedSessionId, attachmentId)
                         },
+                    )
+
+                    SettingsPanel(
+                        expanded = showSettings,
+                        onExpandedChange = { showSettings = it },
+                        providers = state.providers,
+                        providerModels = state.providerModels,
+                        modelGroups = state.modelGroups,
+                        modelGroupMembers = state.modelGroupMembers,
+                        defaultModelGroups = state.defaultModelGroups,
+                        appSettings = state.appSettings,
+                        configAudits = state.configAudits,
+                        onSaveProvider = store::saveProvider,
+                        onDeleteProvider = store::deleteProvider,
+                        onRefreshModels = store::refreshProviderModels,
+                        onSaveModelOverride = store::saveModelOverride,
+                        onSaveModelGroup = store::saveModelGroup,
+                        onAddModelGroupMember = store::addModelGroupMember,
+                        onSetDefaultModelGroup = store::setDefaultModelGroup,
+                        onSaveAppSetting = store::saveAppSetting,
                     )
 
                     TimelineSnapshot(
@@ -270,6 +300,436 @@ private fun PendingAttachmentRow(
                 Text("Remove")
             }
         }
+    }
+}
+
+@Composable
+private fun SettingsPanel(
+    expanded: Boolean,
+    onExpandedChange: (Boolean) -> Unit,
+    providers: List<UiProviderSettings>,
+    providerModels: List<UiProviderModelSettings>,
+    modelGroups: List<UiModelGroupSettings>,
+    modelGroupMembers: List<UiModelGroupMemberSettings>,
+    defaultModelGroups: List<UiDefaultModelGroupSettings>,
+    appSettings: List<UiAppSetting>,
+    configAudits: List<UiConfigAudit>,
+    onSaveProvider: (String, String, String, String, Boolean) -> Unit,
+    onDeleteProvider: (String, Boolean) -> Unit,
+    onRefreshModels: (String, String) -> Unit,
+    onSaveModelOverride: (String, String, String, Boolean, Boolean, Boolean, UInt, UInt) -> Unit,
+    onSaveModelGroup: (String, String, String, String) -> Unit,
+    onAddModelGroupMember: (String, String, String, UInt, Boolean) -> Unit,
+    onSetDefaultModelGroup: (String, String) -> Unit,
+    onSaveAppSetting: (String, String, Boolean) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = "Settings",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+            TextButton(onClick = { onExpandedChange(!expanded) }) {
+                Text(if (expanded) "Hide" else "Open")
+            }
+        }
+        if (!expanded) {
+            Text(
+                text = "${providers.size} providers, ${modelGroups.size} groups",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            return
+        }
+
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(max = 340.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            item {
+                ProviderSettingsSection(
+                    providers = providers,
+                    providerModels = providerModels,
+                    onSaveProvider = onSaveProvider,
+                    onDeleteProvider = onDeleteProvider,
+                    onRefreshModels = onRefreshModels,
+                    onSaveModelOverride = onSaveModelOverride,
+                )
+            }
+            item {
+                ModelGroupSettingsSection(
+                    providers = providers,
+                    providerModels = providerModels,
+                    modelGroups = modelGroups,
+                    modelGroupMembers = modelGroupMembers,
+                    defaultModelGroups = defaultModelGroups,
+                    onSaveModelGroup = onSaveModelGroup,
+                    onAddModelGroupMember = onAddModelGroupMember,
+                    onSetDefaultModelGroup = onSetDefaultModelGroup,
+                )
+            }
+            item {
+                AppSettingsSection(
+                    appSettings = appSettings,
+                    onSaveAppSetting = onSaveAppSetting,
+                )
+            }
+            item {
+                ConfigAuditSection(configAudits = configAudits)
+            }
+        }
+    }
+}
+
+@Composable
+private fun ProviderSettingsSection(
+    providers: List<UiProviderSettings>,
+    providerModels: List<UiProviderModelSettings>,
+    onSaveProvider: (String, String, String, String, Boolean) -> Unit,
+    onDeleteProvider: (String, Boolean) -> Unit,
+    onRefreshModels: (String, String) -> Unit,
+    onSaveModelOverride: (String, String, String, Boolean, Boolean, Boolean, UInt, UInt) -> Unit,
+) {
+    var providerId by rememberSaveable { mutableStateOf("") }
+    var name by rememberSaveable { mutableStateOf("OpenAI Compatible") }
+    var baseUrl by rememberSaveable { mutableStateOf("https://api.openai.com/v1") }
+    var secretRef by rememberSaveable { mutableStateOf("android-secret://providers/default-openai-compatible") }
+    var enabled by rememberSaveable { mutableStateOf(true) }
+    var modelId by rememberSaveable { mutableStateOf("hambur-openai-compatible-text") }
+    var deleteApproved by rememberSaveable { mutableStateOf(false) }
+
+    SettingsSurface {
+        Text(
+            text = "Providers",
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.SemiBold,
+        )
+        providers.take(4).forEach { provider ->
+            SettingsSummaryRow(
+                label = provider.name,
+                value = "${provider.baseUrl} / ${provider.secretLabel}",
+            )
+        }
+        OutlinedTextField(
+            value = providerId,
+            onValueChange = { providerId = it },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            label = { Text("Provider id") },
+        )
+        OutlinedTextField(
+            value = name,
+            onValueChange = { name = it },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            label = { Text("Name") },
+        )
+        OutlinedTextField(
+            value = baseUrl,
+            onValueChange = { baseUrl = it },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            label = { Text("Base URL") },
+        )
+        OutlinedTextField(
+            value = secretRef,
+            onValueChange = { secretRef = it },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            label = { Text("Secret ref") },
+        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Checkbox(checked = enabled, onCheckedChange = { enabled = it })
+            Text("Enabled", style = MaterialTheme.typography.bodySmall)
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(
+                onClick = { onSaveProvider(providerId, name, baseUrl, secretRef, enabled) },
+                enabled = baseUrl.isNotBlank() && secretRef.isNotBlank(),
+            ) {
+                Text("Save")
+            }
+            TextButton(
+                onClick = { onDeleteProvider(providerId, deleteApproved) },
+                enabled = providerId.isNotBlank() && deleteApproved,
+            ) {
+                Text("Delete")
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Checkbox(checked = deleteApproved, onCheckedChange = { deleteApproved = it })
+                Text("Approve", style = MaterialTheme.typography.bodySmall)
+            }
+        }
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            OutlinedTextField(
+                value = modelId,
+                onValueChange = { modelId = it },
+                modifier = Modifier.weight(1f),
+                singleLine = true,
+                label = { Text("Model id") },
+            )
+            TextButton(
+                onClick = { onRefreshModels(providerId, modelId) },
+                enabled = providerId.isNotBlank(),
+            ) {
+                Text("Refresh")
+            }
+        }
+        providerModels.take(5).forEach { model ->
+            SettingsSummaryRow(
+                label = model.modelId,
+                value = "ctx ${model.contextLimit}, image ${model.supportsImageInput}",
+            )
+        }
+        TextButton(
+            onClick = {
+                onSaveModelOverride(
+                    providerId,
+                    modelId,
+                    modelId,
+                    true,
+                    true,
+                    modelId.contains("vision", ignoreCase = true),
+                    32000u,
+                    4096u,
+                )
+            },
+            enabled = providerId.isNotBlank() && modelId.isNotBlank(),
+        ) {
+            Text("Save override")
+        }
+    }
+}
+
+@Composable
+private fun ModelGroupSettingsSection(
+    providers: List<UiProviderSettings>,
+    providerModels: List<UiProviderModelSettings>,
+    modelGroups: List<UiModelGroupSettings>,
+    modelGroupMembers: List<UiModelGroupMemberSettings>,
+    defaultModelGroups: List<UiDefaultModelGroupSettings>,
+    onSaveModelGroup: (String, String, String, String) -> Unit,
+    onAddModelGroupMember: (String, String, String, UInt, Boolean) -> Unit,
+    onSetDefaultModelGroup: (String, String) -> Unit,
+) {
+    var groupId by rememberSaveable { mutableStateOf("grp_primary_chat") }
+    var groupName by rememberSaveable { mutableStateOf("Primary Chat") }
+    var defaultKey by rememberSaveable { mutableStateOf("primary") }
+    var providerId by rememberSaveable { mutableStateOf("") }
+    var modelId by rememberSaveable { mutableStateOf("") }
+
+    SettingsSurface {
+        Text(
+            text = "Model groups",
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.SemiBold,
+        )
+        modelGroups.take(4).forEach { group ->
+            SettingsSummaryRow(label = group.id, value = "${group.name} / ${group.routingStrategy}")
+        }
+        defaultModelGroups.take(4).forEach { default ->
+            SettingsSummaryRow(label = "default ${default.key}", value = default.groupId)
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedTextField(
+                value = groupId,
+                onValueChange = { groupId = it },
+                modifier = Modifier.weight(1f),
+                singleLine = true,
+                label = { Text("Group id") },
+            )
+            OutlinedTextField(
+                value = groupName,
+                onValueChange = { groupName = it },
+                modifier = Modifier.weight(1f),
+                singleLine = true,
+                label = { Text("Name") },
+            )
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(
+                onClick = { onSaveModelGroup(groupId, groupName, "fallback", "default") },
+                enabled = groupId.isNotBlank(),
+            ) {
+                Text("Save group")
+            }
+            TextButton(
+                onClick = { onSetDefaultModelGroup(defaultKey, groupId) },
+                enabled = groupId.isNotBlank() && defaultKey.isNotBlank(),
+            ) {
+                Text("Set default")
+            }
+        }
+        OutlinedTextField(
+            value = defaultKey,
+            onValueChange = { defaultKey = it },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            label = { Text("Default key") },
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedTextField(
+                value = providerId,
+                onValueChange = { providerId = it },
+                modifier = Modifier.weight(1f),
+                singleLine = true,
+                label = { Text("Provider id") },
+            )
+            OutlinedTextField(
+                value = modelId,
+                onValueChange = { modelId = it },
+                modifier = Modifier.weight(1f),
+                singleLine = true,
+                label = { Text("Model id") },
+            )
+        }
+        TextButton(
+            onClick = { onAddModelGroupMember(groupId, providerId, modelId, 0u, true) },
+            enabled = groupId.isNotBlank() && providerId.isNotBlank() && modelId.isNotBlank(),
+        ) {
+            Text("Add member")
+        }
+        modelGroupMembers.take(5).forEach { member ->
+            SettingsSummaryRow(
+                label = member.groupId,
+                value = "${member.providerName.ifBlank { member.providerId }} / ${member.modelDisplayName}",
+            )
+        }
+        if (providers.isNotEmpty() && providerModels.isNotEmpty()) {
+            Text(
+                text = "Known: ${providers.first().id} / ${providerModels.first().modelId}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+@Composable
+private fun AppSettingsSection(
+    appSettings: List<UiAppSetting>,
+    onSaveAppSetting: (String, String, Boolean) -> Unit,
+) {
+    var key by rememberSaveable { mutableStateOf("tool_settings") }
+    var value by rememberSaveable { mutableStateOf("""{"enabled":true}""") }
+    var approved by rememberSaveable { mutableStateOf(false) }
+    SettingsSurface {
+        Text(
+            text = "Tools, skills, memory, startup, rootfs",
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.SemiBold,
+        )
+        appSettings.take(5).forEach { setting ->
+            SettingsSummaryRow(label = setting.key, value = setting.value)
+        }
+        OutlinedTextField(
+            value = key,
+            onValueChange = { key = it },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            label = { Text("Setting key") },
+        )
+        OutlinedTextField(
+            value = value,
+            onValueChange = { value = it },
+            modifier = Modifier.fillMaxWidth(),
+            minLines = 2,
+            maxLines = 4,
+            label = { Text("JSON") },
+        )
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Button(
+                onClick = { onSaveAppSetting(key, value, approved) },
+                enabled = key.isNotBlank() && value.isNotBlank(),
+            ) {
+                Text("Save setting")
+            }
+            Checkbox(checked = approved, onCheckedChange = { approved = it })
+            Text("Approve dangerous", style = MaterialTheme.typography.bodySmall)
+        }
+    }
+}
+
+@Composable
+private fun ConfigAuditSection(configAudits: List<UiConfigAudit>) {
+    SettingsSurface {
+        Text(
+            text = "Config audit",
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.SemiBold,
+        )
+        if (configAudits.isEmpty()) {
+            Text(
+                text = "No config changes",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        } else {
+            configAudits.take(6).forEach { audit ->
+                SettingsSummaryRow(
+                    label = audit.action,
+                    value = "${audit.targetKind}:${audit.targetId} ${audit.redactedSummary}",
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsSurface(content: @Composable ColumnScope.() -> Unit) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(8.dp),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+        color = MaterialTheme.colorScheme.surface,
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+            content = content,
+        )
+    }
+}
+
+@Composable
+private fun SettingsSummaryRow(label: String, value: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.secondary,
+            modifier = Modifier.width(116.dp),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.weight(1f),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 

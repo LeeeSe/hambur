@@ -141,6 +141,92 @@ dictionary AppSnapshotDTO {
     sequence<AttachmentDTO> pending_attachments;
 };
 
+dictionary PublicProviderDTO {
+    string id;
+    string name;
+    string icon_name;
+    string api_type;
+    string base_url;
+    string secret_label;
+    boolean enabled;
+    u64 created_at_ms;
+    u64 updated_at_ms;
+};
+
+dictionary ProviderModelDTO {
+    string id;
+    string provider_id;
+    string model_id;
+    string display_name;
+    boolean supports_tool_call;
+    boolean supports_reasoning;
+    boolean supports_image_input;
+    boolean supports_structured_output;
+    boolean supports_temperature;
+    u32 context_limit;
+    u32 output_limit;
+    string reasoning_field;
+    string metadata_json;
+    u64 synced_at_ms;
+};
+
+dictionary ModelGroupDTO {
+    string id;
+    string name;
+    string routing_strategy;
+    string fallback_policy;
+    u64 created_at_ms;
+    u64 updated_at_ms;
+};
+
+dictionary ModelGroupMemberDTO {
+    string id;
+    string group_id;
+    string provider_id;
+    string provider_name;
+    string model_id;
+    string model_display_name;
+    u32 position;
+    boolean enabled;
+};
+
+dictionary DefaultModelGroupDTO {
+    string key;
+    string group_id;
+    u64 updated_at_ms;
+};
+
+dictionary AppSettingDTO {
+    string key;
+    string value;
+    u64 updated_at_ms;
+};
+
+dictionary ConfigAuditDTO {
+    string id;
+    string command_id;
+    string actor;
+    string action;
+    string target_kind;
+    string target_id;
+    string redacted_summary;
+    boolean approval_required;
+    string approval_token;
+    u64 created_at_ms;
+};
+
+dictionary SettingsSnapshotDTO {
+    u64 snapshot_sequence;
+    u64 created_at_ms;
+    sequence<PublicProviderDTO> providers;
+    sequence<ProviderModelDTO> provider_models;
+    sequence<ModelGroupDTO> model_groups;
+    sequence<ModelGroupMemberDTO> model_group_members;
+    sequence<DefaultModelGroupDTO> default_model_groups;
+    sequence<AppSettingDTO> settings;
+    sequence<ConfigAuditDTO> config_audits;
+};
+
 dictionary SessionListSnapshotDTO {
     u64 snapshot_sequence;
     u64 created_at_ms;
@@ -205,6 +291,7 @@ interface BackendRuntime {
     TimelinePageDTO get_timeline_page(string session_id, u64 before_cursor, u32 limit);
     MessageSnapshotDTO get_message_snapshot(string message_id);
     SearchSnapshotDTO search_sessions(string query, u32 limit);
+    SettingsSnapshotDTO get_settings_snapshot();
     CommandAck create_session(string title);
     CommandAck open_session(string session_id);
     CommandAck delete_session(string session_id);

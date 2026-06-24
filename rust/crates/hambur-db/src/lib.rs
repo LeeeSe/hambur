@@ -284,6 +284,19 @@ pub struct ProviderRecord {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PublicProviderRecord {
+    pub id: String,
+    pub name: String,
+    pub icon_name: String,
+    pub api_type: String,
+    pub base_url: String,
+    pub secret_label: String,
+    pub enabled: bool,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProviderModelUpsert {
     pub model_id: String,
     pub display_name: String,
@@ -314,6 +327,83 @@ pub struct ProviderModelRecord {
     pub reasoning_field: String,
     pub metadata_json: String,
     pub synced_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderModelOverride {
+    pub provider_id: String,
+    pub model_id: String,
+    pub display_name: String,
+    pub supports_tool_call: bool,
+    pub supports_reasoning: bool,
+    pub supports_image_input: bool,
+    pub supports_structured_output: bool,
+    pub supports_temperature: bool,
+    pub context_limit: u32,
+    pub output_limit: u32,
+    pub reasoning_field: String,
+    pub metadata_json: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelGroupRecord {
+    pub id: String,
+    pub name: String,
+    pub routing_strategy: String,
+    pub fallback_policy: String,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelGroupMemberRecord {
+    pub id: String,
+    pub group_id: String,
+    pub provider_id: String,
+    pub provider_name: String,
+    pub model_id: String,
+    pub model_display_name: String,
+    pub position: u32,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DefaultModelGroupRecord {
+    pub key: String,
+    pub group_id: String,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AppSettingRecord {
+    pub key: String,
+    pub value: String,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConfigAuditRecord {
+    pub id: String,
+    pub command_id: String,
+    pub actor: String,
+    pub action: String,
+    pub target_kind: String,
+    pub target_id: String,
+    pub redacted_summary: String,
+    pub approval_required: bool,
+    pub approval_token: String,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SettingsSnapshot {
+    pub providers: Vec<PublicProviderRecord>,
+    pub provider_models: Vec<ProviderModelRecord>,
+    pub model_groups: Vec<ModelGroupRecord>,
+    pub model_group_members: Vec<ModelGroupMemberRecord>,
+    pub default_model_groups: Vec<DefaultModelGroupRecord>,
+    pub settings: Vec<AppSettingRecord>,
+    pub config_audits: Vec<ConfigAuditRecord>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1918,6 +2008,26 @@ impl HamburDatabase {
         provider_record_from_row(&row)
     }
 
+    pub async fn delete_provider(&self, provider_id: &str) -> HamburResult<()> {
+        let provider_id = provider_id.trim();
+        if provider_id.is_empty() {
+            return Err(HamburError::InvalidCommand(
+                "provider_id must not be empty".to_string(),
+            ));
+        }
+        let changed = self
+            .connection
+            .execute("DELETE FROM providers WHERE id = ?1", params![provider_id])
+            .await
+            .map_err(database_error)?;
+        if changed == 0 {
+            return Err(HamburError::ProviderUnavailable(format!(
+                "provider not found: {provider_id}"
+            )));
+        }
+        Ok(())
+    }
+
     pub async fn replace_provider_models(
         &self,
         provider_id: &str,
@@ -1997,6 +2107,120 @@ impl HamburDatabase {
                 .await?;
         }
         Ok(saved)
+    }
+
+    pub async fn upsert_provider_model_override(
+        &self,
+        input: ProviderModelOverride,
+    ) -> HamburResult<ProviderModelRecord> {
+        let provider_id = input.provider_id.trim().to_string();
+        let model_id = input.model_id.trim().to_string();
+        if provider_id.is_empty() || model_id.is_empty() {
+            return Err(HamburError::InvalidCommand(
+                "provider_id and model_id must not be empty".to_string(),
+            ));
+        }
+        self.provider_by_id(&provider_id).await?;
+        let display_name = if input.display_name.trim().is_empty() {
+            model_id.clone()
+        } else {
+            input.display_name.trim().chars().take(160).collect()
+        };
+        let now = now_ms();
+        self.connection
+            .execute(
+                "INSERT INTO provider_models
+                    (
+                        id,
+                        provider_id,
+                        model_id,
+                        display_name,
+                        supports_tool_call,
+                        supports_reasoning,
+                        supports_image_input,
+                        supports_structured_output,
+                        supports_temperature,
+                        context_limit,
+                        output_limit,
+                        reasoning_field,
+                        metadata_json,
+                        synced_at_ms
+                    )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                 ON CONFLICT(provider_id, model_id) DO UPDATE SET
+                    display_name = excluded.display_name,
+                    supports_tool_call = excluded.supports_tool_call,
+                    supports_reasoning = excluded.supports_reasoning,
+                    supports_image_input = excluded.supports_image_input,
+                    supports_structured_output = excluded.supports_structured_output,
+                    supports_temperature = excluded.supports_temperature,
+                    context_limit = excluded.context_limit,
+                    output_limit = excluded.output_limit,
+                    reasoning_field = excluded.reasoning_field,
+                    metadata_json = excluded.metadata_json,
+                    synced_at_ms = excluded.synced_at_ms",
+                params![
+                    new_id("pmod"),
+                    provider_id.clone(),
+                    model_id.clone(),
+                    display_name,
+                    input.supports_tool_call,
+                    input.supports_reasoning,
+                    input.supports_image_input,
+                    input.supports_structured_output,
+                    input.supports_temperature,
+                    input.context_limit.max(1) as i64,
+                    input.output_limit.max(1) as i64,
+                    input.reasoning_field,
+                    input.metadata_json,
+                    now as i64
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+
+        self.provider_model_by_key(&provider_id, &model_id).await
+    }
+
+    pub async fn provider_model_by_key(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+    ) -> HamburResult<ProviderModelRecord> {
+        let mut rows = self
+            .connection
+            .query(
+                "
+                SELECT
+                    id,
+                    provider_id,
+                    model_id,
+                    display_name,
+                    supports_tool_call,
+                    supports_reasoning,
+                    supports_image_input,
+                    supports_structured_output,
+                    supports_temperature,
+                    context_limit,
+                    output_limit,
+                    reasoning_field,
+                    metadata_json,
+                    synced_at_ms
+                FROM provider_models
+                WHERE provider_id = ?1 AND model_id = ?2
+                LIMIT 1
+                ",
+                params![provider_id, model_id],
+            )
+            .await
+            .map_err(database_error)?;
+
+        let Some(row) = rows.next().await.map_err(database_error)? else {
+            return Err(HamburError::ModelUnavailable(format!(
+                "provider model not found: {provider_id}/{model_id}"
+            )));
+        };
+        provider_model_from_row(&row)
     }
 
     pub async fn provider_models(
@@ -2130,6 +2354,186 @@ impl HamburDatabase {
             .await
             .map_err(database_error)?;
         Ok(())
+    }
+
+    pub async fn upsert_model_group(
+        &self,
+        group_id: &str,
+        name: &str,
+        routing_strategy: &str,
+        fallback_policy: &str,
+    ) -> HamburResult<ModelGroupRecord> {
+        let group_id = normalize_setting_id(group_id, "grp");
+        let name = normalize_title(name);
+        let routing_strategy = normalize_routing_strategy(routing_strategy)?;
+        let fallback_policy = normalize_fallback_policy(fallback_policy)?;
+        let now = now_ms();
+        self.connection
+            .execute(
+                "INSERT INTO model_groups
+                    (id, name, routing_strategy, fallback_policy, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+                 ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    routing_strategy = excluded.routing_strategy,
+                    fallback_policy = excluded.fallback_policy,
+                    updated_at_ms = excluded.updated_at_ms",
+                params![
+                    group_id.clone(),
+                    name,
+                    routing_strategy,
+                    fallback_policy,
+                    now as i64
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+        self.model_group_by_id(&group_id).await
+    }
+
+    pub async fn upsert_model_group_member(
+        &self,
+        group_id: &str,
+        provider_id: &str,
+        model_id: &str,
+        position: u32,
+        enabled: bool,
+    ) -> HamburResult<ModelGroupMemberRecord> {
+        self.model_group_by_id(group_id).await?;
+        self.provider_model_by_key(provider_id, model_id).await?;
+        self.connection
+            .execute(
+                "INSERT INTO model_group_members
+                    (id, group_id, provider_id, model_id, position, enabled)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(group_id, provider_id, model_id) DO UPDATE SET
+                    position = excluded.position,
+                    enabled = excluded.enabled",
+                params![
+                    new_id("mgm"),
+                    group_id,
+                    provider_id,
+                    model_id,
+                    position as i64,
+                    enabled
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+        self.model_group_member_by_key(group_id, provider_id, model_id)
+            .await
+    }
+
+    pub async fn set_default_model_group(
+        &self,
+        key: &str,
+        group_id: &str,
+    ) -> HamburResult<DefaultModelGroupRecord> {
+        let key = normalize_default_group_key(key)?;
+        self.model_group_by_id(group_id).await?;
+        let now = now_ms();
+        self.connection
+            .execute(
+                "INSERT INTO default_model_groups (key, group_id, updated_at_ms)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(key) DO UPDATE SET
+                    group_id = excluded.group_id,
+                    updated_at_ms = excluded.updated_at_ms",
+                params![key.clone(), group_id, now as i64],
+            )
+            .await
+            .map_err(database_error)?;
+        Ok(DefaultModelGroupRecord {
+            key,
+            group_id: group_id.to_string(),
+            updated_at_ms: now,
+        })
+    }
+
+    pub async fn upsert_app_setting(
+        &self,
+        key: &str,
+        value: &str,
+    ) -> HamburResult<AppSettingRecord> {
+        let key = normalize_app_setting_key(key)?;
+        let value = value.trim().chars().take(8000).collect::<String>();
+        let now = now_ms();
+        self.connection
+            .execute(
+                "INSERT INTO app_settings (key, value, updated_at_ms)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at_ms = excluded.updated_at_ms",
+                params![key.clone(), value.clone(), now as i64],
+            )
+            .await
+            .map_err(database_error)?;
+        Ok(AppSettingRecord {
+            key,
+            value,
+            updated_at_ms: now,
+        })
+    }
+
+    pub async fn insert_config_audit(
+        &self,
+        command_id: &str,
+        actor: &str,
+        action: &str,
+        target_kind: &str,
+        target_id: &str,
+        redacted_summary: &str,
+        approval_required: bool,
+        approval_token: &str,
+    ) -> HamburResult<ConfigAuditRecord> {
+        let id = new_id("audit");
+        let now = now_ms();
+        let record = ConfigAuditRecord {
+            id: id.clone(),
+            command_id: command_id.trim().chars().take(120).collect(),
+            actor: actor.trim().chars().take(80).collect(),
+            action: action.trim().chars().take(80).collect(),
+            target_kind: target_kind.trim().chars().take(80).collect(),
+            target_id: target_id.trim().chars().take(180).collect(),
+            redacted_summary: redacted_summary.trim().chars().take(500).collect(),
+            approval_required,
+            approval_token: approval_token.trim().chars().take(160).collect(),
+            created_at_ms: now,
+        };
+        self.connection
+            .execute(
+                "INSERT INTO config_audit
+                    (id, command_id, actor, action, target_kind, target_id, redacted_summary, approval_required, approval_token, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    record.id.clone(),
+                    record.command_id.clone(),
+                    record.actor.clone(),
+                    record.action.clone(),
+                    record.target_kind.clone(),
+                    record.target_id.clone(),
+                    record.redacted_summary.clone(),
+                    record.approval_required,
+                    record.approval_token.clone(),
+                    record.created_at_ms as i64
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+        Ok(record)
+    }
+
+    pub async fn settings_snapshot(&self) -> HamburResult<SettingsSnapshot> {
+        Ok(SettingsSnapshot {
+            providers: self.public_providers().await?,
+            provider_models: self.all_provider_models().await?,
+            model_groups: self.model_groups().await?,
+            model_group_members: self.model_group_members().await?,
+            default_model_groups: self.default_model_groups().await?,
+            settings: self.app_settings().await?,
+            config_audits: self.config_audits(40).await?,
+        })
     }
 
     pub async fn primary_chat_route(&self) -> HamburResult<Vec<ModelRouteSnapshot>> {
@@ -2492,6 +2896,28 @@ impl HamburDatabase {
                     group_id TEXT NOT NULL,
                     updated_at_ms INTEGER NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    key TEXT PRIMARY KEY NOT NULL,
+                    value TEXT NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS config_audit (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    command_id TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    target_kind TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    redacted_summary TEXT NOT NULL,
+                    approval_required INTEGER NOT NULL,
+                    approval_token TEXT NOT NULL DEFAULT '',
+                    created_at_ms INTEGER NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_config_audit_created
+                    ON config_audit(created_at_ms DESC, id DESC);
                 ",
             )
             .await
@@ -3294,6 +3720,249 @@ impl HamburDatabase {
         };
         file_cleanup_job_from_row(&row)
     }
+
+    async fn public_providers(&self) -> HamburResult<Vec<PublicProviderRecord>> {
+        let mut rows = self
+            .connection
+            .query(
+                "
+                SELECT id, name, icon_name, api_type, base_url, secret_ref, enabled, created_at_ms, updated_at_ms
+                FROM providers
+                ORDER BY updated_at_ms DESC, id ASC
+                ",
+                (),
+            )
+            .await
+            .map_err(database_error)?;
+        let mut providers = Vec::new();
+        while let Some(row) = rows.next().await.map_err(database_error)? {
+            providers.push(public_provider_from_row(&row)?);
+        }
+        Ok(providers)
+    }
+
+    async fn all_provider_models(&self) -> HamburResult<Vec<ProviderModelRecord>> {
+        let mut rows = self
+            .connection
+            .query(
+                "
+                SELECT
+                    id,
+                    provider_id,
+                    model_id,
+                    display_name,
+                    supports_tool_call,
+                    supports_reasoning,
+                    supports_image_input,
+                    supports_structured_output,
+                    supports_temperature,
+                    context_limit,
+                    output_limit,
+                    reasoning_field,
+                    metadata_json,
+                    synced_at_ms
+                FROM provider_models
+                ORDER BY provider_id ASC, model_id ASC
+                ",
+                (),
+            )
+            .await
+            .map_err(database_error)?;
+        let mut models = Vec::new();
+        while let Some(row) = rows.next().await.map_err(database_error)? {
+            models.push(provider_model_from_row(&row)?);
+        }
+        Ok(models)
+    }
+
+    async fn model_groups(&self) -> HamburResult<Vec<ModelGroupRecord>> {
+        let mut rows = self
+            .connection
+            .query(
+                "
+                SELECT id, name, routing_strategy, fallback_policy, created_at_ms, updated_at_ms
+                FROM model_groups
+                ORDER BY id ASC
+                ",
+                (),
+            )
+            .await
+            .map_err(database_error)?;
+        let mut groups = Vec::new();
+        while let Some(row) = rows.next().await.map_err(database_error)? {
+            groups.push(model_group_from_row(&row)?);
+        }
+        Ok(groups)
+    }
+
+    async fn model_group_by_id(&self, group_id: &str) -> HamburResult<ModelGroupRecord> {
+        let mut rows = self
+            .connection
+            .query(
+                "
+                SELECT id, name, routing_strategy, fallback_policy, created_at_ms, updated_at_ms
+                FROM model_groups
+                WHERE id = ?1
+                LIMIT 1
+                ",
+                params![group_id],
+            )
+            .await
+            .map_err(database_error)?;
+        let Some(row) = rows.next().await.map_err(database_error)? else {
+            return Err(HamburError::ModelUnavailable(format!(
+                "model group not found: {group_id}"
+            )));
+        };
+        model_group_from_row(&row)
+    }
+
+    async fn model_group_members(&self) -> HamburResult<Vec<ModelGroupMemberRecord>> {
+        let mut rows = self
+            .connection
+            .query(
+                "
+                SELECT
+                    mgm.id,
+                    mgm.group_id,
+                    mgm.provider_id,
+                    p.name,
+                    mgm.model_id,
+                    pm.display_name,
+                    mgm.position,
+                    mgm.enabled
+                FROM model_group_members mgm
+                JOIN providers p ON p.id = mgm.provider_id
+                JOIN provider_models pm ON pm.provider_id = mgm.provider_id AND pm.model_id = mgm.model_id
+                ORDER BY mgm.group_id ASC, mgm.position ASC, mgm.provider_id ASC, mgm.model_id ASC
+                ",
+                (),
+            )
+            .await
+            .map_err(database_error)?;
+        let mut members = Vec::new();
+        while let Some(row) = rows.next().await.map_err(database_error)? {
+            members.push(model_group_member_from_row(&row)?);
+        }
+        Ok(members)
+    }
+
+    async fn model_group_member_by_key(
+        &self,
+        group_id: &str,
+        provider_id: &str,
+        model_id: &str,
+    ) -> HamburResult<ModelGroupMemberRecord> {
+        let mut rows = self
+            .connection
+            .query(
+                "
+                SELECT
+                    mgm.id,
+                    mgm.group_id,
+                    mgm.provider_id,
+                    p.name,
+                    mgm.model_id,
+                    pm.display_name,
+                    mgm.position,
+                    mgm.enabled
+                FROM model_group_members mgm
+                JOIN providers p ON p.id = mgm.provider_id
+                JOIN provider_models pm ON pm.provider_id = mgm.provider_id AND pm.model_id = mgm.model_id
+                WHERE mgm.group_id = ?1 AND mgm.provider_id = ?2 AND mgm.model_id = ?3
+                LIMIT 1
+                ",
+                params![group_id, provider_id, model_id],
+            )
+            .await
+            .map_err(database_error)?;
+        let Some(row) = rows.next().await.map_err(database_error)? else {
+            return Err(HamburError::ModelUnavailable(format!(
+                "model group member not found: {group_id}/{provider_id}/{model_id}"
+            )));
+        };
+        model_group_member_from_row(&row)
+    }
+
+    async fn default_model_groups(&self) -> HamburResult<Vec<DefaultModelGroupRecord>> {
+        let mut rows = self
+            .connection
+            .query(
+                "
+                SELECT key, group_id, updated_at_ms
+                FROM default_model_groups
+                ORDER BY key ASC
+                ",
+                (),
+            )
+            .await
+            .map_err(database_error)?;
+        let mut defaults = Vec::new();
+        while let Some(row) = rows.next().await.map_err(database_error)? {
+            defaults.push(DefaultModelGroupRecord {
+                key: row.get::<String>(0).map_err(database_error)?,
+                group_id: row.get::<String>(1).map_err(database_error)?,
+                updated_at_ms: unsigned_ms(row.get::<i64>(2).map_err(database_error)?),
+            });
+        }
+        Ok(defaults)
+    }
+
+    async fn app_settings(&self) -> HamburResult<Vec<AppSettingRecord>> {
+        let mut rows = self
+            .connection
+            .query(
+                "
+                SELECT key, value, updated_at_ms
+                FROM app_settings
+                ORDER BY key ASC
+                ",
+                (),
+            )
+            .await
+            .map_err(database_error)?;
+        let mut settings = Vec::new();
+        while let Some(row) = rows.next().await.map_err(database_error)? {
+            settings.push(AppSettingRecord {
+                key: row.get::<String>(0).map_err(database_error)?,
+                value: row.get::<String>(1).map_err(database_error)?,
+                updated_at_ms: unsigned_ms(row.get::<i64>(2).map_err(database_error)?),
+            });
+        }
+        Ok(settings)
+    }
+
+    async fn config_audits(&self, limit: u32) -> HamburResult<Vec<ConfigAuditRecord>> {
+        let limit = clamp_limit(limit, 1, 100);
+        let mut rows = self
+            .connection
+            .query(
+                "
+                SELECT
+                    id,
+                    command_id,
+                    actor,
+                    action,
+                    target_kind,
+                    target_id,
+                    redacted_summary,
+                    approval_required,
+                    approval_token,
+                    created_at_ms
+                FROM config_audit
+                ORDER BY created_at_ms DESC, id DESC
+                LIMIT ?1
+                ",
+                params![limit as i64],
+            )
+            .await
+            .map_err(database_error)?;
+        let mut audits = Vec::new();
+        while let Some(row) = rows.next().await.map_err(database_error)? {
+            audits.push(config_audit_from_row(&row)?);
+        }
+        Ok(audits)
+    }
 }
 
 fn normalize_title(title: &str) -> String {
@@ -3302,6 +3971,70 @@ fn normalize_title(title: &str) -> String {
         DEFAULT_SESSION_TITLE.to_string()
     } else {
         title.chars().take(120).collect()
+    }
+}
+
+fn normalize_setting_id(value: &str, prefix: &str) -> String {
+    let normalized = value
+        .trim()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+        .take(120)
+        .collect::<String>();
+    if normalized.is_empty() {
+        new_id(prefix)
+    } else {
+        normalized
+    }
+}
+
+fn normalize_routing_strategy(value: &str) -> HamburResult<String> {
+    let value = value.trim();
+    match value {
+        "" | "fallback" => Ok("fallback".to_string()),
+        "round_robin" | "priority" => Ok(value.to_string()),
+        _ => Err(HamburError::InvalidCommand(format!(
+            "invalid routing_strategy: {value}"
+        ))),
+    }
+}
+
+fn normalize_fallback_policy(value: &str) -> HamburResult<String> {
+    let value = value.trim();
+    match value {
+        "" | "default" => Ok("default".to_string()),
+        "never" | "always_before_output" => Ok(value.to_string()),
+        _ => Err(HamburError::InvalidCommand(format!(
+            "invalid fallback_policy: {value}"
+        ))),
+    }
+}
+
+fn normalize_default_group_key(value: &str) -> HamburResult<String> {
+    let key = value.trim();
+    match key {
+        "primary" | "secondary" | "vision" | "tools" => Ok(key.to_string()),
+        _ => Err(HamburError::InvalidCommand(format!(
+            "invalid default model group key: {key}"
+        ))),
+    }
+}
+
+fn normalize_app_setting_key(value: &str) -> HamburResult<String> {
+    let key = value.trim();
+    let allowed = [
+        "tool_settings",
+        "skills",
+        "memory_projections",
+        "startup_tasks",
+        "rootfs_settings",
+    ];
+    if allowed.contains(&key) {
+        Ok(key.to_string())
+    } else {
+        Err(HamburError::InvalidCommand(format!(
+            "invalid app setting key: {key}"
+        )))
     }
 }
 
@@ -3381,6 +4114,19 @@ fn normalize_secret_ref(secret_ref: &str) -> HamburResult<String> {
         ));
     }
     Ok(secret_ref.chars().take(256).collect())
+}
+
+fn secret_label(secret_ref: &str) -> String {
+    let secret_ref = secret_ref.trim();
+    if secret_ref.is_empty() {
+        "Not configured".to_string()
+    } else if secret_ref.starts_with("android-secret://") {
+        "Android Secret Store".to_string()
+    } else if secret_ref.starts_with("env://") {
+        "Environment Secret".to_string()
+    } else {
+        "Secret reference".to_string()
+    }
 }
 
 fn normalize_file_scope(scope: &str) -> HamburResult<String> {
@@ -3506,6 +4252,21 @@ fn provider_record_from_row(row: &Row) -> HamburResult<ProviderRecord> {
     })
 }
 
+fn public_provider_from_row(row: &Row) -> HamburResult<PublicProviderRecord> {
+    let secret_ref = row.get::<String>(5).map_err(database_error)?;
+    Ok(PublicProviderRecord {
+        id: row.get::<String>(0).map_err(database_error)?,
+        name: row.get::<String>(1).map_err(database_error)?,
+        icon_name: row.get::<String>(2).map_err(database_error)?,
+        api_type: row.get::<String>(3).map_err(database_error)?,
+        base_url: row.get::<String>(4).map_err(database_error)?,
+        secret_label: secret_label(&secret_ref),
+        enabled: sql_bool(row.get::<i64>(6).map_err(database_error)?),
+        created_at_ms: unsigned_ms(row.get::<i64>(7).map_err(database_error)?),
+        updated_at_ms: unsigned_ms(row.get::<i64>(8).map_err(database_error)?),
+    })
+}
+
 fn provider_model_from_row(row: &Row) -> HamburResult<ProviderModelRecord> {
     Ok(ProviderModelRecord {
         id: row.get::<String>(0).map_err(database_error)?,
@@ -3522,6 +4283,45 @@ fn provider_model_from_row(row: &Row) -> HamburResult<ProviderModelRecord> {
         reasoning_field: row.get::<String>(11).map_err(database_error)?,
         metadata_json: row.get::<String>(12).map_err(database_error)?,
         synced_at_ms: unsigned_ms(row.get::<i64>(13).map_err(database_error)?),
+    })
+}
+
+fn model_group_from_row(row: &Row) -> HamburResult<ModelGroupRecord> {
+    Ok(ModelGroupRecord {
+        id: row.get::<String>(0).map_err(database_error)?,
+        name: row.get::<String>(1).map_err(database_error)?,
+        routing_strategy: row.get::<String>(2).map_err(database_error)?,
+        fallback_policy: row.get::<String>(3).map_err(database_error)?,
+        created_at_ms: unsigned_ms(row.get::<i64>(4).map_err(database_error)?),
+        updated_at_ms: unsigned_ms(row.get::<i64>(5).map_err(database_error)?),
+    })
+}
+
+fn model_group_member_from_row(row: &Row) -> HamburResult<ModelGroupMemberRecord> {
+    Ok(ModelGroupMemberRecord {
+        id: row.get::<String>(0).map_err(database_error)?,
+        group_id: row.get::<String>(1).map_err(database_error)?,
+        provider_id: row.get::<String>(2).map_err(database_error)?,
+        provider_name: row.get::<String>(3).map_err(database_error)?,
+        model_id: row.get::<String>(4).map_err(database_error)?,
+        model_display_name: row.get::<String>(5).map_err(database_error)?,
+        position: unsigned_count(row.get::<i64>(6).map_err(database_error)?),
+        enabled: sql_bool(row.get::<i64>(7).map_err(database_error)?),
+    })
+}
+
+fn config_audit_from_row(row: &Row) -> HamburResult<ConfigAuditRecord> {
+    Ok(ConfigAuditRecord {
+        id: row.get::<String>(0).map_err(database_error)?,
+        command_id: row.get::<String>(1).map_err(database_error)?,
+        actor: row.get::<String>(2).map_err(database_error)?,
+        action: row.get::<String>(3).map_err(database_error)?,
+        target_kind: row.get::<String>(4).map_err(database_error)?,
+        target_id: row.get::<String>(5).map_err(database_error)?,
+        redacted_summary: row.get::<String>(6).map_err(database_error)?,
+        approval_required: sql_bool(row.get::<i64>(7).map_err(database_error)?),
+        approval_token: row.get::<String>(8).map_err(database_error)?,
+        created_at_ms: unsigned_ms(row.get::<i64>(9).map_err(database_error)?),
     })
 }
 

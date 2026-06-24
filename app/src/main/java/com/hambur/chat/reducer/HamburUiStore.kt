@@ -6,8 +6,15 @@ import com.hambur.chat.uniffi.AttachmentDto
 import com.hambur.chat.uniffi.BackendCommand
 import com.hambur.chat.uniffi.BackendEvent
 import com.hambur.chat.uniffi.CommandAck
+import com.hambur.chat.uniffi.ConfigAuditDto
+import com.hambur.chat.uniffi.DefaultModelGroupDto
 import com.hambur.chat.uniffi.MarkdownBlockNodeDto
+import com.hambur.chat.uniffi.ModelGroupDto
+import com.hambur.chat.uniffi.ModelGroupMemberDto
+import com.hambur.chat.uniffi.ProviderModelDto
+import com.hambur.chat.uniffi.PublicProviderDto
 import com.hambur.chat.uniffi.SessionListSnapshotDto
+import com.hambur.chat.uniffi.SettingsSnapshotDto
 import com.hambur.chat.uniffi.TimelineItemDto
 import com.hambur.chat.uniffi.createRuntime
 import java.util.concurrent.atomic.AtomicLong
@@ -53,6 +60,63 @@ data class UiPendingAttachment(
     val sandboxPath: String,
 )
 
+data class UiProviderSettings(
+    val id: String,
+    val name: String,
+    val baseUrl: String,
+    val secretLabel: String,
+    val enabled: Boolean,
+)
+
+data class UiProviderModelSettings(
+    val providerId: String,
+    val modelId: String,
+    val displayName: String,
+    val supportsToolCall: Boolean,
+    val supportsReasoning: Boolean,
+    val supportsImageInput: Boolean,
+    val supportsTemperature: Boolean,
+    val contextLimit: UInt,
+    val outputLimit: UInt,
+)
+
+data class UiModelGroupSettings(
+    val id: String,
+    val name: String,
+    val routingStrategy: String,
+    val fallbackPolicy: String,
+)
+
+data class UiModelGroupMemberSettings(
+    val groupId: String,
+    val providerId: String,
+    val providerName: String,
+    val modelId: String,
+    val modelDisplayName: String,
+    val position: UInt,
+    val enabled: Boolean,
+)
+
+data class UiDefaultModelGroupSettings(
+    val key: String,
+    val groupId: String,
+)
+
+data class UiAppSetting(
+    val key: String,
+    val value: String,
+)
+
+data class UiConfigAudit(
+    val id: String,
+    val action: String,
+    val targetKind: String,
+    val targetId: String,
+    val redactedSummary: String,
+    val approvalRequired: Boolean,
+    val createdAtMs: ULong,
+)
+
 data class AppShellState(
     val runtimeStatus: String = "Starting",
     val latestEventKind: String = "Waiting",
@@ -61,6 +125,13 @@ data class AppShellState(
     val selectedSessionId: String = "",
     val timelineItems: List<UiTimelineItem> = emptyList(),
     val pendingAttachments: List<UiPendingAttachment> = emptyList(),
+    val providers: List<UiProviderSettings> = emptyList(),
+    val providerModels: List<UiProviderModelSettings> = emptyList(),
+    val modelGroups: List<UiModelGroupSettings> = emptyList(),
+    val modelGroupMembers: List<UiModelGroupMemberSettings> = emptyList(),
+    val defaultModelGroups: List<UiDefaultModelGroupSettings> = emptyList(),
+    val appSettings: List<UiAppSetting> = emptyList(),
+    val configAudits: List<UiConfigAudit> = emptyList(),
     val markdownMessageId: String = "",
     val markdownBlocks: List<MarkdownBlockNodeDto> = emptyList(),
     val pendingMarkdownBlock: MarkdownBlockNodeDto? = null,
@@ -124,6 +195,176 @@ class HamburUiStore(appFilesDir: String) {
                     kind = "SoftDeleteSession",
                     idempotencyKey = "$sessionId:soft-delete:${nextCommandOrdinal()}",
                     sessionId = sessionId,
+                ),
+            )
+        }
+    }
+
+    fun saveProvider(
+        providerId: String,
+        name: String,
+        baseUrl: String,
+        secretRef: String,
+        enabled: Boolean,
+    ) {
+        if (baseUrl.isBlank() || secretRef.isBlank()) return
+        val payload = """
+            {"secretRef":"${secretRef.jsonEscaped()}","enabled":$enabled,"iconName":"sparkles"}
+        """.trimIndent()
+        runCommand {
+            runtime.dispatch(
+                backendCommand(
+                    kind = "UpdateProvider",
+                    idempotencyKey = "provider:${providerId.ifBlank { "new" }}:update:${nextCommandOrdinal()}",
+                    title = name.ifBlank { "OpenAI Compatible" },
+                    providerId = providerId,
+                    chunk = baseUrl,
+                    payloadJson = payload,
+                ),
+            )
+        }
+    }
+
+    fun deleteProvider(providerId: String, approved: Boolean) {
+        if (providerId.isBlank() || !approved) return
+        val payload = """{"approvalToken":"approve:delete-provider"}"""
+        runCommand {
+            runtime.dispatch(
+                backendCommand(
+                    kind = "DeleteProvider",
+                    idempotencyKey = "provider:$providerId:delete:${nextCommandOrdinal()}",
+                    providerId = providerId,
+                    payloadJson = payload,
+                ),
+            )
+        }
+    }
+
+    fun refreshProviderModels(providerId: String, modelId: String) {
+        if (providerId.isBlank()) return
+        runCommand {
+            runtime.dispatch(
+                backendCommand(
+                    kind = "RefreshProviderModels",
+                    idempotencyKey = "provider:$providerId:models:${nextCommandOrdinal()}",
+                    providerId = providerId,
+                    modelId = modelId.ifBlank { "hambur-openai-compatible-text" },
+                ),
+            )
+        }
+    }
+
+    fun saveModelOverride(
+        providerId: String,
+        modelId: String,
+        displayName: String,
+        supportsToolCall: Boolean,
+        supportsReasoning: Boolean,
+        supportsImageInput: Boolean,
+        contextLimit: UInt,
+        outputLimit: UInt,
+    ) {
+        if (providerId.isBlank() || modelId.isBlank()) return
+        val payload = """
+            {"providerId":"${providerId.jsonEscaped()}","modelId":"${modelId.jsonEscaped()}","displayName":"${displayName.jsonEscaped()}","supportsToolCall":$supportsToolCall,"supportsReasoning":$supportsReasoning,"supportsImageInput":$supportsImageInput,"supportsStructuredOutput":false,"supportsTemperature":true,"contextLimit":$contextLimit,"outputLimit":$outputLimit}
+        """.trimIndent()
+        runCommand {
+            runtime.dispatch(
+                backendCommand(
+                    kind = "UpdateModelOverride",
+                    idempotencyKey = "model:$providerId:$modelId:override:${nextCommandOrdinal()}",
+                    providerId = providerId,
+                    modelId = modelId,
+                    title = displayName,
+                    payloadJson = payload,
+                ),
+            )
+        }
+    }
+
+    fun saveModelGroup(
+        groupId: String,
+        name: String,
+        routingStrategy: String,
+        fallbackPolicy: String,
+    ) {
+        val payload = """
+            {"groupId":"${groupId.jsonEscaped()}","name":"${name.jsonEscaped()}","routingStrategy":"${routingStrategy.jsonEscaped()}","fallbackPolicy":"${fallbackPolicy.jsonEscaped()}"}
+        """.trimIndent()
+        runCommand {
+            runtime.dispatch(
+                backendCommand(
+                    kind = "UpdateModelGroup",
+                    idempotencyKey = "model-group:${groupId.ifBlank { "new" }}:update:${nextCommandOrdinal()}",
+                    messageId = groupId,
+                    title = name,
+                    payloadJson = payload,
+                ),
+            )
+        }
+    }
+
+    fun addModelGroupMember(
+        groupId: String,
+        providerId: String,
+        modelId: String,
+        position: UInt,
+        enabled: Boolean,
+    ) {
+        if (groupId.isBlank() || providerId.isBlank() || modelId.isBlank()) return
+        val payload = """
+            {"groupId":"${groupId.jsonEscaped()}","providerId":"${providerId.jsonEscaped()}","modelId":"${modelId.jsonEscaped()}","position":$position,"enabled":$enabled}
+        """.trimIndent()
+        runCommand {
+            runtime.dispatch(
+                backendCommand(
+                    kind = "UpdateModelGroupMember",
+                    idempotencyKey = "model-group-member:$groupId:$providerId:$modelId:${nextCommandOrdinal()}",
+                    messageId = groupId,
+                    providerId = providerId,
+                    modelId = modelId,
+                    payloadJson = payload,
+                ),
+            )
+        }
+    }
+
+    fun setDefaultModelGroup(key: String, groupId: String) {
+        if (key.isBlank() || groupId.isBlank()) return
+        val payload = """{"key":"${key.jsonEscaped()}","groupId":"${groupId.jsonEscaped()}"}"""
+        runCommand {
+            runtime.dispatch(
+                backendCommand(
+                    kind = "SetDefaultModelGroup",
+                    idempotencyKey = "default-model-group:$key:$groupId:${nextCommandOrdinal()}",
+                    chunk = key,
+                    messageId = groupId,
+                    payloadJson = payload,
+                ),
+            )
+        }
+    }
+
+    fun saveAppSetting(key: String, value: String, approved: Boolean = false) {
+        val commandKind = when (key) {
+            "tool_settings" -> "UpdateToolSettings"
+            "skills" -> "UpdateSkills"
+            "memory_projections" -> "UpdateMemoryProjections"
+            "startup_tasks" -> "UpdateStartupTasks"
+            "rootfs_settings" -> "UpdateRootfsSettings"
+            else -> return
+        }
+        val payload = if (key == "startup_tasks" || key == "rootfs_settings") {
+            value.withApprovalToken("approve:$key", approved)
+        } else {
+            value
+        }
+        runCommand {
+            runtime.dispatch(
+                backendCommand(
+                    kind = commandKind,
+                    idempotencyKey = "app-setting:$key:${nextCommandOrdinal()}",
+                    payloadJson = payload,
                 ),
             )
         }
@@ -341,6 +582,9 @@ class HamburUiStore(appFilesDir: String) {
             timelinePage?.snapshotSequence ?: 0UL,
         )
         val timelineItems = timelinePage?.items.orEmpty()
+        val settingsSnapshot = runCatching {
+            runtime.getSettingsSnapshot()
+        }.getOrNull()
 
         val bufferedEvents = synchronized(startupLock) {
             _state.update {
@@ -348,6 +592,7 @@ class HamburUiStore(appFilesDir: String) {
                     snapshot = sessionSnapshot,
                     selectedSessionId = selectedSessionId,
                     timelineItems = timelineItems,
+                    settingsSnapshot = settingsSnapshot,
                     baselineSequence = baselineSequence,
                 )
             }
@@ -389,6 +634,9 @@ class HamburUiStore(appFilesDir: String) {
             markdownEvents.fold(state) { nextState, markdownEvent ->
                 nextState.reduce(markdownEvent)
             }.reduce(event)
+        }
+        if (event.kind == "SettingsChanged" || event.kind == "ModelsUpdated") {
+            refreshSettingsSnapshot()
         }
     }
 
@@ -438,6 +686,15 @@ class HamburUiStore(appFilesDir: String) {
                 runtimeStatus = "Error",
                 footer = ack.message.ifBlank { ack.rejectionCode },
             )
+        }
+    }
+
+    private fun refreshSettingsSnapshot() {
+        val snapshot = runCatching {
+            runtime.getSettingsSnapshot()
+        }.getOrNull() ?: return
+        _state.update { state ->
+            state.applySettingsSnapshot(snapshot)
         }
     }
 
@@ -517,6 +774,7 @@ private fun AppShellState.applyBaseline(
     snapshot: SessionListSnapshotDto,
     selectedSessionId: String,
     timelineItems: List<TimelineItemDto>,
+    settingsSnapshot: SettingsSnapshotDto?,
     baselineSequence: ULong,
 ): AppShellState {
     return copy(
@@ -533,6 +791,13 @@ private fun AppShellState.applyBaseline(
         },
         selectedSessionId = selectedSessionId,
         timelineItems = timelineItems.toUiTimelineItems(),
+        providers = settingsSnapshot?.providers?.toUiProviders().orEmpty(),
+        providerModels = settingsSnapshot?.providerModels?.toUiProviderModels().orEmpty(),
+        modelGroups = settingsSnapshot?.modelGroups?.toUiModelGroups().orEmpty(),
+        modelGroupMembers = settingsSnapshot?.modelGroupMembers?.toUiModelGroupMembers().orEmpty(),
+        defaultModelGroups = settingsSnapshot?.defaultModelGroups?.toUiDefaultModelGroups().orEmpty(),
+        appSettings = settingsSnapshot?.settings?.toUiAppSettings().orEmpty(),
+        configAudits = settingsSnapshot?.configAudits?.toUiConfigAudits().orEmpty(),
         markdownMessageId = "",
         markdownBlocks = emptyList(),
         pendingMarkdownBlock = null,
@@ -542,6 +807,18 @@ private fun AppShellState.applyBaseline(
         lastAppliedSequence = baselineSequence,
         appliedEventIds = emptySet(),
         activeTurnIds = emptyMap(),
+    )
+}
+
+private fun AppShellState.applySettingsSnapshot(snapshot: SettingsSnapshotDto): AppShellState {
+    return copy(
+        providers = snapshot.providers.toUiProviders(),
+        providerModels = snapshot.providerModels.toUiProviderModels(),
+        modelGroups = snapshot.modelGroups.toUiModelGroups(),
+        modelGroupMembers = snapshot.modelGroupMembers.toUiModelGroupMembers(),
+        defaultModelGroups = snapshot.defaultModelGroups.toUiDefaultModelGroups(),
+        appSettings = snapshot.settings.toUiAppSettings(),
+        configAudits = snapshot.configAudits.toUiConfigAudits(),
     )
 }
 
@@ -569,6 +846,7 @@ private fun AppShellState.reduce(event: BackendEvent): AppShellState {
         "AttachmentImported",
         "PendingAttachmentRemoved",
         "PendingAttachmentsCleaned",
+        "SettingsChanged",
         "MessageUpserted",
         "AssistantMessageFinished",
         "ToolCallFinished",
@@ -595,6 +873,7 @@ private fun AppShellState.reduce(event: BackendEvent): AppShellState {
         event.kind == "SessionOpened" -> "Session opened"
         event.kind == "SessionDeleted" -> "Session deleted"
         event.kind == "ModelsUpdated" -> event.message.ifBlank { "Models updated" }
+        event.kind == "SettingsChanged" -> event.message.ifBlank { "Settings updated" }
         event.kind == "AttachmentImported" -> event.message.ifBlank { "Attachment imported" }
         event.kind == "PendingAttachmentRemoved" -> "Attachment removed"
         event.kind == "PendingAttachmentsCleaned" -> "Pending attachments cleared"
@@ -759,6 +1038,91 @@ private fun List<AttachmentDto>.toUiPendingAttachments(): List<UiPendingAttachme
     }
 }
 
+private fun List<PublicProviderDto>.toUiProviders(): List<UiProviderSettings> {
+    return map {
+        UiProviderSettings(
+            id = it.id,
+            name = it.name,
+            baseUrl = it.baseUrl,
+            secretLabel = it.secretLabel,
+            enabled = it.enabled,
+        )
+    }
+}
+
+private fun List<ProviderModelDto>.toUiProviderModels(): List<UiProviderModelSettings> {
+    return map {
+        UiProviderModelSettings(
+            providerId = it.providerId,
+            modelId = it.modelId,
+            displayName = it.displayName,
+            supportsToolCall = it.supportsToolCall,
+            supportsReasoning = it.supportsReasoning,
+            supportsImageInput = it.supportsImageInput,
+            supportsTemperature = it.supportsTemperature,
+            contextLimit = it.contextLimit,
+            outputLimit = it.outputLimit,
+        )
+    }
+}
+
+private fun List<ModelGroupDto>.toUiModelGroups(): List<UiModelGroupSettings> {
+    return map {
+        UiModelGroupSettings(
+            id = it.id,
+            name = it.name,
+            routingStrategy = it.routingStrategy,
+            fallbackPolicy = it.fallbackPolicy,
+        )
+    }
+}
+
+private fun List<ModelGroupMemberDto>.toUiModelGroupMembers(): List<UiModelGroupMemberSettings> {
+    return map {
+        UiModelGroupMemberSettings(
+            groupId = it.groupId,
+            providerId = it.providerId,
+            providerName = it.providerName,
+            modelId = it.modelId,
+            modelDisplayName = it.modelDisplayName,
+            position = it.position,
+            enabled = it.enabled,
+        )
+    }
+}
+
+private fun List<DefaultModelGroupDto>.toUiDefaultModelGroups(): List<UiDefaultModelGroupSettings> {
+    return map {
+        UiDefaultModelGroupSettings(
+            key = it.key,
+            groupId = it.groupId,
+        )
+    }
+}
+
+private fun List<com.hambur.chat.uniffi.AppSettingDto>.toUiAppSettings(): List<UiAppSetting> {
+    return map {
+        UiAppSetting(
+            key = it.key,
+            value = it.value,
+        )
+    }
+}
+
+private fun List<ConfigAuditDto>.toUiConfigAudits(): List<UiConfigAudit> {
+    return map {
+        UiConfigAudit(
+            id = it.id,
+            action = it.action,
+            targetKind = it.targetKind,
+            targetId = it.targetId,
+            redactedSummary = it.redactedSummary,
+            approvalRequired = it.approvalRequired,
+            createdAtMs = it.createdAtMs,
+        )
+    }
+}
+
 private fun String.jsonEscaped(): String {
     return buildString {
         this@jsonEscaped.forEach { ch ->
@@ -772,6 +1136,21 @@ private fun String.jsonEscaped(): String {
             }
         }
     }
+}
+
+private fun String.withApprovalToken(token: String, approved: Boolean): String {
+    if (!approved) return this
+    val trimmed = trim()
+    if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+        val body = trimmed.drop(1).dropLast(1).trim()
+        val suffix = "\"approvalToken\":\"${token.jsonEscaped()}\""
+        return if (body.isEmpty()) {
+            "{$suffix}"
+        } else {
+            "{$body,$suffix}"
+        }
+    }
+    return """{"value":"${trimmed.jsonEscaped()}","approvalToken":"${token.jsonEscaped()}"}"""
 }
 
 private fun attachmentPayloadJson(attachmentIds: List<String>): String {

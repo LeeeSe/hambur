@@ -10,7 +10,8 @@ use hambur_core::{DTO_SCHEMA_VERSION, HamburError, HamburResult, new_id, now_ms}
 use hambur_db::{
     AppSnapshot, AttachmentRecord, HamburDatabase, MessageRecord, ModelRouteSnapshot,
     NewAttachment, NewFileRecord, NewTimelineItem, NewToolCall, NewToolResult, NewTraceSpan,
-    ProviderModelUpsert, ProviderUpsert, SessionSummary, TimelineItemSnapshot,
+    ProviderModelOverride, ProviderModelUpsert, ProviderUpsert, SessionSummary, SettingsSnapshot,
+    TimelineItemSnapshot,
 };
 use hambur_filestore::FileStore;
 use hambur_llm::{
@@ -105,6 +106,13 @@ pub struct RuntimeSearchSnapshot {
     pub sessions: Vec<SessionSummary>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeSettingsSnapshot {
+    pub snapshot_sequence: u64,
+    pub created_at_ms: u64,
+    pub settings: SettingsSnapshot,
+}
+
 #[derive(Debug, Clone)]
 pub enum RuntimeEventKind {
     RuntimeReady,
@@ -127,6 +135,7 @@ pub enum RuntimeEventKind {
     AttachmentImported,
     PendingAttachmentRemoved,
     PendingAttachmentsCleaned,
+    SettingsChanged,
     TurnFinished,
     TurnFailed,
     TurnCancelled,
@@ -157,6 +166,7 @@ impl RuntimeEventKind {
             Self::AttachmentImported => "AttachmentImported",
             Self::PendingAttachmentRemoved => "PendingAttachmentRemoved",
             Self::PendingAttachmentsCleaned => "PendingAttachmentsCleaned",
+            Self::SettingsChanged => "SettingsChanged",
             Self::TurnFinished => "TurnFinished",
             Self::TurnFailed => "TurnFailed",
             Self::TurnCancelled => "TurnCancelled",
@@ -348,7 +358,17 @@ impl RuntimeEngine {
                 self.execute_delete_session(command)
             }
             "UpdateProvider" => self.execute_update_provider(command),
+            "DeleteProvider" => self.execute_delete_provider(command),
             "RefreshProviderModels" => self.execute_refresh_provider_models(command),
+            "UpdateModelOverride" => self.execute_update_model_override(command),
+            "UpdateModelGroup" => self.execute_update_model_group(command),
+            "UpdateModelGroupMember" => self.execute_update_model_group_member(command),
+            "SetDefaultModelGroup" => self.execute_set_default_model_group(command),
+            "UpdateToolSettings"
+            | "UpdateSkills"
+            | "UpdateMemoryProjections"
+            | "UpdateStartupTasks"
+            | "UpdateRootfsSettings" => self.execute_update_app_setting(command),
             "ImportAttachmentFromUri" => self.execute_import_attachment(command),
             "RemovePendingAttachment" => self.execute_remove_pending_attachment(command),
             "ClearPendingAttachments" => self.execute_clear_pending_attachments(command),
@@ -453,30 +473,98 @@ impl RuntimeEngine {
             .provider_id
             .clone()
             .if_blank(command.message_id.clone());
-        let result = self
-            .tokio
-            .block_on(self.database.upsert_provider(ProviderUpsert {
-                id: provider_id,
-                name: command.title,
-                icon_name: "sparkles".to_string(),
-                api_type: OPENAI_COMPATIBLE_PROTOCOL.to_string(),
-                base_url: command.chunk,
-                secret_ref: command.payload_json,
-                enabled: true,
-            }));
+        let result = self.tokio.block_on(async {
+            let provider = self
+                .database
+                .upsert_provider(ProviderUpsert {
+                    id: provider_id.clone(),
+                    name: command.title.clone(),
+                    icon_name: config_payload_string(&command.payload_json, "iconName")
+                        .if_blank("sparkles".to_string()),
+                    api_type: OPENAI_COMPATIBLE_PROTOCOL.to_string(),
+                    base_url: command.chunk.clone(),
+                    secret_ref: provider_secret_ref_from_payload(&command.payload_json),
+                    enabled: config_payload_bool(&command.payload_json, "enabled", true),
+                })
+                .await?;
+            self.database
+                .insert_config_audit(
+                    &command.command_id,
+                    "user",
+                    "UpdateProvider",
+                    "provider",
+                    &provider.id,
+                    &format!(
+                        "Provider '{}' saved with redacted secret ({})",
+                        provider.name,
+                        redacted_secret_label(&provider.secret_ref)
+                    ),
+                    false,
+                    "",
+                )
+                .await?;
+            self.database.bootstrap_snapshot().await
+        });
 
         match result {
-            Ok(_) => {
-                let snapshot = self
-                    .tokio
-                    .block_on(self.database.bootstrap_snapshot())
-                    .unwrap_or_default();
+            Ok(snapshot) => {
                 let _ = self.emit_session_event(
-                    RuntimeEventKind::ModelsUpdated,
+                    RuntimeEventKind::SettingsChanged,
                     String::new(),
                     String::new(),
                     snapshot,
                     "Provider updated".to_string(),
+                    None,
+                );
+                accepted_ack(command.command_id, command.idempotency_key)
+            }
+            Err(error) => {
+                let _ = self.emit_error(error.clone());
+                rejected_ack(command.command_id, command.idempotency_key, error)
+            }
+        }
+    }
+
+    fn execute_delete_provider(&self, command: RuntimeCommand) -> RuntimeCommandAck {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return rejected_ack(
+                command.command_id,
+                command.idempotency_key,
+                HamburError::RuntimeClosed,
+            );
+        }
+        if let Err(error) = require_approval(&command, "delete-provider") {
+            return rejected_ack(command.command_id, command.idempotency_key, error);
+        }
+        let provider_id = command
+            .provider_id
+            .clone()
+            .if_blank(command.message_id.clone());
+        let result = self.tokio.block_on(async {
+            self.database.delete_provider(&provider_id).await?;
+            self.database
+                .insert_config_audit(
+                    &command.command_id,
+                    "user",
+                    "DeleteProvider",
+                    "provider",
+                    &provider_id,
+                    "Provider deleted after explicit approval",
+                    true,
+                    &approval_token_from_payload(&command.payload_json),
+                )
+                .await?;
+            self.database.bootstrap_snapshot().await
+        });
+
+        match result {
+            Ok(snapshot) => {
+                let _ = self.emit_session_event(
+                    RuntimeEventKind::SettingsChanged,
+                    String::new(),
+                    String::new(),
+                    snapshot,
+                    "Provider deleted".to_string(),
                     None,
                 );
                 accepted_ack(command.command_id, command.idempotency_key)
@@ -545,6 +633,16 @@ impl RuntimeEngine {
                             index as u32,
                         ));
                 }
+                let _ = self.tokio.block_on(self.database.insert_config_audit(
+                    &command.command_id,
+                    "user",
+                    "RefreshProviderModels",
+                    "provider",
+                    &provider_id,
+                    &format!("{} provider models refreshed", models.len()),
+                    false,
+                    "",
+                ));
                 let snapshot = self
                     .tokio
                     .block_on(self.database.bootstrap_snapshot())
@@ -555,6 +653,258 @@ impl RuntimeEngine {
                     String::new(),
                     snapshot,
                     format!("{} models refreshed", models.len()),
+                    None,
+                );
+                accepted_ack(command.command_id, command.idempotency_key)
+            }
+            Err(error) => {
+                let _ = self.emit_error(error.clone());
+                rejected_ack(command.command_id, command.idempotency_key, error)
+            }
+        }
+    }
+
+    fn execute_update_model_override(&self, command: RuntimeCommand) -> RuntimeCommandAck {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return rejected_ack(
+                command.command_id,
+                command.idempotency_key,
+                HamburError::RuntimeClosed,
+            );
+        }
+        let payload = config_payload_value(&command.payload_json);
+        let provider_id = command
+            .provider_id
+            .clone()
+            .if_blank(config_string(&payload, "providerId").if_blank(command.message_id.clone()));
+        let model_id = command
+            .model_id
+            .clone()
+            .if_blank(config_string(&payload, "modelId"));
+        let result = self.tokio.block_on(async {
+            let model = self
+                .database
+                .upsert_provider_model_override(ProviderModelOverride {
+                    provider_id: provider_id.clone(),
+                    model_id: model_id.clone(),
+                    display_name: command
+                        .title
+                        .clone()
+                        .if_blank(config_string(&payload, "displayName")),
+                    supports_tool_call: config_bool(&payload, "supportsToolCall", true),
+                    supports_reasoning: config_bool(&payload, "supportsReasoning", true),
+                    supports_image_input: config_bool(&payload, "supportsImageInput", false),
+                    supports_structured_output: config_bool(
+                        &payload,
+                        "supportsStructuredOutput",
+                        false,
+                    ),
+                    supports_temperature: config_bool(&payload, "supportsTemperature", true),
+                    context_limit: config_u32(&payload, "contextLimit", 32000),
+                    output_limit: config_u32(&payload, "outputLimit", 4096),
+                    reasoning_field: config_string(&payload, "reasoningField"),
+                    metadata_json: config_object_string(&payload, "metadataJson"),
+                })
+                .await?;
+            self.database
+                .insert_config_audit(
+                    &command.command_id,
+                    "user",
+                    "UpdateModelOverride",
+                    "provider_model",
+                    &format!("{}/{}", model.provider_id, model.model_id),
+                    &format!("Model '{}' overrides saved", model.display_name),
+                    false,
+                    "",
+                )
+                .await?;
+            self.database.bootstrap_snapshot().await
+        });
+        self.finish_settings_command(command, result, "Model overrides updated")
+    }
+
+    fn execute_update_model_group(&self, command: RuntimeCommand) -> RuntimeCommandAck {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return rejected_ack(
+                command.command_id,
+                command.idempotency_key,
+                HamburError::RuntimeClosed,
+            );
+        }
+        let payload = config_payload_value(&command.payload_json);
+        let group_id = command
+            .message_id
+            .clone()
+            .if_blank(config_string(&payload, "groupId"));
+        let result = self.tokio.block_on(async {
+            let group = self
+                .database
+                .upsert_model_group(
+                    &group_id,
+                    &command
+                        .title
+                        .clone()
+                        .if_blank(config_string(&payload, "name")),
+                    &config_string(&payload, "routingStrategy"),
+                    &config_string(&payload, "fallbackPolicy"),
+                )
+                .await?;
+            self.database
+                .insert_config_audit(
+                    &command.command_id,
+                    "user",
+                    "UpdateModelGroup",
+                    "model_group",
+                    &group.id,
+                    &format!("Model group '{}' saved", group.name),
+                    false,
+                    "",
+                )
+                .await?;
+            self.database.bootstrap_snapshot().await
+        });
+        self.finish_settings_command(command, result, "Model group updated")
+    }
+
+    fn execute_update_model_group_member(&self, command: RuntimeCommand) -> RuntimeCommandAck {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return rejected_ack(
+                command.command_id,
+                command.idempotency_key,
+                HamburError::RuntimeClosed,
+            );
+        }
+        let payload = config_payload_value(&command.payload_json);
+        let group_id = command
+            .message_id
+            .clone()
+            .if_blank(config_string(&payload, "groupId"))
+            .if_blank("grp_primary_chat".to_string());
+        let provider_id = command
+            .provider_id
+            .clone()
+            .if_blank(config_string(&payload, "providerId"));
+        let model_id = command
+            .model_id
+            .clone()
+            .if_blank(config_string(&payload, "modelId"));
+        let position = config_u32(&payload, "position", 0);
+        let enabled = config_bool(&payload, "enabled", true);
+        let result = self.tokio.block_on(async {
+            let member = self
+                .database
+                .upsert_model_group_member(&group_id, &provider_id, &model_id, position, enabled)
+                .await?;
+            self.database
+                .insert_config_audit(
+                    &command.command_id,
+                    "user",
+                    "UpdateModelGroupMember",
+                    "model_group_member",
+                    &format!(
+                        "{}/{}/{}",
+                        member.group_id, member.provider_id, member.model_id
+                    ),
+                    &format!("Model group member enabled={}", member.enabled),
+                    false,
+                    "",
+                )
+                .await?;
+            self.database.bootstrap_snapshot().await
+        });
+        self.finish_settings_command(command, result, "Model group member updated")
+    }
+
+    fn execute_set_default_model_group(&self, command: RuntimeCommand) -> RuntimeCommandAck {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return rejected_ack(
+                command.command_id,
+                command.idempotency_key,
+                HamburError::RuntimeClosed,
+            );
+        }
+        let payload = config_payload_value(&command.payload_json);
+        let key = command
+            .chunk
+            .clone()
+            .if_blank(config_string(&payload, "key"));
+        let group_id = command
+            .message_id
+            .clone()
+            .if_blank(config_string(&payload, "groupId"));
+        let result = self.tokio.block_on(async {
+            let default = self
+                .database
+                .set_default_model_group(&key, &group_id)
+                .await?;
+            self.database
+                .insert_config_audit(
+                    &command.command_id,
+                    "user",
+                    "SetDefaultModelGroup",
+                    "default_model_group",
+                    &default.key,
+                    &format!("Default group '{}' -> '{}'", default.key, default.group_id),
+                    false,
+                    "",
+                )
+                .await?;
+            self.database.bootstrap_snapshot().await
+        });
+        self.finish_settings_command(command, result, "Default model group updated")
+    }
+
+    fn execute_update_app_setting(&self, command: RuntimeCommand) -> RuntimeCommandAck {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return rejected_ack(
+                command.command_id,
+                command.idempotency_key,
+                HamburError::RuntimeClosed,
+            );
+        }
+        let setting_key = setting_key_for_command(&command.kind);
+        if setting_requires_approval(setting_key)
+            && let Err(error) = require_approval(&command, setting_key)
+        {
+            return rejected_ack(command.command_id, command.idempotency_key, error);
+        }
+        let result = self.tokio.block_on(async {
+            let setting = self
+                .database
+                .upsert_app_setting(setting_key, &command.payload_json)
+                .await?;
+            let approval_token = approval_token_from_payload(&command.payload_json);
+            self.database
+                .insert_config_audit(
+                    &command.command_id,
+                    "user",
+                    command.kind.as_str(),
+                    "app_setting",
+                    &setting.key,
+                    &format!("Setting '{}' updated", setting.key),
+                    setting_requires_approval(&setting.key),
+                    &approval_token,
+                )
+                .await?;
+            self.database.bootstrap_snapshot().await
+        });
+        self.finish_settings_command(command, result, "Setting updated")
+    }
+
+    fn finish_settings_command(
+        &self,
+        command: RuntimeCommand,
+        result: HamburResult<AppSnapshot>,
+        message: &'static str,
+    ) -> RuntimeCommandAck {
+        match result {
+            Ok(snapshot) => {
+                let _ = self.emit_session_event(
+                    RuntimeEventKind::SettingsChanged,
+                    String::new(),
+                    String::new(),
+                    snapshot,
+                    message.to_string(),
                     None,
                 );
                 accepted_ack(command.command_id, command.idempotency_key)
@@ -2413,6 +2763,17 @@ impl RuntimeEngine {
         }
     }
 
+    pub fn get_settings_snapshot(&self) -> RuntimeSettingsSnapshot {
+        RuntimeSettingsSnapshot {
+            snapshot_sequence: self.snapshot_sequence(),
+            created_at_ms: now_ms(),
+            settings: self
+                .tokio
+                .block_on(self.database.settings_snapshot())
+                .unwrap_or_default(),
+        }
+    }
+
     pub fn shutdown(&self) {
         if self.shutdown.swap(true, Ordering::SeqCst) {
             return;
@@ -2653,10 +3014,51 @@ fn validate_command(command: &RuntimeCommand) -> HamburResult<()> {
             }
             Ok(())
         }
+        "DeleteProvider" => {
+            if command.provider_id.is_empty() && command.message_id.is_empty() {
+                return Err(HamburError::InvalidCommand(
+                    "provider_id must not be empty".to_string(),
+                ));
+            }
+            Ok(())
+        }
         "RefreshProviderModels" => {
             if command.provider_id.is_empty() && command.message_id.is_empty() {
                 return Err(HamburError::InvalidCommand(
                     "provider_id must not be empty".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        "UpdateModelOverride" => {
+            if command.provider_id.is_empty()
+                && command.message_id.is_empty()
+                && config_payload_string(&command.payload_json, "providerId").is_empty()
+            {
+                return Err(HamburError::InvalidCommand(
+                    "provider_id must not be empty".to_string(),
+                ));
+            }
+            if command.model_id.is_empty()
+                && config_payload_string(&command.payload_json, "modelId").is_empty()
+            {
+                return Err(HamburError::InvalidCommand(
+                    "model_id must not be empty".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        "UpdateModelGroup" => Ok(()),
+        "UpdateModelGroupMember" => Ok(()),
+        "SetDefaultModelGroup" => Ok(()),
+        "UpdateToolSettings"
+        | "UpdateSkills"
+        | "UpdateMemoryProjections"
+        | "UpdateStartupTasks"
+        | "UpdateRootfsSettings" => {
+            if command.payload_json.trim().is_empty() {
+                return Err(HamburError::InvalidCommand(
+                    "setting payload_json must not be empty".to_string(),
                 ));
             }
             Ok(())
@@ -3092,6 +3494,129 @@ fn default_models_response(model_id: &str) -> String {
     format!(
         r#"{{"data":[{{"id":"{model_id}","display_name":"{model_id}","supports_reasoning":true,"supports_tool_call":true,"supports_image_input":{supports_image_input},"supports_structured_output":false,"supports_temperature":true,"context_limit":32000,"output_limit":4096}}]}}"#
     )
+}
+
+fn config_payload_value(payload_json: &str) -> Value {
+    serde_json::from_str::<Value>(payload_json)
+        .unwrap_or_else(|_| Value::Object(Default::default()))
+}
+
+fn config_payload_string(payload_json: &str, key: &str) -> String {
+    let value = config_payload_value(payload_json);
+    config_string(&value, key)
+}
+
+fn config_string(value: &Value, key: &str) -> String {
+    value
+        .get(key)
+        .or_else(|| value.get(to_snake_key(key).as_str()))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+fn config_bool(value: &Value, key: &str, fallback: bool) -> bool {
+    value
+        .get(key)
+        .or_else(|| value.get(to_snake_key(key).as_str()))
+        .and_then(Value::as_bool)
+        .unwrap_or(fallback)
+}
+
+fn config_payload_bool(payload_json: &str, key: &str, fallback: bool) -> bool {
+    let value = config_payload_value(payload_json);
+    config_bool(&value, key, fallback)
+}
+
+fn config_u32(value: &Value, key: &str, fallback: u32) -> u32 {
+    value
+        .get(key)
+        .or_else(|| value.get(to_snake_key(key).as_str()))
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(fallback)
+}
+
+fn config_object_string(value: &Value, key: &str) -> String {
+    let Some(child) = value
+        .get(key)
+        .or_else(|| value.get(to_snake_key(key).as_str()))
+    else {
+        return "{}".to_string();
+    };
+    if let Some(text) = child.as_str() {
+        if text.trim().is_empty() {
+            "{}".to_string()
+        } else {
+            text.to_string()
+        }
+    } else {
+        child.to_string()
+    }
+}
+
+fn to_snake_key(key: &str) -> String {
+    let mut output = String::new();
+    for (index, ch) in key.chars().enumerate() {
+        if ch.is_ascii_uppercase() {
+            if index > 0 {
+                output.push('_');
+            }
+            output.push(ch.to_ascii_lowercase());
+        } else {
+            output.push(ch);
+        }
+    }
+    output
+}
+
+fn provider_secret_ref_from_payload(payload_json: &str) -> String {
+    let parsed = config_payload_value(payload_json);
+    config_string(&parsed, "secretRef")
+        .if_blank(config_string(&parsed, "secret_ref"))
+        .if_blank(payload_json.trim().to_string())
+}
+
+fn redacted_secret_label(secret_ref: &str) -> &'static str {
+    if secret_ref.starts_with("android-secret://") {
+        "android-secret"
+    } else if secret_ref.starts_with("env://") {
+        "env"
+    } else {
+        "secret-ref"
+    }
+}
+
+fn approval_token_from_payload(payload_json: &str) -> String {
+    config_payload_string(payload_json, "approvalToken")
+}
+
+fn require_approval(command: &RuntimeCommand, scope: &str) -> HamburResult<()> {
+    let token = approval_token_from_payload(&command.payload_json);
+    let expected = format!("approve:{scope}");
+    if token == expected {
+        Ok(())
+    } else {
+        Err(HamburError::InvalidCommand(format!(
+            "{scope} requires approval token: {expected}"
+        )))
+    }
+}
+
+fn setting_key_for_command(command_kind: &str) -> &'static str {
+    match command_kind {
+        "UpdateToolSettings" => "tool_settings",
+        "UpdateSkills" => "skills",
+        "UpdateMemoryProjections" => "memory_projections",
+        "UpdateStartupTasks" => "startup_tasks",
+        "UpdateRootfsSettings" => "rootfs_settings",
+        _ => "tool_settings",
+    }
+}
+
+fn setting_requires_approval(setting_key: &str) -> bool {
+    matches!(setting_key, "rootfs_settings" | "startup_tasks")
 }
 
 trait IfBlank {
@@ -4016,6 +4541,261 @@ mod tests {
         assert_eq!(message.model_id_snapshot, "model-vision");
         assert!(message.content_text.contains("ImagePart"));
         assert!(!message.content_text.contains("base64"));
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
+    fn settings_snapshot_redacts_secrets_and_audits_config_mutations() {
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+
+        let provider = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_settings_provider".to_string(),
+            idempotency_key: "settings:provider:update".to_string(),
+            kind: "UpdateProvider".to_string(),
+            provider_id: "provider_settings".to_string(),
+            title: "Settings Provider".to_string(),
+            chunk: "https://api.settings.test/v1".to_string(),
+            payload_json: serde_json::json!({
+                "secretRef": "android-secret://providers/settings",
+                "enabled": true
+            })
+            .to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(provider.accepted, "provider rejected: {}", provider.message);
+        let event = runtime.next_event().expect("settings event");
+        assert_eq!(event.kind.as_str(), "SettingsChanged");
+
+        let snapshot = runtime.get_settings_snapshot();
+        assert_eq!(snapshot.settings.providers.len(), 1);
+        let provider = &snapshot.settings.providers[0];
+        assert_eq!(provider.id, "provider_settings");
+        assert_eq!(provider.secret_label, "Android Secret Store");
+        assert!(!provider.secret_label.contains("settings"));
+        assert!(
+            snapshot
+                .settings
+                .config_audits
+                .iter()
+                .any(|audit| audit.action == "UpdateProvider"
+                    && audit.redacted_summary.contains("redacted secret"))
+        );
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
+    fn destructive_config_mutations_require_approval() {
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+        configure_named_test_provider(&runtime, "provider_delete", "model-delete");
+
+        let rejected_delete = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_delete_without_approval".to_string(),
+            idempotency_key: "settings:delete:without-approval".to_string(),
+            kind: "DeleteProvider".to_string(),
+            provider_id: "provider_delete".to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(!rejected_delete.accepted);
+        assert_eq!(rejected_delete.rejection_code, "InvalidCommand");
+
+        let rejected_rootfs = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_rootfs_without_approval".to_string(),
+            idempotency_key: "settings:rootfs:without-approval".to_string(),
+            kind: "UpdateRootfsSettings".to_string(),
+            payload_json: serde_json::json!({"enabled": true}).to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(!rejected_rootfs.accepted);
+        assert_eq!(rejected_rootfs.rejection_code, "InvalidCommand");
+
+        let approved_rootfs = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_rootfs_with_approval".to_string(),
+            idempotency_key: "settings:rootfs:with-approval".to_string(),
+            kind: "UpdateRootfsSettings".to_string(),
+            payload_json: serde_json::json!({
+                "enabled": true,
+                "approvalToken": "approve:rootfs_settings"
+            })
+            .to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(
+            approved_rootfs.accepted,
+            "rootfs rejected: {}",
+            approved_rootfs.message
+        );
+        let _ = runtime.next_event().expect("rootfs settings event");
+
+        let approved_delete = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_delete_with_approval".to_string(),
+            idempotency_key: "settings:delete:with-approval".to_string(),
+            kind: "DeleteProvider".to_string(),
+            provider_id: "provider_delete".to_string(),
+            payload_json: serde_json::json!({
+                "approvalToken": "approve:delete-provider"
+            })
+            .to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(
+            approved_delete.accepted,
+            "delete rejected: {}",
+            approved_delete.message
+        );
+        let _ = runtime.next_event().expect("provider deleted event");
+
+        let snapshot = runtime.get_settings_snapshot();
+        assert!(snapshot.settings.providers.is_empty());
+        assert!(
+            snapshot
+                .settings
+                .config_audits
+                .iter()
+                .any(|audit| audit.action == "DeleteProvider" && audit.approval_required)
+        );
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
+    fn model_groups_and_app_settings_persist_through_restart() {
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+
+        {
+            let runtime = RuntimeEngine::create(AppBootstrap {
+                app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            })
+            .expect("create runtime");
+            let _ = runtime.next_event().expect("ready event");
+            configure_named_test_provider(&runtime, "provider_persist", "model-persist");
+
+            let group = runtime.dispatch(RuntimeCommand {
+                command_id: "cmd_group_persist".to_string(),
+                idempotency_key: "settings:group:persist".to_string(),
+                kind: "UpdateModelGroup".to_string(),
+                message_id: "grp_persist".to_string(),
+                title: "Persistent Group".to_string(),
+                payload_json: serde_json::json!({
+                    "groupId": "grp_persist",
+                    "name": "Persistent Group",
+                    "routingStrategy": "fallback",
+                    "fallbackPolicy": "default"
+                })
+                .to_string(),
+                ..RuntimeCommand::default()
+            });
+            assert!(group.accepted, "group rejected: {}", group.message);
+            let _ = runtime.next_event().expect("group event");
+
+            let member = runtime.dispatch(RuntimeCommand {
+                command_id: "cmd_group_member_persist".to_string(),
+                idempotency_key: "settings:group-member:persist".to_string(),
+                kind: "UpdateModelGroupMember".to_string(),
+                message_id: "grp_persist".to_string(),
+                provider_id: "provider_persist".to_string(),
+                model_id: "model-persist".to_string(),
+                payload_json: serde_json::json!({
+                    "groupId": "grp_persist",
+                    "providerId": "provider_persist",
+                    "modelId": "model-persist",
+                    "position": 0,
+                    "enabled": true
+                })
+                .to_string(),
+                ..RuntimeCommand::default()
+            });
+            assert!(member.accepted, "member rejected: {}", member.message);
+            let _ = runtime.next_event().expect("member event");
+
+            let default = runtime.dispatch(RuntimeCommand {
+                command_id: "cmd_default_group_persist".to_string(),
+                idempotency_key: "settings:default-group:persist".to_string(),
+                kind: "SetDefaultModelGroup".to_string(),
+                chunk: "primary".to_string(),
+                message_id: "grp_persist".to_string(),
+                payload_json: serde_json::json!({
+                    "key": "primary",
+                    "groupId": "grp_persist"
+                })
+                .to_string(),
+                ..RuntimeCommand::default()
+            });
+            assert!(default.accepted, "default rejected: {}", default.message);
+            let _ = runtime.next_event().expect("default event");
+
+            let tool_settings = runtime.dispatch(RuntimeCommand {
+                command_id: "cmd_tool_settings_persist".to_string(),
+                idempotency_key: "settings:tool:persist".to_string(),
+                kind: "UpdateToolSettings".to_string(),
+                payload_json: serde_json::json!({
+                    "terminal": false,
+                    "browser": true
+                })
+                .to_string(),
+                ..RuntimeCommand::default()
+            });
+            assert!(
+                tool_settings.accepted,
+                "tool setting rejected: {}",
+                tool_settings.message
+            );
+            let _ = runtime.next_event().expect("tool settings event");
+            runtime.shutdown();
+        }
+
+        let restarted = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+        })
+        .expect("restart runtime");
+        let _ = restarted.next_event().expect("restart ready");
+        let snapshot = restarted.get_settings_snapshot();
+        assert!(
+            snapshot
+                .settings
+                .model_groups
+                .iter()
+                .any(|group| group.id == "grp_persist")
+        );
+        assert!(
+            snapshot
+                .settings
+                .model_group_members
+                .iter()
+                .any(|member| member.group_id == "grp_persist"
+                    && member.provider_id == "provider_persist"
+                    && member.model_id == "model-persist")
+        );
+        assert!(
+            snapshot
+                .settings
+                .default_model_groups
+                .iter()
+                .any(|default| default.key == "primary" && default.group_id == "grp_persist")
+        );
+        assert!(
+            snapshot
+                .settings
+                .settings
+                .iter()
+                .any(|setting| setting.key == "tool_settings" && setting.value.contains("browser"))
+        );
 
         let _ = fs::remove_dir_all(app_files_dir);
     }

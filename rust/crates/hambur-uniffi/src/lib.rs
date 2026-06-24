@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use hambur_core::{new_id, now_ms};
 use hambur_db::{
-    AppSnapshot, AttachmentRecord, MessageRecord, SessionSummary, TimelineItemSnapshot,
+    AppSettingRecord, AppSnapshot, AttachmentRecord, ConfigAuditRecord, DefaultModelGroupRecord,
+    MessageRecord, ModelGroupMemberRecord, ModelGroupRecord, ProviderModelRecord,
+    PublicProviderRecord, SessionSummary, TimelineItemSnapshot,
 };
 use hambur_markdown::{
     MarkdownBlockNode, MarkdownInlineNode, MarkdownRenderUpdate, MarkdownTableRow,
@@ -10,7 +12,7 @@ use hambur_markdown::{
 use hambur_runtime::{
     AppBootstrap, RuntimeCommand, RuntimeCommandAck, RuntimeEngine, RuntimeEvent,
     RuntimeMessageSnapshot, RuntimeSearchSnapshot, RuntimeSessionListSnapshot,
-    RuntimeSessionSnapshot, RuntimeTimelinePage,
+    RuntimeSessionSnapshot, RuntimeSettingsSnapshot, RuntimeTimelinePage,
 };
 
 uniffi::include_scaffolding!("hambur_uniffi");
@@ -154,6 +156,92 @@ pub struct AppSnapshotDTO {
     pub pending_attachments: Vec<AttachmentDTO>,
 }
 
+pub struct PublicProviderDTO {
+    pub id: String,
+    pub name: String,
+    pub icon_name: String,
+    pub api_type: String,
+    pub base_url: String,
+    pub secret_label: String,
+    pub enabled: bool,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+pub struct ProviderModelDTO {
+    pub id: String,
+    pub provider_id: String,
+    pub model_id: String,
+    pub display_name: String,
+    pub supports_tool_call: bool,
+    pub supports_reasoning: bool,
+    pub supports_image_input: bool,
+    pub supports_structured_output: bool,
+    pub supports_temperature: bool,
+    pub context_limit: u32,
+    pub output_limit: u32,
+    pub reasoning_field: String,
+    pub metadata_json: String,
+    pub synced_at_ms: u64,
+}
+
+pub struct ModelGroupDTO {
+    pub id: String,
+    pub name: String,
+    pub routing_strategy: String,
+    pub fallback_policy: String,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+pub struct ModelGroupMemberDTO {
+    pub id: String,
+    pub group_id: String,
+    pub provider_id: String,
+    pub provider_name: String,
+    pub model_id: String,
+    pub model_display_name: String,
+    pub position: u32,
+    pub enabled: bool,
+}
+
+pub struct DefaultModelGroupDTO {
+    pub key: String,
+    pub group_id: String,
+    pub updated_at_ms: u64,
+}
+
+pub struct AppSettingDTO {
+    pub key: String,
+    pub value: String,
+    pub updated_at_ms: u64,
+}
+
+pub struct ConfigAuditDTO {
+    pub id: String,
+    pub command_id: String,
+    pub actor: String,
+    pub action: String,
+    pub target_kind: String,
+    pub target_id: String,
+    pub redacted_summary: String,
+    pub approval_required: bool,
+    pub approval_token: String,
+    pub created_at_ms: u64,
+}
+
+pub struct SettingsSnapshotDTO {
+    pub snapshot_sequence: u64,
+    pub created_at_ms: u64,
+    pub providers: Vec<PublicProviderDTO>,
+    pub provider_models: Vec<ProviderModelDTO>,
+    pub model_groups: Vec<ModelGroupDTO>,
+    pub model_group_members: Vec<ModelGroupMemberDTO>,
+    pub default_model_groups: Vec<DefaultModelGroupDTO>,
+    pub settings: Vec<AppSettingDTO>,
+    pub config_audits: Vec<ConfigAuditDTO>,
+}
+
 pub struct SessionListSnapshotDTO {
     pub snapshot_sequence: u64,
     pub created_at_ms: u64,
@@ -267,6 +355,10 @@ impl BackendRuntime {
 
     pub fn search_sessions(&self, query: String, limit: u32) -> SearchSnapshotDTO {
         self.engine.search_sessions(query, limit).into()
+    }
+
+    pub fn get_settings_snapshot(&self) -> SettingsSnapshotDTO {
+        self.engine.get_settings_snapshot().into()
     }
 
     pub fn create_session(&self, title: String) -> CommandAck {
@@ -428,6 +520,57 @@ impl From<RuntimeSearchSnapshot> for SearchSnapshotDTO {
     }
 }
 
+impl From<RuntimeSettingsSnapshot> for SettingsSnapshotDTO {
+    fn from(value: RuntimeSettingsSnapshot) -> Self {
+        Self {
+            snapshot_sequence: value.snapshot_sequence,
+            created_at_ms: value.created_at_ms,
+            providers: value
+                .settings
+                .providers
+                .into_iter()
+                .map(PublicProviderDTO::from)
+                .collect(),
+            provider_models: value
+                .settings
+                .provider_models
+                .into_iter()
+                .map(ProviderModelDTO::from)
+                .collect(),
+            model_groups: value
+                .settings
+                .model_groups
+                .into_iter()
+                .map(ModelGroupDTO::from)
+                .collect(),
+            model_group_members: value
+                .settings
+                .model_group_members
+                .into_iter()
+                .map(ModelGroupMemberDTO::from)
+                .collect(),
+            default_model_groups: value
+                .settings
+                .default_model_groups
+                .into_iter()
+                .map(DefaultModelGroupDTO::from)
+                .collect(),
+            settings: value
+                .settings
+                .settings
+                .into_iter()
+                .map(AppSettingDTO::from)
+                .collect(),
+            config_audits: value
+                .settings
+                .config_audits
+                .into_iter()
+                .map(ConfigAuditDTO::from)
+                .collect(),
+        }
+    }
+}
+
 impl From<MarkdownInlineNode> for MarkdownInlineNodeDTO {
     fn from(value: MarkdownInlineNode) -> Self {
         Self {
@@ -518,6 +661,108 @@ impl From<AppSnapshot> for AppSnapshotDTO {
                 .into_iter()
                 .map(AttachmentDTO::from)
                 .collect(),
+        }
+    }
+}
+
+impl From<PublicProviderRecord> for PublicProviderDTO {
+    fn from(value: PublicProviderRecord) -> Self {
+        Self {
+            id: value.id,
+            name: value.name,
+            icon_name: value.icon_name,
+            api_type: value.api_type,
+            base_url: value.base_url,
+            secret_label: value.secret_label,
+            enabled: value.enabled,
+            created_at_ms: value.created_at_ms,
+            updated_at_ms: value.updated_at_ms,
+        }
+    }
+}
+
+impl From<ProviderModelRecord> for ProviderModelDTO {
+    fn from(value: ProviderModelRecord) -> Self {
+        Self {
+            id: value.id,
+            provider_id: value.provider_id,
+            model_id: value.model_id,
+            display_name: value.display_name,
+            supports_tool_call: value.supports_tool_call,
+            supports_reasoning: value.supports_reasoning,
+            supports_image_input: value.supports_image_input,
+            supports_structured_output: value.supports_structured_output,
+            supports_temperature: value.supports_temperature,
+            context_limit: value.context_limit,
+            output_limit: value.output_limit,
+            reasoning_field: value.reasoning_field,
+            metadata_json: value.metadata_json,
+            synced_at_ms: value.synced_at_ms,
+        }
+    }
+}
+
+impl From<ModelGroupRecord> for ModelGroupDTO {
+    fn from(value: ModelGroupRecord) -> Self {
+        Self {
+            id: value.id,
+            name: value.name,
+            routing_strategy: value.routing_strategy,
+            fallback_policy: value.fallback_policy,
+            created_at_ms: value.created_at_ms,
+            updated_at_ms: value.updated_at_ms,
+        }
+    }
+}
+
+impl From<ModelGroupMemberRecord> for ModelGroupMemberDTO {
+    fn from(value: ModelGroupMemberRecord) -> Self {
+        Self {
+            id: value.id,
+            group_id: value.group_id,
+            provider_id: value.provider_id,
+            provider_name: value.provider_name,
+            model_id: value.model_id,
+            model_display_name: value.model_display_name,
+            position: value.position,
+            enabled: value.enabled,
+        }
+    }
+}
+
+impl From<DefaultModelGroupRecord> for DefaultModelGroupDTO {
+    fn from(value: DefaultModelGroupRecord) -> Self {
+        Self {
+            key: value.key,
+            group_id: value.group_id,
+            updated_at_ms: value.updated_at_ms,
+        }
+    }
+}
+
+impl From<AppSettingRecord> for AppSettingDTO {
+    fn from(value: AppSettingRecord) -> Self {
+        Self {
+            key: value.key,
+            value: value.value,
+            updated_at_ms: value.updated_at_ms,
+        }
+    }
+}
+
+impl From<ConfigAuditRecord> for ConfigAuditDTO {
+    fn from(value: ConfigAuditRecord) -> Self {
+        Self {
+            id: value.id,
+            command_id: value.command_id,
+            actor: value.actor,
+            action: value.action,
+            target_kind: value.target_kind,
+            target_id: value.target_id,
+            redacted_summary: value.redacted_summary,
+            approval_required: value.approval_required,
+            approval_token: value.approval_token,
+            created_at_ms: value.created_at_ms,
         }
     }
 }

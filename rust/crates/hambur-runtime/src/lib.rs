@@ -1,9 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{
     Arc, Mutex, Weak,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -227,6 +227,7 @@ pub struct RuntimeEngine {
     platform_requests: Mutex<HashMap<String, oneshot::Sender<PlatformResultPayload>>>,
     delegate_tasks: Mutex<HashMap<String, DelegateTaskState>>,
     delegate_sessions: Mutex<HashSet<String>>,
+    process_sessions: Mutex<HashMap<String, BackgroundProcessSession>>,
     router: Mutex<ModelRouter>,
     tools: ToolScheduler,
     idempotency: Mutex<HashMap<String, RuntimeCommandAck>>,
@@ -289,6 +290,59 @@ struct PreparedDelegateTurn {
     stream_chunks_by_route: Vec<Vec<Vec<u8>>>,
 }
 
+struct BackgroundProcessSession {
+    session_id: String,
+    process_session_id: String,
+    backend: String,
+    command: String,
+    cwd: String,
+    started_at_ms: u64,
+    pid: u32,
+    child: Child,
+    output: Arc<Mutex<ProcessOutputBuffer>>,
+    exit_code: Option<i32>,
+    finished_at_ms: u64,
+}
+
+#[derive(Debug, Default)]
+struct ProcessOutputBuffer {
+    stdout: VecDeque<u8>,
+    stderr: VecDeque<u8>,
+    stdout_total_bytes: u64,
+    stderr_total_bytes: u64,
+}
+
+impl ProcessOutputBuffer {
+    fn push_stdout(&mut self, bytes: &[u8]) {
+        push_ring(&mut self.stdout, bytes);
+        self.stdout_total_bytes += bytes.len() as u64;
+    }
+
+    fn push_stderr(&mut self, bytes: &[u8]) {
+        push_ring(&mut self.stderr, bytes);
+        self.stderr_total_bytes += bytes.len() as u64;
+    }
+
+    fn snapshot(&self) -> ProcessOutputSnapshot {
+        ProcessOutputSnapshot {
+            stdout: String::from_utf8_lossy(&self.stdout.iter().copied().collect::<Vec<_>>())
+                .to_string(),
+            stderr: String::from_utf8_lossy(&self.stderr.iter().copied().collect::<Vec<_>>())
+                .to_string(),
+            stdout_total_bytes: self.stdout_total_bytes,
+            stderr_total_bytes: self.stderr_total_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProcessOutputSnapshot {
+    stdout: String,
+    stderr: String,
+    stdout_total_bytes: u64,
+    stderr_total_bytes: u64,
+}
+
 enum StreamAttemptResult {
     Completed,
     Cancelled,
@@ -332,6 +386,7 @@ impl RuntimeEngine {
             platform_requests: Mutex::new(HashMap::new()),
             delegate_tasks: Mutex::new(HashMap::new()),
             delegate_sessions: Mutex::new(HashSet::new()),
+            process_sessions: Mutex::new(HashMap::new()),
             router: Mutex::new(ModelRouter::default()),
             tools,
             idempotency: Mutex::new(HashMap::new()),
@@ -542,6 +597,7 @@ impl RuntimeEngine {
             .block_on(self.database.delete_session(&command.session_id))
         {
             Ok(snapshot) => {
+                self.kill_processes_for_session(&command.session_id);
                 let _ = self.emit(RuntimeEventKind::SessionDeleted, snapshot, None);
                 accepted_ack(command.command_id, command.idempotency_key)
             }
@@ -2864,22 +2920,7 @@ impl RuntimeEngine {
             );
         }
         if invocation.name == "process" {
-            return ToolResult::failed(
-                &invocation.tool_call_id,
-                &invocation.name,
-                "process background sessions are not attached yet",
-            );
-        }
-        if arguments
-            .get("background")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            return ToolResult::failed(
-                &invocation.tool_call_id,
-                &invocation.name,
-                "terminal background execution requires process sessions",
-            );
+            return self.resolve_process_tool_result(invocation, arguments);
         }
         let command = arguments
             .get("command")
@@ -2920,6 +2961,19 @@ impl RuntimeEngine {
             );
         }
 
+        if arguments
+            .get("background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return self.start_background_process(
+                invocation,
+                command,
+                &cwd.sandbox_path,
+                &cwd.host_path,
+            );
+        }
+
         let timeout_ms = arguments
             .get("timeout_ms")
             .and_then(Value::as_u64)
@@ -2933,6 +2987,362 @@ impl RuntimeEngine {
                 error.to_string(),
             )
         })
+    }
+
+    fn start_background_process(
+        &self,
+        invocation: &ToolInvocation,
+        command: &str,
+        sandbox_cwd: &str,
+        host_cwd: &std::path::Path,
+    ) -> ToolResult {
+        let shell = platform_shell();
+        let mut child = match Command::new(shell)
+            .arg("-lc")
+            .arg(command)
+            .current_dir(host_cwd)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                return ToolResult::failed(
+                    &invocation.tool_call_id,
+                    &invocation.name,
+                    format!("terminal background spawn failed: {error}"),
+                );
+            }
+        };
+        let process_session_id = new_id("proc");
+        let started_at_ms = now_ms();
+        let pid = child.id();
+        let output = Arc::new(Mutex::new(ProcessOutputBuffer::default()));
+        if let Some(stdout) = child.stdout.take() {
+            spawn_process_pipe_reader(stdout, output.clone(), true);
+        }
+        if let Some(stderr) = child.stderr.take() {
+            spawn_process_pipe_reader(stderr, output.clone(), false);
+        }
+
+        let state = BackgroundProcessSession {
+            session_id: invocation.session_id.clone(),
+            process_session_id: process_session_id.clone(),
+            backend: self.sandbox.rootfs_status().backend.clone(),
+            command: command.to_string(),
+            cwd: sandbox_cwd.to_string(),
+            started_at_ms,
+            pid,
+            child,
+            output,
+            exit_code: None,
+            finished_at_ms: 0,
+        };
+        if let Ok(mut sessions) = self.process_sessions.lock() {
+            sessions.insert(process_session_id.clone(), state);
+        } else {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                "process registry unavailable",
+            );
+        }
+
+        let content = json!({
+            "processSessionId": process_session_id,
+            "backend": self.sandbox.rootfs_status().backend,
+            "command": command,
+            "cwd": sandbox_cwd,
+            "startedAt": started_at_ms,
+            "pid": pid
+        });
+        ToolResult {
+            tool_call_id: invocation.tool_call_id.clone(),
+            tool_name: invocation.name.clone(),
+            is_error: false,
+            content_json: content.to_string(),
+            summary: "background process started".to_string(),
+            artifacts_json: "[]".to_string(),
+            trust_level: "untrusted".to_string(),
+            truncated: false,
+            offloaded_file_id: String::new(),
+            offloaded_path: String::new(),
+            context_stub: content.to_string(),
+        }
+    }
+
+    fn resolve_process_tool_result(
+        &self,
+        invocation: &ToolInvocation,
+        arguments: &Value,
+    ) -> ToolResult {
+        let action = arguments
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let process_session_id = arguments
+            .get("process_session_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        match action {
+            "list" => self.list_process_sessions(invocation),
+            "poll" | "log" => self.snapshot_process_session(invocation, process_session_id, false),
+            "wait" => {
+                let timeout_ms = arguments
+                    .get("timeout_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(30_000)
+                    .clamp(1_000, 300_000);
+                self.wait_process_session(invocation, process_session_id, timeout_ms)
+            }
+            "kill" | "close" => self.kill_process_session(invocation, process_session_id),
+            "write" | "submit" => ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                "process stdin is not attached for this backend",
+            ),
+            _ => ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                format!("unsupported process action: {action}"),
+            ),
+        }
+    }
+
+    fn list_process_sessions(&self, invocation: &ToolInvocation) -> ToolResult {
+        let mut sessions = match self.process_sessions.lock() {
+            Ok(sessions) => sessions,
+            Err(_) => {
+                return ToolResult::failed(
+                    &invocation.tool_call_id,
+                    &invocation.name,
+                    "process registry unavailable",
+                );
+            }
+        };
+        let mut values = Vec::new();
+        for state in sessions
+            .values_mut()
+            .filter(|state| state.session_id == invocation.session_id)
+        {
+            refresh_process_exit(state);
+            values.push(process_status_json(state, None));
+        }
+        let content = json!({ "processes": values });
+        ToolResult {
+            tool_call_id: invocation.tool_call_id.clone(),
+            tool_name: invocation.name.clone(),
+            is_error: false,
+            content_json: content.to_string(),
+            summary: format!("{} process sessions", values.len()),
+            artifacts_json: "[]".to_string(),
+            trust_level: "trusted".to_string(),
+            truncated: false,
+            offloaded_file_id: String::new(),
+            offloaded_path: String::new(),
+            context_stub: content.to_string(),
+        }
+    }
+
+    fn snapshot_process_session(
+        &self,
+        invocation: &ToolInvocation,
+        process_session_id: &str,
+        remove_finished: bool,
+    ) -> ToolResult {
+        let mut sessions = match self.process_sessions.lock() {
+            Ok(sessions) => sessions,
+            Err(_) => {
+                return ToolResult::failed(
+                    &invocation.tool_call_id,
+                    &invocation.name,
+                    "process registry unavailable",
+                );
+            }
+        };
+        let Some(state) = sessions.get_mut(process_session_id) else {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                "process session not found",
+            );
+        };
+        if state.session_id != invocation.session_id {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                "process session belongs to a different session",
+            );
+        }
+        refresh_process_exit(state);
+        let output = state
+            .output
+            .lock()
+            .map(|buffer| buffer.snapshot())
+            .unwrap_or_default();
+        let content = process_status_json(state, Some(output));
+        if remove_finished && state.exit_code.is_some() {
+            sessions.remove(process_session_id);
+        }
+        ToolResult {
+            tool_call_id: invocation.tool_call_id.clone(),
+            tool_name: invocation.name.clone(),
+            is_error: false,
+            content_json: content.to_string(),
+            summary: "process session snapshot".to_string(),
+            artifacts_json: "[]".to_string(),
+            trust_level: "untrusted".to_string(),
+            truncated: false,
+            offloaded_file_id: String::new(),
+            offloaded_path: String::new(),
+            context_stub: content.to_string(),
+        }
+    }
+
+    fn wait_process_session(
+        &self,
+        invocation: &ToolInvocation,
+        process_session_id: &str,
+        timeout_ms: u64,
+    ) -> ToolResult {
+        let deadline = Instant::now() + StdDuration::from_millis(timeout_ms);
+        loop {
+            {
+                let mut sessions = match self.process_sessions.lock() {
+                    Ok(sessions) => sessions,
+                    Err(_) => {
+                        return ToolResult::failed(
+                            &invocation.tool_call_id,
+                            &invocation.name,
+                            "process registry unavailable",
+                        );
+                    }
+                };
+                let Some(state) = sessions.get_mut(process_session_id) else {
+                    return ToolResult::failed(
+                        &invocation.tool_call_id,
+                        &invocation.name,
+                        "process session not found",
+                    );
+                };
+                if state.session_id != invocation.session_id {
+                    return ToolResult::failed(
+                        &invocation.tool_call_id,
+                        &invocation.name,
+                        "process session belongs to a different session",
+                    );
+                }
+                refresh_process_exit(state);
+                if state.exit_code.is_some() {
+                    let output = state
+                        .output
+                        .lock()
+                        .map(|buffer| buffer.snapshot())
+                        .unwrap_or_default();
+                    let content = process_status_json(state, Some(output));
+                    sessions.remove(process_session_id);
+                    return ToolResult {
+                        tool_call_id: invocation.tool_call_id.clone(),
+                        tool_name: invocation.name.clone(),
+                        is_error: false,
+                        content_json: content.to_string(),
+                        summary: "process session finished".to_string(),
+                        artifacts_json: "[]".to_string(),
+                        trust_level: "untrusted".to_string(),
+                        truncated: false,
+                        offloaded_file_id: String::new(),
+                        offloaded_path: String::new(),
+                        context_stub: content.to_string(),
+                    };
+                }
+            }
+            if Instant::now() >= deadline {
+                return ToolResult::failed(
+                    &invocation.tool_call_id,
+                    &invocation.name,
+                    "process wait timed out",
+                );
+            }
+            thread::sleep(StdDuration::from_millis(20));
+        }
+    }
+
+    fn kill_process_session(
+        &self,
+        invocation: &ToolInvocation,
+        process_session_id: &str,
+    ) -> ToolResult {
+        let mut sessions = match self.process_sessions.lock() {
+            Ok(sessions) => sessions,
+            Err(_) => {
+                return ToolResult::failed(
+                    &invocation.tool_call_id,
+                    &invocation.name,
+                    "process registry unavailable",
+                );
+            }
+        };
+        let Some(mut state) = sessions.remove(process_session_id) else {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                "process session not found",
+            );
+        };
+        if state.session_id != invocation.session_id {
+            sessions.insert(process_session_id.to_string(), state);
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                "process session belongs to a different session",
+            );
+        }
+        let _ = state.child.kill();
+        let _ = state.child.wait();
+        state.exit_code = Some(-1);
+        state.finished_at_ms = now_ms();
+        let output = state
+            .output
+            .lock()
+            .map(|buffer| buffer.snapshot())
+            .unwrap_or_default();
+        let content = process_status_json(&state, Some(output));
+        ToolResult {
+            tool_call_id: invocation.tool_call_id.clone(),
+            tool_name: invocation.name.clone(),
+            is_error: false,
+            content_json: content.to_string(),
+            summary: "process session closed".to_string(),
+            artifacts_json: "[]".to_string(),
+            trust_level: "untrusted".to_string(),
+            truncated: false,
+            offloaded_file_id: String::new(),
+            offloaded_path: String::new(),
+            context_stub: content.to_string(),
+        }
+    }
+
+    fn kill_processes_for_session(&self, session_id: &str) {
+        let mut sessions = match self.process_sessions.lock() {
+            Ok(sessions) => sessions,
+            Err(_) => return,
+        };
+        let ids = sessions
+            .iter()
+            .filter_map(|(id, state)| {
+                if state.session_id == session_id {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        for id in ids {
+            if let Some(mut state) = sessions.remove(&id) {
+                let _ = state.child.kill();
+                let _ = state.child.wait();
+            }
+        }
     }
 
     async fn execute_browser_tool(
@@ -4791,11 +5201,7 @@ fn run_terminal_command(
     cwd: &std::path::Path,
     timeout_ms: u64,
 ) -> RawToolOutput {
-    let shell = if cfg!(target_os = "android") {
-        "/system/bin/sh"
-    } else {
-        "/bin/sh"
-    };
+    let shell = platform_shell();
     let mut child = match Command::new(shell)
         .arg("-lc")
         .arg(command)
@@ -4905,6 +5311,91 @@ fn run_terminal_command(
             status: "spawn_failed".to_string(),
         },
     }
+}
+
+fn platform_shell() -> &'static str {
+    if cfg!(target_os = "android") {
+        "/system/bin/sh"
+    } else {
+        "/bin/sh"
+    }
+}
+
+fn spawn_process_pipe_reader(
+    mut reader: impl Read + Send + 'static,
+    output: Arc<Mutex<ProcessOutputBuffer>>,
+    stdout: bool,
+) {
+    thread::spawn(move || {
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(size) => {
+                    if let Ok(mut output) = output.lock() {
+                        if stdout {
+                            output.push_stdout(&buffer[..size]);
+                        } else {
+                            output.push_stderr(&buffer[..size]);
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+fn push_ring(buffer: &mut VecDeque<u8>, bytes: &[u8]) {
+    const PROCESS_OUTPUT_RING_BYTES: usize = 64 * 1024;
+    for byte in bytes {
+        if buffer.len() >= PROCESS_OUTPUT_RING_BYTES {
+            buffer.pop_front();
+        }
+        buffer.push_back(*byte);
+    }
+}
+
+fn refresh_process_exit(state: &mut BackgroundProcessSession) {
+    if state.exit_code.is_some() {
+        return;
+    }
+    if let Ok(Some(status)) = state.child.try_wait() {
+        state.exit_code = Some(status.code().unwrap_or(-1));
+        state.finished_at_ms = now_ms();
+    }
+}
+
+fn process_status_json(
+    state: &BackgroundProcessSession,
+    output: Option<ProcessOutputSnapshot>,
+) -> Value {
+    let mut value = json!({
+        "processSessionId": state.process_session_id,
+        "backend": state.backend,
+        "command": state.command,
+        "cwd": state.cwd,
+        "startedAt": state.started_at_ms,
+        "pid": state.pid,
+        "running": state.exit_code.is_none(),
+        "exitCode": state.exit_code,
+        "finishedAt": state.finished_at_ms
+    });
+    if let Some(output) = output
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert("stdout".to_string(), json!(output.stdout));
+        object.insert("stderr".to_string(), json!(output.stderr));
+        object.insert(
+            "stdoutTotalBytes".to_string(),
+            json!(output.stdout_total_bytes),
+        );
+        object.insert(
+            "stderrTotalBytes".to_string(),
+            json!(output.stderr_total_bytes),
+        );
+    }
+    value
 }
 
 fn run_web_fetch(invocation: &ToolInvocation, arguments: &Value) -> RawToolOutput {
@@ -5448,15 +5939,21 @@ mod tests {
         io::{Read, Write},
         net::TcpListener,
         path::PathBuf,
+        process::{Command, Stdio},
+        sync::{Arc, Mutex},
         thread,
     };
 
-    use hambur_core::new_id;
+    use hambur_core::{new_id, now_ms};
     use hambur_sandbox::SandboxAccess;
     use hambur_tools::ToolInvocation;
     use tokio::sync::oneshot;
 
-    use super::{AppBootstrap, DelegateTaskState, NewTraceSpan, RuntimeCommand, RuntimeEngine};
+    use super::{
+        AppBootstrap, BackgroundProcessSession, DelegateTaskState, NewTraceSpan,
+        ProcessOutputBuffer, RuntimeCommand, RuntimeEngine, platform_shell,
+        spawn_process_pipe_reader,
+    };
 
     #[test]
     fn bootstrap_snapshot_survives_restart_without_replayed_session_event() {
@@ -7174,6 +7671,84 @@ mod tests {
             message
                 .content_text
                 .contains("sandbox path must not escape")
+        );
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
+    fn milestone7_process_wait_returns_background_output_and_removes_finished_session() {
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+        let session_id = create_test_session(&runtime);
+
+        let mut child = Command::new(platform_shell())
+            .arg("-lc")
+            .arg("printf process-ready")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn background process");
+        let output = Arc::new(Mutex::new(ProcessOutputBuffer::default()));
+        if let Some(stdout) = child.stdout.take() {
+            spawn_process_pipe_reader(stdout, output.clone(), true);
+        }
+        if let Some(stderr) = child.stderr.take() {
+            spawn_process_pipe_reader(stderr, output.clone(), false);
+        }
+        let process_session_id = new_id("proc");
+        runtime
+            .process_sessions
+            .lock()
+            .expect("process registry")
+            .insert(
+                process_session_id.clone(),
+                BackgroundProcessSession {
+                    session_id: session_id.clone(),
+                    process_session_id: process_session_id.clone(),
+                    backend: "host-test".to_string(),
+                    command: "printf process-ready".to_string(),
+                    cwd: "/var/hambur/workspace".to_string(),
+                    started_at_ms: now_ms(),
+                    pid: child.id(),
+                    child,
+                    output,
+                    exit_code: None,
+                    finished_at_ms: 0,
+                },
+            );
+
+        let invocation = ToolInvocation::from_model_call(
+            0,
+            "call_process_wait".to_string(),
+            "turn_process".to_string(),
+            session_id.clone(),
+            "process".to_string(),
+            serde_json::json!({
+                "action": "wait",
+                "process_session_id": process_session_id,
+                "timeout_ms": 30_000
+            })
+            .to_string(),
+        )
+        .expect("process invocation");
+        let result = runtime
+            .resolve_process_tool_result(&invocation, &invocation.arguments_value().unwrap());
+        assert!(!result.is_error, "process wait failed: {}", result.summary);
+        assert!(result.context_stub.contains("process-ready"));
+        assert!(result.context_stub.contains("processSessionId"));
+        assert!(
+            runtime
+                .process_sessions
+                .lock()
+                .expect("process registry")
+                .is_empty()
         );
 
         let _ = fs::remove_dir_all(app_files_dir);

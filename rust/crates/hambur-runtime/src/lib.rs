@@ -225,6 +225,8 @@ pub struct RuntimeEngine {
     markdown_streams: Mutex<HashMap<String, MarkdownPipeline>>,
     active_turns: Mutex<HashMap<String, ActiveTurn>>,
     platform_requests: Mutex<HashMap<String, oneshot::Sender<PlatformResultPayload>>>,
+    delegate_tasks: Mutex<HashMap<String, DelegateTaskState>>,
+    delegate_sessions: Mutex<HashSet<String>>,
     router: Mutex<ModelRouter>,
     tools: ToolScheduler,
     idempotency: Mutex<HashMap<String, RuntimeCommandAck>>,
@@ -246,6 +248,45 @@ struct PlatformResultPayload {
     payload_json: String,
     error_code: String,
     message: String,
+}
+
+struct DelegateTaskState {
+    parent_session_id: String,
+    parent_turn_id: String,
+    child_session_id: String,
+    trace_id: String,
+    sender: oneshot::Sender<DelegateCompletionPayload>,
+}
+
+#[derive(Debug, Clone)]
+struct DelegateCompletionPayload {
+    is_error: bool,
+    content: Value,
+    summary: String,
+}
+
+#[derive(Debug, Clone)]
+struct DelegateTaskSnapshot {
+    parent_session_id: String,
+    child_session_id: String,
+}
+
+impl DelegateTaskState {
+    fn snapshot(&self) -> DelegateTaskSnapshot {
+        DelegateTaskSnapshot {
+            parent_session_id: self.parent_session_id.clone(),
+            child_session_id: self.child_session_id.clone(),
+        }
+    }
+}
+
+struct PreparedDelegateTurn {
+    turn_id: String,
+    assistant_message_id: String,
+    route_candidates: Vec<ModelRouteSnapshot>,
+    fallback_policy: FallbackPolicy,
+    cancel: Arc<AtomicBool>,
+    stream_chunks_by_route: Vec<Vec<Vec<u8>>>,
 }
 
 enum StreamAttemptResult {
@@ -289,6 +330,8 @@ impl RuntimeEngine {
             markdown_streams: Mutex::new(HashMap::new()),
             active_turns: Mutex::new(HashMap::new()),
             platform_requests: Mutex::new(HashMap::new()),
+            delegate_tasks: Mutex::new(HashMap::new()),
+            delegate_sessions: Mutex::new(HashSet::new()),
             router: Mutex::new(ModelRouter::default()),
             tools,
             idempotency: Mutex::new(HashMap::new()),
@@ -2625,6 +2668,10 @@ impl RuntimeEngine {
     ) -> HamburResult<Vec<ToolExecutionRecord>> {
         let mut regular = Vec::new();
         let mut records = Vec::new();
+        let delegate_task_count = invocations
+            .iter()
+            .filter(|invocation| invocation.name == "delegate_task")
+            .count();
         for invocation in invocations {
             match invocation.name.as_str() {
                 "view_image" => {
@@ -2654,7 +2701,30 @@ impl RuntimeEngine {
                     records.push(self.execute_web_tool(invocation).await);
                 }
                 "delegate_task" | "submit_delegate_result" => {
-                    records.push(self.execute_delegate_tool(session_id, invocation).await);
+                    if invocation.name == "delegate_task" && delegate_task_count > 3 {
+                        let started_at_ms = now_ms();
+                        records.push(ToolExecutionRecord {
+                            result: ToolResult::failed(
+                                &invocation.tool_call_id,
+                                &invocation.name,
+                                "delegate batch limit exceeded",
+                            ),
+                            invocation,
+                            started_at_ms,
+                            ended_at_ms: now_ms(),
+                        });
+                    } else {
+                        records.push(
+                            self.execute_delegate_tool(
+                                session_id,
+                                turn_id,
+                                route,
+                                route_candidates,
+                                invocation,
+                            )
+                            .await,
+                        );
+                    }
                 }
                 _ => {
                     regular.push(invocation);
@@ -3099,11 +3169,24 @@ impl RuntimeEngine {
     async fn execute_delegate_tool(
         &self,
         session_id: &str,
+        turn_id: &str,
+        route: &ModelRouteSnapshot,
+        route_candidates: &[ModelRouteSnapshot],
         invocation: ToolInvocation,
     ) -> ToolExecutionRecord {
         let started_at_ms = now_ms();
         let result = match invocation.arguments_value() {
-            Ok(arguments) => self.resolve_delegate_result(session_id, &invocation, &arguments),
+            Ok(arguments) => {
+                self.resolve_delegate_result(
+                    session_id,
+                    turn_id,
+                    route,
+                    route_candidates,
+                    &invocation,
+                    &arguments,
+                )
+                .await
+            }
             Err(error) => ToolResult::failed(
                 &invocation.tool_call_id,
                 &invocation.name,
@@ -3118,9 +3201,12 @@ impl RuntimeEngine {
         }
     }
 
-    fn resolve_delegate_result(
+    async fn resolve_delegate_result(
         &self,
         session_id: &str,
+        turn_id: &str,
+        route: &ModelRouteSnapshot,
+        route_candidates: &[ModelRouteSnapshot],
         invocation: &ToolInvocation,
         arguments: &Value,
     ) -> ToolResult {
@@ -3136,57 +3222,189 @@ impl RuntimeEngine {
             );
         }
         if invocation.name == "submit_delegate_result" {
-            for path in arguments
-                .get("artifact_paths")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-            {
-                if let Err(error) = self.sandbox.resolve(session_id, path, SandboxAccess::Read) {
+            return self
+                .resolve_submit_delegate_result(session_id, invocation, arguments)
+                .await;
+        }
+        if self
+            .delegate_sessions
+            .lock()
+            .map(|sessions| sessions.contains(session_id))
+            .unwrap_or(false)
+        {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                "delegate_task is disabled inside delegate sessions",
+            );
+        }
+
+        self.resolve_delegate_task_result(
+            session_id,
+            turn_id,
+            route,
+            route_candidates,
+            invocation,
+            arguments,
+        )
+        .await
+    }
+
+    async fn resolve_submit_delegate_result(
+        &self,
+        session_id: &str,
+        invocation: &ToolInvocation,
+        arguments: &Value,
+    ) -> ToolResult {
+        let mut child_paths = Vec::new();
+        for path in arguments
+            .get("artifact_paths")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            let child_path = match self.sandbox.resolve(session_id, path, SandboxAccess::Read) {
+                Ok(resolved) => resolved,
+                Err(error) => {
                     return ToolResult::failed(
                         &invocation.tool_call_id,
                         &invocation.name,
                         error.to_string(),
                     );
                 }
-            }
-            let content = json!({
-                "summary": arguments.get("summary").and_then(Value::as_str).unwrap_or_default(),
-                "findings": arguments.get("findings").cloned().unwrap_or_else(|| json!([])),
-                "changedFiles": arguments.get("changed_files").or_else(|| arguments.get("changedFiles")).cloned().unwrap_or_else(|| json!([])),
-                "artifactPaths": arguments.get("artifact_paths").or_else(|| arguments.get("artifactPaths")).cloned().unwrap_or_else(|| json!([])),
-                "risks": arguments.get("risks").cloned().unwrap_or_else(|| json!([])),
-                "nextSteps": arguments.get("next_steps").or_else(|| arguments.get("nextSteps")).cloned().unwrap_or_else(|| json!([]))
-            });
-            return ToolResult {
-                tool_call_id: invocation.tool_call_id.clone(),
-                tool_name: invocation.name.clone(),
-                is_error: false,
-                content_json: content.to_string(),
-                summary: "Delegate result submitted".to_string(),
-                artifacts_json: "[]".to_string(),
-                trust_level: "trusted".to_string(),
-                truncated: false,
-                offloaded_file_id: String::new(),
-                offloaded_path: String::new(),
-                context_stub: content.to_string(),
             };
+            child_paths.push(child_path);
         }
 
-        let delegate_session_id = new_id("delegate_session");
+        let Some(state) = self
+            .delegate_tasks
+            .lock()
+            .ok()
+            .and_then(|tasks| tasks.get(session_id).map(DelegateTaskState::snapshot))
+        else {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                "submit_delegate_result is available only inside delegate sessions",
+            );
+        };
+        let mut artifact_mappings = Vec::new();
+        for child_path in child_paths {
+            if child_path.host_path.exists() {
+                let Ok(metadata) = fs::metadata(&child_path.host_path) else {
+                    return ToolResult::failed(
+                        &invocation.tool_call_id,
+                        &invocation.name,
+                        "delegate artifact metadata unavailable",
+                    );
+                };
+                if metadata.len() > 10 * 1024 * 1024 {
+                    return ToolResult::failed(
+                        &invocation.tool_call_id,
+                        &invocation.name,
+                        "delegate artifact is too large",
+                    );
+                }
+                let relative_name = child_path
+                    .sandbox_path
+                    .trim_start_matches("/var/hambur/workspace/")
+                    .trim_start_matches('/')
+                    .to_string()
+                    .if_blank("artifact".to_string());
+                let parent_sandbox_path = format!(
+                    "/var/hambur/workspace/delegates/{}/{}",
+                    state.child_session_id, relative_name
+                );
+                let parent_path = match self.sandbox.resolve(
+                    &state.parent_session_id,
+                    &parent_sandbox_path,
+                    SandboxAccess::Write,
+                ) {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        return ToolResult::failed(
+                            &invocation.tool_call_id,
+                            &invocation.name,
+                            error.to_string(),
+                        );
+                    }
+                };
+                if parent_path.host_path.exists() {
+                    return ToolResult::failed(
+                        &invocation.tool_call_id,
+                        &invocation.name,
+                        format!(
+                            "delegate artifact target already exists: {}",
+                            parent_path.sandbox_path
+                        ),
+                    );
+                }
+                if let Some(parent) = parent_path.host_path.parent() {
+                    if let Err(error) = fs::create_dir_all(parent) {
+                        return ToolResult::failed(
+                            &invocation.tool_call_id,
+                            &invocation.name,
+                            format!("create delegate artifact directory: {error}"),
+                        );
+                    }
+                }
+                if let Err(error) = fs::copy(&child_path.host_path, &parent_path.host_path) {
+                    return ToolResult::failed(
+                        &invocation.tool_call_id,
+                        &invocation.name,
+                        format!("copy delegate artifact: {error}"),
+                    );
+                }
+                artifact_mappings.push(json!({
+                    "childPath": child_path.sandbox_path,
+                    "parentPath": parent_path.sandbox_path,
+                    "bytes": metadata.len()
+                }));
+            }
+        }
+
         let content = json!({
-            "delegateSessionId": delegate_session_id,
-            "status": "awaiting_submit_delegate_result",
-            "task": arguments.get("task").and_then(Value::as_str).unwrap_or_default(),
-            "delegateTaskDisabledInChild": true
+            "summary": arguments.get("summary").and_then(Value::as_str).unwrap_or_default(),
+            "findings": arguments.get("findings").cloned().unwrap_or_else(|| json!([])),
+            "changedFiles": arguments.get("changed_files").or_else(|| arguments.get("changedFiles")).cloned().unwrap_or_else(|| json!([])),
+            "artifactPaths": arguments.get("artifact_paths").or_else(|| arguments.get("artifactPaths")).cloned().unwrap_or_else(|| json!([])),
+            "artifactMappings": artifact_mappings,
+            "risks": arguments.get("risks").cloned().unwrap_or_else(|| json!([])),
+            "nextSteps": arguments.get("next_steps").or_else(|| arguments.get("nextSteps")).cloned().unwrap_or_else(|| json!([]))
+        });
+        let Some(state) = self
+            .delegate_tasks
+            .lock()
+            .ok()
+            .and_then(|mut tasks| tasks.remove(session_id))
+        else {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                "submit_delegate_result is available only inside delegate sessions",
+            );
+        };
+        let summary = arguments
+            .get("summary")
+            .and_then(Value::as_str)
+            .unwrap_or("Delegate result submitted")
+            .to_string();
+        let _ = self
+            .database
+            .update_trace_span_status(&state.trace_id, "completed", &summary, true)
+            .await;
+        let _ = state.sender.send(DelegateCompletionPayload {
+            is_error: false,
+            content: content.clone(),
+            summary: summary.clone(),
         });
         ToolResult {
             tool_call_id: invocation.tool_call_id.clone(),
             tool_name: invocation.name.clone(),
             is_error: false,
             content_json: content.to_string(),
-            summary: "Delegate session created".to_string(),
+            summary: "Delegate result submitted".to_string(),
             artifacts_json: "[]".to_string(),
             trust_level: "trusted".to_string(),
             truncated: false,
@@ -3194,6 +3412,356 @@ impl RuntimeEngine {
             offloaded_path: String::new(),
             context_stub: content.to_string(),
         }
+    }
+
+    async fn resolve_delegate_task_result(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        route: &ModelRouteSnapshot,
+        route_candidates: &[ModelRouteSnapshot],
+        invocation: &ToolInvocation,
+        arguments: &Value,
+    ) -> ToolResult {
+        let pending_count = self
+            .delegate_tasks
+            .lock()
+            .map(|tasks| {
+                tasks
+                    .values()
+                    .filter(|task| task.parent_turn_id == turn_id)
+                    .count()
+            })
+            .unwrap_or(usize::MAX);
+        if pending_count >= 3 {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                "delegate batch limit exceeded",
+            );
+        }
+
+        let task = arguments
+            .get("task")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if task.is_empty() {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                "delegate task must not be empty",
+            );
+        }
+        let timeout_ms = arguments
+            .get("timeout_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(600_000)
+            .clamp(1_000, 600_000);
+        let payload_json = arguments
+            .get("payload_json")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        let child_snapshot = match self
+            .database
+            .create_session(&format!(
+                "Delegate: {}",
+                task.chars().take(72).collect::<String>()
+            ))
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return ToolResult::failed(
+                    &invocation.tool_call_id,
+                    &invocation.name,
+                    error.to_string(),
+                );
+            }
+        };
+        let delegate_session_id = child_snapshot.selected_session_id;
+        if let Err(error) = self.database.open_session(session_id).await {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                error.to_string(),
+            );
+        }
+        if let Err(error) = self.sandbox.prepare_session(&delegate_session_id) {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                error.to_string(),
+            );
+        }
+        let trace = match self
+            .database
+            .insert_trace_span(NewTraceSpan {
+                session_id: session_id.to_string(),
+                turn_id: turn_id.to_string(),
+                kind: "tool".to_string(),
+                title: "Delegate session".to_string(),
+                content: format!("delegateSessionId={delegate_session_id}\ntask={task}"),
+                status: "running".to_string(),
+                tool_call_id: invocation.tool_call_id.clone(),
+                payload_json: json!({
+                    "delegateSessionId": delegate_session_id,
+                    "task": task,
+                    "toolsets": arguments.get("toolsets").cloned().unwrap_or_else(|| json!([]))
+                })
+                .to_string(),
+                visible: true,
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(trace) => trace,
+            Err(error) => {
+                return ToolResult::failed(
+                    &invocation.tool_call_id,
+                    &invocation.name,
+                    error.to_string(),
+                );
+            }
+        };
+
+        let prepared = match self
+            .prepare_delegate_child_turn(
+                session_id,
+                turn_id,
+                &delegate_session_id,
+                task,
+                payload_json,
+                route.clone(),
+                route_candidates.to_vec(),
+            )
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let _ = self
+                    .database
+                    .update_trace_span_status(&trace.id, "failed", &error.to_string(), true)
+                    .await;
+                return ToolResult::failed(
+                    &invocation.tool_call_id,
+                    &invocation.name,
+                    error.to_string(),
+                );
+            }
+        };
+        let (sender, receiver) = oneshot::channel();
+        let state = DelegateTaskState {
+            parent_session_id: session_id.to_string(),
+            parent_turn_id: turn_id.to_string(),
+            child_session_id: delegate_session_id.clone(),
+            trace_id: trace.id.clone(),
+            sender,
+        };
+        if let Ok(mut tasks) = self.delegate_tasks.lock() {
+            tasks.insert(delegate_session_id.clone(), state);
+        } else {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                "delegate registry unavailable",
+            );
+        }
+        if let Ok(mut sessions) = self.delegate_sessions.lock() {
+            sessions.insert(delegate_session_id.clone());
+        }
+        self.spawn_prepared_delegate_turn(delegate_session_id.clone(), prepared);
+
+        match timeout(Duration::from_millis(timeout_ms), receiver).await {
+            Ok(Ok(completion)) => ToolResult {
+                tool_call_id: invocation.tool_call_id.clone(),
+                tool_name: invocation.name.clone(),
+                is_error: completion.is_error,
+                content_json: completion.content.to_string(),
+                summary: completion.summary.clone(),
+                artifacts_json: completion
+                    .content
+                    .get("artifactMappings")
+                    .cloned()
+                    .unwrap_or_else(|| json!([]))
+                    .to_string(),
+                trust_level: "trusted".to_string(),
+                truncated: false,
+                offloaded_file_id: String::new(),
+                offloaded_path: String::new(),
+                context_stub: completion.content.to_string(),
+            },
+            _ => {
+                let _ = self
+                    .delegate_tasks
+                    .lock()
+                    .ok()
+                    .and_then(|mut tasks| tasks.remove(&delegate_session_id));
+                let message = "delegate task timed out before submit_delegate_result";
+                let _ = self
+                    .database
+                    .update_trace_span_status(&trace.id, "failed", message, true)
+                    .await;
+                ToolResult::failed(&invocation.tool_call_id, &invocation.name, message)
+            }
+        }
+    }
+
+    async fn prepare_delegate_child_turn(
+        &self,
+        parent_session_id: &str,
+        parent_turn_id: &str,
+        delegate_session_id: &str,
+        task: &str,
+        payload_json: String,
+        route: ModelRouteSnapshot,
+        route_candidates: Vec<ModelRouteSnapshot>,
+    ) -> HamburResult<PreparedDelegateTurn> {
+        let child_content = format!(
+            "Delegate task from parent session {parent_session_id}, turn {parent_turn_id}.\n\n{task}\n\nFinish by calling submit_delegate_result."
+        );
+        let turn = self
+            .database
+            .create_turn_with_route(delegate_session_id, "StreamingAssistant", &route)
+            .await?;
+        let user_message = self
+            .database
+            .insert_message_with_route(
+                delegate_session_id,
+                "user",
+                &child_content,
+                "",
+                "completed",
+                &turn.id,
+                &route,
+            )
+            .await?;
+        self.database
+            .upsert_timeline_item(
+                delegate_session_id,
+                NewTimelineItem {
+                    stable_key: user_message.id.clone(),
+                    content_type: "message".to_string(),
+                    display_sequence: user_message.created_at_ms,
+                    payload_ref: user_message.id.clone(),
+                    small_summary: child_content.chars().take(160).collect(),
+                    kind: "UserMessage".to_string(),
+                },
+            )
+            .await?;
+        let assistant_message = self
+            .database
+            .insert_message_with_route(
+                delegate_session_id,
+                "assistant",
+                "",
+                "",
+                "streaming",
+                &turn.id,
+                &route,
+            )
+            .await?;
+        self.database
+            .upsert_timeline_item(
+                delegate_session_id,
+                NewTimelineItem {
+                    stable_key: assistant_message.id.clone(),
+                    content_type: "message".to_string(),
+                    display_sequence: assistant_message.created_at_ms,
+                    payload_ref: assistant_message.id.clone(),
+                    small_summary: format!(
+                        "{} via {}",
+                        route.model_display_name, route.provider_name
+                    ),
+                    kind: "AssistantMessage".to_string(),
+                },
+            )
+            .await?;
+        let snapshot = self.database.session_snapshot(delegate_session_id).await?;
+        let cancel = Arc::new(AtomicBool::new(false));
+        if let Ok(mut active_turns) = self.active_turns.lock() {
+            active_turns.insert(
+                delegate_session_id.to_string(),
+                ActiveTurn {
+                    turn_id: turn.id.clone(),
+                    cancel: cancel.clone(),
+                },
+            );
+        }
+        let _ = self.emit_session_event(
+            RuntimeEventKind::TurnStarted,
+            delegate_session_id.to_string(),
+            turn.id.clone(),
+            snapshot.clone(),
+            "DelegateTask".to_string(),
+            None,
+        );
+        let _ = self.emit_session_event(
+            RuntimeEventKind::MessageUpserted,
+            delegate_session_id.to_string(),
+            turn.id.clone(),
+            snapshot.clone(),
+            child_content.clone(),
+            None,
+        );
+        let _ = self.emit_session_event(
+            RuntimeEventKind::AssistantMessageStarted,
+            delegate_session_id.to_string(),
+            turn.id.clone(),
+            snapshot,
+            route.model_display_name.clone(),
+            None,
+        );
+
+        let route_candidates = if route_candidates.is_empty() {
+            vec![route.clone()]
+        } else {
+            route_candidates
+        };
+        let fallback_policy = FallbackPolicy::parse(&route.fallback_policy);
+        let stream_command = RuntimeCommand {
+            session_id: delegate_session_id.to_string(),
+            payload_json,
+            ..RuntimeCommand::default()
+        };
+        let stream_chunks_by_route = route_candidates
+            .iter()
+            .map(|candidate| stream_chunks_for_command(&stream_command, &child_content, candidate))
+            .collect::<Vec<_>>();
+        Ok(PreparedDelegateTurn {
+            turn_id: turn.id,
+            assistant_message_id: assistant_message.id,
+            route_candidates,
+            fallback_policy,
+            cancel,
+            stream_chunks_by_route,
+        })
+    }
+
+    fn spawn_prepared_delegate_turn(
+        &self,
+        delegate_session_id: String,
+        prepared: PreparedDelegateTurn,
+    ) {
+        let Some(engine) = self.self_ref.lock().ok().and_then(|value| value.upgrade()) else {
+            return;
+        };
+        let handle = self.tokio.handle().clone();
+        handle.spawn(async move {
+            engine
+                .run_chat_turn(
+                    delegate_session_id,
+                    prepared.turn_id,
+                    prepared.assistant_message_id,
+                    prepared.route_candidates,
+                    prepared.fallback_policy,
+                    prepared.cancel,
+                    prepared.stream_chunks_by_route,
+                )
+                .await;
+        });
     }
 
     async fn execute_view_image_tool(
@@ -4884,8 +5452,11 @@ mod tests {
     };
 
     use hambur_core::new_id;
+    use hambur_sandbox::SandboxAccess;
+    use hambur_tools::ToolInvocation;
+    use tokio::sync::oneshot;
 
-    use super::{AppBootstrap, RuntimeCommand, RuntimeEngine};
+    use super::{AppBootstrap, DelegateTaskState, NewTraceSpan, RuntimeCommand, RuntimeEngine};
 
     #[test]
     fn bootstrap_snapshot_survives_restart_without_replayed_session_event() {
@@ -5234,7 +5805,7 @@ mod tests {
             ..RuntimeCommand::default()
         });
         assert!(first.accepted, "seed rejected: {}", first.message);
-        wait_for_event(&runtime, "TurnFinished");
+        wait_for_session_event(&runtime, "TurnFinished", &session_id);
 
         let timeline = runtime.get_timeline_page(session_id.clone(), 0, 20);
         let assistant = timeline
@@ -5259,7 +5830,7 @@ mod tests {
             "regenerate rejected: {}",
             regenerate.message
         );
-        wait_for_event(&runtime, "TurnFinished");
+        wait_for_session_event(&runtime, "TurnFinished", &session_id);
 
         let timeline = runtime.get_timeline_page(session_id, 0, 20);
         let assistant_count = timeline
@@ -6378,6 +6949,186 @@ mod tests {
     }
 
     #[test]
+    fn milestone7_delegate_task_waits_for_child_submit_result() {
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+        let session_id = create_test_session(&runtime);
+        configure_test_provider(&runtime, "gpt-delegate");
+
+        let child_sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
+            "{\"index\":0,\"id\":\"call_child_submit\",\"function\":{\"name\":\"submit_delegate_result\",\"arguments\":\"{\\\"summary\\\":\\\"child done\\\",\\\"findings\\\":[\\\"verified\\\"],\\\"changed_files\\\":[\\\"src/lib.rs\\\"],\\\"risks\\\":[],\\\"next_steps\\\":[]}\"}}",
+            "]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let child_payload_json = serde_json::json!({"sse": child_sse}).to_string();
+        let delegate_args = serde_json::json!({
+            "task": "inspect a narrow implementation detail",
+            "timeout_ms": 30_000,
+            "payload_json": child_payload_json
+        })
+        .to_string();
+        let escaped_delegate_args = delegate_args.replace('\\', "\\\\").replace('"', "\\\"");
+        let parent_sse = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_delegate_task\",\"function\":{{\"name\":\"delegate_task\",\"arguments\":\"{escaped_delegate_args}\"}}}}]}},\"finish_reason\":\"tool_calls\"}}]}}\n\n\
+             data: [DONE]\n\n"
+        );
+        let send = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_m7_delegate_task".to_string(),
+            idempotency_key: "message:m7:delegate-task".to_string(),
+            kind: "SendMessage".to_string(),
+            session_id: session_id.clone(),
+            content: "delegate work".to_string(),
+            payload_json: serde_json::json!({"sse": parent_sse}).to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(send.accepted, "send rejected: {}", send.message);
+        wait_for_session_event(&runtime, "TurnFinished", &session_id);
+
+        let timeline = runtime.get_timeline_page(session_id.clone(), 0, 50);
+        assert!(
+            timeline
+                .items
+                .iter()
+                .any(|item| item.kind == "ToolTrace" && item.trace_title == "Delegate session")
+        );
+        let continuation = timeline
+            .items
+            .iter()
+            .rev()
+            .find(|item| item.kind == "AssistantMessage")
+            .expect("assistant continuation");
+        let message = runtime
+            .get_message_snapshot(continuation.payload_ref.clone())
+            .message
+            .expect("message");
+        assert!(message.content_text.contains("child done"));
+        assert!(message.content_text.contains("verified"));
+        assert!(message.content_text.contains("changedFiles"));
+
+        let sessions = runtime.get_session_list_snapshot(10, 0);
+        assert_eq!(sessions.selected_session_id, session_id);
+        assert!(
+            sessions
+                .sessions
+                .iter()
+                .any(|session| session.title.starts_with("Delegate: inspect"))
+        );
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
+    fn milestone7_submit_delegate_result_copies_child_artifacts_to_parent_workspace() {
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+        let session_id = create_test_session(&runtime);
+
+        let child_snapshot = runtime
+            .tokio
+            .block_on(runtime.database.create_session("Delegate: artifact"))
+            .expect("create child");
+        let delegate_session_id = child_snapshot.selected_session_id;
+        runtime
+            .tokio
+            .block_on(runtime.database.open_session(&session_id))
+            .expect("restore parent");
+        runtime
+            .sandbox
+            .prepare_session(&delegate_session_id)
+            .expect("prepare child sandbox");
+        let child_report = runtime
+            .sandbox
+            .resolve(
+                &delegate_session_id,
+                "/var/hambur/workspace/report.txt",
+                SandboxAccess::Write,
+            )
+            .expect("child report path");
+        fs::write(&child_report.host_path, "delegate report").expect("write child report");
+        let (sender, receiver) = oneshot::channel();
+        let trace = runtime
+            .tokio
+            .block_on(runtime.database.insert_trace_span(NewTraceSpan {
+                session_id: session_id.clone(),
+                kind: "tool".to_string(),
+                title: "Delegate session".to_string(),
+                content: format!("delegateSessionId={delegate_session_id}"),
+                status: "running".to_string(),
+                tool_call_id: "call_delegate_artifact".to_string(),
+                visible: true,
+                ..Default::default()
+            }))
+            .expect("delegate trace");
+        runtime
+            .delegate_tasks
+            .lock()
+            .expect("delegate registry")
+            .insert(
+                delegate_session_id.clone(),
+                DelegateTaskState {
+                    parent_session_id: session_id.clone(),
+                    parent_turn_id: "turn_parent".to_string(),
+                    child_session_id: delegate_session_id.clone(),
+                    trace_id: trace.id,
+                    sender,
+                },
+            );
+
+        let invocation = ToolInvocation::from_model_call(
+            0,
+            "call_child_submit_artifact".to_string(),
+            "turn_child".to_string(),
+            delegate_session_id.clone(),
+            "submit_delegate_result".to_string(),
+            serde_json::json!({
+                "summary": "artifact ready",
+                "artifact_paths": ["/var/hambur/workspace/report.txt"]
+            })
+            .to_string(),
+        )
+        .expect("invocation");
+        let result = runtime
+            .tokio
+            .block_on(runtime.resolve_submit_delegate_result(
+                &delegate_session_id,
+                &invocation,
+                &invocation.arguments_value().expect("arguments"),
+            ));
+        assert!(!result.is_error, "submit failed: {}", result.summary);
+        let completion = receiver
+            .blocking_recv()
+            .expect("delegate completion payload");
+        assert_eq!(completion.summary, "artifact ready");
+
+        let parent_path =
+            format!("/var/hambur/workspace/delegates/{delegate_session_id}/report.txt");
+        assert!(result.content_json.contains(&parent_path));
+        let parent_report = runtime
+            .sandbox
+            .resolve(&session_id, &parent_path, SandboxAccess::Read)
+            .expect("parent report path");
+        assert_eq!(
+            fs::read_to_string(parent_report.host_path).expect("read copied report"),
+            "delegate report"
+        );
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
     fn milestone7_terminal_uses_sandbox_path_policy_before_execution() {
         let app_files_dir = temp_app_dir();
         fs::create_dir_all(&app_files_dir).expect("create temp app dir");
@@ -6563,5 +7314,15 @@ mod tests {
             }
         }
         panic!("missing event: {kind}");
+    }
+
+    fn wait_for_session_event(runtime: &RuntimeEngine, kind: &str, session_id: &str) {
+        for _ in 0..128 {
+            let event = runtime.next_event().expect("runtime event");
+            if event.kind.as_str() == kind && event.session_id == session_id {
+                return;
+            }
+        }
+        panic!("missing event: {kind} for session {session_id}");
     }
 }

@@ -193,7 +193,8 @@ impl ToolSchemaCompiler {
                         "items": {"type": "string"},
                         "maxItems": 8
                     },
-                    "timeout_ms": {"type": "integer", "minimum": 1000, "maximum": 600000}
+                    "timeout_ms": {"type": "integer", "minimum": 1000, "maximum": 600000},
+                    "payload_json": {"type": "string"}
                 },
                 "required": ["task"],
                 "additionalProperties": false

@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use hambur_core::{new_id, now_ms};
-use hambur_db::{AppSnapshot, MessageRecord, SessionSummary, TimelineItemSnapshot};
+use hambur_db::{
+    AppSnapshot, AttachmentRecord, MessageRecord, SessionSummary, TimelineItemSnapshot,
+};
 use hambur_markdown::{
     MarkdownBlockNode, MarkdownInlineNode, MarkdownRenderUpdate, MarkdownTableRow,
 };
@@ -125,10 +127,31 @@ pub struct TimelineItemDTO {
     pub tool_name: String,
 }
 
+pub struct AttachmentDTO {
+    pub id: String,
+    pub session_id: String,
+    pub message_id: String,
+    pub kind: String,
+    pub display_name: String,
+    pub mime_type: String,
+    pub byte_size: u64,
+    pub origin_type: String,
+    pub original_uri: String,
+    pub file_id: String,
+    pub sandbox_path: String,
+    pub width: u32,
+    pub height: u32,
+    pub sha256: String,
+    pub status: String,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
 pub struct AppSnapshotDTO {
     pub sessions: Vec<SessionSummaryDTO>,
     pub selected_session_id: String,
     pub timeline_items: Vec<TimelineItemDTO>,
+    pub pending_attachments: Vec<AttachmentDTO>,
 }
 
 pub struct SessionListSnapshotDTO {
@@ -490,6 +513,11 @@ impl From<AppSnapshot> for AppSnapshotDTO {
                 .into_iter()
                 .map(TimelineItemDTO::from)
                 .collect(),
+            pending_attachments: value
+                .pending_attachments
+                .into_iter()
+                .map(AttachmentDTO::from)
+                .collect(),
         }
     }
 }
@@ -523,6 +551,30 @@ impl From<TimelineItemSnapshot> for TimelineItemDTO {
             trace_status: value.trace_status,
             tool_call_id: value.tool_call_id,
             tool_name: value.tool_name,
+        }
+    }
+}
+
+impl From<AttachmentRecord> for AttachmentDTO {
+    fn from(value: AttachmentRecord) -> Self {
+        Self {
+            id: value.id,
+            session_id: value.session_id,
+            message_id: value.message_id,
+            kind: value.kind,
+            display_name: value.display_name,
+            mime_type: value.mime_type,
+            byte_size: value.byte_size,
+            origin_type: value.origin_type,
+            original_uri: value.original_uri,
+            file_id: value.file_id,
+            sandbox_path: value.sandbox_path,
+            width: value.width,
+            height: value.height,
+            sha256: value.sha256,
+            status: value.status,
+            created_at_ms: value.created_at_ms,
+            updated_at_ms: value.updated_at_ms,
         }
     }
 }

@@ -318,10 +318,10 @@ impl OpenAiCompatibleAdapter {
         if request.max_output_tokens > 0 {
             body["max_tokens"] = json!(request.max_output_tokens);
         }
-        if let Some(temperature) = request.temperature {
-            if target.model.capabilities.supports_temperature {
-                body["temperature"] = json!(temperature);
-            }
+        if let Some(temperature) = request.temperature
+            && target.model.capabilities.supports_temperature
+        {
+            body["temperature"] = json!(temperature);
         }
         if request.reasoning_mode == ReasoningMode::Enabled
             && target.model.capabilities.supports_reasoning
@@ -444,15 +444,15 @@ impl OpenAiCompatibleAdapter {
         let mut events = Vec::new();
         for choice in choices {
             if let Some(delta) = choice.get("delta") {
-                if let Some(content) = delta.get("content").and_then(Value::as_str) {
-                    if !content.is_empty() {
-                        events.push(ProviderStreamEvent::ContentDelta(content.to_string()));
-                    }
+                if let Some(content) = delta.get("content").and_then(Value::as_str)
+                    && !content.is_empty()
+                {
+                    events.push(ProviderStreamEvent::ContentDelta(content.to_string()));
                 }
-                if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
-                    if !reasoning.is_empty() {
-                        events.push(ProviderStreamEvent::ReasoningDelta(reasoning.to_string()));
-                    }
+                if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str)
+                    && !reasoning.is_empty()
+                {
+                    events.push(ProviderStreamEvent::ReasoningDelta(reasoning.to_string()));
                 }
                 if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
                     for tool_call in tool_calls {

@@ -114,10 +114,31 @@ dictionary TimelineItemDTO {
     string tool_name;
 };
 
+dictionary AttachmentDTO {
+    string id;
+    string session_id;
+    string message_id;
+    string kind;
+    string display_name;
+    string mime_type;
+    u64 byte_size;
+    string origin_type;
+    string original_uri;
+    string file_id;
+    string sandbox_path;
+    u32 width;
+    u32 height;
+    string sha256;
+    string status;
+    u64 created_at_ms;
+    u64 updated_at_ms;
+};
+
 dictionary AppSnapshotDTO {
     sequence<SessionSummaryDTO> sessions;
     string selected_session_id;
     sequence<TimelineItemDTO> timeline_items;
+    sequence<AttachmentDTO> pending_attachments;
 };
 
 dictionary SessionListSnapshotDTO {

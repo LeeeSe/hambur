@@ -64,6 +64,19 @@ impl ToolSchemaCompiler {
                 "additionalProperties": false
             }),
         })?;
+        compiler.register(ToolSchema {
+            name: "view_image".to_string(),
+            description: "Resolve an image file path for model vision handoff.".to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "detail": {"type": "string", "enum": ["low", "high", "auto"]}
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        })?;
         Ok(compiler)
     }
 
@@ -310,7 +323,7 @@ impl ToolResultNormalizer {
     }
 
     pub fn normalize(&self, raw: RawToolOutput) -> HamburResult<ToolResult> {
-        let bytes = raw.content.as_bytes().len();
+        let bytes = raw.content.len();
         let untrusted = raw.trust_level == "untrusted";
         let wrapped_content = if untrusted {
             wrap_untrusted(&raw.tool_name, &raw.tool_call_id, &raw.content)
@@ -370,12 +383,15 @@ impl ToolResultNormalizer {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ToolScheduler {
     schemas: ToolSchemaCompiler,
     normalizer: ToolResultNormalizer,
     max_parallel_tool_calls: usize,
+    view_image_handler: Option<ViewImageHandler>,
 }
+
+type ViewImageHandler = Arc<dyn Fn(&ToolInvocation, &Value) -> RawToolOutput + Send + Sync>;
 
 impl ToolScheduler {
     pub fn new(offload_dir: impl AsRef<Path>) -> HamburResult<Self> {
@@ -383,6 +399,7 @@ impl ToolScheduler {
             schemas: ToolSchemaCompiler::with_builtin_tools()?,
             normalizer: ToolResultNormalizer::new(offload_dir.as_ref().to_path_buf())?,
             max_parallel_tool_calls: MAX_PARALLEL_TOOL_CALLS,
+            view_image_handler: None,
         })
     }
 
@@ -392,6 +409,14 @@ impl ToolScheduler {
 
     pub fn with_parallel_limit(mut self, limit: usize) -> Self {
         self.max_parallel_tool_calls = limit.clamp(1, MAX_PARALLEL_TOOL_CALLS);
+        self
+    }
+
+    pub fn with_view_image_handler<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(&ToolInvocation, &Value) -> RawToolOutput + Send + Sync + 'static,
+    {
+        self.view_image_handler = Some(Arc::new(handler));
         self
     }
 
@@ -418,9 +443,10 @@ impl ToolScheduler {
                     })?;
                 let schemas = self.schemas.clone();
                 let normalizer = self.normalizer.clone();
+                let view_image_handler = self.view_image_handler.clone();
                 join_set.spawn(async move {
                     let _permit = permit;
-                    execute_one_tool(schemas, normalizer, invocation).await
+                    execute_one_tool(schemas, normalizer, view_image_handler, invocation).await
                 });
 
                 if is_serial {
@@ -443,6 +469,7 @@ impl ToolScheduler {
 async fn execute_one_tool(
     schemas: ToolSchemaCompiler,
     normalizer: ToolResultNormalizer,
+    view_image_handler: Option<ViewImageHandler>,
     invocation: ToolInvocation,
 ) -> HamburResult<ToolExecutionRecord> {
     let started_at_ms = now_ms();
@@ -458,6 +485,20 @@ async fn execute_one_tool(
                     trust_level: "trusted".to_string(),
                     command_or_url: invocation.arguments_json.clone(),
                     status: error.code().as_str().to_string(),
+                }
+            } else if invocation.name == "view_image" {
+                match &view_image_handler {
+                    Some(handler) => handler(&invocation, &arguments),
+                    None => RawToolOutput {
+                        tool_call_id: invocation.tool_call_id.clone(),
+                        tool_name: invocation.name.clone(),
+                        is_error: true,
+                        content: "view_image is unavailable for the active route".to_string(),
+                        summary: "Image view unavailable".to_string(),
+                        trust_level: "trusted".to_string(),
+                        command_or_url: invocation.arguments_json.clone(),
+                        status: "CapabilityMismatch".to_string(),
+                    },
                 }
             } else {
                 run_builtin_tool(&invocation, &arguments)
@@ -546,6 +587,16 @@ fn run_builtin_tool(invocation: &ToolInvocation, arguments: &Value) -> RawToolOu
                 status: "ok".to_string(),
             }
         }
+        "view_image" => RawToolOutput {
+            tool_call_id: invocation.tool_call_id.clone(),
+            tool_name: invocation.name.clone(),
+            is_error: true,
+            content: "view_image requires a runtime file resolver".to_string(),
+            summary: "Image view unavailable".to_string(),
+            trust_level: "trusted".to_string(),
+            command_or_url: invocation.arguments_json.clone(),
+            status: "CapabilityMismatch".to_string(),
+        },
         _ => RawToolOutput {
             tool_call_id: invocation.tool_call_id.clone(),
             tool_name: invocation.name.clone(),
@@ -579,6 +630,22 @@ fn display_title(name: &str, arguments_json: &str) -> String {
             }
         }
         "echo" => "Echo".to_string(),
+        "view_image" => {
+            let path = serde_json::from_str::<Value>(arguments_json)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            if path.is_empty() {
+                "View image".to_string()
+            } else {
+                format!("View image: {path}")
+            }
+        }
         _ => name.replace('_', " "),
     }
 }
@@ -616,6 +683,7 @@ fn is_parallel_tool(name: &str) -> bool {
             | "skill_view"
             | "get_current_time"
             | "echo"
+            | "view_image"
     )
 }
 

@@ -2,6 +2,7 @@ package com.hambur.chat.reducer
 
 import android.util.Log
 import com.hambur.chat.uniffi.AppBootstrapConfig
+import com.hambur.chat.uniffi.AttachmentDto
 import com.hambur.chat.uniffi.BackendCommand
 import com.hambur.chat.uniffi.BackendEvent
 import com.hambur.chat.uniffi.CommandAck
@@ -43,6 +44,15 @@ data class UiTimelineItem(
     val toolName: String = "",
 )
 
+data class UiPendingAttachment(
+    val id: String,
+    val kind: String,
+    val displayName: String,
+    val mimeType: String,
+    val byteSize: ULong,
+    val sandboxPath: String,
+)
+
 data class AppShellState(
     val runtimeStatus: String = "Starting",
     val latestEventKind: String = "Waiting",
@@ -50,6 +60,7 @@ data class AppShellState(
     val sessions: List<UiSessionSummary> = emptyList(),
     val selectedSessionId: String = "",
     val timelineItems: List<UiTimelineItem> = emptyList(),
+    val pendingAttachments: List<UiPendingAttachment> = emptyList(),
     val markdownMessageId: String = "",
     val markdownBlocks: List<MarkdownBlockNodeDto> = emptyList(),
     val pendingMarkdownBlock: MarkdownBlockNodeDto? = null,
@@ -159,10 +170,17 @@ class HamburUiStore(appFilesDir: String) {
     }
 
     fun sendMessage(sessionId: String, content: String) {
-        if (sessionId.isBlank() || content.isBlank()) return
+        if (sessionId.isBlank()) return
+        val attachmentIds = _state.value.pendingAttachments.map { it.id }
+        if (content.isBlank() && attachmentIds.isEmpty()) return
 
         scope.launch {
             ensureDefaultTextProvider()
+            val payload = if (attachmentIds.isEmpty()) {
+                ""
+            } else {
+                attachmentPayloadJson(attachmentIds)
+            }
             val ack = runtime.dispatch(
                 backendCommand(
                     kind = "SendMessage",
@@ -170,9 +188,52 @@ class HamburUiStore(appFilesDir: String) {
                     sessionId = sessionId,
                     content = content,
                     reasoning = "Routing through the configured OpenAI-compatible text provider.",
+                    payloadJson = payload,
                 ),
             )
             applyRejectedAck(ack)
+        }
+    }
+
+    fun importAttachmentMetadata(
+        sessionId: String,
+        displayName: String,
+        mimeType: String,
+        byteSize: ULong = 0UL,
+        originalUri: String = "",
+        sourcePath: String = "",
+    ) {
+        if (sessionId.isBlank()) return
+        val escapedName = displayName.jsonEscaped()
+        val escapedMime = mimeType.jsonEscaped()
+        val escapedUri = originalUri.jsonEscaped()
+        val escapedPath = sourcePath.jsonEscaped()
+        val payload = """
+            {"displayName":"$escapedName","mimeType":"$escapedMime","byteSize":$byteSize,"originalUri":"$escapedUri","sourcePath":"$escapedPath","originType":"content_uri"}
+        """.trimIndent()
+        runCommand {
+            runtime.dispatch(
+                backendCommand(
+                    kind = "ImportAttachmentFromUri",
+                    idempotencyKey = "$sessionId:import-attachment:${nextCommandOrdinal()}",
+                    sessionId = sessionId,
+                    payloadJson = payload,
+                ),
+            )
+        }
+    }
+
+    fun removePendingAttachment(sessionId: String, attachmentId: String) {
+        if (sessionId.isBlank() || attachmentId.isBlank()) return
+        runCommand {
+            runtime.dispatch(
+                backendCommand(
+                    kind = "RemovePendingAttachment",
+                    idempotencyKey = "$attachmentId:remove",
+                    sessionId = sessionId,
+                    messageId = attachmentId,
+                ),
+            )
         }
     }
 
@@ -476,6 +537,7 @@ private fun AppShellState.applyBaseline(
         markdownBlocks = emptyList(),
         pendingMarkdownBlock = null,
         activePreviewPath = "",
+        pendingAttachments = emptyList(),
         snapshotSequence = baselineSequence,
         lastAppliedSequence = baselineSequence,
         appliedEventIds = emptySet(),
@@ -504,6 +566,9 @@ private fun AppShellState.reduce(event: BackendEvent): AppShellState {
         "SessionOpened",
         "SessionDeleted",
         "ModelsUpdated",
+        "AttachmentImported",
+        "PendingAttachmentRemoved",
+        "PendingAttachmentsCleaned",
         "MessageUpserted",
         "AssistantMessageFinished",
         "ToolCallFinished",
@@ -530,6 +595,9 @@ private fun AppShellState.reduce(event: BackendEvent): AppShellState {
         event.kind == "SessionOpened" -> "Session opened"
         event.kind == "SessionDeleted" -> "Session deleted"
         event.kind == "ModelsUpdated" -> event.message.ifBlank { "Models updated" }
+        event.kind == "AttachmentImported" -> event.message.ifBlank { "Attachment imported" }
+        event.kind == "PendingAttachmentRemoved" -> "Attachment removed"
+        event.kind == "PendingAttachmentsCleaned" -> "Pending attachments cleared"
         event.kind == "TurnStarted" -> "Turn started"
         event.kind == "AssistantMessageStarted" -> "Assistant streaming"
         event.kind == "AssistantReasoningDelta" -> "Reasoning streamed"
@@ -600,6 +668,7 @@ private fun AppShellState.reduce(event: BackendEvent): AppShellState {
                 toolName = it.toolName,
             )
         },
+        pendingAttachments = snapshot.pendingAttachments.toUiPendingAttachments(),
         markdownMessageId = when {
             shouldApplyMarkdown -> markdownUpdate.messageId
             sessionChanged -> ""
@@ -674,6 +743,44 @@ private fun List<TimelineItemDto>.toUiTimelineItems(): List<UiTimelineItem> {
             toolCallId = it.toolCallId,
             toolName = it.toolName,
         )
+    }
+}
+
+private fun List<AttachmentDto>.toUiPendingAttachments(): List<UiPendingAttachment> {
+    return map {
+        UiPendingAttachment(
+            id = it.id,
+            kind = it.kind,
+            displayName = it.displayName,
+            mimeType = it.mimeType,
+            byteSize = it.byteSize,
+            sandboxPath = it.sandboxPath,
+        )
+    }
+}
+
+private fun String.jsonEscaped(): String {
+    return buildString {
+        this@jsonEscaped.forEach { ch ->
+            when (ch) {
+                '\\' -> append("\\\\")
+                '"' -> append("\\\"")
+                '\n' -> append("\\n")
+                '\r' -> append("\\r")
+                '\t' -> append("\\t")
+                else -> append(ch)
+            }
+        }
+    }
+}
+
+private fun attachmentPayloadJson(attachmentIds: List<String>): String {
+    return attachmentIds.joinToString(
+        prefix = "{\"attachmentIds\":[\"",
+        separator = "\",\"",
+        postfix = "\"]}",
+    ) {
+        it.jsonEscaped()
     }
 }
 

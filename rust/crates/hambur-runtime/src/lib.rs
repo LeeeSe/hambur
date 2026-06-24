@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex, Weak,
@@ -7,10 +8,11 @@ use std::sync::{
 
 use hambur_core::{DTO_SCHEMA_VERSION, HamburError, HamburResult, new_id, now_ms};
 use hambur_db::{
-    AppSnapshot, HamburDatabase, MessageRecord, ModelRouteSnapshot, NewTimelineItem, NewToolCall,
-    NewToolResult, NewTraceSpan, ProviderModelUpsert, ProviderUpsert, SessionSummary,
-    TimelineItemSnapshot,
+    AppSnapshot, AttachmentRecord, HamburDatabase, MessageRecord, ModelRouteSnapshot,
+    NewAttachment, NewFileRecord, NewTimelineItem, NewToolCall, NewToolResult, NewTraceSpan,
+    ProviderModelUpsert, ProviderUpsert, SessionSummary, TimelineItemSnapshot,
 };
+use hambur_filestore::FileStore;
 use hambur_llm::{
     CompleteToolCall, FallbackPolicy, ModelCapabilities, ModelRouter, OPENAI_COMPATIBLE_PROTOCOL,
     OpenAiCompatibleAdapter, ProviderConfig, ProviderModel, ProviderStreamEvent, ProviderTarget,
@@ -18,7 +20,11 @@ use hambur_llm::{
     scripted_openai_sse_chunks, should_fallback,
 };
 use hambur_markdown::{MarkdownPipeline, MarkdownRenderUpdate};
-use hambur_tools::{MAX_TOOL_ITERATIONS_PER_TURN, ToolCallBatch, ToolInvocation, ToolScheduler};
+use hambur_tools::{
+    MAX_TOOL_ITERATIONS_PER_TURN, ToolCallBatch, ToolExecutionRecord, ToolInvocation, ToolResult,
+    ToolScheduler,
+};
+use serde_json::{Value, json};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
@@ -118,6 +124,9 @@ pub enum RuntimeEventKind {
     ToolCallDelta,
     ToolCallFinished,
     ToolCallFailed,
+    AttachmentImported,
+    PendingAttachmentRemoved,
+    PendingAttachmentsCleaned,
     TurnFinished,
     TurnFailed,
     TurnCancelled,
@@ -145,6 +154,9 @@ impl RuntimeEventKind {
             Self::ToolCallDelta => "ToolCallDelta",
             Self::ToolCallFinished => "ToolCallFinished",
             Self::ToolCallFailed => "ToolCallFailed",
+            Self::AttachmentImported => "AttachmentImported",
+            Self::PendingAttachmentRemoved => "PendingAttachmentRemoved",
+            Self::PendingAttachmentsCleaned => "PendingAttachmentsCleaned",
             Self::TurnFinished => "TurnFinished",
             Self::TurnFailed => "TurnFailed",
             Self::TurnCancelled => "TurnCancelled",
@@ -174,6 +186,7 @@ pub struct RuntimeEngine {
     self_ref: Mutex<Weak<RuntimeEngine>>,
     bootstrap: AppBootstrap,
     database: HamburDatabase,
+    filestore: FileStore,
     markdown_streams: Mutex<HashMap<String, MarkdownPipeline>>,
     active_turns: Mutex<HashMap<String, ActiveTurn>>,
     router: Mutex<ModelRouter>,
@@ -212,6 +225,12 @@ impl RuntimeEngine {
             .map_err(|error| HamburError::Internal(format!("tokio runtime: {error}")))?;
         let database_path = database_path(&bootstrap);
         let database = tokio.block_on(HamburDatabase::open(database_path))?;
+        let filestore = FileStore::new(&bootstrap.app_files_dir)?;
+        let jobs = tokio.block_on(database.cleanup_pending_attachments(0))?;
+        for job in jobs {
+            let _ = filestore.delete_relative_if_exists(&job.relative_path);
+            let _ = tokio.block_on(database.mark_file_cleanup_done(&job.id));
+        }
         let snapshot = tokio.block_on(database.bootstrap_snapshot())?;
         let tools = ToolScheduler::new(PathBuf::from(&bootstrap.app_files_dir).join("offloads"))?;
         let (sender, receiver) = mpsc::channel(64);
@@ -220,6 +239,7 @@ impl RuntimeEngine {
             self_ref: Mutex::new(Weak::new()),
             bootstrap,
             database,
+            filestore,
             markdown_streams: Mutex::new(HashMap::new()),
             active_turns: Mutex::new(HashMap::new()),
             router: Mutex::new(ModelRouter::default()),
@@ -329,6 +349,9 @@ impl RuntimeEngine {
             }
             "UpdateProvider" => self.execute_update_provider(command),
             "RefreshProviderModels" => self.execute_refresh_provider_models(command),
+            "ImportAttachmentFromUri" => self.execute_import_attachment(command),
+            "RemovePendingAttachment" => self.execute_remove_pending_attachment(command),
+            "ClearPendingAttachments" => self.execute_clear_pending_attachments(command),
             "SendMessage" => self.execute_send_message(command, "SendMessage"),
             "RetryTurn" => self.execute_send_message(command, "RetryTurn"),
             "RegenerateMessage" => self.execute_send_message(command, "RegenerateMessage"),
@@ -513,6 +536,15 @@ impl RuntimeEngine {
             .block_on(self.database.replace_provider_models(&provider_id, upserts))
         {
             Ok(models) => {
+                for (index, model) in models.iter().enumerate() {
+                    let _ = self
+                        .tokio
+                        .block_on(self.database.upsert_primary_chat_member(
+                            &provider_id,
+                            &model.model_id,
+                            index as u32,
+                        ));
+                }
                 let snapshot = self
                     .tokio
                     .block_on(self.database.bootstrap_snapshot())
@@ -523,6 +555,207 @@ impl RuntimeEngine {
                     String::new(),
                     snapshot,
                     format!("{} models refreshed", models.len()),
+                    None,
+                );
+                accepted_ack(command.command_id, command.idempotency_key)
+            }
+            Err(error) => {
+                let _ = self.emit_error(error.clone());
+                rejected_ack(command.command_id, command.idempotency_key, error)
+            }
+        }
+    }
+
+    fn execute_import_attachment(&self, command: RuntimeCommand) -> RuntimeCommandAck {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return rejected_ack(
+                command.command_id,
+                command.idempotency_key,
+                HamburError::RuntimeClosed,
+            );
+        }
+
+        let metadata = match AttachmentImportPayload::parse(&command.payload_json) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                let _ = self.emit_error(error.clone());
+                return rejected_ack(command.command_id, command.idempotency_key, error);
+            }
+        };
+        let display_name = metadata.display_name.if_blank("attachment".to_string());
+        let reserved = match self
+            .filestore
+            .reserve_session_attachment(&command.session_id, &display_name)
+        {
+            Ok(reserved) => reserved,
+            Err(error) => {
+                let _ = self.emit_error(error.clone());
+                return rejected_ack(command.command_id, command.idempotency_key, error);
+            }
+        };
+
+        if !metadata.source_path.trim().is_empty() {
+            if let Err(error) = fs::copy(&metadata.source_path, &reserved.host_path)
+                .map(|_| ())
+                .map_err(|error| HamburError::Internal(format!("copy attachment source: {error}")))
+            {
+                let _ = self.emit_error(error.clone());
+                return rejected_ack(command.command_id, command.idempotency_key, error);
+            }
+        } else if !reserved.host_path.exists()
+            && let Err(error) = fs::write(&reserved.host_path, [])
+        {
+            let error = HamburError::Internal(format!("create attachment placeholder: {error}"));
+            let _ = self.emit_error(error.clone());
+            return rejected_ack(command.command_id, command.idempotency_key, error);
+        }
+
+        let byte_size = if reserved.host_path.exists() {
+            fs::metadata(&reserved.host_path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(metadata.byte_size)
+        } else {
+            metadata.byte_size
+        };
+        let result = self.tokio.block_on(async {
+            self.database
+                .upsert_file_record(NewFileRecord {
+                    id: reserved.file_id.clone(),
+                    scope: "session".to_string(),
+                    session_id: command.session_id.clone(),
+                    relative_path: reserved.relative_path.clone(),
+                    sandbox_path: reserved.sandbox_path.clone(),
+                    mime_type: metadata.mime_type.clone(),
+                    byte_size,
+                    sha256: metadata.sha256.clone(),
+                    retention_policy: "delete_with_session".to_string(),
+                })
+                .await?;
+            let attachment = self
+                .database
+                .create_pending_attachment(NewAttachment {
+                    id: String::new(),
+                    session_id: command.session_id.clone(),
+                    message_id: String::new(),
+                    kind: metadata.kind.clone(),
+                    display_name,
+                    mime_type: metadata.mime_type.clone(),
+                    byte_size,
+                    origin_type: metadata.origin_type.clone(),
+                    original_uri: metadata.original_uri.clone(),
+                    file_id: reserved.file_id,
+                    sandbox_path: reserved.sandbox_path,
+                    width: metadata.width,
+                    height: metadata.height,
+                    sha256: metadata.sha256,
+                    status: "pending".to_string(),
+                })
+                .await?;
+            let snapshot = self.database.session_snapshot(&command.session_id).await?;
+            Ok::<_, HamburError>((attachment, snapshot))
+        });
+
+        match result {
+            Ok((attachment, snapshot)) => {
+                let _ = self.emit_session_event(
+                    RuntimeEventKind::AttachmentImported,
+                    command.session_id.clone(),
+                    String::new(),
+                    snapshot,
+                    attachment.display_name,
+                    None,
+                );
+                accepted_ack(command.command_id, command.idempotency_key)
+            }
+            Err(error) => {
+                let _ = self.emit_error(error.clone());
+                rejected_ack(command.command_id, command.idempotency_key, error)
+            }
+        }
+    }
+
+    fn execute_remove_pending_attachment(&self, command: RuntimeCommand) -> RuntimeCommandAck {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return rejected_ack(
+                command.command_id,
+                command.idempotency_key,
+                HamburError::RuntimeClosed,
+            );
+        }
+        let attachment_id = command.message_id.clone().if_blank(command.chunk.clone());
+        if attachment_id.trim().is_empty() {
+            return rejected_ack(
+                command.command_id,
+                command.idempotency_key,
+                HamburError::InvalidCommand("attachment_id must not be empty".to_string()),
+            );
+        }
+
+        let result = self.tokio.block_on(async {
+            let (_attachment, cleanup) = self
+                .database
+                .remove_pending_attachment(&command.session_id, &attachment_id)
+                .await?;
+            if let Some(job) = cleanup {
+                let _ = self.filestore.delete_relative_if_exists(&job.relative_path);
+                let _ = self.database.mark_file_cleanup_done(&job.id).await;
+            }
+            self.database.session_snapshot(&command.session_id).await
+        });
+
+        match result {
+            Ok(snapshot) => {
+                let _ = self.emit_session_event(
+                    RuntimeEventKind::PendingAttachmentRemoved,
+                    command.session_id.clone(),
+                    String::new(),
+                    snapshot,
+                    attachment_id,
+                    None,
+                );
+                accepted_ack(command.command_id, command.idempotency_key)
+            }
+            Err(error) => {
+                let _ = self.emit_error(error.clone());
+                rejected_ack(command.command_id, command.idempotency_key, error)
+            }
+        }
+    }
+
+    fn execute_clear_pending_attachments(&self, command: RuntimeCommand) -> RuntimeCommandAck {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return rejected_ack(
+                command.command_id,
+                command.idempotency_key,
+                HamburError::RuntimeClosed,
+            );
+        }
+        let result = self.tokio.block_on(async {
+            let pending = self
+                .database
+                .pending_attachments_for_session(&command.session_id)
+                .await?;
+            for attachment in pending {
+                let (_removed, cleanup) = self
+                    .database
+                    .remove_pending_attachment(&command.session_id, &attachment.id)
+                    .await?;
+                if let Some(job) = cleanup {
+                    let _ = self.filestore.delete_relative_if_exists(&job.relative_path);
+                    let _ = self.database.mark_file_cleanup_done(&job.id).await;
+                }
+            }
+            self.database.session_snapshot(&command.session_id).await
+        });
+
+        match result {
+            Ok(snapshot) => {
+                let _ = self.emit_session_event(
+                    RuntimeEventKind::PendingAttachmentsCleaned,
+                    command.session_id.clone(),
+                    String::new(),
+                    snapshot,
+                    "Pending attachments cleared".to_string(),
                     None,
                 );
                 accepted_ack(command.command_id, command.idempotency_key)
@@ -547,13 +780,17 @@ impl RuntimeEngine {
             );
         }
 
-        let content = match self.resolve_turn_content(&command, command_kind) {
+        let mut content = match self.resolve_turn_content(&command, command_kind) {
             Ok(content) => content,
             Err(error) => {
                 let _ = self.emit_error(error.clone());
                 return rejected_ack(command.command_id, command.idempotency_key, error);
             }
         };
+        let attachment_ids = parse_attachment_ids(&command.payload_json);
+        if content.trim().is_empty() && !attachment_ids.is_empty() {
+            content = "Attached files.".to_string();
+        }
         if content.trim().is_empty() {
             return rejected_ack(
                 command.command_id,
@@ -561,6 +798,18 @@ impl RuntimeEngine {
                 HamburError::InvalidCommand("message content must not be empty".to_string()),
             );
         }
+
+        let pending_attachments =
+            match self.load_pending_attachments(&command.session_id, &attachment_ids) {
+                Ok(attachments) => attachments,
+                Err(error) => {
+                    let _ = self.emit_error(error.clone());
+                    return rejected_ack(command.command_id, command.idempotency_key, error);
+                }
+            };
+        let requires_image_input = pending_attachments
+            .iter()
+            .any(|attachment| attachment.kind == "image");
 
         if self.active_turn_for_session(&command.session_id).is_some() {
             return rejected_ack(
@@ -580,7 +829,7 @@ impl RuntimeEngine {
         let mut plan = route_plan_from_records(routes);
         let requirements = RouteRequirements {
             requires_tool_protocol: false,
-            requires_image_input: false,
+            requires_image_input,
             requires_structured_output: false,
         };
         plan = match self
@@ -608,6 +857,7 @@ impl RuntimeEngine {
             );
         };
 
+        let user_content = format_user_content_with_attachments(&content, &pending_attachments);
         let setup = self.tokio.block_on(async {
             let turn = self
                 .database
@@ -618,12 +868,19 @@ impl RuntimeEngine {
                 .insert_message_with_route(
                     &command.session_id,
                     "user",
-                    &content,
+                    &user_content,
                     "",
                     "completed",
                     &turn.id,
                     &route,
                 )
+                .await?;
+            let attachment_ids = pending_attachments
+                .iter()
+                .map(|attachment| attachment.id.clone())
+                .collect::<Vec<_>>();
+            self.database
+                .attach_pending_to_message(&command.session_id, &user_message.id, &attachment_ids)
                 .await?;
             self.database
                 .upsert_timeline_item(
@@ -633,7 +890,7 @@ impl RuntimeEngine {
                         content_type: "message".to_string(),
                         display_sequence: user_message.created_at_ms,
                         payload_ref: user_message.id.clone(),
-                        small_summary: content.chars().take(160).collect(),
+                        small_summary: user_content.chars().take(160).collect(),
                         kind: if command_kind == "EditMessage" {
                             "EditedUserMessage".to_string()
                         } else {
@@ -706,7 +963,7 @@ impl RuntimeEngine {
             command.session_id.clone(),
             turn.id.clone(),
             snapshot.clone(),
-            content.clone(),
+            user_content.clone(),
             None,
         );
         let _ = self.emit_session_event(
@@ -777,6 +1034,38 @@ impl RuntimeEngine {
                     .source_user_message_for(&command.session_id, &source_message_id),
             )
             .map(|message| message.content_text)
+    }
+
+    fn load_pending_attachments(
+        &self,
+        session_id: &str,
+        attachment_ids: &[String],
+    ) -> HamburResult<Vec<AttachmentRecord>> {
+        if attachment_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut seen = HashSet::new();
+        let mut attachments = Vec::new();
+        for attachment_id in attachment_ids {
+            if !seen.insert(attachment_id.clone()) {
+                continue;
+            }
+            let attachment = self
+                .tokio
+                .block_on(self.database.attachment_by_id(attachment_id))?;
+            if attachment.session_id != session_id {
+                return Err(HamburError::InvalidCommand(format!(
+                    "attachment does not belong to session: {attachment_id}"
+                )));
+            }
+            if attachment.status != "pending" || !attachment.message_id.is_empty() {
+                return Err(HamburError::InvalidCommand(format!(
+                    "attachment is not pending: {attachment_id}"
+                )));
+            }
+            attachments.push(attachment);
+        }
+        Ok(attachments)
     }
 
     fn execute_cancel_turn(&self, command: RuntimeCommand) -> RuntimeCommandAck {
@@ -865,19 +1154,19 @@ impl RuntimeEngine {
         {
             let _ = self.emit_markdown(command.session_id.clone(), result.0);
         }
-        if let Some(update) = result.1 {
-            if !update.committed_nodes.is_empty()
+        if let Some(update) = result.1
+            && (!update.committed_nodes.is_empty()
                 || update.pending_node.is_some()
                 || update.reset
-                || !update.invalidated_block_ids.is_empty()
-            {
-                let _ = self.emit_markdown(command.session_id.clone(), update);
-            }
+                || !update.invalidated_block_ids.is_empty())
+        {
+            let _ = self.emit_markdown(command.session_id.clone(), update);
         }
 
         accepted_ack(command.command_id, command.idempotency_key)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_chat_turn(
         self: Arc<Self>,
         session_id: String,
@@ -889,6 +1178,7 @@ impl RuntimeEngine {
         stream_chunks_by_route: Vec<Vec<Vec<u8>>>,
     ) {
         let target_count = routes.len();
+        let route_candidates = routes.clone();
         let mut last_error = None;
 
         for (attempt_index, route) in routes.into_iter().enumerate() {
@@ -952,6 +1242,7 @@ impl RuntimeEngine {
                     turn_id.clone(),
                     assistant_message_id.clone(),
                     route,
+                    route_candidates.clone(),
                     cancel.clone(),
                     stream_chunks,
                 )
@@ -995,12 +1286,14 @@ impl RuntimeEngine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_chat_stream_attempt(
         self: Arc<Self>,
         session_id: String,
         turn_id: String,
         assistant_message_id: String,
         route: ModelRouteSnapshot,
+        route_candidates: Vec<ModelRouteSnapshot>,
         cancel: Arc<AtomicBool>,
         stream_chunks: Vec<Vec<u8>>,
     ) -> StreamAttemptResult {
@@ -1241,6 +1534,7 @@ impl RuntimeEngine {
                     &turn_id,
                     &assistant_message_id,
                     &route,
+                    &route_candidates,
                     &cancel,
                     &content,
                     &reasoning,
@@ -1373,12 +1667,14 @@ impl RuntimeEngine {
         StreamAttemptResult::Completed
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_tool_batch_and_continue(
         &self,
         session_id: &str,
         turn_id: &str,
         assistant_message_id: &str,
         route: &ModelRouteSnapshot,
+        route_candidates: &[ModelRouteSnapshot],
         cancel: &Arc<AtomicBool>,
         content: &str,
         reasoning: &str,
@@ -1523,12 +1819,17 @@ impl RuntimeEngine {
             return Ok(());
         }
 
-        let batch = ToolCallBatch::new(
-            turn_id.to_string(),
-            assistant_message_id.to_string(),
-            invocations,
-        );
-        let records = self.tools.execute_batch(batch).await?;
+        let records = self
+            .execute_runtime_tool_batch(
+                session_id,
+                turn_id,
+                assistant_message_id,
+                route,
+                route_candidates,
+                invocations,
+            )
+            .await?;
+        let view_image_handoff = select_view_image_handoff_route(route, route_candidates, &records);
         let mut context_stubs = Vec::new();
         for record in records {
             let tool_message = self
@@ -1628,7 +1929,58 @@ impl RuntimeEngine {
         self.database
             .update_turn_status(turn_id, "ContinuingAfterTools", false)
             .await?;
+        let continuation_route = view_image_handoff.unwrap_or_else(|| route.clone());
+        if continuation_route.provider_id != route.provider_id
+            || continuation_route.model_id != route.model_id
+        {
+            self.database
+                .update_turn_route_snapshot(turn_id, &continuation_route)
+                .await?;
+            let snapshot = self
+                .database
+                .session_snapshot(session_id)
+                .await
+                .unwrap_or_default();
+            let _ = self.emit_session_event(
+                RuntimeEventKind::TurnStateChanged,
+                session_id.to_string(),
+                turn_id.to_string(),
+                snapshot,
+                "RouteHandoff(ImageInspectionRequired)".to_string(),
+                None,
+            );
+        }
         let continuation_content = format_tool_continuation(&context_stubs);
+        if context_stubs
+            .iter()
+            .any(|stub| stub.contains("ImagePart(fileId="))
+        {
+            let synthetic = self
+                .database
+                .insert_message_with_route(
+                    session_id,
+                    "user",
+                    &format_synthetic_view_image_message(&context_stubs),
+                    "",
+                    "completed",
+                    turn_id,
+                    &continuation_route,
+                )
+                .await?;
+            self.database
+                .upsert_timeline_item(
+                    session_id,
+                    NewTimelineItem {
+                        stable_key: synthetic.id.clone(),
+                        content_type: "message".to_string(),
+                        display_sequence: synthetic.created_at_ms,
+                        payload_ref: synthetic.id.clone(),
+                        small_summary: synthetic.content_text.chars().take(160).collect(),
+                        kind: "SyntheticUserMessage".to_string(),
+                    },
+                )
+                .await?;
+        }
         let continuation = self
             .database
             .insert_message_with_route(
@@ -1638,7 +1990,7 @@ impl RuntimeEngine {
                 "",
                 "completed",
                 turn_id,
-                route,
+                &continuation_route,
             )
             .await?;
         self.database
@@ -1699,6 +2051,174 @@ impl RuntimeEngine {
             .update_trace_span_status(trace_id, status, summary, true)
             .await?;
         Ok(())
+    }
+
+    async fn execute_runtime_tool_batch(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        assistant_message_id: &str,
+        route: &ModelRouteSnapshot,
+        route_candidates: &[ModelRouteSnapshot],
+        invocations: Vec<ToolInvocation>,
+    ) -> HamburResult<Vec<ToolExecutionRecord>> {
+        let mut regular = Vec::new();
+        let mut records = Vec::new();
+        for invocation in invocations {
+            if invocation.name == "view_image" {
+                records.push(
+                    self.execute_view_image_tool(session_id, route, route_candidates, invocation)
+                        .await,
+                );
+            } else {
+                regular.push(invocation);
+            }
+        }
+
+        if !regular.is_empty() {
+            let batch = ToolCallBatch::new(
+                turn_id.to_string(),
+                assistant_message_id.to_string(),
+                regular,
+            );
+            records.extend(self.tools.execute_batch(batch).await?);
+        }
+        records.sort_by_key(|record| record.invocation.index);
+        Ok(records)
+    }
+
+    async fn execute_view_image_tool(
+        &self,
+        session_id: &str,
+        route: &ModelRouteSnapshot,
+        route_candidates: &[ModelRouteSnapshot],
+        invocation: ToolInvocation,
+    ) -> ToolExecutionRecord {
+        let started_at_ms = now_ms();
+        let result = match invocation.arguments_value() {
+            Ok(arguments) => {
+                self.resolve_view_image_result(
+                    session_id,
+                    route,
+                    route_candidates,
+                    &invocation,
+                    &arguments,
+                )
+                .await
+            }
+            Err(error) => ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                error.to_string(),
+            ),
+        };
+        ToolExecutionRecord {
+            invocation,
+            result,
+            started_at_ms,
+            ended_at_ms: now_ms(),
+        }
+    }
+
+    async fn resolve_view_image_result(
+        &self,
+        session_id: &str,
+        route: &ModelRouteSnapshot,
+        route_candidates: &[ModelRouteSnapshot],
+        invocation: &ToolInvocation,
+        arguments: &Value,
+    ) -> ToolResult {
+        let path = arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        let detail = arguments
+            .get("detail")
+            .and_then(Value::as_str)
+            .unwrap_or("auto")
+            .trim();
+        if path.is_empty() {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                "view_image path must not be empty",
+            );
+        }
+        if !route.supports_image_input && vision_handoff_target(route_candidates, route).is_none() {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                "view_image unavailable: no vision-capable handoff target",
+            );
+        }
+
+        let file = match self
+            .database
+            .resolve_file_by_sandbox_path(session_id, path)
+            .await
+        {
+            Ok(file) => file,
+            Err(error) => {
+                return ToolResult::failed(
+                    &invocation.tool_call_id,
+                    &invocation.name,
+                    error.to_string(),
+                );
+            }
+        };
+        if !file.mime_type.starts_with("image/") {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                "view_image requires an image file",
+            );
+        }
+        let image_attached_to_next_request =
+            route.supports_image_input || vision_handoff_target(route_candidates, route).is_some();
+        let content = json!({
+            "path": path,
+            "resolvedPath": file.sandbox_path,
+            "detail": normalize_image_detail(detail),
+            "width": 0,
+            "height": 0,
+            "mimeType": file.mime_type,
+            "fileId": file.id,
+            "imageAttachedToNextRequest": image_attached_to_next_request
+        });
+        let context_stub = format!(
+            "Image returned by view_image for tool_call_id={}: ImagePart(fileId={}, path={}, mimeType={}, detail={})",
+            invocation.tool_call_id,
+            content
+                .get("fileId")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            content
+                .get("resolvedPath")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            content
+                .get("mimeType")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            content
+                .get("detail")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        );
+        ToolResult {
+            tool_call_id: invocation.tool_call_id.clone(),
+            tool_name: invocation.name.clone(),
+            is_error: false,
+            content_json: content.to_string(),
+            summary: "Image prepared for vision continuation".to_string(),
+            artifacts_json: "[]".to_string(),
+            trust_level: "trusted".to_string(),
+            truncated: false,
+            offloaded_file_id: String::new(),
+            offloaded_path: String::new(),
+            context_stub,
+        }
     }
 
     async fn finish_cancelled_turn(
@@ -1928,13 +2448,12 @@ impl RuntimeEngine {
     }
 
     fn clear_active_turn(&self, session_id: &str, turn_id: &str) {
-        if let Ok(mut turns) = self.active_turns.lock() {
-            if turns
+        if let Ok(mut turns) = self.active_turns.lock()
+            && turns
                 .get(session_id)
                 .is_some_and(|active| active.turn_id == turn_id)
-            {
-                turns.remove(session_id);
-            }
+        {
+            turns.remove(session_id);
         }
     }
 
@@ -2142,6 +2661,23 @@ fn validate_command(command: &RuntimeCommand) -> HamburResult<()> {
             }
             Ok(())
         }
+        "ImportAttachmentFromUri" => {
+            require_session_id(command)?;
+            Ok(())
+        }
+        "RemovePendingAttachment" => {
+            require_session_id(command)?;
+            if command.message_id.is_empty() && command.chunk.trim().is_empty() {
+                return Err(HamburError::InvalidCommand(
+                    "attachment_id must not be empty".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        "ClearPendingAttachments" => {
+            require_session_id(command)?;
+            Ok(())
+        }
         "SendMessage" | "EditMessage" => {
             require_session_id(command)?;
             if command.content.trim().is_empty() && command.chunk.trim().is_empty() {
@@ -2314,6 +2850,117 @@ fn stream_chunks_for_command(
     scripted_openai_sse_chunks(&response, &reasoning)
 }
 
+#[derive(Debug, Clone, Default)]
+struct AttachmentImportPayload {
+    display_name: String,
+    mime_type: String,
+    byte_size: u64,
+    origin_type: String,
+    original_uri: String,
+    source_path: String,
+    kind: String,
+    width: u32,
+    height: u32,
+    sha256: String,
+}
+
+impl AttachmentImportPayload {
+    fn parse(payload_json: &str) -> HamburResult<Self> {
+        let value = if payload_json.trim().is_empty() {
+            Value::Object(Default::default())
+        } else {
+            serde_json::from_str::<Value>(payload_json).map_err(|error| {
+                HamburError::InvalidCommand(format!(
+                    "attachment import payload must be JSON: {error}"
+                ))
+            })?
+        };
+        let get_string = |keys: &[&str]| {
+            keys.iter()
+                .find_map(|key| value.get(*key).and_then(Value::as_str))
+                .unwrap_or_default()
+                .to_string()
+        };
+        let mime_type = get_string(&["mimeType", "mime_type"]);
+        let kind = get_string(&["kind"]);
+        Ok(Self {
+            display_name: get_string(&["displayName", "display_name", "name"]),
+            mime_type: if mime_type.trim().is_empty() {
+                "application/octet-stream".to_string()
+            } else {
+                mime_type
+            },
+            byte_size: value
+                .get("byteSize")
+                .or_else(|| value.get("byte_size"))
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            origin_type: get_string(&["originType", "origin_type"])
+                .if_blank("content_uri".to_string()),
+            original_uri: get_string(&["originalUri", "original_uri", "uri"]),
+            source_path: get_string(&["sourcePath", "source_path", "path"]),
+            kind,
+            width: value
+                .get("width")
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .unwrap_or_default(),
+            height: value
+                .get("height")
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .unwrap_or_default(),
+            sha256: get_string(&["sha256"]),
+        })
+    }
+}
+
+fn parse_attachment_ids(payload_json: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<Value>(payload_json) else {
+        return Vec::new();
+    };
+    let Some(values) = value
+        .get("attachmentIds")
+        .or_else(|| value.get("attachment_ids"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    values
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn format_user_content_with_attachments(content: &str, attachments: &[AttachmentRecord]) -> String {
+    if attachments.is_empty() {
+        return content.to_string();
+    }
+    let mut formatted = content.trim().to_string();
+    formatted.push_str("\n\nAttachments:");
+    for attachment in attachments {
+        if attachment.kind == "image" {
+            formatted.push_str(&format!(
+                "\n- ImagePart(fileId={}, sandboxPath={}, mimeType={}, detail=auto)",
+                attachment.file_id, attachment.sandbox_path, attachment.mime_type
+            ));
+        } else {
+            formatted.push_str(&format!(
+                "\n- FileReferencePart(fileId={}, sandboxPath={}, name={}, size={}, mimeType={})",
+                attachment.file_id,
+                attachment.sandbox_path,
+                attachment.display_name,
+                attachment.byte_size,
+                attachment.mime_type
+            ));
+        }
+    }
+    formatted
+}
+
 fn format_tool_continuation(context_stubs: &[String]) -> String {
     if context_stubs.is_empty() {
         return "Tool batch completed with no output.".to_string();
@@ -2323,6 +2970,71 @@ fn format_tool_continuation(context_stubs: &[String]) -> String {
         output.push_str(&format!("\n{}. {}\n", index + 1, stub.trim()));
     }
     output
+}
+
+fn format_synthetic_view_image_message(context_stubs: &[String]) -> String {
+    let image_parts = context_stubs
+        .iter()
+        .filter(|stub| stub.contains("ImagePart(fileId="))
+        .map(|stub| stub.trim())
+        .collect::<Vec<_>>();
+    if image_parts.is_empty() {
+        "Image returned by view_image.".to_string()
+    } else {
+        format!(
+            "Synthetic multimodal continuation for view_image.\n{}",
+            image_parts.join("\n")
+        )
+    }
+}
+
+fn normalize_image_detail(detail: &str) -> &'static str {
+    match detail {
+        "low" => "low",
+        "high" => "high",
+        _ => "auto",
+    }
+}
+
+fn vision_handoff_target(
+    route_candidates: &[ModelRouteSnapshot],
+    active_route: &ModelRouteSnapshot,
+) -> Option<ModelRouteSnapshot> {
+    route_candidates
+        .iter()
+        .find(|candidate| {
+            candidate.supports_image_input
+                && (candidate.provider_id != active_route.provider_id
+                    || candidate.model_id != active_route.model_id)
+        })
+        .cloned()
+}
+
+fn select_view_image_handoff_route(
+    active_route: &ModelRouteSnapshot,
+    route_candidates: &[ModelRouteSnapshot],
+    records: &[ToolExecutionRecord],
+) -> Option<ModelRouteSnapshot> {
+    if active_route.supports_image_input {
+        return None;
+    }
+    let needs_handoff = records.iter().any(|record| {
+        record.invocation.name == "view_image"
+            && !record.result.is_error
+            && serde_json::from_str::<Value>(&record.result.content_json)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("imageAttachedToNextRequest")
+                        .and_then(Value::as_bool)
+                })
+                .unwrap_or(false)
+    });
+    if needs_handoff {
+        vision_handoff_target(route_candidates, active_route)
+    } else {
+        None
+    }
 }
 
 fn scripted_route_value<'a>(
@@ -2376,8 +3088,9 @@ fn default_models_response(model_id: &str) -> String {
     } else {
         model_id.trim()
     };
+    let supports_image_input = model_id.to_ascii_lowercase().contains("vision");
     format!(
-        r#"{{"data":[{{"id":"{model_id}","display_name":"{model_id}","supports_reasoning":true,"supports_tool_call":true,"supports_image_input":false,"supports_structured_output":false,"supports_temperature":true,"context_limit":32000,"output_limit":4096}}]}}"#
+        r#"{{"data":[{{"id":"{model_id}","display_name":"{model_id}","supports_reasoning":true,"supports_tool_call":true,"supports_image_input":{supports_image_input},"supports_structured_output":false,"supports_temperature":true,"context_limit":32000,"output_limit":4096}}]}}"#
     )
 }
 
@@ -2603,7 +3316,7 @@ mod tests {
                 }
                 "MarkdownRenderUpdate" => {
                     saw_markdown = true;
-                    assert_eq!(event.markdown_render_update.message_id.is_empty(), false);
+                    assert!(!event.markdown_render_update.message_id.is_empty());
                 }
                 "TurnFinished" => {
                     finished = Some(event);
@@ -3037,6 +3750,276 @@ mod tests {
         let _ = fs::remove_dir_all(app_files_dir);
     }
 
+    #[test]
+    fn attachment_import_remove_and_startup_cleanup() {
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+        let session_id = create_test_session(&runtime);
+
+        let import = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_import_attachment".to_string(),
+            idempotency_key: "content://image:import:test".to_string(),
+            kind: "ImportAttachmentFromUri".to_string(),
+            session_id: session_id.clone(),
+            payload_json: serde_json::json!({
+                "displayName": "photo.png",
+                "mimeType": "image/png",
+                "byteSize": 12,
+                "originalUri": "content://images/photo"
+            })
+            .to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(import.accepted, "import rejected: {}", import.message);
+        let imported = runtime.next_event().expect("attachment imported");
+        assert_eq!(imported.kind.as_str(), "AttachmentImported");
+        assert_eq!(imported.snapshot.pending_attachments.len(), 1);
+        let attachment_id = imported.snapshot.pending_attachments[0].id.clone();
+
+        let remove = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_remove_attachment".to_string(),
+            idempotency_key: format!("{attachment_id}:remove"),
+            kind: "RemovePendingAttachment".to_string(),
+            session_id: session_id.clone(),
+            message_id: attachment_id,
+            ..RuntimeCommand::default()
+        });
+        assert!(remove.accepted, "remove rejected: {}", remove.message);
+        let removed = runtime.next_event().expect("attachment removed");
+        assert_eq!(removed.kind.as_str(), "PendingAttachmentRemoved");
+        assert!(removed.snapshot.pending_attachments.is_empty());
+
+        let import_stale = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_import_stale".to_string(),
+            idempotency_key: "content://stale:import:test".to_string(),
+            kind: "ImportAttachmentFromUri".to_string(),
+            session_id: session_id.clone(),
+            payload_json: serde_json::json!({
+                "displayName": "stale.png",
+                "mimeType": "image/png"
+            })
+            .to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(import_stale.accepted);
+        let stale_event = runtime.next_event().expect("stale imported");
+        assert_eq!(stale_event.snapshot.pending_attachments.len(), 1);
+        runtime.shutdown();
+        drop(runtime);
+
+        let restarted = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+        })
+        .expect("restart runtime");
+        let ready = restarted.next_event().expect("ready after cleanup");
+        assert_eq!(ready.kind.as_str(), "RuntimeReady");
+        assert!(ready.snapshot.pending_attachments.is_empty());
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
+    fn send_message_consumes_image_attachment_and_requires_vision_route() {
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+        let session_id = create_test_session(&runtime);
+        configure_named_models(
+            &runtime,
+            "provider_vision",
+            &[("model-text", false), ("model-vision", true)],
+        );
+
+        let import = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_import_for_send".to_string(),
+            idempotency_key: "content://image:send:test".to_string(),
+            kind: "ImportAttachmentFromUri".to_string(),
+            session_id: session_id.clone(),
+            payload_json: serde_json::json!({
+                "displayName": "photo.png",
+                "mimeType": "image/png"
+            })
+            .to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(import.accepted);
+        let imported = runtime.next_event().expect("attachment imported");
+        let attachment_id = imported.snapshot.pending_attachments[0].id.clone();
+
+        let send = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_send_with_image".to_string(),
+            idempotency_key: "message:image:send".to_string(),
+            kind: "SendMessage".to_string(),
+            session_id: session_id.clone(),
+            content: "describe this".to_string(),
+            payload_json: serde_json::json!({
+                "attachmentIds": [attachment_id],
+                "content": "image accepted",
+                "reasoning": "vision"
+            })
+            .to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(send.accepted, "send rejected: {}", send.message);
+        wait_for_event(&runtime, "TurnFinished");
+        let timeline = runtime.get_timeline_page(session_id, 0, 20);
+        let user = timeline
+            .items
+            .iter()
+            .find(|item| item.kind == "UserMessage")
+            .expect("user message");
+        let user_message = runtime
+            .get_message_snapshot(user.payload_ref.clone())
+            .message
+            .expect("user message snapshot");
+        assert!(user_message.content_text.contains("ImagePart"));
+        assert!(
+            runtime
+                .get_session_snapshot(user_message.session_id)
+                .timeline_items
+                .len()
+                >= 2
+        );
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
+    fn text_only_route_rejects_image_attachment_without_vision_model() {
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+        let session_id = create_test_session(&runtime);
+        configure_test_provider(&runtime, "model-text");
+
+        let import = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_import_image_text_only".to_string(),
+            idempotency_key: "content://image:text-only:test".to_string(),
+            kind: "ImportAttachmentFromUri".to_string(),
+            session_id: session_id.clone(),
+            payload_json: serde_json::json!({
+                "displayName": "photo.png",
+                "mimeType": "image/png"
+            })
+            .to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(import.accepted);
+        let imported = runtime.next_event().expect("attachment imported");
+        let attachment_id = imported.snapshot.pending_attachments[0].id.clone();
+
+        let send = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_send_image_text_only".to_string(),
+            idempotency_key: "message:image:text-only".to_string(),
+            kind: "SendMessage".to_string(),
+            session_id,
+            content: "describe this".to_string(),
+            payload_json: serde_json::json!({"attachmentIds": [attachment_id]}).to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(!send.accepted);
+        assert_eq!(send.rejection_code, "CapabilityMismatch");
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
+    fn view_image_text_route_hands_off_to_vision_continuation() {
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+        let session_id = create_test_session(&runtime);
+        configure_named_models(
+            &runtime,
+            "provider_combo",
+            &[("model-text", false), ("model-vision", true)],
+        );
+
+        let import = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_import_view_image".to_string(),
+            idempotency_key: "content://view-image:import:test".to_string(),
+            kind: "ImportAttachmentFromUri".to_string(),
+            session_id: session_id.clone(),
+            payload_json: serde_json::json!({
+                "displayName": "view.png",
+                "mimeType": "image/png"
+            })
+            .to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(import.accepted);
+        let imported = runtime.next_event().expect("attachment imported");
+        let path = imported.snapshot.pending_attachments[0]
+            .sandbox_path
+            .clone();
+
+        let sse = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_view\",\"function\":{{\"name\":\"view_image\",\"arguments\":\"{{\\\"path\\\":\\\"{}\\\"}}\"}}}}]}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n",
+            path
+        );
+        let send = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_view_image_turn".to_string(),
+            idempotency_key: "message:view-image:handoff".to_string(),
+            kind: "SendMessage".to_string(),
+            session_id: session_id.clone(),
+            content: "inspect image by tool".to_string(),
+            payload_json: serde_json::json!({"sse": sse}).to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(send.accepted, "send rejected: {}", send.message);
+
+        let mut saw_handoff = false;
+        for _ in 0..96 {
+            let event = runtime.next_event().expect("view image event");
+            if event.kind.as_str() == "TurnStateChanged"
+                && event.message.contains("ImageInspectionRequired")
+            {
+                saw_handoff = true;
+            }
+            if event.kind.as_str() == "TurnFinished" {
+                break;
+            }
+        }
+        assert!(saw_handoff, "missing vision handoff event");
+        let timeline = runtime.get_timeline_page(session_id, 0, 50);
+        let continuation = timeline
+            .items
+            .iter()
+            .rev()
+            .find(|item| item.kind == "AssistantMessage")
+            .expect("assistant continuation");
+        let message = runtime
+            .get_message_snapshot(continuation.payload_ref.clone())
+            .message
+            .expect("continuation message");
+        assert_eq!(message.model_id_snapshot, "model-vision");
+        assert!(message.content_text.contains("ImagePart"));
+        assert!(!message.content_text.contains("base64"));
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
     fn temp_app_dir() -> PathBuf {
         std::env::temp_dir().join(new_id("hambur_runtime_test"))
     }
@@ -3054,6 +4037,10 @@ mod tests {
     }
 
     fn configure_named_test_provider(runtime: &RuntimeEngine, provider_id: &str, model_id: &str) {
+        configure_named_models(runtime, provider_id, &[(model_id, false)]);
+    }
+
+    fn configure_named_models(runtime: &RuntimeEngine, provider_id: &str, models: &[(&str, bool)]) {
         let provider = runtime.dispatch(RuntimeCommand {
             command_id: format!("cmd_provider_good_{provider_id}"),
             idempotency_key: format!("{provider_id}:update:test"),
@@ -3067,9 +4054,23 @@ mod tests {
         assert!(provider.accepted, "provider rejected: {}", provider.message);
         let _ = runtime.next_event().expect("provider event");
 
-        let models_json = format!(
-            r#"{{"data":[{{"id":"{model_id}","display_name":"{model_id}","supports_reasoning":true,"supports_tool_call":true,"supports_image_input":false,"supports_structured_output":false,"supports_temperature":true,"context_limit":32000,"output_limit":4096}}]}}"#
-        );
+        let data = models
+            .iter()
+            .map(|(model_id, supports_image_input)| {
+                serde_json::json!({
+                    "id": model_id,
+                    "display_name": model_id,
+                    "supports_reasoning": true,
+                    "supports_tool_call": true,
+                    "supports_image_input": supports_image_input,
+                    "supports_structured_output": false,
+                    "supports_temperature": true,
+                    "context_limit": 32000,
+                    "output_limit": 4096
+                })
+            })
+            .collect::<Vec<_>>();
+        let models_json = serde_json::json!({"data": data}).to_string();
         let models = runtime.dispatch(RuntimeCommand {
             command_id: format!("cmd_models_{provider_id}"),
             idempotency_key: format!("{provider_id}:models:test"),

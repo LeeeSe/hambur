@@ -43,6 +43,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.hambur.chat.reducer.HamburUiStore
+import com.hambur.chat.reducer.UiPendingAttachment
 import com.hambur.chat.reducer.UiSessionSummary
 import com.hambur.chat.reducer.UiTimelineItem
 import com.hambur.chat.uniffi.MarkdownBlockNodeDto
@@ -112,6 +113,7 @@ fun AppShell(appFilesDir: String) {
                         message = draftMessage,
                         enabled = state.selectedSessionId.isNotBlank(),
                         streaming = state.activeTurnIds.containsKey(state.selectedSessionId),
+                        pendingAttachments = state.pendingAttachments,
                         onMessageChange = { draftMessage = it },
                         onSend = {
                             store.sendMessage(state.selectedSessionId, draftMessage)
@@ -119,6 +121,16 @@ fun AppShell(appFilesDir: String) {
                         },
                         onStop = {
                             store.cancelActiveTurn(state.selectedSessionId)
+                        },
+                        onAddImage = {
+                            store.importAttachmentMetadata(
+                                sessionId = state.selectedSessionId,
+                                displayName = "image.png",
+                                mimeType = "image/png",
+                            )
+                        },
+                        onRemoveAttachment = { attachmentId ->
+                            store.removePendingAttachment(state.selectedSessionId, attachmentId)
                         },
                     )
 
@@ -152,43 +164,110 @@ private fun ChatComposer(
     message: String,
     enabled: Boolean,
     streaming: Boolean,
+    pendingAttachments: List<UiPendingAttachment>,
     onMessageChange: (String) -> Unit,
     onSend: () -> Unit,
     onStop: () -> Unit,
+    onAddImage: () -> Unit,
+    onRemoveAttachment: (String) -> Unit,
 ) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        OutlinedTextField(
-            value = message,
-            onValueChange = onMessageChange,
-            modifier = Modifier.weight(1f),
-            minLines = 1,
-            maxLines = 3,
-            label = { Text("Message") },
-            enabled = enabled && !streaming,
-        )
-        if (streaming) {
-            Button(
-                onClick = onStop,
-                enabled = enabled,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.tertiary,
-                ),
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        if (pendingAttachments.isNotEmpty()) {
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 72.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                Text("Stop")
+                items(
+                    items = pendingAttachments,
+                    key = { it.id },
+                ) { attachment ->
+                    PendingAttachmentRow(
+                        attachment = attachment,
+                        onRemove = { onRemoveAttachment(attachment.id) },
+                    )
+                }
             }
-        } else {
-            Button(
-                onClick = onSend,
-                enabled = enabled && message.isNotBlank(),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.primary,
-                ),
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            OutlinedTextField(
+                value = message,
+                onValueChange = onMessageChange,
+                modifier = Modifier.weight(1f),
+                minLines = 1,
+                maxLines = 3,
+                label = { Text("Message") },
+                enabled = enabled && !streaming,
+            )
+            TextButton(
+                onClick = onAddImage,
+                enabled = enabled && !streaming,
             ) {
-                Text("Send")
+                Text("Image")
+            }
+            if (streaming) {
+                Button(
+                    onClick = onStop,
+                    enabled = enabled,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.tertiary,
+                    ),
+                ) {
+                    Text("Stop")
+                }
+            } else {
+                Button(
+                    onClick = onSend,
+                    enabled = enabled && (message.isNotBlank() || pendingAttachments.isNotEmpty()),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.primary,
+                    ),
+                ) {
+                    Text("Send")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PendingAttachmentRow(
+    attachment: UiPendingAttachment,
+    onRemove: () -> Unit,
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(8.dp),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+        color = MaterialTheme.colorScheme.surface,
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = attachment.kind,
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.secondary,
+                modifier = Modifier.width(56.dp),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = attachment.displayName.ifBlank { attachment.mimeType },
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.weight(1f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            TextButton(onClick = onRemove) {
+                Text("Remove")
             }
         }
     }

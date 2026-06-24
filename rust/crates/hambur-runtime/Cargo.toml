@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 hambur-core.workspace = true
 hambur-db.workspace = true
+hambur-filestore.workspace = true
 hambur-llm.workspace = true
 hambur-markdown.workspace = true
 hambur-tools.workspace = true

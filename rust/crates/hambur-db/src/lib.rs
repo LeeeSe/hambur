@@ -180,6 +180,86 @@ pub struct ToolResultRecord {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NewFileRecord {
+    pub id: String,
+    pub scope: String,
+    pub session_id: String,
+    pub relative_path: String,
+    pub sandbox_path: String,
+    pub mime_type: String,
+    pub byte_size: u64,
+    pub sha256: String,
+    pub retention_policy: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileRecord {
+    pub id: String,
+    pub scope: String,
+    pub session_id: String,
+    pub relative_path: String,
+    pub sandbox_path: String,
+    pub mime_type: String,
+    pub byte_size: u64,
+    pub sha256: String,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub retention_policy: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NewAttachment {
+    pub id: String,
+    pub session_id: String,
+    pub message_id: String,
+    pub kind: String,
+    pub display_name: String,
+    pub mime_type: String,
+    pub byte_size: u64,
+    pub origin_type: String,
+    pub original_uri: String,
+    pub file_id: String,
+    pub sandbox_path: String,
+    pub width: u32,
+    pub height: u32,
+    pub sha256: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AttachmentRecord {
+    pub id: String,
+    pub session_id: String,
+    pub message_id: String,
+    pub kind: String,
+    pub display_name: String,
+    pub mime_type: String,
+    pub byte_size: u64,
+    pub origin_type: String,
+    pub original_uri: String,
+    pub file_id: String,
+    pub sandbox_path: String,
+    pub width: u32,
+    pub height: u32,
+    pub sha256: String,
+    pub status: String,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileCleanupJobRecord {
+    pub id: String,
+    pub file_id: String,
+    pub relative_path: String,
+    pub reason: String,
+    pub status: String,
+    pub attempts: u32,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProviderUpsert {
     pub id: String,
     pub name: String,
@@ -271,6 +351,7 @@ pub struct AppSnapshot {
     pub sessions: Vec<SessionSummary>,
     pub selected_session_id: String,
     pub timeline_items: Vec<TimelineItemSnapshot>,
+    pub pending_attachments: Vec<AttachmentRecord>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -418,6 +499,7 @@ impl HamburDatabase {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_message_with_route(
         &self,
         session_id: &str,
@@ -903,6 +985,453 @@ impl HamburDatabase {
             .map_err(database_error)?;
 
         self.tool_result_by_id(&id).await
+    }
+
+    pub async fn upsert_file_record(&self, input: NewFileRecord) -> HamburResult<FileRecord> {
+        let id = if input.id.trim().is_empty() {
+            new_id("file")
+        } else {
+            input.id.trim().chars().take(160).collect()
+        };
+        let scope = normalize_file_scope(&input.scope)?;
+        let session_id = input.session_id.trim().to_string();
+        if scope == "session" {
+            self.ensure_session_exists(&session_id).await?;
+        }
+        let relative_path = normalize_db_path(&input.relative_path, "relative_path")?;
+        let sandbox_path = normalize_db_path(&input.sandbox_path, "sandbox_path")?;
+        let mime_type = normalize_mime_type(&input.mime_type);
+        let retention_policy = normalize_retention_policy(&input.retention_policy)?;
+        let now = now_ms();
+        self.connection
+            .execute(
+                "INSERT INTO files
+                    (
+                        id,
+                        scope,
+                        session_id,
+                        relative_path,
+                        sandbox_path,
+                        mime_type,
+                        byte_size,
+                        sha256,
+                        created_at_ms,
+                        updated_at_ms,
+                        retention_policy
+                    )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10)
+                 ON CONFLICT(id) DO UPDATE SET
+                    scope = excluded.scope,
+                    session_id = excluded.session_id,
+                    relative_path = excluded.relative_path,
+                    sandbox_path = excluded.sandbox_path,
+                    mime_type = excluded.mime_type,
+                    byte_size = excluded.byte_size,
+                    sha256 = excluded.sha256,
+                    updated_at_ms = excluded.updated_at_ms,
+                    retention_policy = excluded.retention_policy",
+                params![
+                    id.clone(),
+                    scope,
+                    session_id,
+                    relative_path,
+                    sandbox_path,
+                    mime_type,
+                    input.byte_size as i64,
+                    input.sha256.trim().chars().take(128).collect::<String>(),
+                    now as i64,
+                    retention_policy,
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+
+        self.file_by_id(&id).await
+    }
+
+    pub async fn create_pending_attachment(
+        &self,
+        input: NewAttachment,
+    ) -> HamburResult<AttachmentRecord> {
+        self.ensure_session_exists(&input.session_id).await?;
+        self.file_by_id(&input.file_id).await?;
+        let id = if input.id.trim().is_empty() {
+            new_id("att")
+        } else {
+            input.id.trim().chars().take(160).collect()
+        };
+        let kind = normalize_attachment_kind(&input.kind, &input.mime_type);
+        let status = normalize_attachment_status(&input.status)?;
+        let now = now_ms();
+        self.connection
+            .execute(
+                "INSERT INTO attachments
+                    (
+                        id,
+                        session_id,
+                        message_id,
+                        kind,
+                        display_name,
+                        mime_type,
+                        byte_size,
+                        origin_type,
+                        original_uri,
+                        file_id,
+                        sandbox_path,
+                        width,
+                        height,
+                        sha256,
+                        status,
+                        created_at_ms,
+                        updated_at_ms
+                    )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16)
+                 ON CONFLICT(id) DO UPDATE SET
+                    display_name = excluded.display_name,
+                    mime_type = excluded.mime_type,
+                    byte_size = excluded.byte_size,
+                    original_uri = excluded.original_uri,
+                    sandbox_path = excluded.sandbox_path,
+                    width = excluded.width,
+                    height = excluded.height,
+                    sha256 = excluded.sha256,
+                    status = excluded.status,
+                    updated_at_ms = excluded.updated_at_ms",
+                params![
+                    id.clone(),
+                    input.session_id,
+                    input.message_id,
+                    kind,
+                    normalize_display_name(&input.display_name),
+                    normalize_mime_type(&input.mime_type),
+                    input.byte_size as i64,
+                    normalize_origin_type(&input.origin_type),
+                    input
+                        .original_uri
+                        .trim()
+                        .chars()
+                        .take(1024)
+                        .collect::<String>(),
+                    input.file_id,
+                    normalize_db_path(&input.sandbox_path, "sandbox_path")?,
+                    input.width as i64,
+                    input.height as i64,
+                    input.sha256.trim().chars().take(128).collect::<String>(),
+                    status,
+                    now as i64,
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+        self.attachment_by_id(&id).await
+    }
+
+    pub async fn pending_attachments_for_session(
+        &self,
+        session_id: &str,
+    ) -> HamburResult<Vec<AttachmentRecord>> {
+        self.ensure_session_exists(session_id).await?;
+        let mut rows = self
+            .connection
+            .query(
+                "
+                SELECT
+                    id,
+                    session_id,
+                    message_id,
+                    kind,
+                    display_name,
+                    mime_type,
+                    byte_size,
+                    origin_type,
+                    original_uri,
+                    file_id,
+                    sandbox_path,
+                    width,
+                    height,
+                    sha256,
+                    status,
+                    created_at_ms,
+                    updated_at_ms
+                FROM attachments
+                WHERE session_id = ?1
+                  AND message_id = ''
+                  AND status = 'pending'
+                ORDER BY created_at_ms ASC, id ASC
+                ",
+                params![session_id],
+            )
+            .await
+            .map_err(database_error)?;
+
+        let mut attachments = Vec::new();
+        while let Some(row) = rows.next().await.map_err(database_error)? {
+            attachments.push(attachment_from_row(&row)?);
+        }
+        Ok(attachments)
+    }
+
+    pub async fn attach_pending_to_message(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        attachment_ids: &[String],
+    ) -> HamburResult<Vec<AttachmentRecord>> {
+        self.ensure_session_exists(session_id).await?;
+        if attachment_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let now = now_ms();
+        let mut attached = Vec::new();
+        for attachment_id in attachment_ids {
+            let attachment = self.attachment_by_id(attachment_id).await?;
+            if attachment.session_id != session_id {
+                return Err(HamburError::InvalidCommand(format!(
+                    "attachment does not belong to session: {attachment_id}"
+                )));
+            }
+            if attachment.status != "pending" || !attachment.message_id.is_empty() {
+                return Err(HamburError::InvalidCommand(format!(
+                    "attachment is not pending: {attachment_id}"
+                )));
+            }
+            self.connection
+                .execute(
+                    "UPDATE attachments
+                     SET message_id = ?1,
+                         status = 'attached',
+                         updated_at_ms = ?2
+                     WHERE id = ?3",
+                    params![message_id, now as i64, attachment_id.clone()],
+                )
+                .await
+                .map_err(database_error)?;
+            attached.push(self.attachment_by_id(attachment_id).await?);
+        }
+        Ok(attached)
+    }
+
+    pub async fn remove_pending_attachment(
+        &self,
+        session_id: &str,
+        attachment_id: &str,
+    ) -> HamburResult<(AttachmentRecord, Option<FileCleanupJobRecord>)> {
+        self.ensure_session_exists(session_id).await?;
+        let attachment = self.attachment_by_id(attachment_id).await?;
+        if attachment.session_id != session_id {
+            return Err(HamburError::InvalidCommand(format!(
+                "attachment does not belong to session: {attachment_id}"
+            )));
+        }
+        if attachment.status != "pending" || !attachment.message_id.is_empty() {
+            return Err(HamburError::InvalidCommand(format!(
+                "attachment is not removable pending state: {attachment_id}"
+            )));
+        }
+        let now = now_ms();
+        self.connection
+            .execute(
+                "UPDATE attachments
+                 SET status = 'removed',
+                     updated_at_ms = ?1
+                 WHERE id = ?2",
+                params![now as i64, attachment_id],
+            )
+            .await
+            .map_err(database_error)?;
+        let removed = self.attachment_by_id(attachment_id).await?;
+        let cleanup = self
+            .schedule_file_cleanup(&removed.file_id, "pending_attachment_removed")
+            .await
+            .ok();
+        Ok((removed, cleanup))
+    }
+
+    pub async fn cleanup_pending_attachments(
+        &self,
+        older_than_ms: u64,
+    ) -> HamburResult<Vec<FileCleanupJobRecord>> {
+        let cutoff = now_ms().saturating_sub(older_than_ms);
+        let mut rows = self
+            .connection
+            .query(
+                "
+                SELECT
+                    id,
+                    session_id,
+                    message_id,
+                    kind,
+                    display_name,
+                    mime_type,
+                    byte_size,
+                    origin_type,
+                    original_uri,
+                    file_id,
+                    sandbox_path,
+                    width,
+                    height,
+                    sha256,
+                    status,
+                    created_at_ms,
+                    updated_at_ms
+                FROM attachments
+                WHERE status = 'pending'
+                  AND message_id = ''
+                  AND created_at_ms < ?1
+                ORDER BY created_at_ms ASC, id ASC
+                ",
+                params![cutoff as i64],
+            )
+            .await
+            .map_err(database_error)?;
+
+        let mut expired = Vec::new();
+        while let Some(row) = rows.next().await.map_err(database_error)? {
+            expired.push(attachment_from_row(&row)?);
+        }
+
+        let now = now_ms();
+        let mut jobs = Vec::new();
+        for attachment in expired {
+            self.connection
+                .execute(
+                    "UPDATE attachments
+                     SET status = 'expired',
+                         updated_at_ms = ?1
+                     WHERE id = ?2 AND status = 'pending'",
+                    params![now as i64, attachment.id],
+                )
+                .await
+                .map_err(database_error)?;
+            if let Ok(job) = self
+                .schedule_file_cleanup(&attachment.file_id, "pending_attachment_expired")
+                .await
+            {
+                jobs.push(job);
+            }
+        }
+        Ok(jobs)
+    }
+
+    pub async fn schedule_file_cleanup(
+        &self,
+        file_id: &str,
+        reason: &str,
+    ) -> HamburResult<FileCleanupJobRecord> {
+        let file = self.file_by_id(file_id).await?;
+        let id = new_id("cleanup");
+        let now = now_ms();
+        self.connection
+            .execute(
+                "INSERT INTO file_cleanup_jobs
+                    (
+                        id,
+                        file_id,
+                        relative_path,
+                        reason,
+                        status,
+                        attempts,
+                        created_at_ms,
+                        updated_at_ms
+                    )
+                 VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?5)",
+                params![
+                    id.clone(),
+                    file.id,
+                    file.relative_path,
+                    reason.trim().chars().take(120).collect::<String>(),
+                    now as i64,
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+        self.file_cleanup_job_by_id(&id).await
+    }
+
+    pub async fn pending_file_cleanup_jobs(
+        &self,
+        limit: u32,
+    ) -> HamburResult<Vec<FileCleanupJobRecord>> {
+        let limit = clamp_limit(limit, 1, 100);
+        let mut rows = self
+            .connection
+            .query(
+                "
+                SELECT id, file_id, relative_path, reason, status, attempts, created_at_ms, updated_at_ms
+                FROM file_cleanup_jobs
+                WHERE status = 'pending'
+                ORDER BY created_at_ms ASC, id ASC
+                LIMIT ?1
+                ",
+                params![limit as i64],
+            )
+            .await
+            .map_err(database_error)?;
+        let mut jobs = Vec::new();
+        while let Some(row) = rows.next().await.map_err(database_error)? {
+            jobs.push(file_cleanup_job_from_row(&row)?);
+        }
+        Ok(jobs)
+    }
+
+    pub async fn mark_file_cleanup_done(&self, job_id: &str) -> HamburResult<FileCleanupJobRecord> {
+        let now = now_ms();
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE file_cleanup_jobs
+                 SET status = 'completed',
+                     updated_at_ms = ?1
+                 WHERE id = ?2",
+                params![now as i64, job_id],
+            )
+            .await
+            .map_err(database_error)?;
+        if changed == 0 {
+            return Err(HamburError::InvalidCommand(format!(
+                "file cleanup job not found: {job_id}"
+            )));
+        }
+        self.file_cleanup_job_by_id(job_id).await
+    }
+
+    pub async fn resolve_file_by_sandbox_path(
+        &self,
+        session_id: &str,
+        sandbox_path: &str,
+    ) -> HamburResult<FileRecord> {
+        self.ensure_session_exists(session_id).await?;
+        let mut rows = self
+            .connection
+            .query(
+                "
+                SELECT
+                    id,
+                    scope,
+                    session_id,
+                    relative_path,
+                    sandbox_path,
+                    mime_type,
+                    byte_size,
+                    sha256,
+                    created_at_ms,
+                    updated_at_ms,
+                    retention_policy
+                FROM files
+                WHERE sandbox_path = ?1
+                  AND (scope != 'session' OR session_id = ?2)
+                LIMIT 1
+                ",
+                params![sandbox_path, session_id],
+            )
+            .await
+            .map_err(database_error)?;
+        let Some(row) = rows.next().await.map_err(database_error)? else {
+            return Err(HamburError::InvalidCommand(format!(
+                "file not found for sandbox path: {sandbox_path}"
+            )));
+        };
+        file_from_row(&row)
     }
 
     pub async fn upsert_timeline_item(
@@ -1559,6 +2088,50 @@ impl HamburDatabase {
         Ok(())
     }
 
+    pub async fn upsert_primary_chat_member(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+        position: u32,
+    ) -> HamburResult<()> {
+        self.provider_by_id(provider_id).await?;
+        let now = now_ms();
+        self.connection
+            .execute(
+                "INSERT INTO model_groups
+                    (id, name, routing_strategy, fallback_policy, created_at_ms, updated_at_ms)
+                 VALUES ('grp_primary_chat', 'Primary Chat', 'fallback', 'default', ?1, ?1)
+                 ON CONFLICT(id) DO UPDATE SET updated_at_ms = excluded.updated_at_ms",
+                params![now as i64],
+            )
+            .await
+            .map_err(database_error)?;
+        self.connection
+            .execute(
+                "INSERT INTO default_model_groups (key, group_id, updated_at_ms)
+                 VALUES ('primary', 'grp_primary_chat', ?1)
+                 ON CONFLICT(key) DO UPDATE SET
+                    group_id = excluded.group_id,
+                    updated_at_ms = excluded.updated_at_ms",
+                params![now as i64],
+            )
+            .await
+            .map_err(database_error)?;
+        self.connection
+            .execute(
+                "INSERT INTO model_group_members
+                    (id, group_id, provider_id, model_id, position, enabled)
+                 VALUES (?1, 'grp_primary_chat', ?2, ?3, ?4, 1)
+                 ON CONFLICT(group_id, provider_id, model_id) DO UPDATE SET
+                    position = excluded.position,
+                    enabled = 1",
+                params![new_id("mgm"), provider_id, model_id, position as i64],
+            )
+            .await
+            .map_err(database_error)?;
+        Ok(())
+    }
+
     pub async fn primary_chat_route(&self) -> HamburResult<Vec<ModelRouteSnapshot>> {
         let mut rows = self
             .connection
@@ -1805,6 +2378,66 @@ impl HamburDatabase {
                 CREATE INDEX IF NOT EXISTS idx_tool_results_tool_call
                     ON tool_results(tool_call_id, created_at_ms, id);
 
+                CREATE TABLE IF NOT EXISTS files (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    scope TEXT NOT NULL,
+                    session_id TEXT NOT NULL DEFAULT '',
+                    relative_path TEXT NOT NULL,
+                    sandbox_path TEXT NOT NULL,
+                    mime_type TEXT NOT NULL,
+                    byte_size INTEGER NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL,
+                    retention_policy TEXT NOT NULL
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_files_sandbox_path
+                    ON files(sandbox_path);
+
+                CREATE INDEX IF NOT EXISTS idx_files_session_scope
+                    ON files(session_id, scope, created_at_ms);
+
+                CREATE TABLE IF NOT EXISTS attachments (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    message_id TEXT NOT NULL DEFAULT '',
+                    kind TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    mime_type TEXT NOT NULL,
+                    byte_size INTEGER NOT NULL,
+                    origin_type TEXT NOT NULL,
+                    original_uri TEXT NOT NULL,
+                    file_id TEXT NOT NULL REFERENCES files(id),
+                    sandbox_path TEXT NOT NULL,
+                    width INTEGER NOT NULL DEFAULT 0,
+                    height INTEGER NOT NULL DEFAULT 0,
+                    sha256 TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_attachments_session_pending
+                    ON attachments(session_id, message_id, status, created_at_ms);
+
+                CREATE INDEX IF NOT EXISTS idx_attachments_message
+                    ON attachments(message_id, created_at_ms, id);
+
+                CREATE TABLE IF NOT EXISTS file_cleanup_jobs (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    file_id TEXT NOT NULL,
+                    relative_path TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    attempts INTEGER NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_file_cleanup_jobs_status
+                    ON file_cleanup_jobs(status, created_at_ms, id);
+
                 CREATE TABLE IF NOT EXISTS providers (
                     id TEXT PRIMARY KEY NOT NULL,
                     name TEXT NOT NULL,
@@ -1986,11 +2619,18 @@ impl HamburDatabase {
             self.timeline_items_for_session(&selected_session_id)
                 .await?
         };
+        let pending_attachments = if selected_session_id.is_empty() {
+            Vec::new()
+        } else {
+            self.pending_attachments_for_session(&selected_session_id)
+                .await?
+        };
 
         Ok(AppSnapshot {
             sessions,
             selected_session_id,
             timeline_items,
+            pending_attachments,
         })
     }
 
@@ -2560,6 +3200,100 @@ impl HamburDatabase {
         };
         tool_result_from_row(&row)
     }
+
+    pub async fn file_by_id(&self, file_id: &str) -> HamburResult<FileRecord> {
+        let mut rows = self
+            .connection
+            .query(
+                "
+                SELECT
+                    id,
+                    scope,
+                    session_id,
+                    relative_path,
+                    sandbox_path,
+                    mime_type,
+                    byte_size,
+                    sha256,
+                    created_at_ms,
+                    updated_at_ms,
+                    retention_policy
+                FROM files
+                WHERE id = ?1
+                LIMIT 1
+                ",
+                params![file_id],
+            )
+            .await
+            .map_err(database_error)?;
+        let Some(row) = rows.next().await.map_err(database_error)? else {
+            return Err(HamburError::InvalidCommand(format!(
+                "file not found: {file_id}"
+            )));
+        };
+        file_from_row(&row)
+    }
+
+    pub async fn attachment_by_id(&self, attachment_id: &str) -> HamburResult<AttachmentRecord> {
+        let mut rows = self
+            .connection
+            .query(
+                "
+                SELECT
+                    id,
+                    session_id,
+                    message_id,
+                    kind,
+                    display_name,
+                    mime_type,
+                    byte_size,
+                    origin_type,
+                    original_uri,
+                    file_id,
+                    sandbox_path,
+                    width,
+                    height,
+                    sha256,
+                    status,
+                    created_at_ms,
+                    updated_at_ms
+                FROM attachments
+                WHERE id = ?1
+                LIMIT 1
+                ",
+                params![attachment_id],
+            )
+            .await
+            .map_err(database_error)?;
+        let Some(row) = rows.next().await.map_err(database_error)? else {
+            return Err(HamburError::InvalidCommand(format!(
+                "attachment not found: {attachment_id}"
+            )));
+        };
+        attachment_from_row(&row)
+    }
+
+    async fn file_cleanup_job_by_id(&self, job_id: &str) -> HamburResult<FileCleanupJobRecord> {
+        let mut rows = self
+            .connection
+            .query(
+                "
+                SELECT id, file_id, relative_path, reason, status, attempts, created_at_ms, updated_at_ms
+                FROM file_cleanup_jobs
+                WHERE id = ?1
+                LIMIT 1
+                ",
+                params![job_id],
+            )
+            .await
+            .map_err(database_error)?;
+        let Some(row) = rows.next().await.map_err(database_error)? else {
+            return Err(HamburError::InvalidCommand(format!(
+                "file cleanup job not found: {job_id}"
+            )));
+        };
+        file_cleanup_job_from_row(&row)
+    }
 }
 
 fn normalize_title(title: &str) -> String {
@@ -2647,6 +3381,100 @@ fn normalize_secret_ref(secret_ref: &str) -> HamburResult<String> {
         ));
     }
     Ok(secret_ref.chars().take(256).collect())
+}
+
+fn normalize_file_scope(scope: &str) -> HamburResult<String> {
+    let scope = scope.trim();
+    match scope {
+        "session" | "global" | "cache" => Ok(scope.to_string()),
+        _ => Err(HamburError::InvalidCommand(format!(
+            "invalid file scope: {scope}"
+        ))),
+    }
+}
+
+fn normalize_retention_policy(policy: &str) -> HamburResult<String> {
+    let policy = policy.trim();
+    match policy {
+        "keep" | "delete_with_session" | "cache" => Ok(policy.to_string()),
+        _ => Err(HamburError::InvalidCommand(format!(
+            "invalid retention policy: {policy}"
+        ))),
+    }
+}
+
+fn normalize_db_path(path: &str, label: &str) -> HamburResult<String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err(HamburError::InvalidCommand(format!(
+            "{label} must not be empty"
+        )));
+    }
+    if path.contains('\0') || path.contains("..") {
+        return Err(HamburError::InvalidCommand(format!(
+            "{label} must not contain traversal"
+        )));
+    }
+    Ok(path.chars().take(1024).collect())
+}
+
+fn normalize_mime_type(mime_type: &str) -> String {
+    let mime_type = mime_type.trim().to_ascii_lowercase();
+    let value = if mime_type.is_empty() {
+        "application/octet-stream".to_string()
+    } else {
+        mime_type
+    };
+    value.chars().take(160).collect()
+}
+
+fn normalize_origin_type(origin_type: &str) -> String {
+    let origin_type = origin_type.trim();
+    match origin_type {
+        "content_uri" | "file" | "camera" | "share" | "sandbox" | "generated" => {
+            origin_type.to_string()
+        }
+        _ => "content_uri".to_string(),
+    }
+}
+
+fn normalize_display_name(display_name: &str) -> String {
+    let display_name = display_name.trim();
+    if display_name.is_empty() {
+        "attachment".to_string()
+    } else {
+        display_name.chars().take(160).collect()
+    }
+}
+
+fn normalize_attachment_kind(kind: &str, mime_type: &str) -> String {
+    let kind = kind.trim();
+    match kind {
+        "image" | "file" | "audio" | "video" | "other" => kind.to_string(),
+        _ => {
+            let mime_type = mime_type.trim().to_ascii_lowercase();
+            if mime_type.starts_with("image/") {
+                "image".to_string()
+            } else if mime_type.starts_with("audio/") {
+                "audio".to_string()
+            } else if mime_type.starts_with("video/") {
+                "video".to_string()
+            } else {
+                "file".to_string()
+            }
+        }
+    }
+}
+
+fn normalize_attachment_status(status: &str) -> HamburResult<String> {
+    let status = status.trim();
+    match status {
+        "pending" | "attached" | "removed" | "expired" => Ok(status.to_string()),
+        "" => Ok("pending".to_string()),
+        _ => Err(HamburError::InvalidCommand(format!(
+            "invalid attachment status: {status}"
+        ))),
+    }
 }
 
 fn sql_bool(value: i64) -> bool {
@@ -2824,6 +3652,57 @@ fn tool_result_from_row(row: &Row) -> HamburResult<ToolResultRecord> {
         offloaded_path: row.get::<String>(12).map_err(database_error)?,
         context_stub: row.get::<String>(13).map_err(database_error)?,
         created_at_ms: unsigned_ms(row.get::<i64>(14).map_err(database_error)?),
+    })
+}
+
+fn file_from_row(row: &Row) -> HamburResult<FileRecord> {
+    Ok(FileRecord {
+        id: row.get::<String>(0).map_err(database_error)?,
+        scope: row.get::<String>(1).map_err(database_error)?,
+        session_id: row.get::<String>(2).map_err(database_error)?,
+        relative_path: row.get::<String>(3).map_err(database_error)?,
+        sandbox_path: row.get::<String>(4).map_err(database_error)?,
+        mime_type: row.get::<String>(5).map_err(database_error)?,
+        byte_size: unsigned_ms(row.get::<i64>(6).map_err(database_error)?),
+        sha256: row.get::<String>(7).map_err(database_error)?,
+        created_at_ms: unsigned_ms(row.get::<i64>(8).map_err(database_error)?),
+        updated_at_ms: unsigned_ms(row.get::<i64>(9).map_err(database_error)?),
+        retention_policy: row.get::<String>(10).map_err(database_error)?,
+    })
+}
+
+fn attachment_from_row(row: &Row) -> HamburResult<AttachmentRecord> {
+    Ok(AttachmentRecord {
+        id: row.get::<String>(0).map_err(database_error)?,
+        session_id: row.get::<String>(1).map_err(database_error)?,
+        message_id: row.get::<String>(2).map_err(database_error)?,
+        kind: row.get::<String>(3).map_err(database_error)?,
+        display_name: row.get::<String>(4).map_err(database_error)?,
+        mime_type: row.get::<String>(5).map_err(database_error)?,
+        byte_size: unsigned_ms(row.get::<i64>(6).map_err(database_error)?),
+        origin_type: row.get::<String>(7).map_err(database_error)?,
+        original_uri: row.get::<String>(8).map_err(database_error)?,
+        file_id: row.get::<String>(9).map_err(database_error)?,
+        sandbox_path: row.get::<String>(10).map_err(database_error)?,
+        width: unsigned_count(row.get::<i64>(11).map_err(database_error)?),
+        height: unsigned_count(row.get::<i64>(12).map_err(database_error)?),
+        sha256: row.get::<String>(13).map_err(database_error)?,
+        status: row.get::<String>(14).map_err(database_error)?,
+        created_at_ms: unsigned_ms(row.get::<i64>(15).map_err(database_error)?),
+        updated_at_ms: unsigned_ms(row.get::<i64>(16).map_err(database_error)?),
+    })
+}
+
+fn file_cleanup_job_from_row(row: &Row) -> HamburResult<FileCleanupJobRecord> {
+    Ok(FileCleanupJobRecord {
+        id: row.get::<String>(0).map_err(database_error)?,
+        file_id: row.get::<String>(1).map_err(database_error)?,
+        relative_path: row.get::<String>(2).map_err(database_error)?,
+        reason: row.get::<String>(3).map_err(database_error)?,
+        status: row.get::<String>(4).map_err(database_error)?,
+        attempts: unsigned_count(row.get::<i64>(5).map_err(database_error)?),
+        created_at_ms: unsigned_ms(row.get::<i64>(6).map_err(database_error)?),
+        updated_at_ms: unsigned_ms(row.get::<i64>(7).map_err(database_error)?),
     })
 }
 

@@ -1597,9 +1597,10 @@ impl RuntimeEngine {
             );
         };
         let fallback_policy = plan.fallback_policy;
+        let tools_json = self.tools.schemas().compile_openai_tools_json();
         let stream_sources_by_route = route_snapshots
             .iter()
-            .map(|route| stream_source_for_command(&command, &content, route))
+            .map(|route| stream_source_for_command(&command, &content, route, &tools_json))
             .collect::<Vec<_>>();
         let handle = self.tokio.handle().clone();
         handle.spawn(async move {
@@ -2035,7 +2036,10 @@ impl RuntimeEngine {
             let stream_source = stream_sources_by_route
                 .get(attempt_index)
                 .cloned()
-                .unwrap_or_else(|| provider_stream_source(&session_id, &turn_id, "", &route));
+                .unwrap_or_else(|| {
+                    let tools_json = self.tools.schemas().compile_openai_tools_json();
+                    provider_stream_source(&session_id, &turn_id, "", &route, &tools_json)
+                });
             match self
                 .clone()
                 .run_chat_stream_attempt(
@@ -4475,9 +4479,12 @@ impl RuntimeEngine {
             payload_json,
             ..RuntimeCommand::default()
         };
+        let tools_json = self.tools.schemas().compile_openai_tools_json();
         let stream_sources_by_route = route_candidates
             .iter()
-            .map(|candidate| stream_source_for_command(&stream_command, &child_content, candidate))
+            .map(|candidate| {
+                stream_source_for_command(&stream_command, &child_content, candidate, &tools_json)
+            })
             .collect::<Vec<_>>();
         Ok(PreparedDelegateTurn {
             turn_id: turn.id,
@@ -5355,6 +5362,7 @@ fn stream_source_for_command(
     command: &RuntimeCommand,
     content: &str,
     route: &ModelRouteSnapshot,
+    tools_json: &str,
 ) -> RouteStreamSource {
     let payload = command.payload_json.trim();
     if payload.starts_with("data:") {
@@ -5391,7 +5399,13 @@ fn stream_source_for_command(
         }
     }
 
-    provider_stream_source(&command.session_id, &command.turn_id, content, route)
+    provider_stream_source(
+        &command.session_id,
+        &command.turn_id,
+        content,
+        route,
+        tools_json,
+    )
 }
 
 fn provider_stream_source(
@@ -5399,6 +5413,7 @@ fn provider_stream_source(
     turn_id: &str,
     content: &str,
     route: &ModelRouteSnapshot,
+    tools_json: &str,
 ) -> RouteStreamSource {
     RouteStreamSource::Provider(ModelRequest {
         request_id: new_id("llm_req"),
@@ -5418,6 +5433,11 @@ fn provider_stream_source(
         },
         max_output_tokens: route.output_limit,
         temperature: Some(0.7),
+        tools_json: if route.supports_tool_call {
+            tools_json.to_string()
+        } else {
+            String::new()
+        },
     })
 }
 
@@ -6493,7 +6513,7 @@ mod tests {
     }
 
     #[test]
-    fn send_message_streams_reasoning_content_and_persists_model_snapshot() {
+    fn scripted_stream_persists_reasoning_content_and_model_snapshot() {
         let app_files_dir = temp_app_dir();
         fs::create_dir_all(&app_files_dir).expect("create temp app dir");
 
@@ -6569,7 +6589,7 @@ mod tests {
     }
 
     #[test]
-    fn send_message_streams_from_real_openai_compatible_http_provider() {
+    fn local_http_provider_streams_openai_compatible_sse() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider server");
         let addr = listener.local_addr().expect("local addr");
         let captured_request = Arc::new(Mutex::new(String::new()));
@@ -6657,6 +6677,493 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires HAMBUR_E2E_OPENAI_API_KEY and a real OpenAI-compatible provider"]
+    fn e2e_real_openai_compatible_provider_streams_text() {
+        let config = RealProviderTestConfig::from_env();
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+        let session_id = create_test_session(&runtime);
+        configure_env_secret_provider(
+            &runtime,
+            "provider_e2e_real",
+            &config.model_id,
+            &config.base_url,
+            &config.secret_env,
+        );
+
+        let ack = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_e2e_real_provider".to_string(),
+            idempotency_key: "message:e2e-real-provider".to_string(),
+            kind: "SendMessage".to_string(),
+            session_id: session_id.clone(),
+            content: "Reply with a short sentence containing hambur-e2e-ok.".to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(ack.accepted, "send rejected: {}", ack.message);
+
+        let mut saw_content_delta = false;
+        let mut terminal = None;
+        for _ in 0..256 {
+            let event = runtime.next_event().expect("real provider event");
+            match event.kind.as_str() {
+                "AssistantContentDelta" => saw_content_delta = true,
+                "TurnFinished" | "TurnFailed" | "TurnCancelled" => {
+                    terminal = Some(event);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let terminal = terminal.expect("real provider turn did not reach terminal event");
+        assert_eq!(
+            terminal.kind.as_str(),
+            "TurnFinished",
+            "real provider did not finish: {} {}",
+            terminal.error_code,
+            terminal.message
+        );
+        assert!(saw_content_delta, "real provider emitted no content delta");
+
+        let timeline = runtime.get_timeline_page(session_id, 0, 20);
+        let assistant = timeline
+            .items
+            .iter()
+            .find(|item| item.kind == "AssistantMessage")
+            .expect("assistant timeline item");
+        let message = runtime
+            .get_message_snapshot(assistant.payload_ref.clone())
+            .message
+            .expect("assistant message snapshot");
+        assert_eq!(message.provider_id_snapshot, "provider_e2e_real");
+        assert_eq!(message.model_id_snapshot, config.model_id);
+        assert!(
+            !message.content_text.trim().is_empty(),
+            "assistant content should not be empty"
+        );
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
+    #[ignore = "requires HAMBUR_E2E_OPENAI_API_KEY and a real OpenAI-compatible provider"]
+    fn e2e_real_openai_compatible_provider_streams_markdown_updates() {
+        let config = RealProviderTestConfig::from_env();
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+        let session_id = create_test_session(&runtime);
+        configure_env_secret_provider(
+            &runtime,
+            "provider_e2e_markdown",
+            &config.model_id,
+            &config.base_url,
+            &config.secret_env,
+        );
+
+        let ack = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_e2e_real_markdown".to_string(),
+            idempotency_key: "message:e2e-real-markdown".to_string(),
+            kind: "SendMessage".to_string(),
+            session_id: session_id.clone(),
+            content: "Reply in Markdown with one heading, one bullet list, and one fenced code block. Keep it short.".to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(ack.accepted, "send rejected: {}", ack.message);
+
+        let mut markdown_updates = 0;
+        let mut terminal = None;
+        for _ in 0..256 {
+            let event = runtime.next_event().expect("real markdown provider event");
+            match event.kind.as_str() {
+                "MarkdownRenderUpdate" => {
+                    let update = event.markdown_render_update;
+                    if !update.committed_nodes.is_empty() || update.pending_node.is_some() {
+                        markdown_updates += 1;
+                    }
+                }
+                "TurnFinished" | "TurnFailed" | "TurnCancelled" => {
+                    terminal = Some(event);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let terminal = terminal.expect("real markdown provider did not reach terminal event");
+        assert_eq!(
+            terminal.kind.as_str(),
+            "TurnFinished",
+            "real provider did not finish: {} {}",
+            terminal.error_code,
+            terminal.message
+        );
+        assert!(
+            markdown_updates > 0,
+            "real provider emitted no markdown updates"
+        );
+
+        let timeline = runtime.get_timeline_page(session_id, 0, 20);
+        let assistant = timeline
+            .items
+            .iter()
+            .find(|item| item.kind == "AssistantMessage")
+            .expect("assistant timeline item");
+        let message = runtime
+            .get_message_snapshot(assistant.payload_ref.clone())
+            .message
+            .expect("assistant message snapshot");
+        assert!(!message.content_text.trim().is_empty());
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
+    #[ignore = "requires HAMBUR_E2E_OPENAI_API_KEY and a real OpenAI-compatible provider"]
+    fn e2e_real_openai_compatible_provider_can_be_cancelled_after_stream_start() {
+        let config = RealProviderTestConfig::from_env();
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+        let session_id = create_test_session(&runtime);
+        configure_env_secret_provider(
+            &runtime,
+            "provider_e2e_cancel",
+            &config.model_id,
+            &config.base_url,
+            &config.secret_env,
+        );
+
+        let ack = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_e2e_real_cancel".to_string(),
+            idempotency_key: "message:e2e-real-cancel".to_string(),
+            kind: "SendMessage".to_string(),
+            session_id: session_id.clone(),
+            content: "Count from 1 to 5000, one number per line. Start immediately.".to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(ack.accepted, "send rejected: {}", ack.message);
+
+        let mut turn_id = String::new();
+        let mut saw_content_delta = false;
+        for _ in 0..256 {
+            let event = runtime.next_event().expect("real cancel provider event");
+            match event.kind.as_str() {
+                "TurnStarted" => turn_id = event.turn_id,
+                "AssistantContentDelta" => {
+                    saw_content_delta = true;
+                    break;
+                }
+                "TurnFailed" | "TurnCancelled" | "TurnFinished" => {
+                    panic!(
+                        "turn ended before cancellation could be issued: {} {}",
+                        event.kind.as_str(),
+                        event.message
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_content_delta,
+            "real provider emitted no content before cancellation"
+        );
+        assert!(!turn_id.is_empty(), "missing turn id before cancellation");
+
+        let cancel = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_e2e_real_cancel_turn".to_string(),
+            idempotency_key: format!("{turn_id}:cancel"),
+            kind: "CancelTurn".to_string(),
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            ..RuntimeCommand::default()
+        });
+        assert!(cancel.accepted, "cancel rejected: {}", cancel.message);
+
+        let mut cancelled = None;
+        for _ in 0..128 {
+            let event = runtime.next_event().expect("real cancel terminal event");
+            match event.kind.as_str() {
+                "TurnCancelled" => {
+                    cancelled = Some(event);
+                    break;
+                }
+                "TurnFinished" | "TurnFailed" => {
+                    panic!(
+                        "expected cancellation but got {}: {}",
+                        event.kind.as_str(),
+                        event.message
+                    );
+                }
+                _ => {}
+            }
+        }
+        let cancelled = cancelled.expect("real provider turn did not cancel");
+        assert_eq!(cancelled.turn_id, turn_id);
+        assert_eq!(cancelled.error_code, "Cancelled");
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
+    #[ignore = "requires HAMBUR_E2E_OPENAI_API_KEY and a real OpenAI-compatible provider"]
+    fn e2e_real_openai_compatible_provider_is_used_after_failed_primary_fallback() {
+        let config = RealProviderTestConfig::from_env();
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+        let session_id = create_test_session(&runtime);
+        configure_env_secret_provider(
+            &runtime,
+            "provider_a_e2e_bad",
+            "bad-e2e-model",
+            "http://127.0.0.1:9/v1",
+            &config.secret_env,
+        );
+        configure_env_secret_provider(
+            &runtime,
+            "provider_z_e2e_real",
+            &config.model_id,
+            &config.base_url,
+            &config.secret_env,
+        );
+
+        let ack = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_e2e_real_fallback".to_string(),
+            idempotency_key: "message:e2e-real-fallback".to_string(),
+            kind: "SendMessage".to_string(),
+            session_id: session_id.clone(),
+            content: "Reply with one short sentence containing hambur-fallback-ok.".to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(ack.accepted, "send rejected: {}", ack.message);
+
+        let mut saw_fallback = false;
+        let mut terminal = None;
+        for _ in 0..512 {
+            let event = runtime.next_event().expect("real fallback provider event");
+            if event.kind.as_str() == "TurnStateChanged" && event.message.contains("Fallback to") {
+                saw_fallback = true;
+            }
+            if matches!(
+                event.kind.as_str(),
+                "TurnFinished" | "TurnFailed" | "TurnCancelled"
+            ) {
+                terminal = Some(event);
+                break;
+            }
+        }
+        let terminal = terminal.expect("real fallback provider did not reach terminal event");
+        assert_eq!(
+            terminal.kind.as_str(),
+            "TurnFinished",
+            "fallback did not finish: {} {}",
+            terminal.error_code,
+            terminal.message
+        );
+        assert!(saw_fallback, "missing fallback state event");
+
+        let timeline = runtime.get_timeline_page(session_id, 0, 20);
+        let assistant = timeline
+            .items
+            .iter()
+            .find(|item| item.kind == "AssistantMessage")
+            .expect("assistant timeline item");
+        let message = runtime
+            .get_message_snapshot(assistant.payload_ref.clone())
+            .message
+            .expect("assistant message snapshot");
+        assert_eq!(message.provider_id_snapshot, "provider_z_e2e_real");
+        assert_eq!(message.model_id_snapshot, config.model_id);
+        assert_eq!(message.status, "completed");
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
+    #[ignore = "requires HAMBUR_E2E_OPENAI_API_KEY and a real OpenAI-compatible provider"]
+    fn e2e_real_openai_compatible_provider_regenerate_uses_real_provider() {
+        let config = RealProviderTestConfig::from_env();
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+        let session_id = create_test_session(&runtime);
+        configure_env_secret_provider(
+            &runtime,
+            "provider_e2e_regen",
+            &config.model_id,
+            &config.base_url,
+            &config.secret_env,
+        );
+
+        let first = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_e2e_regen_seed".to_string(),
+            idempotency_key: "message:e2e-regenerate:seed".to_string(),
+            kind: "SendMessage".to_string(),
+            session_id: session_id.clone(),
+            content: "Reply with a short sentence containing hambur-regenerate-seed.".to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(first.accepted, "seed rejected: {}", first.message);
+        wait_for_session_finished(&runtime, &session_id, "seed turn");
+
+        let timeline = runtime.get_timeline_page(session_id.clone(), 0, 20);
+        let first_assistant = timeline
+            .items
+            .iter()
+            .find(|item| item.kind == "AssistantMessage")
+            .expect("assistant timeline item")
+            .clone();
+        let regenerate = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_e2e_regenerate".to_string(),
+            idempotency_key: format!("{}:regenerate:e2e", first_assistant.payload_ref),
+            kind: "RegenerateMessage".to_string(),
+            session_id: session_id.clone(),
+            source_message_id: first_assistant.payload_ref,
+            ..RuntimeCommand::default()
+        });
+        assert!(
+            regenerate.accepted,
+            "regenerate rejected: {}",
+            regenerate.message
+        );
+        wait_for_session_finished(&runtime, &session_id, "regenerate turn");
+
+        let timeline = runtime.get_timeline_page(session_id, 0, 50);
+        let assistant_messages = timeline
+            .items
+            .iter()
+            .filter(|item| item.kind == "AssistantMessage")
+            .collect::<Vec<_>>();
+        assert_eq!(assistant_messages.len(), 2);
+        let latest = assistant_messages.last().expect("latest assistant");
+        let message = runtime
+            .get_message_snapshot(latest.payload_ref.clone())
+            .message
+            .expect("latest assistant message");
+        assert_eq!(message.provider_id_snapshot, "provider_e2e_regen");
+        assert_eq!(message.model_id_snapshot, config.model_id);
+        assert_eq!(message.status, "completed");
+        assert!(!message.content_text.trim().is_empty());
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
+    #[ignore = "requires HAMBUR_E2E_OPENAI_API_KEY and a real OpenAI-compatible provider with tool calling"]
+    fn e2e_real_openai_compatible_provider_executes_tool_call() {
+        let config = RealProviderTestConfig::from_env();
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+        let session_id = create_test_session(&runtime);
+        configure_env_secret_provider_with_capabilities(
+            &runtime,
+            "provider_e2e_tools",
+            &config.model_id,
+            &config.base_url,
+            &config.secret_env,
+            true,
+            false,
+        );
+
+        let ack = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_e2e_real_tools".to_string(),
+            idempotency_key: "message:e2e-real-tools".to_string(),
+            kind: "SendMessage".to_string(),
+            session_id: session_id.clone(),
+            content: concat!(
+                "Call the echo tool exactly once with JSON arguments ",
+                "{\"text\":\"hambur-real-tool-ok\"}. ",
+                "Do not answer directly before calling the tool."
+            )
+            .to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(ack.accepted, "send rejected: {}", ack.message);
+
+        let mut saw_tool_delta = false;
+        let mut finished_tools = 0;
+        let mut terminal = None;
+        for _ in 0..256 {
+            let event = runtime.next_event().expect("real tool provider event");
+            if event.session_id != session_id {
+                continue;
+            }
+            match event.kind.as_str() {
+                "ToolCallDelta" => saw_tool_delta = true,
+                "ToolCallFinished" => {
+                    finished_tools += 1;
+                    assert!(
+                        event.message.contains("hambur-real-tool-ok"),
+                        "unexpected tool summary: {}",
+                        event.message
+                    );
+                }
+                "TurnFinished" | "TurnFailed" | "TurnCancelled" => {
+                    terminal = Some(event);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let terminal = terminal.expect("real tool provider did not reach terminal event");
+        assert_eq!(
+            terminal.kind.as_str(),
+            "TurnFinished",
+            "real provider tool turn did not finish: {} {}",
+            terminal.error_code,
+            terminal.message
+        );
+        assert!(saw_tool_delta, "real provider emitted no tool call delta");
+        assert!(finished_tools > 0, "real provider executed no tools");
+
+        let timeline = runtime.get_timeline_page(session_id, 0, 50);
+        assert!(
+            timeline.items.iter().any(|item| item.kind == "ToolTrace"),
+            "missing tool trace"
+        );
+        let continuation = timeline
+            .items
+            .iter()
+            .rev()
+            .find(|item| item.kind == "AssistantMessage")
+            .expect("assistant continuation");
+        let message = runtime
+            .get_message_snapshot(continuation.payload_ref.clone())
+            .message
+            .expect("continuation message");
+        assert_eq!(message.provider_id_snapshot, "provider_e2e_tools");
+        assert_eq!(message.model_id_snapshot, config.model_id);
+        assert!(message.content_text.contains("hambur-real-tool-ok"));
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
     fn duplicate_send_message_is_rejected_while_turn_is_active() {
         let app_files_dir = temp_app_dir();
         fs::create_dir_all(&app_files_dir).expect("create temp app dir");
@@ -6719,7 +7226,7 @@ mod tests {
     }
 
     #[test]
-    fn cancel_turn_stops_streaming() {
+    fn scripted_stream_cancel_turn_stops_streaming() {
         let app_files_dir = temp_app_dir();
         fs::create_dir_all(&app_files_dir).expect("create temp app dir");
 
@@ -6776,7 +7283,7 @@ mod tests {
     }
 
     #[test]
-    fn regenerate_message_uses_source_user_content() {
+    fn scripted_stream_regenerate_message_uses_source_user_content() {
         let app_files_dir = temp_app_dir();
         fs::create_dir_all(&app_files_dir).expect("create temp app dir");
 
@@ -6856,7 +7363,7 @@ mod tests {
     }
 
     #[test]
-    fn fallback_switches_target_before_semantic_output() {
+    fn scripted_routes_fallback_switches_target_before_semantic_output() {
         let app_files_dir = temp_app_dir();
         fs::create_dir_all(&app_files_dir).expect("create temp app dir");
 
@@ -6922,7 +7429,7 @@ mod tests {
     }
 
     #[test]
-    fn fallback_does_not_switch_after_semantic_output() {
+    fn scripted_routes_fallback_does_not_switch_after_semantic_output() {
         let app_files_dir = temp_app_dir();
         fs::create_dir_all(&app_files_dir).expect("create temp app dir");
 
@@ -6987,7 +7494,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_calls_execute_as_one_batch_and_render_traces() {
+    fn scripted_tool_calls_execute_as_one_batch_and_render_traces() {
         let app_files_dir = temp_app_dir();
         fs::create_dir_all(&app_files_dir).expect("create temp app dir");
 
@@ -8542,6 +9049,93 @@ mod tests {
         let _ = runtime.next_event().expect("models event");
     }
 
+    struct RealProviderTestConfig {
+        secret_env: String,
+        base_url: String,
+        model_id: String,
+    }
+
+    impl RealProviderTestConfig {
+        fn from_env() -> Self {
+            let secret_env = "HAMBUR_E2E_OPENAI_API_KEY".to_string();
+            let api_key = std::env::var(&secret_env)
+                .expect("set HAMBUR_E2E_OPENAI_API_KEY to run this ignored integration test");
+            assert!(!api_key.trim().is_empty(), "API key must not be empty");
+            Self {
+                secret_env,
+                base_url: std::env::var("HAMBUR_E2E_OPENAI_BASE_URL")
+                    .unwrap_or_else(|_| "https://opencode.ai/zen/v1".to_string()),
+                model_id: std::env::var("HAMBUR_E2E_OPENAI_MODEL")
+                    .unwrap_or_else(|_| "deepseek-v4-flash-free".to_string()),
+            }
+        }
+    }
+
+    fn configure_env_secret_provider(
+        runtime: &RuntimeEngine,
+        provider_id: &str,
+        model_id: &str,
+        base_url: &str,
+        secret_env: &str,
+    ) {
+        configure_env_secret_provider_with_capabilities(
+            runtime,
+            provider_id,
+            model_id,
+            base_url,
+            secret_env,
+            false,
+            false,
+        );
+    }
+
+    fn configure_env_secret_provider_with_capabilities(
+        runtime: &RuntimeEngine,
+        provider_id: &str,
+        model_id: &str,
+        base_url: &str,
+        secret_env: &str,
+        supports_tool_call: bool,
+        supports_image_input: bool,
+    ) {
+        let provider = runtime.dispatch(RuntimeCommand {
+            command_id: format!("cmd_provider_env_{provider_id}"),
+            idempotency_key: format!("{provider_id}:env-provider:e2e"),
+            kind: "UpdateProvider".to_string(),
+            provider_id: provider_id.to_string(),
+            title: format!("E2E Provider {provider_id}"),
+            chunk: base_url.to_string(),
+            payload_json: format!("env://{secret_env}"),
+            ..RuntimeCommand::default()
+        });
+        assert!(provider.accepted, "provider rejected: {}", provider.message);
+        let _ = runtime.next_event().expect("provider event");
+
+        let models = runtime.dispatch(RuntimeCommand {
+            command_id: format!("cmd_models_env_{provider_id}"),
+            idempotency_key: format!("{provider_id}:env-models:e2e"),
+            kind: "RefreshProviderModels".to_string(),
+            provider_id: provider_id.to_string(),
+            payload_json: serde_json::json!({
+                "data": [{
+                    "id": model_id,
+                    "display_name": model_id,
+                    "supports_reasoning": false,
+                    "supports_tool_call": supports_tool_call,
+                    "supports_image_input": supports_image_input,
+                    "supports_structured_output": false,
+                    "supports_temperature": true,
+                    "context_limit": 32000,
+                    "output_limit": 1024
+                }]
+            })
+            .to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(models.accepted, "models rejected: {}", models.message);
+        let _ = runtime.next_event().expect("models event");
+    }
+
     fn wait_for_event(runtime: &RuntimeEngine, kind: &str) {
         for _ in 0..64 {
             let event = runtime.next_event().expect("runtime event");
@@ -8560,6 +9154,28 @@ mod tests {
             }
         }
         panic!("missing event: {kind} for session {session_id}");
+    }
+
+    fn wait_for_session_finished(runtime: &RuntimeEngine, session_id: &str, label: &str) {
+        for _ in 0..256 {
+            let event = runtime.next_event().expect("runtime event");
+            if event.session_id != session_id {
+                continue;
+            }
+            match event.kind.as_str() {
+                "TurnFinished" => return,
+                "TurnFailed" | "TurnCancelled" => {
+                    panic!(
+                        "{label} ended as {}: {} {}",
+                        event.kind.as_str(),
+                        event.error_code,
+                        event.message
+                    );
+                }
+                _ => {}
+            }
+        }
+        panic!("missing TurnFinished for {label} in session {session_id}");
     }
 
     fn wait_for_session_event_result(

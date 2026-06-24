@@ -203,6 +203,8 @@ pub struct ModelRequest {
     pub reasoning_mode: ReasoningMode,
     pub max_output_tokens: u32,
     pub temperature: Option<f32>,
+    #[serde(default)]
+    pub tools_json: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -315,6 +317,24 @@ impl OpenAiCompatibleAdapter {
             "stream": true,
             "messages": messages,
         });
+        let tools_json = request.tools_json.trim();
+        if !tools_json.is_empty() {
+            let tools: Value = serde_json::from_str(tools_json).map_err(|error| {
+                HamburError::InvalidCommand(format!("invalid OpenAI tools JSON: {error}"))
+            })?;
+            match &tools {
+                Value::Array(items) if !items.is_empty() => {
+                    body["tools"] = tools;
+                    body["tool_choice"] = json!("auto");
+                }
+                Value::Array(_) => {}
+                _ => {
+                    return Err(HamburError::InvalidCommand(
+                        "OpenAI tools JSON must be an array".to_string(),
+                    ));
+                }
+            }
+        }
         if request.max_output_tokens > 0 {
             body["max_tokens"] = json!(request.max_output_tokens);
         }
@@ -759,6 +779,51 @@ mod tests {
                 .any(|(_, value)| value == "Bearer sk-secret")
         );
         assert!(!spec.redacted_debug().contains("sk-secret"));
+    }
+
+    #[test]
+    fn openai_request_json_includes_tools_when_present() {
+        let target = test_target(
+            "gpt-test",
+            ModelCapabilities {
+                supports_tool_call: true,
+                ..Default::default()
+            },
+        );
+        let request = ModelRequest {
+            request_id: "req".to_string(),
+            session_id: "ses".to_string(),
+            turn_id: "turn".to_string(),
+            purpose: "chat".to_string(),
+            stream: true,
+            messages: vec![ModelMessage {
+                role: "user".to_string(),
+                content: "use echo".to_string(),
+            }],
+            tools_json: serde_json::json!([{
+                "type": "function",
+                "function": {
+                    "name": "echo",
+                    "description": "Echo text.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "text": {"type": "string"}
+                        },
+                        "required": ["text"],
+                        "additionalProperties": false
+                    }
+                }
+            }])
+            .to_string(),
+            ..Default::default()
+        };
+
+        let spec = OpenAiCompatibleAdapter::build_stream_request(&request, &target, "sk-secret")
+            .expect("request spec");
+        let body: Value = serde_json::from_str(&spec.body_json).expect("request JSON");
+        assert_eq!(body["tools"][0]["function"]["name"].as_str(), Some("echo"));
+        assert_eq!(body["tool_choice"].as_str(), Some("auto"));
     }
 
     #[test]

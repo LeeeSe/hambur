@@ -1,7 +1,18 @@
+use std::future::{Ready, ready};
 use std::path::Path;
+use std::sync::Mutex;
 
 use hambur_core::{HamburError, HamburResult, new_id, now_ms};
-use turso::{Builder, Connection, Row, params};
+use rusqlite::types::{Value, ValueRef};
+
+macro_rules! params {
+    () => {
+        Vec::<Value>::new()
+    };
+    ($($value:expr),+ $(,)?) => {
+        vec![$(IntoSqlValue::into_sql_value($value)),+]
+    };
+}
 
 const DEFAULT_SESSION_TITLE: &str = "Untitled session";
 
@@ -464,11 +475,7 @@ impl HamburDatabase {
             })?;
         }
 
-        let database = Builder::new_local(path.to_string_lossy().as_ref())
-            .build()
-            .await
-            .map_err(database_error)?;
-        let connection = database.connect().map_err(database_error)?;
+        let connection = Connection::open(path)?;
         let database = Self { connection };
         database.migrate().await?;
         Ok(database)
@@ -2597,7 +2604,7 @@ impl HamburDatabase {
                   AND mgm.enabled = 1
                 ORDER BY mgm.position ASC, p.id ASC, pm.model_id ASC
                 ",
-                (),
+                params![],
             )
             .await
             .map_err(database_error)?;
@@ -2646,7 +2653,7 @@ impl HamburDatabase {
                 ORDER BY p.updated_at_ms DESC, pm.model_id ASC
                 LIMIT 1
                 ",
-                (),
+                params![],
             )
             .await
             .map_err(database_error)?;
@@ -3025,7 +3032,7 @@ impl HamburDatabase {
         let pragma = format!("PRAGMA table_info({table})");
         let mut rows = self
             .connection
-            .query(pragma.as_str(), ())
+            .query(pragma.as_str(), params![])
             .await
             .map_err(database_error)?;
         while let Some(row) = rows.next().await.map_err(database_error)? {
@@ -3037,7 +3044,7 @@ impl HamburDatabase {
 
         let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {definition}");
         self.connection
-            .execute(sql.as_str(), ())
+            .execute(sql.as_str(), params![])
             .await
             .map(|_| ())
             .map_err(database_error)
@@ -3374,7 +3381,10 @@ impl HamburDatabase {
                 .map_err(database_error),
             None => self
                 .connection
-                .execute("DELETE FROM app_state WHERE key = 'active_session_id'", ())
+                .execute(
+                    "DELETE FROM app_state WHERE key = 'active_session_id'",
+                    params![],
+                )
                 .await
                 .map(|_| ())
                 .map_err(database_error),
@@ -3386,7 +3396,7 @@ impl HamburDatabase {
             .connection
             .query(
                 "SELECT value FROM app_state WHERE key = 'active_session_id' LIMIT 1",
-                (),
+                params![],
             )
             .await
             .map_err(database_error)?;
@@ -3755,7 +3765,7 @@ impl HamburDatabase {
                 FROM providers
                 ORDER BY updated_at_ms DESC, id ASC
                 ",
-                (),
+                params![],
             )
             .await
             .map_err(database_error)?;
@@ -3789,7 +3799,7 @@ impl HamburDatabase {
                 FROM provider_models
                 ORDER BY provider_id ASC, model_id ASC
                 ",
-                (),
+                params![],
             )
             .await
             .map_err(database_error)?;
@@ -3809,7 +3819,7 @@ impl HamburDatabase {
                 FROM model_groups
                 ORDER BY id ASC
                 ",
-                (),
+                params![],
             )
             .await
             .map_err(database_error)?;
@@ -3861,7 +3871,7 @@ impl HamburDatabase {
                 JOIN provider_models pm ON pm.provider_id = mgm.provider_id AND pm.model_id = mgm.model_id
                 ORDER BY mgm.group_id ASC, mgm.position ASC, mgm.provider_id ASC, mgm.model_id ASC
                 ",
-                (),
+                params![],
             )
             .await
             .map_err(database_error)?;
@@ -3918,7 +3928,7 @@ impl HamburDatabase {
                 FROM default_model_groups
                 ORDER BY key ASC
                 ",
-                (),
+                params![],
             )
             .await
             .map_err(database_error)?;
@@ -3942,7 +3952,7 @@ impl HamburDatabase {
                 FROM app_settings
                 ORDER BY key ASC
                 ",
-                (),
+                params![],
             )
             .await
             .map_err(database_error)?;
@@ -4698,8 +4708,153 @@ fn file_cleanup_job_from_row(row: &Row) -> HamburResult<FileCleanupJobRecord> {
     })
 }
 
-fn database_error(error: turso::Error) -> HamburError {
-    HamburError::Internal(format!("turso: {error}"))
+struct Connection {
+    inner: Mutex<rusqlite::Connection>,
+}
+
+impl Connection {
+    fn open(path: &Path) -> HamburResult<Self> {
+        let inner = rusqlite::Connection::open(path).map_err(database_error)?;
+        Ok(Self {
+            inner: Mutex::new(inner),
+        })
+    }
+
+    fn execute(&self, sql: &str, params: SqlParams) -> Ready<Result<usize, rusqlite::Error>> {
+        let result = self
+            .inner
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)
+            .and_then(|connection| connection.execute(sql, rusqlite::params_from_iter(params)));
+        ready(result)
+    }
+
+    fn execute_batch(&self, sql: &str) -> Ready<Result<(), rusqlite::Error>> {
+        let result = self
+            .inner
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)
+            .and_then(|connection| connection.execute_batch(sql));
+        ready(result)
+    }
+
+    fn query(&self, sql: &str, params: SqlParams) -> Ready<Result<Rows, rusqlite::Error>> {
+        let result = self
+            .inner
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)
+            .and_then(|connection| {
+                let mut statement = connection.prepare(sql)?;
+                let column_count = statement.column_count();
+                let mut rows = statement.query(rusqlite::params_from_iter(params))?;
+                let mut values = Vec::new();
+                while let Some(row) = rows.next()? {
+                    let mut columns = Vec::with_capacity(column_count);
+                    for index in 0..column_count {
+                        columns.push(row.get::<_, Value>(index)?);
+                    }
+                    values.push(Row { columns });
+                }
+                Ok(Rows {
+                    rows: values,
+                    next_index: 0,
+                })
+            });
+        ready(result)
+    }
+}
+
+type SqlParams = Vec<Value>;
+
+trait IntoSqlValue {
+    fn into_sql_value(self) -> Value;
+}
+
+impl IntoSqlValue for Value {
+    fn into_sql_value(self) -> Value {
+        self
+    }
+}
+
+impl IntoSqlValue for String {
+    fn into_sql_value(self) -> Value {
+        Value::Text(self)
+    }
+}
+
+impl IntoSqlValue for &str {
+    fn into_sql_value(self) -> Value {
+        Value::Text(self.to_string())
+    }
+}
+
+impl IntoSqlValue for &String {
+    fn into_sql_value(self) -> Value {
+        Value::Text(self.clone())
+    }
+}
+
+impl IntoSqlValue for i64 {
+    fn into_sql_value(self) -> Value {
+        Value::Integer(self)
+    }
+}
+
+impl IntoSqlValue for i32 {
+    fn into_sql_value(self) -> Value {
+        Value::Integer(i64::from(self))
+    }
+}
+
+impl IntoSqlValue for u32 {
+    fn into_sql_value(self) -> Value {
+        Value::Integer(i64::from(self))
+    }
+}
+
+impl IntoSqlValue for bool {
+    fn into_sql_value(self) -> Value {
+        Value::Integer(i64::from(self))
+    }
+}
+
+struct Rows {
+    rows: Vec<Row>,
+    next_index: usize,
+}
+
+impl Rows {
+    fn next(&mut self) -> Ready<Result<Option<Row>, rusqlite::Error>> {
+        let row = self.rows.get(self.next_index).cloned();
+        if row.is_some() {
+            self.next_index += 1;
+        }
+        ready(Ok(row))
+    }
+}
+
+#[derive(Clone)]
+struct Row {
+    columns: Vec<Value>,
+}
+
+impl Row {
+    fn get<T>(&self, index: usize) -> Result<T, rusqlite::Error>
+    where
+        T: rusqlite::types::FromSql,
+    {
+        let value = self
+            .columns
+            .get(index)
+            .ok_or(rusqlite::Error::InvalidColumnIndex(index))?;
+        rusqlite::types::FromSql::column_result(ValueRef::from(value)).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(index, value.data_type(), Box::new(error))
+        })
+    }
+}
+
+fn database_error(error: rusqlite::Error) -> HamburError {
+    HamburError::Internal(format!("rusqlite: {error}"))
 }
 
 #[cfg(test)]

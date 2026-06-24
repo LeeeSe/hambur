@@ -8,7 +8,7 @@ tokio
 reqwest 
 futures-util
 serde serde_json
-turso 数据库
+rusqlite 数据库
 
 compose:
 Jetpack Compose
@@ -1209,7 +1209,7 @@ Do not build provider JSON before `ContextValidator` accepts the request.
 
 ### Model Capability Rules
 
-Store model capability metadata in Turso without pricing fields:
+Store model capability metadata in rusqlite/SQLite without pricing fields:
 
 ```text
 supportsToolCall
@@ -1487,7 +1487,7 @@ inside the final request builder.
 Do not persist generated Base64.
 
 Do not send generated Base64 through UniFFI events, commands, platform results,
-or Turso.
+or rusqlite/SQLite.
 
 If a user message contains image input, `ModelRouter` must select a target that
 supports image input before the first provider request.
@@ -1650,11 +1650,11 @@ No image bytes or Base64 strings cross UniFFI.
 
 ### Storage Authority
 
-All structured domain data must be stored in Turso/libSQL.
+All structured domain data must be stored in rusqlite/SQLite.
 
-Rust must be the only reader and writer of Turso/libSQL.
+Rust must be the only reader and writer of rusqlite/SQLite.
 
-Kotlin must not open Turso/libSQL directly.
+Kotlin must not open rusqlite/SQLite directly.
 
 Compose must not query persistence.
 
@@ -1668,7 +1668,7 @@ The new app has no legacy data migration path.
 Use three storage layers:
 
 ```text
-Turso/libSQL:
+rusqlite/SQLite:
 - sessions
 - session_branches
 - turns
@@ -1958,7 +1958,7 @@ updatedAt
 retentionPolicy      // keep, delete_with_session, cache
 ```
 
-File bytes stay in the File Store, not in Turso/libSQL.
+File bytes stay in the File Store, not in rusqlite/SQLite.
 
 ### Config Tables
 
@@ -2188,7 +2188,7 @@ memory_replace
 memory_remove
 ```
 
-Memory update tools must write `memory_entries` in Turso/libSQL inside a
+Memory update tools must write `memory_entries` in rusqlite/SQLite inside a
 transaction. After commit, Rust must atomically regenerate the memory Markdown
 projection files.
 
@@ -2196,7 +2196,7 @@ projection files.
 
 Skill source remains the file tree.
 
-Turso/libSQL stores the skill index.
+rusqlite/SQLite stores the skill index.
 
 Use:
 
@@ -2235,11 +2235,11 @@ sha256
 Rust must rescan skill files when fingerprint changes.
 
 Skill file content must be read from the File Store. Do not duplicate full skill
-content into Turso/libSQL as canonical data.
+content into rusqlite/SQLite as canonical data.
 
 ### Search
 
-Use SQLite FTS5 tables in Turso/libSQL.
+Use SQLite FTS5 tables in rusqlite/SQLite.
 
 Required search indexes:
 
@@ -2457,11 +2457,11 @@ cache -> delete any time
 
 ### Non-Negotiable Constraints
 
-Turso/libSQL is the only structured database.
+rusqlite/SQLite is the only structured database.
 
 Rust is the only database access layer.
 
-Kotlin must not access Turso/libSQL directly.
+Kotlin must not access rusqlite/SQLite directly.
 
 Compose must not query persistence.
 
@@ -2473,7 +2473,7 @@ Timeline order is stored, not inferred.
 
 Secrets never live as plain DB values.
 
-File bytes live in the File Store, not in Turso/libSQL.
+File bytes live in the File Store, not in rusqlite/SQLite.
 
 Memory DB rows are authoritative; memory Markdown files are read-only
 projections.
@@ -3124,7 +3124,7 @@ schema internals.
 Provider API keys must be written only to Android Secret Store through a platform
 request.
 
-Turso/libSQL must store only `secretRef`.
+rusqlite/SQLite must store only `secretRef`.
 
 ### Browser Tool
 
@@ -3297,7 +3297,7 @@ iteration limit, `delegate_task` must return a failed ToolResult.
 
 ### Session Search Tool
 
-`session_search` must use Turso/libSQL and FTS indexes.
+`session_search` must use rusqlite/SQLite and FTS indexes.
 
 It must support:
 
@@ -3503,7 +3503,7 @@ Business state must not be stored only in Compose local state.
 
 Screens must expose callbacks as `UiAction`.
 
-Screens must not call repositories, Turso, FileStore, provider services, or tool
+Screens must not call repositories, rusqlite/SQLite, FileStore, provider services, or tool
 services directly.
 
 `HamburUiStore` must map `UiAction` to either:
@@ -3935,7 +3935,7 @@ clear visible log buffer
 Recent log entries are an in-memory diagnostic ring buffer.
 
 Clear logs is a local UI diagnostic action. It must not delete domain data and
-must not write Turso.
+must not write rusqlite/SQLite.
 
 Rust tracing and Kotlin logs must share backend sequence ids when available.
 
@@ -4106,7 +4106,7 @@ hambur-uniffi:
   UniFFI exported API, DTO mapping, Android-facing cdylib
 
 hambur-db:
-  Turso/libSQL schema, repositories, transactions, snapshots, search
+  rusqlite/SQLite schema, repositories, transactions, snapshots, search
 
 hambur-llm:
   provider registry, router, request compiler, adapters, SSE decoder
@@ -4289,7 +4289,7 @@ reqwest
 futures-util
 serde
 serde_json
-turso/libSQL client
+rusqlite/SQLite client
 pulldown-cmark
 mdstream
 uuid
@@ -4377,7 +4377,7 @@ Internal Rust crates do not know Compose.
 
 Kotlin does not build provider HTTP requests.
 
-Kotlin does not access Turso.
+Kotlin does not access rusqlite/SQLite.
 
 No large bytes cross UniFFI.
 
@@ -4418,12 +4418,12 @@ no Miuix dependency
 no Room dependency
 ```
 
-### Milestone 1 - Turso Persistence And Snapshots
+### Milestone 1 - SQLite Persistence And Snapshots
 
 Deliver:
 
 ```text
-Turso/libSQL schema
+rusqlite/SQLite schema
 sessions
 messages
 timeline_items
@@ -4561,7 +4561,7 @@ approval dialogs
 Exit criteria:
 
 ```text
-settings persist through Rust/Turso
+settings persist through Rust/rusqlite/SQLite
 API keys are redacted and secret-backed
 config mutations are audited
 destructive mutations require approval
@@ -4782,7 +4782,7 @@ The major architecture decisions are now fixed:
 Markdown streaming/parsing/rendering
 Rust runtime and UniFFI command/event protocol
 LLM provider/routing/request execution
-Turso persistence and timeline
+SQLite persistence and timeline
 Agent tools/sandbox/file/platform capabilities
 Compose UI/reducer/navigation
 Rust crate layout and build

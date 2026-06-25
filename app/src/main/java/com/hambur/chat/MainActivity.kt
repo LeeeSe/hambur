@@ -8,9 +8,11 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import com.hambur.chat.platform.AndroidPlatformAdapter
 import com.hambur.chat.ui.app.HamburApp
+import java.io.File
+import java.util.UUID
 
 class MainActivity : ComponentActivity() {
-    private var pendingPickedAttachment: ((String, String, ULong, String) -> Unit)? = null
+    private var pendingPickedAttachment: ((String, String, ULong, String, String) -> Unit)? = null
     private val imagePicker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         handlePickedAttachment(uri)
     }
@@ -26,6 +28,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             HamburApp(
                 appFilesDir = filesDir.absolutePath,
+                nativeLibraryDir = applicationInfo.nativeLibraryDir,
                 platformAdapter = platformAdapter,
                 onPickImage = { onPicked ->
                     pendingPickedAttachment = onPicked
@@ -48,6 +51,7 @@ class MainActivity : ComponentActivity() {
             contentResolver.getType(uri).orEmpty(),
             sizeFor(uri),
             uri.toString(),
+            copyUriToCache(uri, displayNameFor(uri)),
         )
     }
 
@@ -89,5 +93,24 @@ class MainActivity : ComponentActivity() {
             }
         }
         return 0UL
+    }
+
+    private fun copyUriToCache(uri: Uri, displayName: String): String {
+        return runCatching {
+            val dir = File(cacheDir, "hambur_attachments").also { it.mkdirs() }
+            val safeName = displayName
+                .ifBlank { uri.lastPathSegment ?: "attachment" }
+                .map { ch ->
+                    if (ch.isLetterOrDigit() || ch == '.' || ch == '-' || ch == '_') ch else '_'
+                }
+                .joinToString("")
+                .ifBlank { "attachment" }
+                .take(96)
+            val file = File(dir, "${UUID.randomUUID()}-$safeName")
+            contentResolver.openInputStream(uri)?.use { input ->
+                file.outputStream().use { output -> input.copyTo(output) }
+            } ?: return@runCatching ""
+            file.absolutePath
+        }.getOrDefault("")
     }
 }

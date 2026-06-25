@@ -115,8 +115,8 @@ fun HamburChatScreen(
     onOpenSettings: () -> Unit,
     onOpenBrowser: () -> Unit,
     onOpenFile: (String) -> Unit,
-    onPickImage: (((String, String, ULong, String) -> Unit) -> Unit) = {},
-    onPickFile: (((String, String, ULong, String) -> Unit) -> Unit) = {},
+    onPickImage: (((String, String, ULong, String, String) -> Unit) -> Unit) = {},
+    onPickFile: (((String, String, ULong, String, String) -> Unit) -> Unit) = {},
 ) {
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val scope = rememberCoroutineScope()
@@ -150,6 +150,11 @@ fun HamburChatScreen(
                     scope.launch { drawerState.close() }
                 },
                 onDeleteSession = store::deleteSession,
+                onRenameSession = { sessionId ->
+                    store.renameSession(sessionId, draftTitle.ifBlank { "New chat" })
+                    draftTitle = ""
+                },
+                onSetSessionPinned = store::setSessionPinned,
                 onUnavailableAction = { unavailableAction = it },
                 onOpenSettings = {
                     scope.launch { drawerState.close() }
@@ -203,24 +208,26 @@ fun HamburChatScreen(
                 onToggleSearch = { searchEnabled = !searchEnabled },
                 onToggleAttachmentPanel = { attachmentPanelOpen = !attachmentPanelOpen },
                 onAddImage = {
-                    onPickImage { displayName, mimeType, byteSize, uri ->
+                    onPickImage { displayName, mimeType, byteSize, uri, sourcePath ->
                         store.importAttachmentMetadata(
                             sessionId = state.selectedSessionId,
                             displayName = displayName,
                             mimeType = mimeType.ifBlank { "image/*" },
                             byteSize = byteSize,
                             originalUri = uri,
+                            sourcePath = sourcePath,
                         )
                     }
                 },
                 onAddFile = {
-                    onPickFile { displayName, mimeType, byteSize, uri ->
+                    onPickFile { displayName, mimeType, byteSize, uri, sourcePath ->
                         store.importAttachmentMetadata(
                             sessionId = state.selectedSessionId,
                             displayName = displayName,
                             mimeType = mimeType.ifBlank { "application/octet-stream" },
                             byteSize = byteSize,
                             originalUri = uri,
+                            sourcePath = sourcePath,
                         )
                     }
                 },
@@ -236,7 +243,12 @@ fun HamburChatScreen(
                         store.editMessage(state.selectedSessionId, editingMessageId, draftMessage)
                         editingMessageId = ""
                     } else {
-                        store.sendMessage(state.selectedSessionId, draftMessage)
+                        store.sendMessage(
+                            sessionId = state.selectedSessionId,
+                            content = draftMessage,
+                            deepThinkingEnabled = thinkingEnabled,
+                            searchEnabled = searchEnabled,
+                        )
                     }
                     draftMessage = ""
                     attachmentPanelOpen = false
@@ -313,6 +325,8 @@ private fun ChatDrawerContent(
     onNewSession: () -> Unit,
     onOpenSession: (String) -> Unit,
     onDeleteSession: (String) -> Unit,
+    onRenameSession: (String) -> Unit,
+    onSetSessionPinned: (String, Boolean) -> Unit,
     onUnavailableAction: (String) -> Unit,
     onOpenSettings: () -> Unit,
 ) {
@@ -396,11 +410,11 @@ private fun ChatDrawerContent(
                                     overflow = TextOverflow.Ellipsis,
                                 )
                                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                    TextButton(onClick = { onUnavailableAction("Rename chat") }) {
+                                    TextButton(onClick = { onRenameSession(session.id) }) {
                                         Text("Rename")
                                     }
-                                    TextButton(onClick = { onUnavailableAction("Pin chat") }) {
-                                        Text("Pin")
+                                    TextButton(onClick = { onSetSessionPinned(session.id, session.pinnedAtMs == 0UL) }) {
+                                        Text(if (session.pinnedAtMs == 0UL) "Pin" else "Unpin")
                                     }
                                 }
                             }
@@ -768,6 +782,16 @@ private fun MessageTimelineItem(
                         )
                     }
                 }
+                if (!message?.attachments.isNullOrEmpty()) {
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        message.attachments.forEach { attachment ->
+                            MessageAttachmentRow(
+                                attachment = attachment,
+                                onOpen = { onOpenFile(attachment.sandboxPath) },
+                            )
+                        }
+                    }
+                }
                 if (!isUser && (markdownBlocks.isNotEmpty() || pendingMarkdown != null)) {
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         markdownBlocks.forEach { block ->
@@ -807,6 +831,47 @@ private fun MessageTimelineItem(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MessageAttachmentRow(
+    attachment: UiPendingAttachment,
+    onOpen: () -> Unit,
+) {
+    Surface(
+        onClick = onOpen,
+        shape = RoundedCornerShape(8.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Icon(
+                imageVector = if (attachment.mimeType.startsWith("image/")) Lucide.Image else Lucide.FileText,
+                contentDescription = null,
+                modifier = Modifier.size(18.dp),
+            )
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = attachment.displayName,
+                    style = MaterialTheme.typography.bodySmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = listOf(attachment.mimeType, "${attachment.byteSize} bytes")
+                        .filter { it.isNotBlank() }
+                        .joinToString(" - "),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
     }

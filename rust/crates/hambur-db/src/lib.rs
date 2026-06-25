@@ -22,6 +22,7 @@ pub struct SessionSummary {
     pub title: String,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+    pub pinned_at_ms: u64,
     pub message_count: u32,
     pub latest_preview: String,
 }
@@ -62,6 +63,7 @@ pub struct MessageRecord {
     pub model_group_id: String,
     pub finish_reason: String,
     pub native_finish_reason: String,
+    pub attachments: Vec<AttachmentRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -522,6 +524,54 @@ impl HamburDatabase {
         self.snapshot_for_selected(Some(session_id)).await
     }
 
+    pub async fn rename_session(&self, session_id: &str, title: &str) -> HamburResult<AppSnapshot> {
+        self.ensure_session_exists(session_id).await?;
+        let now = now_ms();
+        let title = normalize_title(title);
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE sessions
+                 SET title = ?1, updated_at_ms = ?2
+                 WHERE id = ?3 AND deleted_at_ms IS NULL",
+                params![title, now as i64, session_id],
+            )
+            .await
+            .map_err(database_error)?;
+        if changed == 0 {
+            return Err(HamburError::InvalidCommand(format!(
+                "session not found: {session_id}"
+            )));
+        }
+        self.snapshot_for_selected(Some(session_id)).await
+    }
+
+    pub async fn set_session_pinned(
+        &self,
+        session_id: &str,
+        pinned: bool,
+    ) -> HamburResult<AppSnapshot> {
+        self.ensure_session_exists(session_id).await?;
+        let now = now_ms();
+        let pinned_at_ms = if pinned { now } else { 0 };
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE sessions
+                 SET pinned_at_ms = ?1, updated_at_ms = ?2
+                 WHERE id = ?3 AND deleted_at_ms IS NULL",
+                params![pinned_at_ms as i64, now as i64, session_id],
+            )
+            .await
+            .map_err(database_error)?;
+        if changed == 0 {
+            return Err(HamburError::InvalidCommand(format!(
+                "session not found: {session_id}"
+            )));
+        }
+        self.snapshot_for_selected(Some(session_id)).await
+    }
+
     pub async fn delete_session(&self, session_id: &str) -> HamburResult<AppSnapshot> {
         let now = now_ms();
         let changed = self
@@ -593,6 +643,7 @@ impl HamburDatabase {
             model_group_id: String::new(),
             finish_reason: String::new(),
             native_finish_reason: String::new(),
+            attachments: Vec::new(),
         })
     }
 
@@ -675,6 +726,7 @@ impl HamburDatabase {
             model_group_id: route.model_group_id.clone(),
             finish_reason: String::new(),
             native_finish_reason: String::new(),
+            attachments: Vec::new(),
         })
     }
 
@@ -1832,7 +1884,11 @@ impl HamburDatabase {
                 "message_id must not be empty".to_string(),
             ));
         }
-        self.message_by_id(message_id).await
+        let Some(mut message) = self.message_by_id(message_id).await? else {
+            return Ok(None);
+        };
+        message.attachments = self.attachments_for_message(message_id).await?;
+        Ok(Some(message))
     }
 
     pub async fn source_user_message_for(
@@ -1918,6 +1974,7 @@ impl HamburDatabase {
                     s.title,
                     s.created_at_ms,
                     s.updated_at_ms,
+                    s.pinned_at_ms,
                     (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count,
                     COALESCE(
                         (
@@ -1932,7 +1989,7 @@ impl HamburDatabase {
                 FROM sessions s
                 WHERE s.deleted_at_ms IS NULL
                   AND s.title LIKE ?1 ESCAPE '\\'
-                ORDER BY s.updated_at_ms DESC, s.created_at_ms DESC, s.id DESC
+                ORDER BY s.pinned_at_ms DESC, s.updated_at_ms DESC, s.created_at_ms DESC, s.id DESC
                 LIMIT ?2
                 ",
                 params![pattern, limit as i64],
@@ -2431,6 +2488,24 @@ impl HamburDatabase {
             .await
     }
 
+    pub async fn delete_model_group_member(
+        &self,
+        group_id: &str,
+        provider_id: &str,
+        model_id: &str,
+    ) -> HamburResult<()> {
+        let group_id = normalize_setting_id(group_id, "grp");
+        let provider_id = normalize_provider_id(provider_id);
+        self.connection
+            .execute(
+                "DELETE FROM model_group_members WHERE group_id = ?1 AND provider_id = ?2 AND model_id = ?3",
+                params![group_id, provider_id, model_id.trim()],
+            )
+            .await
+            .map_err(database_error)?;
+        Ok(())
+    }
+
     pub async fn set_default_model_group(
         &self,
         key: &str,
@@ -2678,11 +2753,12 @@ impl HamburDatabase {
                     title TEXT NOT NULL,
                     created_at_ms INTEGER NOT NULL,
                     updated_at_ms INTEGER NOT NULL,
+                    pinned_at_ms INTEGER NOT NULL DEFAULT 0,
                     deleted_at_ms INTEGER
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_sessions_active_updated
-                    ON sessions(deleted_at_ms, updated_at_ms DESC, created_at_ms DESC);
+                    ON sessions(deleted_at_ms, pinned_at_ms DESC, updated_at_ms DESC, created_at_ms DESC);
 
                 CREATE TABLE IF NOT EXISTS app_state (
                     key TEXT PRIMARY KEY NOT NULL,
@@ -2956,6 +3032,8 @@ impl HamburDatabase {
             .await
             .map_err(database_error)?;
 
+        self.add_column_if_missing("sessions", "pinned_at_ms", "INTEGER NOT NULL DEFAULT 0")
+            .await?;
         self.add_column_if_missing("messages", "turn_id", "TEXT NOT NULL DEFAULT ''")
             .await?;
         self.add_column_if_missing("messages", "status", "TEXT NOT NULL DEFAULT 'completed'")
@@ -3112,6 +3190,7 @@ impl HamburDatabase {
                     s.title,
                     s.created_at_ms,
                     s.updated_at_ms,
+                    s.pinned_at_ms,
                     (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count,
                     COALESCE(
                         (
@@ -3125,7 +3204,7 @@ impl HamburDatabase {
                     ) AS latest_preview
                 FROM sessions s
                 WHERE s.deleted_at_ms IS NULL
-                ORDER BY s.updated_at_ms DESC, s.created_at_ms DESC, s.id DESC
+                ORDER BY s.pinned_at_ms DESC, s.updated_at_ms DESC, s.created_at_ms DESC, s.id DESC
                 LIMIT ?1 OFFSET ?2
                 ",
                 params![limit as i64, offset as i64],
@@ -3314,6 +3393,7 @@ impl HamburDatabase {
                     s.title,
                     s.created_at_ms,
                     s.updated_at_ms,
+                    s.pinned_at_ms,
                     (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count,
                     COALESCE(
                         (
@@ -3735,6 +3815,51 @@ impl HamburDatabase {
         attachment_from_row(&row)
     }
 
+    pub async fn attachments_for_message(
+        &self,
+        message_id: &str,
+    ) -> HamburResult<Vec<AttachmentRecord>> {
+        if message_id.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut rows = self
+            .connection
+            .query(
+                "
+                SELECT
+                    id,
+                    session_id,
+                    message_id,
+                    kind,
+                    display_name,
+                    mime_type,
+                    byte_size,
+                    origin_type,
+                    original_uri,
+                    file_id,
+                    sandbox_path,
+                    width,
+                    height,
+                    sha256,
+                    status,
+                    created_at_ms,
+                    updated_at_ms
+                FROM attachments
+                WHERE message_id = ?1
+                  AND status = 'attached'
+                ORDER BY created_at_ms ASC, id ASC
+                ",
+                params![message_id],
+            )
+            .await
+            .map_err(database_error)?;
+        let mut attachments = Vec::new();
+        while let Some(row) = rows.next().await.map_err(database_error)? {
+            attachments.push(attachment_from_row(&row)?);
+        }
+        Ok(attachments)
+    }
+
     async fn file_cleanup_job_by_id(&self, job_id: &str) -> HamburResult<FileCleanupJobRecord> {
         let mut rows = self
             .connection
@@ -4084,6 +4209,13 @@ fn normalize_app_setting_key(value: &str) -> HamburResult<String> {
         "startup_tasks",
         "rootfs_settings",
         "browser_tool_settings",
+        "appearance",
+        "logs",
+        "token_usage",
+        "persona",
+        "environment_variables",
+        "deep_thinking",
+        "search",
     ];
     if allowed.contains(&key) {
         Ok(key.to_string())
@@ -4103,8 +4235,32 @@ fn normalize_prefixed_setting_key(key: &str) -> HamburResult<String> {
             "invalid app setting key: {key}"
         )));
     }
-    let id = normalize_setting_key_suffix(id);
+    let id = if prefix == "skill_enabled" {
+        normalize_skill_setting_key_suffix(id)?
+    } else {
+        normalize_setting_key_suffix(id)
+    };
     Ok(format!("{prefix}:{id}"))
+}
+
+fn normalize_skill_setting_key_suffix(value: &str) -> HamburResult<String> {
+    let value = value
+        .trim()
+        .trim_start_matches("/var/hambur/skills/")
+        .trim_start_matches('/');
+    if value.is_empty() || value.contains("..") || value.contains('\\') {
+        return Err(HamburError::InvalidCommand(
+            "invalid skill setting key".to_string(),
+        ));
+    }
+    if !value.ends_with("/SKILL.md") {
+        return Ok(normalize_setting_key_suffix(value));
+    }
+    Ok(value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/'))
+        .take(240)
+        .collect())
 }
 
 fn normalize_setting_key_suffix(value: &str) -> String {
@@ -4156,9 +4312,18 @@ fn normalize_app_setting_value(key: &str, value: &str) -> HamburResult<String> {
         "lastSelectedSessionId" => Ok(value.chars().take(160).collect()),
         "browser_tool_settings" => normalize_browser_tool_settings(value),
         key if key.starts_with("skill_enabled:") => normalize_bool_setting(key, value),
-        "tool_settings" | "skills" | "memory_projections" | "startup_tasks" | "rootfs_settings" => {
-            normalize_json_or_text_setting(value)
-        }
+        "tool_settings"
+        | "skills"
+        | "memory_projections"
+        | "startup_tasks"
+        | "rootfs_settings"
+        | "appearance"
+        | "logs"
+        | "token_usage"
+        | "persona"
+        | "environment_variables"
+        | "deep_thinking"
+        | "search" => normalize_json_or_text_setting(value),
         key if key.starts_with("startup_task:") || key.starts_with("rootfs_setting:") => {
             normalize_json_or_text_setting(value)
         }
@@ -4436,8 +4601,9 @@ fn session_summary_from_row(row: &Row) -> HamburResult<SessionSummary> {
         title: row.get::<String>(1).map_err(database_error)?,
         created_at_ms: unsigned_ms(row.get::<i64>(2).map_err(database_error)?),
         updated_at_ms: unsigned_ms(row.get::<i64>(3).map_err(database_error)?),
-        message_count: unsigned_count(row.get::<i64>(4).map_err(database_error)?),
-        latest_preview: row.get::<String>(5).map_err(database_error)?,
+        pinned_at_ms: unsigned_ms(row.get::<i64>(4).map_err(database_error)?),
+        message_count: unsigned_count(row.get::<i64>(5).map_err(database_error)?),
+        latest_preview: row.get::<String>(6).map_err(database_error)?,
     })
 }
 
@@ -4590,6 +4756,7 @@ fn message_from_row(row: &Row) -> HamburResult<MessageRecord> {
         model_group_id: row.get::<String>(14).map_err(database_error)?,
         finish_reason: row.get::<String>(15).map_err(database_error)?,
         native_finish_reason: row.get::<String>(16).map_err(database_error)?,
+        attachments: Vec::new(),
     })
 }
 

@@ -10,12 +10,17 @@ import com.hambur.chat.uniffi.ConfigAuditDto
 import com.hambur.chat.uniffi.DefaultModelGroupDto
 import com.hambur.chat.uniffi.MarkdownBlockNodeDto
 import com.hambur.chat.uniffi.MessageDto
+import com.hambur.chat.uniffi.MemoryFileDetailDto
+import com.hambur.chat.uniffi.MemoryFileSummaryDto
 import com.hambur.chat.uniffi.ModelGroupDto
 import com.hambur.chat.uniffi.ModelGroupMemberDto
 import com.hambur.chat.uniffi.ProviderModelDto
 import com.hambur.chat.uniffi.PublicProviderDto
 import com.hambur.chat.uniffi.SessionListSnapshotDto
+import com.hambur.chat.uniffi.RootfsStatusDto
 import com.hambur.chat.uniffi.SettingsSnapshotDto
+import com.hambur.chat.uniffi.SkillDetailDto
+import com.hambur.chat.uniffi.SkillSummaryDto
 import com.hambur.chat.uniffi.TimelineItemDto
 import com.hambur.chat.uniffi.createRuntime
 import com.hambur.chat.platform.AndroidPlatformAdapter
@@ -37,6 +42,7 @@ import org.json.JSONObject
 data class UiSessionSummary(
     val id: String,
     val title: String,
+    val pinnedAtMs: ULong,
     val messageCount: UInt,
     val latestPreview: String,
 )
@@ -69,6 +75,7 @@ data class UiMessageSnapshot(
     val finishReason: String,
     val nativeFinishReason: String,
     val versionSequence: ULong,
+    val attachments: List<UiPendingAttachment> = emptyList(),
 )
 
 data class UiPendingAttachment(
@@ -86,6 +93,8 @@ data class UiProviderSettings(
     val baseUrl: String,
     val secretLabel: String,
     val enabled: Boolean,
+    val iconName: String,
+    val apiType: String,
 )
 
 data class UiProviderModelSettings(
@@ -137,6 +146,40 @@ data class UiConfigAudit(
     val createdAtMs: ULong,
 )
 
+data class UiSkillSummary(
+    val name: String,
+    val description: String,
+    val path: String,
+    val category: String,
+    val tags: List<String>,
+    val enabled: Boolean,
+    val files: List<String>,
+)
+
+data class UiSkillDetail(
+    val summary: UiSkillSummary = UiSkillSummary("", "", "", "", emptyList(), true, emptyList()),
+    val content: String = "",
+    val linkedFilesJson: String = "",
+    val selectedFilePath: String = "",
+    val selectedFileContent: String = "",
+)
+
+data class UiMemoryFileSummary(
+    val name: String,
+    val sizeBytes: ULong,
+    val modifiedAtMs: ULong,
+    val entryCount: UInt,
+    val preview: String,
+)
+
+data class UiMemoryFileDetail(
+    val name: String = "",
+    val sizeBytes: ULong = 0UL,
+    val modifiedAtMs: ULong = 0UL,
+    val entryCount: UInt = 0u,
+    val content: String = "",
+)
+
 data class UiSharedBrowserState(
     val active: Boolean = false,
     val requestId: String = "",
@@ -162,6 +205,10 @@ data class HamburUiState(
     val defaultModelGroups: List<UiDefaultModelGroupSettings> = emptyList(),
     val appSettings: List<UiAppSetting> = emptyList(),
     val configAudits: List<UiConfigAudit> = emptyList(),
+    val skills: List<UiSkillSummary> = emptyList(),
+    val skillDetails: Map<String, UiSkillDetail> = emptyMap(),
+    val memoryFiles: List<UiMemoryFileSummary> = emptyList(),
+    val memoryFileDetails: Map<String, UiMemoryFileDetail> = emptyMap(),
     val sharedBrowser: UiSharedBrowserState = UiSharedBrowserState(),
     val markdownMessageId: String = "",
     val markdownBlocks: List<MarkdownBlockNodeDto> = emptyList(),
@@ -173,14 +220,21 @@ data class HamburUiState(
     val lastAppliedSequence: ULong = 0UL,
     val appliedEventIds: Set<String> = emptySet(),
     val activeTurnIds: Map<String, String> = emptyMap(),
+    val rootfsStatus: RootfsStatusDto? = null,
 )
 
 class HamburUiStore(
     appFilesDir: String,
+    nativeLibraryDir: String,
     private val platformAdapter: AndroidPlatformAdapter,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val runtime = createRuntime(AppBootstrapConfig(appFilesDir = appFilesDir))
+    private val runtime = createRuntime(
+        AppBootstrapConfig(
+            appFilesDir = appFilesDir,
+            nativeLibraryDir = nativeLibraryDir,
+        )
+    )
     private val _state = MutableStateFlow(HamburUiState())
     private val startupLock = Any()
     private val startupBuffer = mutableListOf<BackendEvent>()
@@ -236,6 +290,34 @@ class HamburUiStore(
         }
     }
 
+    fun renameSession(sessionId: String, title: String) {
+        if (sessionId.isBlank() || title.isBlank()) return
+        runCommand {
+            runtime.dispatch(
+                backendCommand(
+                    kind = "RenameSession",
+                    idempotencyKey = "$sessionId:rename:${nextCommandOrdinal()}",
+                    sessionId = sessionId,
+                    title = title,
+                ),
+            )
+        }
+    }
+
+    fun setSessionPinned(sessionId: String, pinned: Boolean) {
+        if (sessionId.isBlank()) return
+        runCommand {
+            runtime.dispatch(
+                backendCommand(
+                    kind = "SetSessionPinned",
+                    idempotencyKey = "$sessionId:pinned:$pinned:${nextCommandOrdinal()}",
+                    sessionId = sessionId,
+                    payloadJson = """{"pinned":$pinned}""",
+                ),
+            )
+        }
+    }
+
     fun saveProvider(
         providerId: String,
         name: String,
@@ -243,11 +325,18 @@ class HamburUiStore(
         secretRef: String,
         apiKey: String,
         enabled: Boolean,
+        iconName: String,
+        apiType: String,
     ) {
-        if (baseUrl.isBlank() || secretRef.isBlank()) return
-        if (apiKey.isNotBlank() && secretRef.startsWith("android-secret://")) {
+        if (baseUrl.isBlank()) return
+        val effectiveSecretRef = if (secretRef.startsWith("android-secret://")) {
+            secretRef
+        } else {
+            "android-secret://providers/${providerId.ifBlank { "prv_" + java.util.UUID.randomUUID().toString().replace("-", "") }}"
+        }
+        if (apiKey.isNotBlank()) {
             runCatching {
-                platformAdapter.saveSecret(secretRef, apiKey)
+                platformAdapter.saveSecret(effectiveSecretRef, apiKey)
             }.onFailure { error ->
                 _state.update {
                     it.copy(
@@ -259,7 +348,7 @@ class HamburUiStore(
             }
         }
         val payload = """
-            {"secretRef":"${secretRef.jsonEscaped()}","enabled":$enabled,"iconName":"sparkles"}
+            {"secretRef":"${effectiveSecretRef.jsonEscaped()}","enabled":$enabled,"iconName":"${iconName.jsonEscaped()}","apiType":"${apiType.jsonEscaped()}"}
         """.trimIndent()
         runCommand {
             runtime.dispatch(
@@ -290,15 +379,63 @@ class HamburUiStore(
         }
     }
 
-    fun refreshProviderModels(providerId: String, modelId: String) {
+    fun refreshProviderModels(
+        providerId: String,
+        baseUrl: String,
+        apiKey: String,
+        secretRef: String,
+        modelId: String
+    ) {
         if (providerId.isBlank()) return
         runCommand {
+            val effectiveSecretRef = if (secretRef.startsWith("android-secret://")) {
+                secretRef
+            } else {
+                "android-secret://providers/${providerId.ifBlank { "prv_" + java.util.UUID.randomUUID().toString().replace("-", "") }}"
+            }
+            val resolvedApiKey = if (apiKey.isNotBlank()) apiKey else platformAdapter.getSecret(effectiveSecretRef).orEmpty()
+            
+            var payload = ""
+            if (baseUrl.isNotBlank()) {
+                val modelsUrl = if (baseUrl.endsWith("/models") || baseUrl.endsWith("/models/")) {
+                    baseUrl
+                } else if (baseUrl.endsWith("/")) {
+                    "${baseUrl}models"
+                } else {
+                    "$baseUrl/models"
+                }
+                
+                try {
+                    val connection = (java.net.URL(modelsUrl).openConnection() as java.net.HttpURLConnection).apply {
+                        connectTimeout = 10000
+                        readTimeout = 10000
+                        requestMethod = "GET"
+                        if (resolvedApiKey.isNotBlank()) {
+                            setRequestProperty("Authorization", "Bearer $resolvedApiKey")
+                        }
+                        setRequestProperty("Accept", "application/json")
+                    }
+                    val status = connection.responseCode
+                    val stream = if (status >= 400) connection.errorStream else connection.inputStream
+                    val text = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
+                    if (status in 200..299 && text.trim().startsWith("{")) {
+                        payload = text
+                    } else {
+                        Log.w("HamburBackend", "Models fetch returned status $status: $text")
+                    }
+                    connection.disconnect()
+                } catch (e: Exception) {
+                    Log.e("HamburBackend", "Failed to fetch models from provider: ${e.message}", e)
+                }
+            }
+
             runtime.dispatch(
                 backendCommand(
                     kind = "RefreshProviderModels",
                     idempotencyKey = "provider:$providerId:models:${nextCommandOrdinal()}",
                     providerId = providerId,
                     modelId = modelId.ifBlank { "hambur-openai-compatible-text" },
+                    payloadJson = payload,
                 ),
             )
         }
@@ -374,6 +511,36 @@ class HamburUiStore(
                     providerId = providerId,
                     modelId = modelId,
                     payloadJson = payload,
+                ),
+            )
+        }
+    }
+
+    fun deleteModelGroup(groupId: String, approved: Boolean = true) {
+        if (groupId.isBlank() || !approved) return
+        val payload = """{"approvalToken":"approve:delete-model-group","groupId":"${groupId.jsonEscaped()}"}"""
+        runCommand {
+            runtime.dispatch(
+                backendCommand(
+                    kind = "DeleteModelGroup",
+                    idempotencyKey = "model-group:$groupId:delete:${nextCommandOrdinal()}",
+                    messageId = groupId,
+                    payloadJson = payload,
+                ),
+            )
+        }
+    }
+
+    fun deleteModelGroupMember(groupId: String, providerId: String, modelId: String) {
+        if (groupId.isBlank() || providerId.isBlank() || modelId.isBlank()) return
+        runCommand {
+            runtime.dispatch(
+                backendCommand(
+                    kind = "DeleteModelGroupMember",
+                    idempotencyKey = "model-group-member:$groupId:$providerId:$modelId:delete:${nextCommandOrdinal()}",
+                    messageId = groupId,
+                    providerId = providerId,
+                    modelId = modelId,
                 ),
             )
         }
@@ -525,8 +692,12 @@ class HamburUiStore(
         }
     }
 
-    fun resetRootfs(approved: Boolean) {
-        val payload = """{"approvalToken":"approve:rootfs_reset"}""".takeIf { approved }.orEmpty()
+    fun resetRootfs(preserveRoot: Boolean, approved: Boolean) {
+        val payload = if (approved) {
+            """{"approvalToken":"approve:rootfs_reset","preserveRoot":$preserveRoot}"""
+        } else {
+            ""
+        }
         runCommand {
             runtime.dispatch(
                 backendCommand(
@@ -535,6 +706,17 @@ class HamburUiStore(
                     payloadJson = payload,
                 ),
             )
+        }
+    }
+
+    fun refreshRootfsStatus() {
+        scope.launch {
+            try {
+                val status = runtime.getRootfsStatus()
+                _state.update { it.copy(rootfsStatus = status) }
+            } catch (e: Exception) {
+                Log.e("HamburUiStore", "Failed to refresh rootfs status: ${e.message}", e)
+            }
         }
     }
 
@@ -608,18 +790,19 @@ class HamburUiStore(
         }
     }
 
-    fun sendMessage(sessionId: String, content: String) {
+    fun sendMessage(
+        sessionId: String,
+        content: String,
+        deepThinkingEnabled: Boolean = false,
+        searchEnabled: Boolean = false,
+    ) {
         if (sessionId.isBlank()) return
         val attachmentIds = _state.value.pendingAttachments.map { it.id }
         if (content.isBlank() && attachmentIds.isEmpty()) return
 
         scope.launch {
             ensureDefaultTextProvider()
-            val payload = if (attachmentIds.isEmpty()) {
-                ""
-            } else {
-                attachmentPayloadJson(attachmentIds)
-            }
+            val payload = sendPayloadJson(attachmentIds, deepThinkingEnabled, searchEnabled)
             val ack = runtime.dispatch(
                 backendCommand(
                     kind = "SendMessage",
@@ -690,14 +873,16 @@ class HamburUiStore(
         byteSize: ULong = 0UL,
         originalUri: String = "",
         sourcePath: String = "",
+        bytesBase64: String = "",
     ) {
         if (sessionId.isBlank()) return
         val escapedName = displayName.jsonEscaped()
         val escapedMime = mimeType.jsonEscaped()
         val escapedUri = originalUri.jsonEscaped()
         val escapedPath = sourcePath.jsonEscaped()
+        val escapedBytes = bytesBase64.jsonEscaped()
         val payload = """
-            {"displayName":"$escapedName","mimeType":"$escapedMime","byteSize":$byteSize,"originalUri":"$escapedUri","sourcePath":"$escapedPath","originType":"content_uri"}
+            {"displayName":"$escapedName","mimeType":"$escapedMime","byteSize":$byteSize,"originalUri":"$escapedUri","sourcePath":"$escapedPath","bytesBase64":"$escapedBytes","originType":"content_uri"}
         """.trimIndent()
         runCommand {
             runtime.dispatch(
@@ -764,6 +949,13 @@ class HamburUiStore(
                 activePreviewPath = destination,
             )
         }
+    }
+
+    fun resolveSandboxHostPath(sessionId: String, sandboxPath: String): String {
+        if (sessionId.isBlank() || sandboxPath.isBlank()) return ""
+        return runCatching {
+            runtime.resolveSandboxFile(sessionId, sandboxPath).hostPath
+        }.getOrDefault("")
     }
 
     fun shutdown() {
@@ -867,6 +1059,7 @@ class HamburUiStore(
 
         bufferedEvents.forEach(::applyEvent)
         refreshVisibleMessageSnapshots()
+        refreshKnowledgeSnapshots()
     }
 
     private fun runCommand(block: () -> CommandAck) {
@@ -1031,6 +1224,52 @@ class HamburUiStore(
         _state.update { state ->
             state.applySettingsSnapshot(snapshot)
         }
+        refreshKnowledgeSnapshots()
+    }
+
+    fun refreshKnowledgeSnapshots() {
+        scope.launch {
+            val skills = runCatching { runtime.listSkills().map { it.toUiSkillSummary() } }
+                .getOrDefault(emptyList())
+            val memoryFiles = runCatching { runtime.listMemoryFiles().map { it.toUiMemoryFileSummary() } }
+                .getOrDefault(emptyList())
+            _state.update {
+                it.copy(skills = skills, memoryFiles = memoryFiles)
+            }
+        }
+    }
+
+    fun loadSkillDetail(skillId: String, filePath: String = "") {
+        if (skillId.isBlank()) return
+        scope.launch {
+            val detail = runCatching {
+                runtime.getSkillDetail(skillId, filePath).toUiSkillDetail()
+            }.getOrNull() ?: return@launch
+            val key = if (filePath.isBlank()) skillId else "$skillId::$filePath"
+            _state.update {
+                it.copy(skillDetails = it.skillDetails + (key to detail))
+            }
+        }
+    }
+
+    fun deleteSkill(skillId: String) {
+        if (skillId.isBlank()) return
+        runCommand {
+            runtime.deleteSkill(skillId)
+        }
+        refreshKnowledgeSnapshots()
+    }
+
+    fun loadMemoryFileDetail(name: String) {
+        if (name.isBlank()) return
+        scope.launch {
+            val detail = runCatching {
+                runtime.getMemoryFileDetail(name).toUiMemoryFileDetail()
+            }.getOrNull() ?: return@launch
+            _state.update {
+                it.copy(memoryFileDetails = it.memoryFileDetails + (name to detail))
+            }
+        }
     }
 
     private fun refreshVisibleMessageSnapshots() {
@@ -1066,6 +1305,11 @@ class HamburUiStore(
         if (defaultProviderConfigured) return
 
         val providerId = "provider-openai-compatible-default"
+        if (_state.value.providers.any { it.id == providerId }) {
+            defaultProviderConfigured = true
+            return
+        }
+
         val providerAck = runtime.dispatch(
             backendCommand(
                 kind = "UpdateProvider",
@@ -1149,6 +1393,7 @@ private fun HamburUiState.applyBaseline(
             UiSessionSummary(
                 id = it.id,
                 title = it.title,
+                pinnedAtMs = it.pinnedAtMs,
                 messageCount = it.messageCount,
                 latestPreview = it.latestPreview,
             )
@@ -1209,6 +1454,8 @@ private fun HamburUiState.reduce(event: BackendEvent): HamburUiState {
         "SessionCreated",
         "SessionOpened",
         "SessionDeleted",
+        "SessionRenamed",
+        "SessionPinnedChanged",
         "ModelsUpdated",
         "AttachmentImported",
         "PendingAttachmentRemoved",
@@ -1239,6 +1486,8 @@ private fun HamburUiState.reduce(event: BackendEvent): HamburUiState {
         event.kind == "SessionCreated" -> "Session created"
         event.kind == "SessionOpened" -> "Session opened"
         event.kind == "SessionDeleted" -> "Session deleted"
+        event.kind == "SessionRenamed" -> "Session renamed"
+        event.kind == "SessionPinnedChanged" -> "Session pinned state updated"
         event.kind == "ModelsUpdated" -> event.message.ifBlank { "Models updated" }
         event.kind == "SettingsChanged" -> event.message.ifBlank { "Settings updated" }
         event.kind == "AttachmentImported" -> event.message.ifBlank { "Attachment imported" }
@@ -1312,6 +1561,7 @@ private fun HamburUiState.reduce(event: BackendEvent): HamburUiState {
             UiSessionSummary(
                 id = it.id,
                 title = it.title,
+                pinnedAtMs = it.pinnedAtMs,
                 messageCount = it.messageCount,
                 latestPreview = it.latestPreview,
             )
@@ -1430,6 +1680,7 @@ private fun MessageDto.toUiMessageSnapshot(): UiMessageSnapshot {
         finishReason = finishReason,
         nativeFinishReason = nativeFinishReason,
         versionSequence = versionSequence,
+        attachments = attachments.toUiPendingAttachments(),
     )
 }
 
@@ -1454,6 +1705,8 @@ private fun List<PublicProviderDto>.toUiProviders(): List<UiProviderSettings> {
             baseUrl = it.baseUrl,
             secretLabel = it.secretLabel,
             enabled = it.enabled,
+            iconName = it.iconName,
+            apiType = it.apiType,
         )
     }
 }
@@ -1531,6 +1784,48 @@ private fun List<ConfigAuditDto>.toUiConfigAudits(): List<UiConfigAudit> {
     }
 }
 
+private fun SkillSummaryDto.toUiSkillSummary(): UiSkillSummary {
+    return UiSkillSummary(
+        name = name,
+        description = description,
+        path = path,
+        category = category,
+        tags = tags,
+        enabled = enabled,
+        files = files,
+    )
+}
+
+private fun SkillDetailDto.toUiSkillDetail(): UiSkillDetail {
+    return UiSkillDetail(
+        summary = summary.toUiSkillSummary(),
+        content = content,
+        linkedFilesJson = linkedFilesJson,
+        selectedFilePath = selectedFilePath,
+        selectedFileContent = selectedFileContent,
+    )
+}
+
+private fun MemoryFileSummaryDto.toUiMemoryFileSummary(): UiMemoryFileSummary {
+    return UiMemoryFileSummary(
+        name = name,
+        sizeBytes = sizeBytes,
+        modifiedAtMs = modifiedAtMs,
+        entryCount = entryCount,
+        preview = preview,
+    )
+}
+
+private fun MemoryFileDetailDto.toUiMemoryFileDetail(): UiMemoryFileDetail {
+    return UiMemoryFileDetail(
+        name = name,
+        sizeBytes = sizeBytes,
+        modifiedAtMs = modifiedAtMs,
+        entryCount = entryCount,
+        content = content,
+    )
+}
+
 private fun String.jsonEscaped(): String {
     return buildString {
         this@jsonEscaped.forEach { ch ->
@@ -1585,14 +1880,15 @@ private fun String.jsonStringAt(parent: String, key: String): String {
     }.getOrDefault("")
 }
 
-private fun attachmentPayloadJson(attachmentIds: List<String>): String {
-    return attachmentIds.joinToString(
-        prefix = "{\"attachmentIds\":[\"",
-        separator = "\",\"",
-        postfix = "\"]}",
-    ) {
+private fun sendPayloadJson(
+    attachmentIds: List<String>,
+    deepThinkingEnabled: Boolean,
+    searchEnabled: Boolean,
+): String {
+    val attachments = attachmentIds.joinToString(prefix = "[\"", separator = "\",\"", postfix = "\"]") {
         it.jsonEscaped()
     }
+    return """{"attachmentIds":$attachments,"deepThinkingEnabled":$deepThinkingEnabled,"searchEnabled":$searchEnabled}"""
 }
 
 private fun maxSequence(first: ULong, second: ULong): ULong {

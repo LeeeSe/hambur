@@ -106,7 +106,16 @@ fun HamburFilePreviewScreen(
     onBack: () -> Unit,
     onOpenFile: (String) -> Unit,
 ) {
-    val resolved = remember(path) { resolvePreviewFile(path) }
+    val resolved = remember(path, state.selectedSessionId) {
+        resolvePreviewFile(
+            path = path,
+            sandboxHostPath = if (path.startsWith("/var/hambur/")) {
+                store.resolveSandboxHostPath(state.selectedSessionId, path)
+            } else {
+                ""
+            },
+        )
+    }
 
     Column(
         modifier = Modifier
@@ -545,7 +554,7 @@ private fun FilePreviewMessage(
     }
 }
 
-private fun resolvePreviewFile(path: String): ResolvedPreviewFile? {
+private fun resolvePreviewFile(path: String, sandboxHostPath: String = ""): ResolvedPreviewFile? {
     if (path.isBlank()) return null
     val normalized = when {
         path.startsWith("file://") -> Uri.parse(path).path.orEmpty()
@@ -555,7 +564,7 @@ private fun resolvePreviewFile(path: String): ResolvedPreviewFile? {
         else -> path
     }
     if (normalized.isBlank()) return null
-    val file = File(normalized)
+    val file = File(sandboxHostPath.ifBlank { normalized })
     val extension = file.extension.lowercase()
     val kind = when {
         extension in setOf("png", "jpg", "jpeg", "webp", "gif", "bmp", "heic", "heif") -> PreviewFileKind.Image

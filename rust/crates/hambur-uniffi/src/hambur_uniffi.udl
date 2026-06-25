@@ -4,6 +4,7 @@ namespace hambur_uniffi {
 
 dictionary AppBootstrapConfig {
     string app_files_dir;
+    string native_library_dir;
 };
 
 dictionary CommandAck {
@@ -105,6 +106,7 @@ dictionary SessionSummaryDTO {
     string title;
     u64 created_at_ms;
     u64 updated_at_ms;
+    u64 pinned_at_ms;
     u32 message_count;
     string latest_preview;
 };
@@ -279,6 +281,7 @@ dictionary MessageDTO {
     string model_group_id;
     string finish_reason;
     string native_finish_reason;
+    sequence<AttachmentDTO> attachments;
 };
 
 dictionary MessageSnapshotDTO {
@@ -294,6 +297,69 @@ dictionary SearchSnapshotDTO {
     sequence<SessionSummaryDTO> sessions;
 };
 
+dictionary FileResolutionDTO {
+    string sandbox_path;
+    string host_path;
+    string relative_path;
+    string root;
+    boolean writable;
+    boolean exists;
+    boolean is_file;
+    string mime_type;
+    u64 byte_size;
+    string file_id;
+};
+
+dictionary SkillSummaryDTO {
+    string name;
+    string description;
+    string path;
+    string category;
+    sequence<string> tags;
+    boolean built_in;
+    boolean enabled;
+    u64 created_at_ms;
+    u64 modified_at_ms;
+    sequence<string> files;
+};
+
+dictionary SkillDetailDTO {
+    SkillSummaryDTO summary;
+    string content;
+    string raw_content;
+    string skill_dir_path;
+    string linked_files_json;
+    string selected_file_path;
+    string selected_file_content;
+};
+
+dictionary MemoryFileSummaryDTO {
+    string name;
+    u64 size_bytes;
+    u64 modified_at_ms;
+    u32 entry_count;
+    string preview;
+};
+
+dictionary MemoryFileDetailDTO {
+    string name;
+    u64 size_bytes;
+    u64 modified_at_ms;
+    u32 entry_count;
+    string content;
+};
+
+dictionary RootfsStatusDTO {
+    boolean rootfs_installed;
+    boolean proot_available;
+    boolean root_available;
+    boolean chroot_available;
+    string backend;
+    string version;
+    u64 rootfs_size_bytes;
+    string rootfs_path;
+};
+
 interface BackendRuntime {
     CommandAck dispatch(BackendCommand command);
     BackendEvent? next_event();
@@ -303,6 +369,13 @@ interface BackendRuntime {
     MessageSnapshotDTO get_message_snapshot(string message_id);
     SearchSnapshotDTO search_sessions(string query, u32 limit);
     SettingsSnapshotDTO get_settings_snapshot();
+    FileResolutionDTO resolve_sandbox_file(string session_id, string sandbox_path);
+    RootfsStatusDTO get_rootfs_status();
+    sequence<SkillSummaryDTO> list_skills();
+    SkillDetailDTO get_skill_detail(string identifier, string file_path);
+    CommandAck delete_skill(string identifier);
+    sequence<MemoryFileSummaryDTO> list_memory_files();
+    MemoryFileDetailDTO get_memory_file_detail(string name);
     CommandAck create_session(string title);
     CommandAck open_session(string session_id);
     CommandAck delete_session(string session_id);

@@ -77,6 +77,75 @@ impl ToolSchemaCompiler {
             }),
         })?;
         compiler.register(ToolSchema {
+            name: "read_file".to_string(),
+            description:
+                "Read a text file with line numbers and pagination from the Hambur sandbox."
+                    .to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "offset": {"type": "integer", "minimum": 1},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 2000}
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        })?;
+        compiler.register(ToolSchema {
+            name: "write_file".to_string(),
+            description:
+                "Write content to a file in the Hambur sandbox, replacing existing content."
+                    .to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"}
+                },
+                "required": ["path", "content"],
+                "additionalProperties": false
+            }),
+        })?;
+        compiler.register(ToolSchema {
+            name: "patch".to_string(),
+            description: "Apply a targeted find-and-replace edit in a Hambur sandbox text file."
+                .to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "properties": {
+                    "mode": {"type": "string", "enum": ["replace", "patch"]},
+                    "path": {"type": "string"},
+                    "old_string": {"type": "string"},
+                    "new_string": {"type": "string"},
+                    "replace_all": {"type": "boolean"},
+                    "patch": {"type": "string"}
+                },
+                "required": ["mode"],
+                "additionalProperties": false
+            }),
+        })?;
+        compiler.register(ToolSchema {
+            name: "search_files".to_string(),
+            description: "Search file names or text contents inside the Hambur sandbox."
+                .to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string"},
+                    "target": {"type": "string", "enum": ["content", "files"]},
+                    "path": {"type": "string"},
+                    "file_glob": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1},
+                    "offset": {"type": "integer", "minimum": 0},
+                    "output_mode": {"type": "string", "enum": ["content", "files_only", "count"]},
+                    "context": {"type": "integer", "minimum": 0}
+                },
+                "required": ["pattern"],
+                "additionalProperties": false
+            }),
+        })?;
+        compiler.register(ToolSchema {
             name: "terminal".to_string(),
             description: "Run a foreground terminal command inside the Hambur sandbox.".to_string(),
             parameters_json_schema: json!({
@@ -197,6 +266,47 @@ impl ToolSchemaCompiler {
                     "payload_json": {"type": "string"}
                 },
                 "required": ["task"],
+                "additionalProperties": false
+            }),
+        })?;
+        compiler.register(ToolSchema {
+            name: "memory".to_string(),
+            description: "Read or update durable Hambur memory shared across all chats."
+                .to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["add", "replace", "remove", "read"]},
+                    "target": {"type": "string", "enum": ["memory", "user"]},
+                    "content": {"type": "string"},
+                    "old_text": {"type": "string"}
+                },
+                "required": ["action", "target"],
+                "additionalProperties": false
+            }),
+        })?;
+        compiler.register(ToolSchema {
+            name: "skills_list".to_string(),
+            description: "List available Hambur skills with compact metadata.".to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string"}
+                },
+                "additionalProperties": false
+            }),
+        })?;
+        compiler.register(ToolSchema {
+            name: "skill_view".to_string(),
+            description: "Load a Hambur skill main content or a linked file inside that skill."
+                .to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "file_path": {"type": "string"}
+                },
+                "required": ["name"],
                 "additionalProperties": false
             }),
         })?;

@@ -54,6 +54,7 @@ android {
     sourceSets {
         getByName("main") {
             kotlin.srcDir(generatedUniffiDir.get().asFile)
+            jniLibs.srcDir("src/main/jniLibs")
             jniLibs.srcDir(generatedJniLibsDir.get().asFile)
         }
     }
@@ -69,13 +70,19 @@ android {
 
     packaging {
         jniLibs {
-            useLegacyPackaging = false
+            useLegacyPackaging = true
+            keepDebugSymbols += "*/arm64-v8a/libproot.so"
         }
     }
 
     buildTypes {
         getByName("release") {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
             signingConfig = signingConfigs.getByName("debug")
         }
     }

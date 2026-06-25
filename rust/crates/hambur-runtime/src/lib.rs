@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
     Arc, Mutex, Weak,
@@ -41,6 +41,7 @@ use tokio::time::{Duration, sleep, timeout};
 #[derive(Debug, Clone)]
 pub struct AppBootstrap {
     pub app_files_dir: String,
+    pub native_library_dir: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -90,6 +91,75 @@ pub struct RuntimeSessionListSnapshot {
     pub created_at_ms: u64,
     pub sessions: Vec<SessionSummary>,
     pub selected_session_id: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeFileResolution {
+    pub sandbox_path: String,
+    pub host_path: String,
+    pub relative_path: String,
+    pub root: String,
+    pub writable: bool,
+    pub exists: bool,
+    pub is_file: bool,
+    pub mime_type: String,
+    pub byte_size: u64,
+    pub file_id: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeRootfsStatus {
+    pub rootfs_installed: bool,
+    pub proot_available: bool,
+    pub root_available: bool,
+    pub chroot_available: bool,
+    pub backend: String,
+    pub version: String,
+    pub rootfs_size_bytes: u64,
+    pub rootfs_path: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeSkillSummary {
+    pub name: String,
+    pub description: String,
+    pub path: String,
+    pub category: String,
+    pub tags: Vec<String>,
+    pub built_in: bool,
+    pub enabled: bool,
+    pub created_at_ms: u64,
+    pub modified_at_ms: u64,
+    pub files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeSkillDetail {
+    pub summary: RuntimeSkillSummary,
+    pub content: String,
+    pub raw_content: String,
+    pub skill_dir_path: String,
+    pub linked_files_json: String,
+    pub selected_file_path: String,
+    pub selected_file_content: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeMemoryFileSummary {
+    pub name: String,
+    pub size_bytes: u64,
+    pub modified_at_ms: u64,
+    pub entry_count: u32,
+    pub preview: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeMemoryFileDetail {
+    pub name: String,
+    pub size_bytes: u64,
+    pub modified_at_ms: u64,
+    pub entry_count: u32,
+    pub content: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -157,6 +227,8 @@ pub enum RuntimeEventKind {
     AttachmentImported,
     PendingAttachmentRemoved,
     PendingAttachmentsCleaned,
+    SessionRenamed,
+    SessionPinnedChanged,
     SettingsChanged,
     TurnFinished,
     TurnFailed,
@@ -191,6 +263,8 @@ impl RuntimeEventKind {
             Self::AttachmentImported => "AttachmentImported",
             Self::PendingAttachmentRemoved => "PendingAttachmentRemoved",
             Self::PendingAttachmentsCleaned => "PendingAttachmentsCleaned",
+            Self::SessionRenamed => "SessionRenamed",
+            Self::SessionPinnedChanged => "SessionPinnedChanged",
             Self::SettingsChanged => "SettingsChanged",
             Self::TurnFinished => "TurnFinished",
             Self::TurnFailed => "TurnFailed",
@@ -386,7 +460,10 @@ impl RuntimeEngine {
         let database_path = database_path(&bootstrap);
         let database = tokio.block_on(HamburDatabase::open(database_path))?;
         let filestore = FileStore::new(&bootstrap.app_files_dir)?;
-        let sandbox = SandboxService::new(&bootstrap.app_files_dir)?;
+        let sandbox = SandboxService::new_with_native_library_dir(
+            &bootstrap.app_files_dir,
+            &bootstrap.native_library_dir,
+        )?;
         let jobs = tokio.block_on(database.cleanup_pending_attachments(0))?;
         for job in jobs {
             let _ = filestore.delete_relative_if_exists(&job.relative_path);
@@ -422,6 +499,14 @@ impl RuntimeEngine {
         }
         engine.emit(RuntimeEventKind::RuntimeReady, snapshot, None)?;
         Ok(engine)
+    }
+
+    fn safe_block_on<F: std::future::Future>(&self, future: F) -> F::Output {
+        if let Ok(_handle) = tokio::runtime::Handle::try_current() {
+            tokio::task::block_in_place(|| self.tokio.block_on(future))
+        } else {
+            self.tokio.block_on(future)
+        }
     }
 
     pub fn dispatch(&self, command: RuntimeCommand) -> RuntimeCommandAck {
@@ -510,6 +595,10 @@ impl RuntimeEngine {
             }
             "CreateSession" => self.execute_create_session(command),
             "OpenSession" => self.execute_open_session(command),
+            "RenameSession" | "UpdateSessionTitle" => self.execute_rename_session(command),
+            "SetSessionPinned" | "PinSession" | "UnpinSession" => {
+                self.execute_set_session_pinned(command)
+            }
             "DeleteSession" | "SoftDeleteSession" | "HardPurgeSession" => {
                 self.execute_delete_session(command)
             }
@@ -523,18 +612,25 @@ impl RuntimeEngine {
             "UpdateModelGroupMember" => self.execute_update_model_group_member(command),
             "SetDefaultModelGroup" => self.execute_set_default_model_group(command),
             "DeleteModelGroup" => self.execute_delete_model_group(command),
+            "DeleteModelGroupMember" => self.execute_delete_model_group_member(command),
             "UpdateDefaultModelGroups" => self.execute_update_default_model_groups(command),
             "UpdateToolSettings"
             | "UpdateSkills"
             | "UpdateMemoryProjections"
             | "UpdateStartupTasks"
             | "UpdateRootfsSettings"
+            | "UpdateAppearance"
+            | "UpdateLogs"
+            | "UpdateTokenUsage"
+            | "UpdatePersona"
+            | "UpdateEnvironmentVariables"
             | "UpdateAppSetting"
             | "UpdateBrowserToolSettings"
             | "UpdateSkillEnabled"
             | "UpdateStartupTask"
             | "DeleteStartupTask"
             | "UpdateRootfsSetting" => self.execute_update_app_setting(command),
+            "DeleteSkill" => self.execute_delete_skill(command),
             "ImportAttachmentFromUri" => self.execute_import_attachment(command),
             "RemovePendingAttachment" => self.execute_remove_pending_attachment(command),
             "ClearPendingAttachments" => self.execute_clear_pending_attachments(command),
@@ -595,6 +691,80 @@ impl RuntimeEngine {
         {
             Ok(snapshot) => {
                 let _ = self.emit(RuntimeEventKind::SessionOpened, snapshot, None);
+                accepted_ack(command.command_id, command.idempotency_key)
+            }
+            Err(error) => {
+                let _ = self.emit_error(error.clone());
+                rejected_ack(command.command_id, command.idempotency_key, error)
+            }
+        }
+    }
+
+    fn execute_rename_session(&self, command: RuntimeCommand) -> RuntimeCommandAck {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return rejected_ack(
+                command.command_id,
+                command.idempotency_key,
+                HamburError::RuntimeClosed,
+            );
+        }
+        let title = command
+            .title
+            .clone()
+            .if_blank(config_payload_string(&command.payload_json, "title"))
+            .if_blank(command.content.clone())
+            .if_blank(command.chunk.clone());
+        match self
+            .tokio
+            .block_on(self.database.rename_session(&command.session_id, &title))
+        {
+            Ok(snapshot) => {
+                let _ = self.emit_session_event(
+                    RuntimeEventKind::SessionRenamed,
+                    command.session_id,
+                    String::new(),
+                    snapshot,
+                    "Session renamed".to_string(),
+                    None,
+                );
+                accepted_ack(command.command_id, command.idempotency_key)
+            }
+            Err(error) => {
+                let _ = self.emit_error(error.clone());
+                rejected_ack(command.command_id, command.idempotency_key, error)
+            }
+        }
+    }
+
+    fn execute_set_session_pinned(&self, command: RuntimeCommand) -> RuntimeCommandAck {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return rejected_ack(
+                command.command_id,
+                command.idempotency_key,
+                HamburError::RuntimeClosed,
+            );
+        }
+        let payload = config_payload_value(&command.payload_json);
+        let pinned = if command.kind == "PinSession" {
+            true
+        } else if command.kind == "UnpinSession" {
+            false
+        } else {
+            config_bool(&payload, "pinned", false)
+        };
+        match self.tokio.block_on(
+            self.database
+                .set_session_pinned(&command.session_id, pinned),
+        ) {
+            Ok(snapshot) => {
+                let _ = self.emit_session_event(
+                    RuntimeEventKind::SessionPinnedChanged,
+                    command.session_id,
+                    String::new(),
+                    snapshot,
+                    pinned.to_string(),
+                    None,
+                );
                 accepted_ack(command.command_id, command.idempotency_key)
             }
             Err(error) => {
@@ -1103,6 +1273,38 @@ impl RuntimeEngine {
         self.finish_settings_command(command, result, "Model group deleted")
     }
 
+    fn execute_delete_model_group_member(&self, command: RuntimeCommand) -> RuntimeCommandAck {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return rejected_ack(
+                command.command_id,
+                command.idempotency_key,
+                HamburError::RuntimeClosed,
+            );
+        }
+        let group_id = command.message_id.clone();
+        let provider_id = command.provider_id.clone();
+        let model_id = command.model_id.clone();
+        let result = self.tokio.block_on(async {
+            self.database
+                .delete_model_group_member(&group_id, &provider_id, &model_id)
+                .await?;
+            self.database
+                .insert_config_audit(
+                    &command.command_id,
+                    "user",
+                    "DeleteModelGroupMember",
+                    "model_group_member",
+                    &format!("{}/{}/{}", group_id, provider_id, model_id),
+                    "Model group member deleted",
+                    false,
+                    "",
+                )
+                .await?;
+            self.database.bootstrap_snapshot().await
+        });
+        self.finish_settings_command(command, result, "Model group member deleted")
+    }
+
     fn execute_update_app_setting(&self, command: RuntimeCommand) -> RuntimeCommandAck {
         if self.shutdown.load(Ordering::SeqCst) {
             return rejected_ack(
@@ -1180,6 +1382,45 @@ impl RuntimeEngine {
         }
     }
 
+    fn execute_delete_skill(&self, command: RuntimeCommand) -> RuntimeCommandAck {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return rejected_ack(
+                command.command_id,
+                command.idempotency_key,
+                HamburError::RuntimeClosed,
+            );
+        }
+        let identifier = command
+            .message_id
+            .clone()
+            .if_blank(config_payload_string(&command.payload_json, "skillId"))
+            .if_blank(config_payload_string(&command.payload_json, "skillPath"));
+        let result = self
+            .delete_skill_internal(&identifier)
+            .and_then(|deleted_path| {
+                self.tokio.block_on(async {
+                    self.database
+                        .delete_app_setting(&format!("skill_enabled:{deleted_path}"))
+                        .await
+                        .ok();
+                    self.database
+                        .insert_config_audit(
+                            &command.command_id,
+                            "user",
+                            "DeleteSkill",
+                            "skill",
+                            &deleted_path,
+                            "Skill directory deleted",
+                            false,
+                            "",
+                        )
+                        .await?;
+                    self.database.bootstrap_snapshot().await
+                })
+            });
+        self.finish_settings_command(command, result, "Skill deleted")
+    }
+
     fn execute_import_attachment(&self, command: RuntimeCommand) -> RuntimeCommandAck {
         if self.shutdown.load(Ordering::SeqCst) {
             return rejected_ack(
@@ -1208,7 +1449,22 @@ impl RuntimeEngine {
             }
         };
 
-        if !metadata.source_path.trim().is_empty() {
+        if !metadata.bytes_base64.trim().is_empty() {
+            let bytes = match BASE64_STANDARD.decode(metadata.bytes_base64.as_bytes()) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    let error =
+                        HamburError::InvalidCommand(format!("attachment bytes base64: {error}"));
+                    let _ = self.emit_error(error.clone());
+                    return rejected_ack(command.command_id, command.idempotency_key, error);
+                }
+            };
+            if let Err(error) = fs::write(&reserved.host_path, bytes) {
+                let error = HamburError::Internal(format!("write attachment bytes: {error}"));
+                let _ = self.emit_error(error.clone());
+                return rejected_ack(command.command_id, command.idempotency_key, error);
+            }
+        } else if !metadata.source_path.trim().is_empty() {
             if let Err(error) = fs::copy(&metadata.source_path, &reserved.host_path)
                 .map(|_| ())
                 .map_err(|error| HamburError::Internal(format!("copy attachment source: {error}")))
@@ -1401,7 +1657,8 @@ impl RuntimeEngine {
                 return rejected_ack(command.command_id, command.idempotency_key, error);
             }
         };
-        let attachment_ids = parse_attachment_ids(&command.payload_json);
+        let send_options = SendOptions::parse(&command.payload_json);
+        let attachment_ids = send_options.attachment_ids.clone();
         if content.trim().is_empty() && !attachment_ids.is_empty() {
             content = "Attached files.".to_string();
         }
@@ -1442,7 +1699,7 @@ impl RuntimeEngine {
         };
         let mut plan = route_plan_from_records(routes);
         let requirements = RouteRequirements {
-            requires_tool_protocol: false,
+            requires_tool_protocol: send_options.search_enabled,
             requires_image_input,
             requires_structured_output: false,
         };
@@ -1600,7 +1857,16 @@ impl RuntimeEngine {
         let tools_json = self.tools.schemas().compile_openai_tools_json();
         let stream_sources_by_route = route_snapshots
             .iter()
-            .map(|route| stream_source_for_command(&command, &content, route, &tools_json))
+            .map(|route| {
+                stream_source_for_command(
+                    &command,
+                    &content,
+                    route,
+                    &tools_json,
+                    send_options.deep_thinking_enabled,
+                    send_options.search_enabled,
+                )
+            })
             .collect::<Vec<_>>();
         let handle = self.tokio.handle().clone();
         handle.spawn(async move {
@@ -1928,22 +2194,33 @@ impl RuntimeEngine {
             return rejected_ack(command.command_id, command.idempotency_key, error);
         }
 
-        let status = self.sandbox.rootfs_status();
+        let (tasks, enabled) = self.get_startup_tasks_and_enabled();
+
         if command.kind == "ResetRootfs" {
-            let _ = fs::remove_dir_all(self.sandbox.root());
-            if let Err(error) = fs::create_dir_all(self.sandbox.root()) {
-                return rejected_ack(
-                    command.command_id,
-                    command.idempotency_key,
-                    HamburError::Internal(format!("recreate sandbox root: {error}")),
-                );
+            let payload = config_payload_value(&command.payload_json);
+            let preserve_root = config_bool(&payload, "preserveRoot", true);
+            if let Err(error) = self.sandbox.reset_rootfs(preserve_root) {
+                return rejected_ack(command.command_id, command.idempotency_key, error);
             }
         }
+
+        if let Err(error) = self.sandbox.ensure_initialized(&tasks, enabled) {
+            return rejected_ack(command.command_id, command.idempotency_key, error);
+        }
+
         if !command.session_id.trim().is_empty()
             && let Err(error) = self.sandbox.prepare_session(&command.session_id)
         {
             return rejected_ack(command.command_id, command.idempotency_key, error);
         }
+
+        let settings_snap = self
+            .tokio
+            .block_on(self.database.settings_snapshot())
+            .unwrap_or_default();
+        let requested_backend = get_rootfs_backend(&settings_snap.settings);
+        self.sandbox.update_rootfs_status(requested_backend);
+        let status = self.sandbox.rootfs_status();
         let snapshot = self
             .tokio
             .block_on(self.database.bootstrap_snapshot())
@@ -2038,7 +2315,15 @@ impl RuntimeEngine {
                 .cloned()
                 .unwrap_or_else(|| {
                     let tools_json = self.tools.schemas().compile_openai_tools_json();
-                    provider_stream_source(&session_id, &turn_id, "", &route, &tools_json)
+                    provider_stream_source(
+                        &session_id,
+                        &turn_id,
+                        "",
+                        &route,
+                        &tools_json,
+                        false,
+                        false,
+                    )
                 });
             match self
                 .clone()
@@ -3011,6 +3296,12 @@ impl RuntimeEngine {
                 "terminal" | "process" => {
                     records.push(self.execute_sandbox_tool(invocation).await);
                 }
+                "read_file" | "write_file" | "patch" | "search_files" => {
+                    records.push(self.execute_file_tool(invocation).await);
+                }
+                "memory" | "skills_list" | "skill_view" => {
+                    records.push(self.execute_knowledge_tool(invocation).await);
+                }
                 "browser_use" => {
                     records.push(
                         self.execute_browser_tool(session_id, turn_id, invocation)
@@ -3149,6 +3440,51 @@ impl RuntimeEngine {
         }
     }
 
+    fn get_startup_tasks_and_enabled(&self) -> (Vec<hambur_sandbox::StartupTask>, bool) {
+        let settings_snap = self
+            .safe_block_on(self.database.settings_snapshot())
+            .unwrap_or_default();
+        let mut tasks = Vec::new();
+        let mut enabled = true;
+        for setting in &settings_snap.settings {
+            if setting.key == "startupTasksEnabled" {
+                enabled = setting.value == "true";
+            } else if setting.key.starts_with("startup_task:") {
+                if let Ok(task) =
+                    serde_json::from_str::<hambur_sandbox::StartupTask>(&setting.value)
+                {
+                    tasks.push(task);
+                }
+            }
+        }
+        (tasks, enabled)
+    }
+
+    fn execute_sandbox_command(
+        &self,
+        session_id: &str,
+        command: &str,
+        cwd_sandbox: &str,
+        timeout_ms: u64,
+    ) -> HamburResult<hambur_sandbox::SandboxExecResult> {
+        let (tasks, enabled) = self.get_startup_tasks_and_enabled();
+        self.sandbox.ensure_initialized(&tasks, enabled)?;
+        let settings_snap = self
+            .safe_block_on(self.database.settings_snapshot())
+            .unwrap_or_default();
+        let requested_backend = get_rootfs_backend(&settings_snap.settings);
+        self.sandbox.update_rootfs_status(requested_backend);
+        let status = self.sandbox.rootfs_status();
+        if !status.available {
+            return Err(HamburError::Internal(format!(
+                "Sandbox rootfs not available: {}",
+                status.reason
+            )));
+        }
+        self.sandbox
+            .execute(session_id, command, cwd_sandbox, timeout_ms)
+    }
+
     async fn execute_sandbox_tool(&self, invocation: ToolInvocation) -> ToolExecutionRecord {
         let started_at_ms = now_ms();
         let result = match invocation.arguments_value() {
@@ -3243,7 +3579,51 @@ impl RuntimeEngine {
             .and_then(Value::as_u64)
             .unwrap_or(30_000)
             .clamp(1_000, 300_000);
-        let raw = run_terminal_command(invocation, command, &cwd.host_path, timeout_ms);
+        let raw = match self.execute_sandbox_command(
+            &invocation.session_id,
+            command,
+            &cwd.sandbox_path,
+            timeout_ms,
+        ) {
+            Ok(exec_result) => {
+                let is_error = exec_result.exit_code != 0 || exec_result.timed_out;
+                let status = if exec_result.timed_out {
+                    "timeout"
+                } else if exec_result.exit_code != 0 {
+                    "failed"
+                } else {
+                    "completed"
+                };
+                let summary = if exec_result.timed_out {
+                    "terminal timed out".to_string()
+                } else {
+                    format!(
+                        "terminal completed with exit code {}",
+                        exec_result.exit_code
+                    )
+                };
+                RawToolOutput {
+                    tool_call_id: invocation.tool_call_id.clone(),
+                    tool_name: invocation.name.clone(),
+                    is_error,
+                    content: serde_json::to_string(&exec_result).unwrap_or_default(),
+                    summary,
+                    trust_level: "untrusted".to_string(),
+                    command_or_url: command.to_string(),
+                    status: status.to_string(),
+                }
+            }
+            Err(error) => RawToolOutput {
+                tool_call_id: invocation.tool_call_id.clone(),
+                tool_name: invocation.name.clone(),
+                is_error: true,
+                content: error.to_string(),
+                summary: "sandbox execution error".to_string(),
+                trust_level: "untrusted".to_string(),
+                command_or_url: command.to_string(),
+                status: "failed".to_string(),
+            },
+        };
         self.tools.normalize_raw(raw).unwrap_or_else(|error| {
             ToolResult::failed(
                 &invocation.tool_call_id,
@@ -3260,15 +3640,43 @@ impl RuntimeEngine {
         sandbox_cwd: &str,
         host_cwd: &std::path::Path,
     ) -> ToolResult {
-        let shell = platform_shell();
-        let mut child = match Command::new(shell)
-            .arg("-lc")
-            .arg(command)
-            .current_dir(host_cwd)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
+        let (tasks, enabled) = self.get_startup_tasks_and_enabled();
+        if let Err(error) = self.sandbox.ensure_initialized(&tasks, enabled) {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                format!("sandbox initialization failed: {error}"),
+            );
+        }
+        let settings_snap = self
+            .safe_block_on(self.database.settings_snapshot())
+            .unwrap_or_default();
+        let requested_backend = get_rootfs_backend(&settings_snap.settings);
+        self.sandbox.update_rootfs_status(requested_backend);
+
+        let (program, args, envs) =
+            match self
+                .sandbox
+                .build_execution_command(&invocation.session_id, command, sandbox_cwd)
+            {
+                Ok(res) => res,
+                Err(error) => {
+                    return ToolResult::failed(
+                        &invocation.tool_call_id,
+                        &invocation.name,
+                        format!("build execution command failed: {error}"),
+                    );
+                }
+            };
+
+        let mut cmd = Command::new(&program);
+        cmd.args(&args);
+        cmd.current_dir(host_cwd);
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+
+        let mut child = match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
             Ok(child) => child,
             Err(error) => {
                 return ToolResult::failed(
@@ -3369,6 +3777,180 @@ impl RuntimeEngine {
                 &invocation.tool_call_id,
                 &invocation.name,
                 format!("unsupported process action: {action}"),
+            ),
+        }
+    }
+
+    async fn execute_file_tool(&self, invocation: ToolInvocation) -> ToolExecutionRecord {
+        let started_at_ms = now_ms();
+        let result = match invocation.arguments_value() {
+            Ok(arguments) => self.resolve_file_tool_result(&invocation, &arguments),
+            Err(error) => ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                error.to_string(),
+            ),
+        };
+        ToolExecutionRecord {
+            invocation,
+            result,
+            started_at_ms,
+            ended_at_ms: now_ms(),
+        }
+    }
+
+    fn resolve_file_tool_result(
+        &self,
+        invocation: &ToolInvocation,
+        arguments: &Value,
+    ) -> ToolResult {
+        if let Err(error) = self
+            .tools
+            .schemas()
+            .validate_arguments(&invocation.name, arguments)
+        {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                error.to_string(),
+            );
+        }
+        let result = match invocation.name.as_str() {
+            "read_file" => self.read_sandbox_file(invocation, arguments),
+            "write_file" => self.write_sandbox_file(invocation, arguments),
+            "patch" => self.patch_sandbox_file(invocation, arguments),
+            "search_files" => self.search_sandbox_files(invocation, arguments),
+            _ => Err(HamburError::InvalidCommand(format!(
+                "unknown file tool: {}",
+                invocation.name
+            ))),
+        };
+        match result {
+            Ok(value) => ToolResult {
+                tool_call_id: invocation.tool_call_id.clone(),
+                tool_name: invocation.name.clone(),
+                is_error: false,
+                summary: value
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .unwrap_or("file tool completed")
+                    .to_string(),
+                content_json: value.to_string(),
+                artifacts_json: "[]".to_string(),
+                trust_level: "trusted".to_string(),
+                truncated: false,
+                offloaded_file_id: String::new(),
+                offloaded_path: String::new(),
+                context_stub: value.to_string(),
+            },
+            Err(error) => ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                error.to_string(),
+            ),
+        }
+    }
+
+    async fn execute_knowledge_tool(&self, invocation: ToolInvocation) -> ToolExecutionRecord {
+        let started_at_ms = now_ms();
+        let result = match invocation.arguments_value() {
+            Ok(arguments) => self.resolve_knowledge_tool_result(&invocation, &arguments),
+            Err(error) => ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                error.to_string(),
+            ),
+        };
+        ToolExecutionRecord {
+            invocation,
+            result,
+            started_at_ms,
+            ended_at_ms: now_ms(),
+        }
+    }
+
+    fn resolve_knowledge_tool_result(
+        &self,
+        invocation: &ToolInvocation,
+        arguments: &Value,
+    ) -> ToolResult {
+        if let Err(error) = self
+            .tools
+            .schemas()
+            .validate_arguments(&invocation.name, arguments)
+        {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                error.to_string(),
+            );
+        }
+        let result = match invocation.name.as_str() {
+            "skills_list" => {
+                let category = arguments
+                    .get("category")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim();
+                let skills = self
+                    .list_skills_internal()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|skill| skill.enabled)
+                    .filter(|skill| category.is_empty() || skill.category == category)
+                    .map(skill_summary_json)
+                    .collect::<Vec<_>>();
+                Ok(json!({
+                    "success": true,
+                    "skills": skills,
+                    "count": skills.len(),
+                    "summary": format!("{} skills", skills.len())
+                }))
+            }
+            "skill_view" => {
+                let name = arguments
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let file_path = arguments
+                    .get("file_path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                self.get_skill_detail_internal(name, file_path)
+                    .map(skill_detail_json)
+            }
+            "memory" => self.memory_tool_result(arguments),
+            _ => Err(HamburError::InvalidCommand(format!(
+                "unknown knowledge tool: {}",
+                invocation.name
+            ))),
+        };
+        match result {
+            Ok(value) => ToolResult {
+                tool_call_id: invocation.tool_call_id.clone(),
+                tool_name: invocation.name.clone(),
+                is_error: !value
+                    .get("success")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+                summary: value
+                    .get("summary")
+                    .or_else(|| value.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("knowledge tool completed")
+                    .to_string(),
+                content_json: value.to_string(),
+                artifacts_json: "[]".to_string(),
+                trust_level: "trusted".to_string(),
+                truncated: false,
+                offloaded_file_id: String::new(),
+                offloaded_path: String::new(),
+                context_stub: value.to_string(),
+            },
+            Err(error) => ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                error.to_string(),
             ),
         }
     }
@@ -4483,7 +5065,14 @@ impl RuntimeEngine {
         let stream_sources_by_route = route_candidates
             .iter()
             .map(|candidate| {
-                stream_source_for_command(&stream_command, &child_content, candidate, &tools_json)
+                stream_source_for_command(
+                    &stream_command,
+                    &child_content,
+                    candidate,
+                    &tools_json,
+                    false,
+                    false,
+                )
             })
             .collect::<Vec<_>>();
         Ok(PreparedDelegateTurn {
@@ -4857,6 +5446,136 @@ impl RuntimeEngine {
         }
     }
 
+    pub fn resolve_sandbox_file(
+        &self,
+        session_id: String,
+        sandbox_path: String,
+    ) -> RuntimeFileResolution {
+        let resolved = match self
+            .sandbox
+            .resolve(&session_id, &sandbox_path, SandboxAccess::Read)
+        {
+            Ok(resolved) => resolved,
+            Err(_) => return RuntimeFileResolution::default(),
+        };
+        let metadata = fs::metadata(&resolved.host_path).ok();
+        let db_file = self
+            .tokio
+            .block_on(
+                self.database
+                    .resolve_file_by_sandbox_path(&session_id, &resolved.sandbox_path),
+            )
+            .ok();
+        RuntimeFileResolution {
+            sandbox_path: resolved.sandbox_path,
+            host_path: resolved.host_path.to_string_lossy().to_string(),
+            relative_path: resolved.relative_path,
+            root: resolved.root,
+            writable: resolved.writable,
+            exists: metadata.is_some(),
+            is_file: metadata.as_ref().is_some_and(|metadata| metadata.is_file()),
+            mime_type: db_file
+                .as_ref()
+                .map(|file| file.mime_type.clone())
+                .unwrap_or_else(|| "application/octet-stream".to_string()),
+            byte_size: metadata
+                .as_ref()
+                .map(|metadata| metadata.len())
+                .or_else(|| db_file.as_ref().map(|file| file.byte_size))
+                .unwrap_or_default(),
+            file_id: db_file.map(|file| file.id).unwrap_or_default(),
+        }
+    }
+
+    pub fn get_rootfs_status(&self) -> RuntimeRootfsStatus {
+        let settings_snap = self
+            .tokio
+            .block_on(self.database.settings_snapshot())
+            .unwrap_or_default();
+        let requested_backend = get_rootfs_backend(&settings_snap.settings);
+
+        // Dynamically probe status
+        let probed = self.sandbox.probe_rootfs_status(requested_backend);
+
+        let rootfs_installed = self.sandbox.is_rootfs_installed();
+
+        // Perform active su check for root & chroot capability
+        let root_check = std::process::Command::new("su")
+            .arg("-c")
+            .arg("id -u")
+            .output();
+        let root_available = match root_check {
+            Ok(out) => out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "0",
+            Err(_) => false,
+        };
+        let mut chroot_available = false;
+        if root_available {
+            let chroot_check = std::process::Command::new("su")
+                .arg("-c")
+                .arg(format!(
+                    "chroot '{}' /bin/sh -lc 'echo hambur-chroot-ok'",
+                    self.sandbox.rootfs_dir().to_string_lossy()
+                ))
+                .output();
+            if let Ok(out) = chroot_check {
+                chroot_available = out.status.success()
+                    && String::from_utf8_lossy(&out.stdout).contains("hambur-chroot-ok");
+            }
+        }
+        let proot_available = self.sandbox.probe_rootfs_status("proot").available;
+
+        let version = if rootfs_installed {
+            let version_file = self.sandbox.rootfs_dir().join(".hambur-rootfs.version");
+            fs::read_to_string(&version_file)
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        } else {
+            String::new()
+        };
+
+        let size_bytes = dir_size(self.sandbox.rootfs_dir());
+
+        RuntimeRootfsStatus {
+            rootfs_installed,
+            proot_available,
+            root_available,
+            chroot_available,
+            backend: probed.backend,
+            version,
+            rootfs_size_bytes: size_bytes,
+            rootfs_path: self.sandbox.rootfs_dir().to_string_lossy().to_string(),
+        }
+    }
+
+    pub fn list_skills(&self) -> Vec<RuntimeSkillSummary> {
+        self.list_skills_internal().unwrap_or_default()
+    }
+
+    pub fn get_skill_detail(&self, identifier: String, file_path: String) -> RuntimeSkillDetail {
+        self.get_skill_detail_internal(&identifier, &file_path)
+            .unwrap_or_default()
+    }
+
+    pub fn delete_skill(&self, identifier: String) -> RuntimeCommandAck {
+        let command = RuntimeCommand {
+            kind: "DeleteSkill".to_string(),
+            message_id: identifier.clone(),
+            idempotency_key: format!("skill:{identifier}:delete:{}", new_id("attempt")),
+            ..RuntimeCommand::default()
+        };
+        self.dispatch(command)
+    }
+
+    pub fn list_memory_files(&self) -> Vec<RuntimeMemoryFileSummary> {
+        self.list_memory_files_internal().unwrap_or_default()
+    }
+
+    pub fn get_memory_file_detail(&self, name: String) -> RuntimeMemoryFileDetail {
+        self.get_memory_file_detail_internal(&name)
+            .unwrap_or_default()
+    }
+
     pub fn shutdown(&self) {
         if self.shutdown.swap(true, Ordering::SeqCst) {
             return;
@@ -5078,8 +5797,1064 @@ impl RuntimeEngine {
     }
 }
 
+fn safe_join(root: &Path, relative: &str) -> HamburResult<PathBuf> {
+    if relative.contains('\0')
+        || relative.contains("..")
+        || relative.contains('\\')
+        || Path::new(relative).is_absolute()
+    {
+        return Err(HamburError::InvalidCommand(
+            "path must not escape root".to_string(),
+        ));
+    }
+    let root = root
+        .canonicalize()
+        .or_else(|_| {
+            fs::create_dir_all(root)?;
+            root.canonicalize()
+        })
+        .map_err(|error| HamburError::Internal(format!("canonicalize root: {error}")))?;
+    let candidate = root.join(relative);
+    let check_path = if candidate.exists() {
+        candidate.canonicalize().map_err(|error| {
+            HamburError::Internal(format!(
+                "canonicalize path {}: {error}",
+                candidate.display()
+            ))
+        })?
+    } else {
+        candidate
+            .parent()
+            .and_then(|parent| parent.canonicalize().ok())
+            .unwrap_or_else(|| root.clone())
+    };
+    if !check_path.starts_with(&root) {
+        return Err(HamburError::InvalidCommand("path escaped root".to_string()));
+    }
+    Ok(candidate)
+}
+
+fn relative_path(root: &Path, path: &Path) -> HamburResult<String> {
+    let root = root
+        .canonicalize()
+        .map_err(|error| HamburError::Internal(format!("canonicalize root: {error}")))?;
+    let path = path
+        .canonicalize()
+        .map_err(|error| HamburError::Internal(format!("canonicalize path: {error}")))?;
+    if !path.starts_with(&root) {
+        return Err(HamburError::InvalidCommand("path escaped root".to_string()));
+    }
+    Ok(path
+        .strip_prefix(root)
+        .unwrap_or(&path)
+        .to_string_lossy()
+        .replace('\\', "/"))
+}
+
+fn collect_named_files(root: &Path, name: &str, output: &mut Vec<PathBuf>) -> HamburResult<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(root)
+        .map_err(|error| HamburError::Internal(format!("read directory: {error}")))?
+    {
+        let entry = entry
+            .map_err(|error| HamburError::Internal(format!("read directory entry: {error}")))?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_named_files(&path, name, output)?;
+        } else if path.file_name().and_then(|value| value.to_str()) == Some(name) {
+            output.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn list_relative_files(root: &Path) -> HamburResult<Vec<String>> {
+    let mut output = Vec::new();
+    collect_relative_files(root, root, &mut output)?;
+    output.sort();
+    Ok(output)
+}
+
+fn collect_relative_files(
+    root: &Path,
+    current: &Path,
+    output: &mut Vec<String>,
+) -> HamburResult<()> {
+    if !current.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(current)
+        .map_err(|error| HamburError::Internal(format!("read directory: {error}")))?
+    {
+        let entry = entry
+            .map_err(|error| HamburError::Internal(format!("read directory entry: {error}")))?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_relative_files(root, &path, output)?;
+        } else if path.is_file() {
+            output.push(
+                path.strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn parse_frontmatter(raw: &str) -> HashMap<String, Vec<String>> {
+    if !raw.starts_with("---\n") {
+        return HashMap::new();
+    }
+    let Some(end) = raw[4..].find("\n---") else {
+        return HashMap::new();
+    };
+    let yaml = &raw[4..4 + end];
+    yaml.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') || !trimmed.contains(':') {
+                return None;
+            }
+            let key = trimmed.split_once(':')?.0.trim().to_string();
+            let value = trimmed.split_once(':')?.1.trim();
+            Some((key, parse_frontmatter_value(value)))
+        })
+        .collect()
+}
+
+fn parse_frontmatter_value(value: &str) -> Vec<String> {
+    let unquoted = value.trim().trim_matches('"').trim_matches('\'');
+    if unquoted.starts_with('[') && unquoted.ends_with(']') {
+        return unquoted
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .split(',')
+            .map(|item| item.trim().trim_matches('"').trim_matches('\'').to_string())
+            .filter(|item| !item.is_empty())
+            .collect();
+    }
+    if unquoted.is_empty() {
+        Vec::new()
+    } else {
+        vec![unquoted.to_string()]
+    }
+}
+
+fn strip_frontmatter(raw: &str) -> String {
+    if !raw.starts_with("---\n") {
+        return raw.to_string();
+    }
+    let Some(end) = raw[4..].find("\n---") else {
+        return raw.to_string();
+    };
+    raw[4 + end + 4..].trim_start_matches('\n').to_string()
+}
+
+fn linked_skill_files_json(skill_dir: &Path) -> String {
+    let mut groups = serde_json::Map::new();
+    for child in ["references", "templates", "scripts", "assets"] {
+        let dir = skill_dir.join(child);
+        if !dir.is_dir() {
+            continue;
+        }
+        let files = list_relative_files(&dir)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|path| Value::String(format!("{child}/{path}")))
+            .collect::<Vec<_>>();
+        if !files.is_empty() {
+            groups.insert(child.to_string(), Value::Array(files));
+        }
+    }
+    Value::Object(groups).to_string()
+}
+
+fn system_time_to_ms(value: std::time::SystemTime) -> Option<u64> {
+    value
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis() as u64)
+}
+
+fn read_memory_file_content(path: &Path) -> HamburResult<String> {
+    let raw = fs::read_to_string(path).unwrap_or_default();
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if is_managed_memory_file(name) {
+        let entries = parse_memory_entries(&raw)
+            .into_iter()
+            .filter(|entry| !is_review_status_entry(entry))
+            .collect::<Vec<_>>();
+        Ok(entries.join(MEMORY_ENTRY_DELIMITER))
+    } else {
+        Ok(raw)
+    }
+}
+
+fn parse_memory_entries(raw: &str) -> Vec<String> {
+    raw.split(MEMORY_ENTRY_DELIMITER)
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn count_memory_entries(raw: &str) -> u32 {
+    u32::try_from(parse_memory_entries(raw).len()).unwrap_or(u32::MAX)
+}
+
+fn memory_preview(raw: &str) -> String {
+    raw.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && *line != "§")
+        .unwrap_or_default()
+        .chars()
+        .take(240)
+        .collect()
+}
+
+fn memory_file_sort_priority(name: &str) -> u8 {
+    if name.eq_ignore_ascii_case(MEMORY_FILE_NAME) {
+        0
+    } else if name.eq_ignore_ascii_case(USER_FILE_NAME) {
+        1
+    } else {
+        2
+    }
+}
+
+fn is_managed_memory_file(name: &str) -> bool {
+    name.eq_ignore_ascii_case(MEMORY_FILE_NAME) || name.eq_ignore_ascii_case(USER_FILE_NAME)
+}
+
+fn is_review_status_entry(content: &str) -> bool {
+    let compact = content
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    if compact.is_empty() {
+        return false;
+    }
+    if compact == "no_changes" || compact == "\"no_changes\"" {
+        return true;
+    }
+    compact.starts_with('{')
+        && (compact.contains("\"memory_review\"")
+            || compact.contains("\"changed_targets\"")
+            || compact.contains("\"action_counts\""))
+}
+
+fn normalize_tool_sandbox_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        "/var/hambur/workspace".to_string()
+    } else if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/var/hambur/workspace/{trimmed}")
+    }
+}
+
+fn collect_all_files(root: &Path, output: &mut Vec<PathBuf>) -> HamburResult<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(root)
+        .map_err(|error| HamburError::Internal(format!("read directory: {error}")))?
+    {
+        let entry = entry
+            .map_err(|error| HamburError::Internal(format!("read directory entry: {error}")))?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_all_files(&path, output)?;
+        } else if path.is_file() {
+            output.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn path_for_search_result(resolved: &hambur_sandbox::SandboxPathResolution, file: &Path) -> String {
+    if resolved.host_path.is_file() {
+        return resolved.sandbox_path.clone();
+    }
+    let relative = file
+        .strip_prefix(&resolved.host_path)
+        .unwrap_or(file)
+        .to_string_lossy()
+        .replace('\\', "/");
+    if relative.is_empty() {
+        resolved.sandbox_path.clone()
+    } else {
+        format!(
+            "{}/{}",
+            resolved.sandbox_path.trim_end_matches('/'),
+            relative.trim_start_matches('/')
+        )
+    }
+}
+
+fn write_memory_entries(path: &Path, entries: &[String]) -> HamburResult<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| HamburError::Internal(format!("create memory parent: {error}")))?;
+    }
+    fs::write(path, entries.join(MEMORY_ENTRY_DELIMITER)).map_err(|error| {
+        HamburError::Internal(format!("write memory file {}: {error}", path.display()))
+    })
+}
+
+fn memory_response(
+    success: bool,
+    target: &str,
+    entries: &[String],
+    message: &str,
+    error: &str,
+) -> Value {
+    let limit = if target == "user" { 1375 } else { 2200 };
+    let current = entries.join(MEMORY_ENTRY_DELIMITER).len();
+    let pct = if limit == 0 {
+        0
+    } else {
+        ((current as f32 / limit as f32) * 100.0).round() as u32
+    }
+    .min(100);
+    json!({
+        "success": success,
+        "target": target,
+        "entries": entries,
+        "usage": format!("{pct}% - {current}/{limit} chars"),
+        "entry_count": entries.len(),
+        "message": message,
+        "error": error,
+        "summary": if success { message } else { error }
+    })
+}
+
+fn skill_summary_json(skill: RuntimeSkillSummary) -> Value {
+    json!({
+        "name": skill.name,
+        "description": skill.description,
+        "path": format!("{SANDBOX_SKILLS_PATH}/{}", skill.path),
+        "category": skill.category,
+        "tags": skill.tags,
+        "builtIn": skill.built_in,
+        "enabled": skill.enabled,
+        "createdAtMs": skill.created_at_ms,
+        "modifiedAtMs": skill.modified_at_ms,
+        "files": skill.files
+    })
+}
+
+fn skill_detail_json(detail: RuntimeSkillDetail) -> Value {
+    json!({
+        "success": true,
+        "name": detail.summary.name,
+        "description": detail.summary.description,
+        "path": format!("{SANDBOX_SKILLS_PATH}/{}", detail.summary.path),
+        "skillDir": format!("{SANDBOX_SKILLS_PATH}/{}", detail.skill_dir_path),
+        "category": detail.summary.category,
+        "tags": detail.summary.tags,
+        "enabled": detail.summary.enabled,
+        "files": detail.summary.files,
+        "linkedFiles": serde_json::from_str::<Value>(&detail.linked_files_json).unwrap_or_else(|_| json!({})),
+        "content": detail.content,
+        "filePath": detail.selected_file_path,
+        "fileContent": detail.selected_file_content,
+        "summary": "skill loaded"
+    })
+}
+
 fn database_path(bootstrap: &AppBootstrap) -> PathBuf {
     PathBuf::from(&bootstrap.app_files_dir).join("hambur.db")
+}
+
+const SANDBOX_SKILLS_PATH: &str = "/var/hambur/skills";
+const SKILL_MAX_LINKED_FILE_BYTES: u64 = 512_000;
+const MEMORY_FILE_NAME: &str = "MEMORY.md";
+const USER_FILE_NAME: &str = "USER.md";
+const MEMORY_ENTRY_DELIMITER: &str = "\n§\n";
+
+impl RuntimeEngine {
+    fn skills_root(&self) -> PathBuf {
+        PathBuf::from(&self.bootstrap.app_files_dir)
+            .join("sandbox")
+            .join("global")
+            .join("skills")
+    }
+
+    fn memory_root(&self) -> PathBuf {
+        PathBuf::from(&self.bootstrap.app_files_dir)
+            .join("sandbox")
+            .join("global")
+            .join("memory")
+    }
+
+    fn list_skills_internal(&self) -> HamburResult<Vec<RuntimeSkillSummary>> {
+        let root = self.skills_root();
+        fs::create_dir_all(&root)
+            .map_err(|error| HamburError::Internal(format!("create skills root: {error}")))?;
+        let disabled = self.disabled_skill_paths();
+        let mut skill_files = Vec::new();
+        collect_named_files(&root, "SKILL.md", &mut skill_files)?;
+        let mut skills = skill_files
+            .into_iter()
+            .filter_map(|path| self.load_skill_from_file(&root, &path, &disabled).ok())
+            .map(|detail| detail.summary)
+            .collect::<Vec<_>>();
+        skills.sort_by(|a, b| {
+            a.category
+                .cmp(&b.category)
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        Ok(skills)
+    }
+
+    fn get_skill_detail_internal(
+        &self,
+        identifier: &str,
+        selected_file_path: &str,
+    ) -> HamburResult<RuntimeSkillDetail> {
+        let root = self.skills_root();
+        fs::create_dir_all(&root)
+            .map_err(|error| HamburError::Internal(format!("create skills root: {error}")))?;
+        let disabled = self.disabled_skill_paths();
+        let skill_file = self.resolve_skill_file(&root, identifier)?;
+        let mut detail = self.load_skill_from_file(&root, &skill_file, &disabled)?;
+        let file_path = selected_file_path.trim().trim_start_matches('/');
+        if !file_path.is_empty() {
+            let skill_dir = root.join(&detail.skill_dir_path);
+            let selected = safe_join(&skill_dir, file_path)?;
+            if !selected.is_file() {
+                return Err(HamburError::InvalidCommand(format!(
+                    "skill file not found: {file_path}"
+                )));
+            }
+            let metadata = fs::metadata(&selected).map_err(|error| {
+                HamburError::Internal(format!("read skill file metadata: {error}"))
+            })?;
+            if metadata.len() > SKILL_MAX_LINKED_FILE_BYTES {
+                return Err(HamburError::InvalidCommand(
+                    "skill file is too large to load".to_string(),
+                ));
+            }
+            detail.selected_file_path = file_path.to_string();
+            detail.selected_file_content = fs::read_to_string(&selected).map_err(|error| {
+                HamburError::Internal(format!("read skill file {}: {error}", selected.display()))
+            })?;
+        }
+        Ok(detail)
+    }
+
+    fn delete_skill_internal(&self, identifier: &str) -> HamburResult<String> {
+        let root = self.skills_root();
+        let skill_file = self.resolve_skill_file(&root, identifier)?;
+        let skill_dir = skill_file.parent().ok_or_else(|| {
+            HamburError::InvalidCommand(format!("skill directory not found: {identifier}"))
+        })?;
+        if !skill_dir.join("SKILL.md").is_file() {
+            return Err(HamburError::InvalidCommand(format!(
+                "skill not found: {identifier}"
+            )));
+        }
+        let relative = relative_path(&root, &skill_file)?.replace('\\', "/");
+        fs::remove_dir_all(skill_dir)
+            .map_err(|error| HamburError::Internal(format!("delete skill directory: {error}")))?;
+        Ok(relative)
+    }
+
+    fn resolve_skill_file(&self, root: &PathBuf, identifier: &str) -> HamburResult<PathBuf> {
+        let raw = identifier.trim();
+        let normalized = raw
+            .strip_prefix(SANDBOX_SKILLS_PATH)
+            .unwrap_or(raw)
+            .trim_start_matches('/')
+            .strip_prefix("skills/")
+            .unwrap_or_else(|| {
+                raw.strip_prefix(SANDBOX_SKILLS_PATH)
+                    .unwrap_or(raw)
+                    .trim_start_matches('/')
+            });
+        if normalized.is_empty()
+            || normalized.contains("..")
+            || normalized.contains('\\')
+            || normalized.starts_with('/')
+        {
+            return Err(HamburError::InvalidCommand(
+                "invalid skill identifier".to_string(),
+            ));
+        }
+        let candidates = [
+            normalized.to_string(),
+            format!("{normalized}/SKILL.md"),
+            format!("{normalized}.md"),
+        ];
+        for candidate in candidates {
+            let path = safe_join(root, &candidate)?;
+            if path.is_file() && path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md")
+            {
+                return Ok(path);
+            }
+        }
+        let lowered = normalized.to_ascii_lowercase();
+        for skill in self.list_skills_internal()? {
+            let path_without_file = skill.path.trim_end_matches("/SKILL.md");
+            if skill.name.eq_ignore_ascii_case(&lowered)
+                || skill.name.eq_ignore_ascii_case(normalized)
+                || path_without_file.eq_ignore_ascii_case(normalized)
+                || path_without_file
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(normalized))
+            {
+                return safe_join(root, &skill.path);
+            }
+        }
+        Err(HamburError::InvalidCommand(format!(
+            "skill not found: {identifier}"
+        )))
+    }
+
+    fn load_skill_from_file(
+        &self,
+        root: &PathBuf,
+        skill_file: &PathBuf,
+        disabled: &HashSet<String>,
+    ) -> HamburResult<RuntimeSkillDetail> {
+        let raw = fs::read_to_string(skill_file).map_err(|error| {
+            HamburError::Internal(format!("read skill {}: {error}", skill_file.display()))
+        })?;
+        let path = relative_path(root, skill_file)?.replace('\\', "/");
+        let skill_dir_path = path.trim_end_matches("/SKILL.md").to_string();
+        let skill_dir = root.join(&skill_dir_path);
+        let frontmatter = parse_frontmatter(&raw);
+        let body = strip_frontmatter(&raw);
+        let name = frontmatter
+            .get("name")
+            .and_then(|values| values.first())
+            .cloned()
+            .unwrap_or_else(|| {
+                skill_dir_path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("skill")
+                    .to_string()
+            });
+        let description = frontmatter
+            .get("description")
+            .and_then(|values| values.first())
+            .cloned()
+            .unwrap_or_default();
+        let tags = frontmatter.get("tags").cloned().unwrap_or_default();
+        let category = skill_dir_path
+            .rsplit_once('/')
+            .map(|(category, _)| category.to_string())
+            .unwrap_or_default();
+        let files = list_relative_files(&skill_dir)?;
+        let modified_at_ms = files
+            .iter()
+            .filter_map(|file| fs::metadata(skill_dir.join(file)).ok())
+            .filter_map(|metadata| metadata.modified().ok())
+            .filter_map(system_time_to_ms)
+            .max()
+            .unwrap_or_default();
+        let created_at_ms = fs::metadata(&skill_dir)
+            .ok()
+            .and_then(|metadata| metadata.created().ok())
+            .and_then(system_time_to_ms)
+            .unwrap_or(modified_at_ms);
+        let linked_files_json = linked_skill_files_json(&skill_dir);
+        Ok(RuntimeSkillDetail {
+            summary: RuntimeSkillSummary {
+                name,
+                description: description.chars().take(320).collect(),
+                path: path.clone(),
+                category,
+                tags,
+                built_in: path.starts_with("system/"),
+                enabled: !disabled.contains(&path),
+                created_at_ms,
+                modified_at_ms,
+                files,
+            },
+            content: body,
+            raw_content: raw,
+            skill_dir_path,
+            linked_files_json,
+            selected_file_path: String::new(),
+            selected_file_content: String::new(),
+        })
+    }
+
+    fn disabled_skill_paths(&self) -> HashSet<String> {
+        self.tokio
+            .block_on(self.database.settings_snapshot())
+            .map(|snapshot| {
+                snapshot
+                    .settings
+                    .into_iter()
+                    .filter_map(|setting| {
+                        setting
+                            .key
+                            .strip_prefix("skill_enabled:")
+                            .filter(|_| setting.value == "false")
+                            .map(ToString::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn list_memory_files_internal(&self) -> HamburResult<Vec<RuntimeMemoryFileSummary>> {
+        let root = self.memory_root();
+        fs::create_dir_all(&root)
+            .map_err(|error| HamburError::Internal(format!("create memory root: {error}")))?;
+        let mut files = Vec::new();
+        for entry in fs::read_dir(&root)
+            .map_err(|error| HamburError::Internal(format!("read memory root: {error}")))?
+        {
+            let entry = entry
+                .map_err(|error| HamburError::Internal(format!("read memory entry: {error}")))?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !name.to_ascii_lowercase().ends_with(".md") {
+                continue;
+            }
+            let raw = read_memory_file_content(&path)?;
+            let metadata = fs::metadata(&path)
+                .map_err(|error| HamburError::Internal(format!("memory metadata: {error}")))?;
+            files.push(RuntimeMemoryFileSummary {
+                name: name.to_string(),
+                size_bytes: metadata.len(),
+                modified_at_ms: metadata
+                    .modified()
+                    .ok()
+                    .and_then(system_time_to_ms)
+                    .unwrap_or_default(),
+                entry_count: count_memory_entries(&raw),
+                preview: memory_preview(&raw),
+            });
+        }
+        files.sort_by(|a, b| {
+            memory_file_sort_priority(&a.name)
+                .cmp(&memory_file_sort_priority(&b.name))
+                .then_with(|| {
+                    a.name
+                        .to_ascii_lowercase()
+                        .cmp(&b.name.to_ascii_lowercase())
+                })
+        });
+        Ok(files)
+    }
+
+    fn get_memory_file_detail_internal(&self, name: &str) -> HamburResult<RuntimeMemoryFileDetail> {
+        let root = self.memory_root();
+        fs::create_dir_all(&root)
+            .map_err(|error| HamburError::Internal(format!("create memory root: {error}")))?;
+        let clean = name.trim();
+        if clean.is_empty()
+            || clean.contains('/')
+            || clean.contains('\\')
+            || !clean.to_ascii_lowercase().ends_with(".md")
+        {
+            return Err(HamburError::InvalidCommand(format!(
+                "invalid memory file name: {name}"
+            )));
+        }
+        let path = safe_join(&root, clean)?;
+        if !path.is_file() {
+            return Err(HamburError::InvalidCommand(format!(
+                "memory file not found: {clean}"
+            )));
+        }
+        let raw = read_memory_file_content(&path)?;
+        let metadata = fs::metadata(&path)
+            .map_err(|error| HamburError::Internal(format!("memory metadata: {error}")))?;
+        Ok(RuntimeMemoryFileDetail {
+            name: clean.to_string(),
+            size_bytes: metadata.len(),
+            modified_at_ms: metadata
+                .modified()
+                .ok()
+                .and_then(system_time_to_ms)
+                .unwrap_or_default(),
+            entry_count: count_memory_entries(&raw),
+            content: raw,
+        })
+    }
+
+    fn resolve_tool_sandbox_path(
+        &self,
+        session_id: &str,
+        raw_path: &str,
+        access: SandboxAccess,
+    ) -> HamburResult<hambur_sandbox::SandboxPathResolution> {
+        let path = normalize_tool_sandbox_path(raw_path);
+        self.sandbox.resolve(session_id, &path, access)
+    }
+
+    fn read_sandbox_file(
+        &self,
+        invocation: &ToolInvocation,
+        arguments: &Value,
+    ) -> HamburResult<Value> {
+        let path = arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let offset = arguments
+            .get("offset")
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .max(1);
+        let limit = arguments
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(500)
+            .clamp(1, 2000);
+        let resolved =
+            self.resolve_tool_sandbox_path(&invocation.session_id, path, SandboxAccess::Read)?;
+        let content = fs::read_to_string(&resolved.host_path).map_err(|error| {
+            HamburError::InvalidCommand(format!("read file {}: {error}", resolved.sandbox_path))
+        })?;
+        let lines = content.lines().collect::<Vec<_>>();
+        let start = usize::try_from(offset.saturating_sub(1)).unwrap_or(usize::MAX);
+        let limit = usize::try_from(limit).unwrap_or(2000);
+        let rendered = lines
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(limit)
+            .map(|(index, line)| format!("{}|{}", index + 1, line))
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "path": resolved.sandbox_path,
+            "offset": offset,
+            "limit": limit,
+            "totalLines": lines.len(),
+            "content": rendered.join("\n"),
+            "summary": format!("read {} lines", rendered.len())
+        }))
+    }
+
+    fn write_sandbox_file(
+        &self,
+        invocation: &ToolInvocation,
+        arguments: &Value,
+    ) -> HamburResult<Value> {
+        let path = arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let content = arguments
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let resolved =
+            self.resolve_tool_sandbox_path(&invocation.session_id, path, SandboxAccess::Write)?;
+        if let Some(parent) = resolved.host_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| HamburError::Internal(format!("create parent: {error}")))?;
+        }
+        fs::write(&resolved.host_path, content.as_bytes())
+            .map_err(|error| HamburError::Internal(format!("write file: {error}")))?;
+        Ok(json!({
+            "path": resolved.sandbox_path,
+            "bytes": content.len(),
+            "summary": "file written"
+        }))
+    }
+
+    fn patch_sandbox_file(
+        &self,
+        invocation: &ToolInvocation,
+        arguments: &Value,
+    ) -> HamburResult<Value> {
+        let mode = arguments
+            .get("mode")
+            .and_then(Value::as_str)
+            .unwrap_or("replace");
+        if mode == "patch" {
+            return Err(HamburError::InvalidCommand(
+                "patch mode='patch' is not implemented; use mode='replace'".to_string(),
+            ));
+        }
+        let path = arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let old = arguments
+            .get("old_string")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let new = arguments
+            .get("new_string")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if old.is_empty() {
+            return Err(HamburError::InvalidCommand(
+                "old_string must not be empty".to_string(),
+            ));
+        }
+        let replace_all = arguments
+            .get("replace_all")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let resolved =
+            self.resolve_tool_sandbox_path(&invocation.session_id, path, SandboxAccess::Write)?;
+        let content = fs::read_to_string(&resolved.host_path)
+            .map_err(|error| HamburError::InvalidCommand(format!("read file: {error}")))?;
+        let count = content.matches(old).count();
+        if count == 0 {
+            return Err(HamburError::InvalidCommand(
+                "old_string was not found".to_string(),
+            ));
+        }
+        if !replace_all && count > 1 {
+            return Err(HamburError::InvalidCommand(format!(
+                "old_string matched {count} times; pass replace_all=true or add context"
+            )));
+        }
+        let updated = if replace_all {
+            content.replace(old, new)
+        } else {
+            content.replacen(old, new, 1)
+        };
+        fs::write(&resolved.host_path, updated.as_bytes())
+            .map_err(|error| HamburError::Internal(format!("write patched file: {error}")))?;
+        Ok(json!({
+            "path": resolved.sandbox_path,
+            "replacements": if replace_all { count } else { 1 },
+            "summary": "file patched"
+        }))
+    }
+
+    fn search_sandbox_files(
+        &self,
+        invocation: &ToolInvocation,
+        arguments: &Value,
+    ) -> HamburResult<Value> {
+        let pattern = arguments
+            .get("pattern")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if pattern.is_empty() {
+            return Err(HamburError::InvalidCommand(
+                "pattern must not be empty".to_string(),
+            ));
+        }
+        let target = arguments
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or("content");
+        let path = arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or("/var/hambur/workspace");
+        let limit = arguments
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(50)
+            .clamp(1, 500) as usize;
+        let offset = arguments.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let resolved =
+            self.resolve_tool_sandbox_path(&invocation.session_id, path, SandboxAccess::Read)?;
+        let mut files = Vec::new();
+        if resolved.host_path.is_file() {
+            files.push(resolved.host_path.clone());
+        } else {
+            collect_all_files(&resolved.host_path, &mut files)?;
+        }
+        let mut results = Vec::new();
+        if target == "files" {
+            for file in files {
+                let relative = file
+                    .strip_prefix(&resolved.host_path)
+                    .unwrap_or(&file)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if file
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .contains(pattern)
+                    || relative.contains(pattern)
+                {
+                    results.push(json!({"path": path_for_search_result(&resolved, &file)}));
+                }
+            }
+        } else {
+            for file in files {
+                let Ok(content) = fs::read_to_string(&file) else {
+                    continue;
+                };
+                for (index, line) in content.lines().enumerate() {
+                    if line.contains(pattern) {
+                        results.push(json!({
+                            "path": path_for_search_result(&resolved, &file),
+                            "line": index + 1,
+                            "content": line
+                        }));
+                    }
+                }
+            }
+        }
+        let total = results.len();
+        let page = results
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "pattern": pattern,
+            "target": target,
+            "results": page,
+            "total": total,
+            "summary": format!("{} matches", total)
+        }))
+    }
+
+    fn memory_tool_result(&self, arguments: &Value) -> HamburResult<Value> {
+        let target = arguments
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or("memory");
+        let target = if target.eq_ignore_ascii_case("user") {
+            "user"
+        } else {
+            "memory"
+        };
+        let action = arguments
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let root = self.memory_root();
+        fs::create_dir_all(&root)
+            .map_err(|error| HamburError::Internal(format!("create memory root: {error}")))?;
+        let path = root.join(if target == "user" {
+            USER_FILE_NAME
+        } else {
+            MEMORY_FILE_NAME
+        });
+        let mut entries = parse_memory_entries(&read_memory_file_content(&path)?);
+        let result = match action {
+            "read" => memory_response(true, target, &entries, "Entries loaded.", ""),
+            "add" => {
+                let content = arguments
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                if content.is_empty() {
+                    memory_response(false, target, &entries, "", "Content cannot be empty.")
+                } else if is_review_status_entry(&content) {
+                    memory_response(
+                        false,
+                        target,
+                        &entries,
+                        "",
+                        "Memory review status is not durable memory and must not be stored.",
+                    )
+                } else if entries.contains(&content) {
+                    memory_response(
+                        true,
+                        target,
+                        &entries,
+                        "Entry already exists (no duplicate added).",
+                        "",
+                    )
+                } else {
+                    entries.push(content);
+                    write_memory_entries(&path, &entries)?;
+                    memory_response(true, target, &entries, "Entry added.", "")
+                }
+            }
+            "replace" => {
+                let old = arguments
+                    .get("old_text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim();
+                let content = arguments
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim();
+                if old.is_empty() || content.is_empty() {
+                    memory_response(
+                        false,
+                        target,
+                        &entries,
+                        "",
+                        "old_text and content are required.",
+                    )
+                } else {
+                    let matches = entries
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, entry)| entry.contains(old))
+                        .map(|(index, _)| index)
+                        .collect::<Vec<_>>();
+                    if matches.len() != 1 {
+                        memory_response(
+                            false,
+                            target,
+                            &entries,
+                            "",
+                            "Expected exactly one matching entry.",
+                        )
+                    } else {
+                        entries[matches[0]] = content.to_string();
+                        write_memory_entries(&path, &entries)?;
+                        memory_response(true, target, &entries, "Entry replaced.", "")
+                    }
+                }
+            }
+            "remove" => {
+                let old = arguments
+                    .get("old_text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim();
+                let matches = entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, entry)| entry.contains(old))
+                    .map(|(index, _)| index)
+                    .collect::<Vec<_>>();
+                if old.is_empty() || matches.len() != 1 {
+                    memory_response(
+                        false,
+                        target,
+                        &entries,
+                        "",
+                        "Expected exactly one matching entry.",
+                    )
+                } else {
+                    entries.remove(matches[0]);
+                    write_memory_entries(&path, &entries)?;
+                    memory_response(true, target, &entries, "Entry removed.", "")
+                }
+            }
+            _ => memory_response(false, target, &entries, "", "Unknown memory action."),
+        };
+        Ok(result)
+    }
 }
 
 fn normalize_command(mut command: RuntimeCommand) -> RuntimeCommand {
@@ -5114,8 +6889,20 @@ fn validate_command(command: &RuntimeCommand) -> HamburResult<()> {
 
     match command.kind.as_str() {
         "Initialize" | "Shutdown" | "CreateSession" => Ok(()),
-        "OpenSession" | "DeleteSession" | "SoftDeleteSession" | "HardPurgeSession" => {
-            require_session_id(command)
+        "OpenSession" | "DeleteSession" | "SoftDeleteSession" | "HardPurgeSession"
+        | "SetSessionPinned" | "PinSession" | "UnpinSession" => require_session_id(command),
+        "RenameSession" | "UpdateSessionTitle" => {
+            require_session_id(command)?;
+            if command.title.trim().is_empty()
+                && command.content.trim().is_empty()
+                && command.chunk.trim().is_empty()
+                && config_payload_string(&command.payload_json, "title").is_empty()
+            {
+                return Err(HamburError::InvalidCommand(
+                    "session title must not be empty".to_string(),
+                ));
+            }
+            Ok(())
         }
         "UpdateProvider" => {
             if command.chunk.trim().is_empty() {
@@ -5185,11 +6972,28 @@ fn validate_command(command: &RuntimeCommand) -> HamburResult<()> {
             }
             Ok(())
         }
+        "DeleteModelGroupMember" => {
+            if command.message_id.is_empty()
+                || command.provider_id.is_empty()
+                || command.model_id.is_empty()
+            {
+                return Err(HamburError::InvalidCommand(
+                    "group_id (message_id), provider_id, and model_id must not be empty"
+                        .to_string(),
+                ));
+            }
+            Ok(())
+        }
         "UpdateToolSettings"
         | "UpdateSkills"
         | "UpdateMemoryProjections"
         | "UpdateStartupTasks"
         | "UpdateRootfsSettings"
+        | "UpdateAppearance"
+        | "UpdateLogs"
+        | "UpdateTokenUsage"
+        | "UpdatePersona"
+        | "UpdateEnvironmentVariables"
         | "UpdateAppSetting"
         | "UpdateBrowserToolSettings"
         | "UpdateSkillEnabled"
@@ -5199,6 +7003,17 @@ fn validate_command(command: &RuntimeCommand) -> HamburResult<()> {
             if command.payload_json.trim().is_empty() {
                 return Err(HamburError::InvalidCommand(
                     "setting payload_json must not be empty".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        "DeleteSkill" => {
+            if command.message_id.trim().is_empty()
+                && config_payload_string(&command.payload_json, "skillId").is_empty()
+                && config_payload_string(&command.payload_json, "skillPath").is_empty()
+            {
+                return Err(HamburError::InvalidCommand(
+                    "skill id must not be empty".to_string(),
                 ));
             }
             Ok(())
@@ -5363,6 +7178,8 @@ fn stream_source_for_command(
     content: &str,
     route: &ModelRouteSnapshot,
     tools_json: &str,
+    deep_thinking_enabled: bool,
+    search_enabled: bool,
 ) -> RouteStreamSource {
     let payload = command.payload_json.trim();
     if payload.starts_with("data:") {
@@ -5405,6 +7222,8 @@ fn stream_source_for_command(
         content,
         route,
         tools_json,
+        deep_thinking_enabled,
+        search_enabled,
     )
 }
 
@@ -5414,19 +7233,28 @@ fn provider_stream_source(
     content: &str,
     route: &ModelRouteSnapshot,
     tools_json: &str,
+    deep_thinking_enabled: bool,
+    search_enabled: bool,
 ) -> RouteStreamSource {
+    let mut system_blocks = vec!["You are Hambur, a concise assistant.".to_string()];
+    if search_enabled {
+        system_blocks.push(
+            "Web/search assistance is enabled for this turn. Use available search or fetch tools when current external information is needed."
+                .to_string(),
+        );
+    }
     RouteStreamSource::Provider(ModelRequest {
         request_id: new_id("llm_req"),
         session_id: session_id.to_string(),
         turn_id: turn_id.to_string(),
         purpose: "chat".to_string(),
         stream: true,
-        system_blocks: vec!["You are Hambur, a concise assistant.".to_string()],
+        system_blocks,
         messages: vec![ModelMessage {
             role: "user".to_string(),
             content: content.to_string(),
         }],
-        reasoning_mode: if route.supports_reasoning {
+        reasoning_mode: if route.supports_reasoning && deep_thinking_enabled {
             ReasoningMode::Enabled
         } else {
             ReasoningMode::Disabled
@@ -5492,6 +7320,7 @@ struct AttachmentImportPayload {
     origin_type: String,
     original_uri: String,
     source_path: String,
+    bytes_base64: String,
     kind: String,
     width: u32,
     height: u32,
@@ -5533,6 +7362,7 @@ impl AttachmentImportPayload {
                 .if_blank("content_uri".to_string()),
             original_uri: get_string(&["originalUri", "original_uri", "uri"]),
             source_path: get_string(&["sourcePath", "source_path", "path"]),
+            bytes_base64: get_string(&["bytesBase64", "bytes_base64", "base64"]),
             kind,
             width: value
                 .get("width")
@@ -5549,24 +7379,46 @@ impl AttachmentImportPayload {
     }
 }
 
-fn parse_attachment_ids(payload_json: &str) -> Vec<String> {
-    let Ok(value) = serde_json::from_str::<Value>(payload_json) else {
-        return Vec::new();
-    };
-    let Some(values) = value
-        .get("attachmentIds")
-        .or_else(|| value.get("attachment_ids"))
-        .and_then(Value::as_array)
-    else {
-        return Vec::new();
-    };
-    values
-        .iter()
-        .filter_map(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .collect()
+#[derive(Debug, Clone, Default)]
+struct SendOptions {
+    attachment_ids: Vec<String>,
+    deep_thinking_enabled: bool,
+    search_enabled: bool,
+}
+
+impl SendOptions {
+    fn parse(payload_json: &str) -> Self {
+        let Ok(value) = serde_json::from_str::<Value>(payload_json) else {
+            return Self::default();
+        };
+        let attachment_ids = value
+            .get("attachmentIds")
+            .or_else(|| value.get("attachment_ids"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .collect();
+        Self {
+            attachment_ids,
+            deep_thinking_enabled: value
+                .get("deepThinkingEnabled")
+                .or_else(|| value.get("deep_thinking_enabled"))
+                .or_else(|| value.get("deepThinking"))
+                .or_else(|| value.get("deep_thinking"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            search_enabled: value
+                .get("searchEnabled")
+                .or_else(|| value.get("search_enabled"))
+                .or_else(|| value.get("search"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        }
+    }
 }
 
 fn format_user_content_with_attachments(content: &str, attachments: &[AttachmentRecord]) -> String {
@@ -5622,6 +7474,7 @@ fn format_synthetic_view_image_message(context_stubs: &[String]) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn run_terminal_command(
     invocation: &ToolInvocation,
     command: &str,
@@ -5740,6 +7593,7 @@ fn run_terminal_command(
     }
 }
 
+#[allow(dead_code)]
 fn platform_shell() -> &'static str {
     if cfg!(target_os = "android") {
         "/system/bin/sh"
@@ -6231,6 +8085,11 @@ fn setting_key_for_command(command: &RuntimeCommand) -> HamburResult<String> {
         "UpdateMemoryProjections" => "memory_projections".to_string(),
         "UpdateStartupTasks" => "startup_tasks".to_string(),
         "UpdateRootfsSettings" => "rootfs_settings".to_string(),
+        "UpdateAppearance" => "appearance".to_string(),
+        "UpdateLogs" => "logs".to_string(),
+        "UpdateTokenUsage" => "token_usage".to_string(),
+        "UpdatePersona" => "persona".to_string(),
+        "UpdateEnvironmentVariables" => "environment_variables".to_string(),
         "UpdateBrowserToolSettings" => "browser_tool_settings".to_string(),
         "UpdateAppSetting" => command
             .chunk
@@ -6371,6 +8230,7 @@ mod tests {
         thread,
     };
 
+    use base64::Engine;
     use hambur_core::{new_id, now_ms};
     use hambur_sandbox::SandboxAccess;
     use hambur_tools::ToolInvocation;
@@ -6390,6 +8250,7 @@ mod tests {
 
         let first = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let ready = first.next_event().expect("ready event");
@@ -6406,6 +8267,7 @@ mod tests {
 
         let restarted = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("restart runtime");
         let restarted_ready = restarted.next_event().expect("restart ready event");
@@ -6423,6 +8285,7 @@ mod tests {
 
         let runtime = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let ready = runtime.next_event().expect("ready event");
@@ -6456,6 +8319,7 @@ mod tests {
 
         let runtime = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let ready = runtime.next_event().expect("ready event");
@@ -6492,6 +8356,7 @@ mod tests {
 
         let runtime = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let _ = runtime.next_event().expect("ready event");
@@ -6519,6 +8384,7 @@ mod tests {
 
         let runtime = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let _ = runtime.next_event().expect("ready event");
@@ -6630,6 +8496,7 @@ mod tests {
         fs::create_dir_all(&app_files_dir).expect("create temp app dir");
         let runtime = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let _ = runtime.next_event().expect("ready event");
@@ -6684,6 +8551,7 @@ mod tests {
         fs::create_dir_all(&app_files_dir).expect("create temp app dir");
         let runtime = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let _ = runtime.next_event().expect("ready event");
@@ -6757,6 +8625,7 @@ mod tests {
         fs::create_dir_all(&app_files_dir).expect("create temp app dir");
         let runtime = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let _ = runtime.next_event().expect("ready event");
@@ -6833,6 +8702,7 @@ mod tests {
         fs::create_dir_all(&app_files_dir).expect("create temp app dir");
         let runtime = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let _ = runtime.next_event().expect("ready event");
@@ -6924,6 +8794,7 @@ mod tests {
         fs::create_dir_all(&app_files_dir).expect("create temp app dir");
         let runtime = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let _ = runtime.next_event().expect("ready event");
@@ -7003,6 +8874,7 @@ mod tests {
         fs::create_dir_all(&app_files_dir).expect("create temp app dir");
         let runtime = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let _ = runtime.next_event().expect("ready event");
@@ -7076,6 +8948,7 @@ mod tests {
         fs::create_dir_all(&app_files_dir).expect("create temp app dir");
         let runtime = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let _ = runtime.next_event().expect("ready event");
@@ -7170,6 +9043,7 @@ mod tests {
 
         let runtime = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let _ = runtime.next_event().expect("ready event");
@@ -7232,6 +9106,7 @@ mod tests {
 
         let runtime = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let _ = runtime.next_event().expect("ready event");
@@ -7289,6 +9164,7 @@ mod tests {
 
         let runtime = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let _ = runtime.next_event().expect("ready event");
@@ -7369,6 +9245,7 @@ mod tests {
 
         let runtime = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let _ = runtime.next_event().expect("ready event");
@@ -7435,6 +9312,7 @@ mod tests {
 
         let runtime = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let _ = runtime.next_event().expect("ready event");
@@ -7500,6 +9378,7 @@ mod tests {
 
         let runtime = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let _ = runtime.next_event().expect("ready event");
@@ -7570,6 +9449,7 @@ mod tests {
 
         let runtime = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let _ = runtime.next_event().expect("ready event");
@@ -7628,6 +9508,7 @@ mod tests {
 
         let restarted = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("restart runtime");
         let ready = restarted.next_event().expect("ready after cleanup");
@@ -7644,6 +9525,7 @@ mod tests {
 
         let runtime = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let _ = runtime.next_event().expect("ready event");
@@ -7715,6 +9597,7 @@ mod tests {
 
         let runtime = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let _ = runtime.next_event().expect("ready event");
@@ -7759,6 +9642,7 @@ mod tests {
 
         let runtime = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let _ = runtime.next_event().expect("ready event");
@@ -7840,6 +9724,7 @@ mod tests {
 
         let runtime = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let _ = runtime.next_event().expect("ready event");
@@ -7887,6 +9772,7 @@ mod tests {
 
         let runtime = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let _ = runtime.next_event().expect("ready event");
@@ -7968,6 +9854,7 @@ mod tests {
 
         let runtime = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let _ = runtime.next_event().expect("ready event");
@@ -8028,6 +9915,7 @@ mod tests {
         {
             let runtime = RuntimeEngine::create(AppBootstrap {
                 app_files_dir: app_files_dir.to_string_lossy().to_string(),
+                native_library_dir: String::new(),
             })
             .expect("create runtime");
             let _ = runtime.next_event().expect("ready event");
@@ -8109,6 +9997,7 @@ mod tests {
 
         let restarted = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("restart runtime");
         let _ = restarted.next_event().expect("restart ready");
@@ -8154,6 +10043,7 @@ mod tests {
 
         let runtime = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let _ = runtime.next_event().expect("ready event");
@@ -8337,6 +10227,7 @@ mod tests {
 
         let runtime = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let _ = runtime.next_event().expect("ready event");
@@ -8391,6 +10282,7 @@ mod tests {
 
         let runtime = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let _ = runtime.next_event().expect("ready event");
@@ -8463,6 +10355,7 @@ mod tests {
 
         let runtime = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let _ = runtime.next_event().expect("ready event");
@@ -8514,6 +10407,7 @@ mod tests {
 
         let runtime = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let _ = runtime.next_event().expect("ready event");
@@ -8565,6 +10459,7 @@ mod tests {
 
         let runtime = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let _ = runtime.next_event().expect("ready event");
@@ -8641,6 +10536,7 @@ mod tests {
 
         let runtime = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let _ = runtime.next_event().expect("ready event");
@@ -8745,6 +10641,7 @@ mod tests {
 
         let runtime = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let _ = runtime.next_event().expect("ready event");
@@ -8796,6 +10693,7 @@ mod tests {
 
         let runtime = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let _ = runtime.next_event().expect("ready event");
@@ -8890,6 +10788,7 @@ mod tests {
 
         let runtime = RuntimeEngine::create(AppBootstrap {
             app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
         })
         .expect("create runtime");
         let _ = runtime.next_event().expect("ready event");
@@ -8938,7 +10837,129 @@ mod tests {
         assert!(validate_web_fetch_url("file:///tmp/nope").is_err());
     }
 
+    #[test]
+    fn session_rename_and_pin_are_persisted_and_sorted_first() {
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+        let first = create_test_session(&runtime);
+        let second = create_test_session(&runtime);
+
+        let rename = runtime.dispatch(RuntimeCommand {
+            idempotency_key: "rename:first".to_string(),
+            kind: "RenameSession".to_string(),
+            session_id: first.clone(),
+            title: "renamed first".to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(rename.accepted, "rename rejected: {}", rename.message);
+        let _ = runtime.next_event().expect("rename event");
+
+        let pin = runtime.dispatch(RuntimeCommand {
+            idempotency_key: "pin:first".to_string(),
+            kind: "SetSessionPinned".to_string(),
+            session_id: first.clone(),
+            payload_json: serde_json::json!({"pinned": true}).to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(pin.accepted, "pin rejected: {}", pin.message);
+        let _ = runtime.next_event().expect("pin event");
+
+        let snapshot = runtime.get_session_list_snapshot(10, 0);
+        assert_eq!(
+            snapshot.sessions.first().map(|session| session.id.as_str()),
+            Some(first.as_str())
+        );
+        let first_summary = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.id == first)
+            .expect("first session");
+        assert_eq!(first_summary.title, "renamed first");
+        assert!(first_summary.pinned_at_ms > 0);
+        assert!(snapshot.sessions.iter().any(|session| session.id == second));
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
+    fn message_snapshot_contains_attached_attachment_records() {
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+        let session_id = create_test_session(&runtime);
+        configure_named_test_provider(&runtime, "provider_attach_dto", "model-attach-dto");
+
+        let import = runtime.dispatch(RuntimeCommand {
+            idempotency_key: "attachment:dto:import".to_string(),
+            kind: "ImportAttachmentFromUri".to_string(),
+            session_id: session_id.clone(),
+            payload_json: serde_json::json!({
+                "displayName": "note.txt",
+                "mimeType": "text/plain",
+                "base64": base64::engine::general_purpose::STANDARD.encode("hello attachment")
+            })
+            .to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(import.accepted, "import rejected: {}", import.message);
+        let imported = runtime.next_event().expect("import event");
+        let attachment_id = imported
+            .snapshot
+            .pending_attachments
+            .first()
+            .expect("pending attachment")
+            .id
+            .clone();
+
+        let send = runtime.dispatch(RuntimeCommand {
+            idempotency_key: "attachment:dto:send".to_string(),
+            kind: "SendMessage".to_string(),
+            session_id: session_id.clone(),
+            content: "see attached".to_string(),
+            payload_json: serde_json::json!({
+                "attachmentIds": [attachment_id],
+                "content": "ok"
+            })
+            .to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(send.accepted, "send rejected: {}", send.message);
+        wait_for_session_finished(&runtime, &session_id, "attachment dto");
+
+        let user_item = runtime
+            .get_session_snapshot(session_id)
+            .timeline_items
+            .into_iter()
+            .find(|item| item.kind == "UserMessage")
+            .expect("user message item");
+        let message = runtime
+            .get_message_snapshot(user_item.payload_ref)
+            .message
+            .expect("message snapshot");
+        assert_eq!(message.attachments.len(), 1);
+        assert_eq!(message.attachments[0].display_name, "note.txt");
+        assert_eq!(message.attachments[0].status, "attached");
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
     fn temp_app_dir() -> PathBuf {
+        unsafe {
+            std::env::set_var("HAMBUR_TEST_MOCK_ROOTFS", "1");
+        }
         std::env::temp_dir().join(new_id("hambur_runtime_test"))
     }
 
@@ -9191,4 +11212,32 @@ mod tests {
         }
         panic!("missing event: {kind} for session {session_id}");
     }
+}
+
+fn dir_size(path: &std::path::Path) -> u64 {
+    if !path.exists() {
+        return 0;
+    }
+    if path.is_file() {
+        return path.metadata().map(|m| m.len()).unwrap_or(0);
+    }
+    let mut size = 0;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            size += dir_size(&entry.path());
+        }
+    }
+    size
+}
+
+fn get_rootfs_backend(settings: &[hambur_db::AppSettingRecord]) -> &str {
+    for s in settings {
+        if s.key == "rootfsBackend" || s.key == "rootfs_setting:rootfsBackend" {
+            let val = s.value.trim_matches('"');
+            if val == "chroot" || val == "proot" {
+                return val;
+            }
+        }
+    }
+    "proot"
 }

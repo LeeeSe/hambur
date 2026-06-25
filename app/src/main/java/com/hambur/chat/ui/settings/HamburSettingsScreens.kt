@@ -8,22 +8,40 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.ui.platform.LocalContext
+import android.widget.Toast
+import com.composables.icons.lucide.Trash2
+import com.composables.icons.lucide.Cloud
+import com.composables.icons.lucide.Settings
+import com.composables.icons.lucide.MessageSquare
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -180,109 +198,6 @@ fun HamburSettingsHomeScreen(
     }
 }
 
-@Composable
-fun ProviderSettingsScreen(
-    state: HamburUiState,
-    store: HamburUiStore,
-    onBack: () -> Unit,
-) {
-    var providerId by rememberSaveable { mutableStateOf(state.providers.firstOrNull()?.id.orEmpty()) }
-    var name by rememberSaveable { mutableStateOf(state.providers.firstOrNull()?.name ?: "OpenAI Compatible") }
-    var baseUrl by rememberSaveable { mutableStateOf(state.providers.firstOrNull()?.baseUrl ?: "https://api.openai.com/v1") }
-    var secretRef by rememberSaveable {
-        mutableStateOf(state.providers.firstOrNull()?.secretLabel?.takeIf { it.startsWith("android-secret://") }
-            ?: "android-secret://providers/default-openai-compatible")
-    }
-    var apiKey by rememberSaveable { mutableStateOf("") }
-    var enabled by rememberSaveable { mutableStateOf(true) }
-    var modelId by rememberSaveable { mutableStateOf("hambur-openai-compatible-text") }
-    var pendingDelete by rememberSaveable { mutableStateOf("") }
-
-    if (pendingDelete.isNotBlank()) {
-        ConfirmDangerDialog(
-            title = "Delete provider",
-            text = "This deletes the provider configuration after explicit approval.",
-            confirmText = "Delete",
-            onConfirm = {
-                store.deleteProvider(pendingDelete, true)
-                pendingDelete = ""
-            },
-            onDismiss = { pendingDelete = "" },
-        )
-    }
-
-    SettingsPage(title = "Providers", onBack = onBack) {
-        item {
-            HamburSection(
-                title = "Configured providers",
-                subtitle = "Saved provider entries from the Rust backend",
-            ) {
-                if (state.providers.isEmpty()) {
-                    Text("No providers configured", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                } else {
-                    state.providers.forEach { provider ->
-                        ProviderRow(
-                            provider = provider,
-                            onUse = {
-                                providerId = provider.id
-                                name = provider.name
-                                baseUrl = provider.baseUrl
-                                enabled = provider.enabled
-                            },
-                            onDelete = { pendingDelete = provider.id },
-                        )
-                    }
-                }
-            }
-        }
-        item {
-            HamburSection(title = "Provider editor") {
-                OutlinedTextField(value = providerId, onValueChange = { providerId = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Provider id") })
-                OutlinedTextField(value = name, onValueChange = { name = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Name") })
-                OutlinedTextField(value = baseUrl, onValueChange = { baseUrl = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Base URL") })
-                OutlinedTextField(value = secretRef, onValueChange = { secretRef = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Secret ref") })
-                OutlinedTextField(value = apiKey, onValueChange = { apiKey = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("API key") })
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Checkbox(checked = enabled, onCheckedChange = { enabled = it })
-                    Text("Enabled")
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(
-                        onClick = { store.saveProvider(providerId, name, baseUrl, secretRef, apiKey, enabled) },
-                        enabled = baseUrl.isNotBlank() && secretRef.isNotBlank(),
-                    ) {
-                        Text("Save provider")
-                    }
-                    SecondaryActionButton(
-                        text = "Refresh models",
-                        enabled = providerId.isNotBlank(),
-                        onClick = { store.refreshProviderModels(providerId, modelId) },
-                    )
-                }
-                OutlinedTextField(value = modelId, onValueChange = { modelId = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Model id") })
-                SecondaryActionButton(
-                    text = "Save model override",
-                    enabled = providerId.isNotBlank() && modelId.isNotBlank(),
-                    onClick = {
-                        store.saveModelOverride(
-                            providerId = providerId,
-                            modelId = modelId,
-                            displayName = modelId,
-                            supportsToolCall = true,
-                            supportsReasoning = true,
-                            supportsImageInput = modelId.contains("vision", ignoreCase = true),
-                            contextLimit = 32000u,
-                            outputLimit = 4096u,
-                        )
-                    },
-                )
-            }
-        }
-        item {
-            ProviderModelsSection(models = state.providerModels)
-        }
-    }
-}
 
 @Composable
 fun ProvidersListScreen(
@@ -453,29 +368,90 @@ private fun ProviderEditorScreen(
     extraContent: androidx.compose.foundation.lazy.LazyListScope.() -> Unit = {},
 ) {
     val provider = state.providers.firstOrNull { it.id == providerId }
-    var id by rememberSaveable(providerId) { mutableStateOf(provider?.id ?: providerId) }
-    var name by rememberSaveable(providerId) { mutableStateOf(provider?.name ?: "OpenAI Compatible") }
+    var id by rememberSaveable(providerId) { mutableStateOf(provider?.id ?: "prv_" + java.util.UUID.randomUUID().toString().replace("-", "")) }
+    var name by rememberSaveable(providerId) { mutableStateOf(provider?.name ?: "") }
     var baseUrl by rememberSaveable(providerId) { mutableStateOf(provider?.baseUrl ?: "https://api.openai.com/v1") }
-    var secretRef by rememberSaveable(providerId) { mutableStateOf("android-secret://providers/${providerId.ifBlank { "new" }}") }
+    var secretRef by rememberSaveable(providerId) { mutableStateOf(provider?.secretLabel ?: "android-secret://providers/$id") }
     var apiKey by rememberSaveable(providerId) { mutableStateOf("") }
     var enabled by rememberSaveable(providerId) { mutableStateOf(provider?.enabled ?: true) }
+    var iconName by rememberSaveable(providerId) { mutableStateOf(provider?.iconName ?: "brain") }
+    var apiType by rememberSaveable(providerId) { mutableStateOf(provider?.apiType ?: "OpenAiCompatible") }
     var refreshModelId by rememberSaveable(providerId) { mutableStateOf("hambur-openai-compatible-text") }
 
-    SettingsPage(title = title, subtitle = id, onBack = onBack) {
+    val context = LocalContext.current
+    var lastCommandSequence by rememberSaveable(providerId) { mutableStateOf(0L) }
+    var pendingAction by rememberSaveable(providerId) { mutableStateOf("") }
+
+    LaunchedEffect(state.lastAppliedSequence) {
+        val currentSequence = state.lastAppliedSequence.toLong()
+        if (lastCommandSequence > 0L && currentSequence > lastCommandSequence) {
+            if (pendingAction == "Refresh" && state.latestEventKind == "ModelsUpdated") {
+                Toast.makeText(context, state.footer.ifBlank { "Models refreshed successfully" }, Toast.LENGTH_SHORT).show()
+                lastCommandSequence = 0L
+                pendingAction = ""
+            } else if (pendingAction == "Save" && state.latestEventKind == "SettingsChanged") {
+                Toast.makeText(context, "Provider saved successfully", Toast.LENGTH_SHORT).show()
+                lastCommandSequence = 0L
+                pendingAction = ""
+            } else if (state.runtimeStatus == "Error") {
+                Toast.makeText(context, "Operation failed: ${state.footer}", Toast.LENGTH_SHORT).show()
+                lastCommandSequence = 0L
+                pendingAction = ""
+            }
+        }
+    }
+
+    SettingsPage(title = title, subtitle = name, onBack = onBack) {
         item {
             HamburSection(title = "Provider") {
-                OutlinedTextField(value = id, onValueChange = { id = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Provider id") })
+                if (provider != null) {
+                    SummaryLine(label = "Provider ID", value = id)
+                }
                 OutlinedTextField(value = name, onValueChange = { name = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Name") })
                 OutlinedTextField(value = baseUrl, onValueChange = { baseUrl = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Base URL") })
-                OutlinedTextField(value = secretRef, onValueChange = { secretRef = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Secret ref") })
-                OutlinedTextField(value = apiKey, onValueChange = { apiKey = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("API key") })
+                OutlinedTextField(value = apiKey, onValueChange = { apiKey = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("API Key (leave blank to keep current)") })
+                
+                Text("Select Icon", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 8.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    listOf("brain", "cloud", "api", "chat").forEach { option ->
+                        val selected = iconName == option
+                        OutlinedCard(
+                            onClick = { iconName = option },
+                            colors = CardDefaults.outlinedCardColors(
+                                containerColor = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface
+                            ),
+                            border = BorderStroke(
+                                width = if (selected) 2.dp else 1.dp,
+                                color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
+                            ),
+                            modifier = Modifier.size(50.dp)
+                        ) {
+                            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                Icon(
+                                    imageVector = getProviderIcon(option),
+                                    contentDescription = null,
+                                    tint = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+                                )
+                            }
+                        }
+                    }
+                }
+
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Switch(checked = enabled, onCheckedChange = { enabled = it })
                     Text("Enabled", modifier = Modifier.padding(start = 8.dp))
                 }
                 Button(
-                    enabled = id.isNotBlank() && baseUrl.isNotBlank() && secretRef.isNotBlank(),
-                    onClick = { store.saveProvider(id, name, baseUrl, secretRef, apiKey, enabled) },
+                    enabled = id.isNotBlank() && baseUrl.isNotBlank() && name.isNotBlank() && secretRef.isNotBlank(),
+                    onClick = {
+                        lastCommandSequence = state.lastAppliedSequence.toLong()
+                        pendingAction = "Save"
+                        Toast.makeText(context, "Saving provider...", Toast.LENGTH_SHORT).show()
+                        store.saveProvider(id, name, baseUrl, secretRef, apiKey, enabled, iconName, apiType)
+                    },
                 ) {
                     Text("Save provider")
                 }
@@ -487,7 +463,18 @@ private fun ProviderEditorScreen(
                 SecondaryActionButton(
                     text = "Refresh models",
                     enabled = id.isNotBlank(),
-                    onClick = { store.refreshProviderModels(id, refreshModelId) },
+                    onClick = {
+                        lastCommandSequence = state.lastAppliedSequence.toLong()
+                        pendingAction = "Refresh"
+                        Toast.makeText(context, "Syncing models from provider...", Toast.LENGTH_SHORT).show()
+                        store.refreshProviderModels(
+                            providerId = id,
+                            baseUrl = baseUrl,
+                            apiKey = apiKey,
+                            secretRef = secretRef,
+                            modelId = refreshModelId
+                        )
+                    },
                 )
             }
         }
@@ -496,81 +483,22 @@ private fun ProviderEditorScreen(
 }
 
 @Composable
-fun ModelGroupSettingsScreen(
-    state: HamburUiState,
-    store: HamburUiStore,
-    onBack: () -> Unit,
-) {
-    var groupId by rememberSaveable { mutableStateOf(state.modelGroups.firstOrNull()?.id ?: "grp_primary_chat") }
-    var groupName by rememberSaveable { mutableStateOf(state.modelGroups.firstOrNull()?.name ?: "Primary Chat") }
-    var routingStrategy by rememberSaveable { mutableStateOf("fallback") }
-    var fallbackPolicy by rememberSaveable { mutableStateOf("default") }
-    var defaultKey by rememberSaveable { mutableStateOf("primary") }
-    var providerId by rememberSaveable { mutableStateOf(state.providers.firstOrNull()?.id.orEmpty()) }
-    var modelId by rememberSaveable { mutableStateOf(state.providerModels.firstOrNull()?.modelId.orEmpty()) }
-
-    SettingsPage(title = "Model Groups", onBack = onBack) {
-        item {
-            HamburSection(title = "Groups") {
-                state.modelGroups.forEach { group ->
-                    SummaryLine(label = group.id, value = "${group.name} / ${group.routingStrategy} / ${group.fallbackPolicy}")
-                }
-                if (state.modelGroups.isEmpty()) {
-                    Text("No model groups configured", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-            }
-        }
-        item {
-            HamburSection(title = "Group editor") {
-                OutlinedTextField(value = groupId, onValueChange = { groupId = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Group id") })
-                OutlinedTextField(value = groupName, onValueChange = { groupName = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Name") })
-                OutlinedTextField(value = routingStrategy, onValueChange = { routingStrategy = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Routing strategy") })
-                OutlinedTextField(value = fallbackPolicy, onValueChange = { fallbackPolicy = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Fallback policy") })
-                Button(
-                    onClick = { store.saveModelGroup(groupId, groupName, routingStrategy, fallbackPolicy) },
-                    enabled = groupId.isNotBlank(),
-                ) {
-                    Text("Save group")
-                }
-            }
-        }
-        item {
-            HamburSection(title = "Default and members") {
-                OutlinedTextField(value = defaultKey, onValueChange = { defaultKey = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Default key") })
-                SecondaryActionButton(
-                    text = "Set default group",
-                    enabled = defaultKey.isNotBlank() && groupId.isNotBlank(),
-                    onClick = { store.setDefaultModelGroup(defaultKey, groupId) },
-                )
-                OutlinedTextField(value = providerId, onValueChange = { providerId = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Provider id") })
-                OutlinedTextField(value = modelId, onValueChange = { modelId = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Model id") })
-                SecondaryActionButton(
-                    text = "Add member",
-                    enabled = groupId.isNotBlank() && providerId.isNotBlank() && modelId.isNotBlank(),
-                    onClick = { store.addModelGroupMember(groupId, providerId, modelId, 0u, true) },
-                )
-                state.defaultModelGroups.forEach { SummaryLine(label = "Default ${it.key}", value = it.groupId) }
-                state.modelGroupMembers.forEach { member ->
-                    SummaryLine(
-                        label = member.groupId,
-                        value = "${member.providerName.ifBlank { member.providerId }} / ${member.modelDisplayName.ifBlank { member.modelId }}",
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
 fun ModelGroupsListScreen(
     state: HamburUiState,
+    store: HamburUiStore,
     onBack: () -> Unit,
     onNewGroup: () -> Unit,
     onOpenGroup: (String) -> Unit,
 ) {
+    var showPrimaryMenu by remember { mutableStateOf(false) }
+    var showSecondaryMenu by remember { mutableStateOf(false) }
+
+    val primaryGroup = state.defaultModelGroups.firstOrNull { it.key == "primary" }?.groupId.orEmpty()
+    val secondaryGroup = state.defaultModelGroups.firstOrNull { it.key == "secondary" }?.groupId.orEmpty()
+
     SettingsPage(title = "Model Groups", onBack = onBack) {
         item {
-            Button(onClick = onNewGroup) {
+            Button(onClick = onNewGroup, modifier = Modifier.fillMaxWidth()) {
                 Text("New model group")
             }
         }
@@ -591,15 +519,97 @@ fun ModelGroupsListScreen(
         }
         item {
             HamburSection(title = "Default model groups") {
-                if (state.defaultModelGroups.isEmpty()) {
-                    Text("No defaults configured", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                } else {
-                    state.defaultModelGroups.forEach {
-                        SummaryLine(label = it.key, value = it.groupId)
+                val primaryGroupName = state.modelGroups.firstOrNull { it.id == primaryGroup }?.name ?: primaryGroup.ifBlank { "Select group" }
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(8.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                    onClick = { showPrimaryMenu = true }
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Text("Primary Model Group (Main chat)", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                        Text(primaryGroupName, color = MaterialTheme.colorScheme.primary)
+                    }
+                }
+
+                val secondaryGroupName = state.modelGroups.firstOrNull { it.id == secondaryGroup }?.name ?: secondaryGroup.ifBlank { "Select group" }
+                Surface(
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                    shape = RoundedCornerShape(8.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                    onClick = { showSecondaryMenu = true }
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Text("Secondary Model Group (Fallback tasks)", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                        Text(secondaryGroupName, color = MaterialTheme.colorScheme.primary)
                     }
                 }
             }
         }
+    }
+
+    if (showPrimaryMenu) {
+        AlertDialog(
+            onDismissRequest = { showPrimaryMenu = false },
+            title = { Text("Select Primary Group") },
+            text = {
+                LazyColumn(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    items(state.modelGroups) { group ->
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(8.dp),
+                            color = if (group.id == primaryGroup) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface,
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                            onClick = {
+                                store.setDefaultModelGroup("primary", group.id)
+                                showPrimaryMenu = false
+                            }
+                        ) {
+                            Text(group.name, modifier = Modifier.padding(16.dp), fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showPrimaryMenu = false }) { Text("Cancel") }
+            }
+        )
+    }
+
+    if (showSecondaryMenu) {
+        AlertDialog(
+            onDismissRequest = { showSecondaryMenu = false },
+            title = { Text("Select Secondary Group") },
+            text = {
+                LazyColumn(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    items(state.modelGroups) { group ->
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(8.dp),
+                            color = if (group.id == secondaryGroup) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface,
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                            onClick = {
+                                store.setDefaultModelGroup("secondary", group.id)
+                                showSecondaryMenu = false
+                            }
+                        ) {
+                            Text(group.name, modifier = Modifier.padding(16.dp), fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showSecondaryMenu = false }) { Text("Cancel") }
+            }
+        )
     }
 }
 
@@ -611,62 +621,226 @@ fun ModelGroupDetailScreen(
     onBack: () -> Unit,
 ) {
     val existing = state.modelGroups.firstOrNull { it.id == groupId }
-    var id by rememberSaveable(groupId) { mutableStateOf(existing?.id ?: "grp_primary_chat") }
-    var name by rememberSaveable(groupId) { mutableStateOf(existing?.name ?: "Primary Chat") }
+    var id by rememberSaveable(groupId) { mutableStateOf(existing?.id ?: "grp_" + java.util.UUID.randomUUID().toString().replace("-", "")) }
+    var name by rememberSaveable(groupId) { mutableStateOf(existing?.name ?: "") }
     var routingStrategy by rememberSaveable(groupId) { mutableStateOf(existing?.routingStrategy ?: "fallback") }
     var fallbackPolicy by rememberSaveable(groupId) { mutableStateOf(existing?.fallbackPolicy ?: "default") }
-    var defaultKey by rememberSaveable(groupId) { mutableStateOf("primary") }
-    var providerId by rememberSaveable(groupId) { mutableStateOf(state.providers.firstOrNull()?.id.orEmpty()) }
-    var modelId by rememberSaveable(groupId) { mutableStateOf(state.providerModels.firstOrNull()?.modelId.orEmpty()) }
-    var position by rememberSaveable(groupId) { mutableStateOf("0") }
 
-    SettingsPage(title = if (existing == null) "New Model Group" else existing.name, subtitle = id, onBack = onBack) {
+    val context = LocalContext.current
+    var lastCommandSequence by rememberSaveable(groupId) { mutableStateOf(0L) }
+    var pendingAction by rememberSaveable(groupId) { mutableStateOf("") }
+
+    LaunchedEffect(state.lastAppliedSequence) {
+        val currentSequence = state.lastAppliedSequence.toLong()
+        if (lastCommandSequence > 0L && currentSequence > lastCommandSequence) {
+            if (pendingAction == "SaveGroup" && state.latestEventKind == "SettingsChanged") {
+                Toast.makeText(context, "Model group saved successfully", Toast.LENGTH_SHORT).show()
+                lastCommandSequence = 0L
+                pendingAction = ""
+            } else if (state.runtimeStatus == "Error") {
+                Toast.makeText(context, "Operation failed: ${state.footer}", Toast.LENGTH_SHORT).show()
+                lastCommandSequence = 0L
+                pendingAction = ""
+            }
+        }
+    }
+
+    var showAddModelDialog by remember { mutableStateOf(false) }
+    var pendingDeleteGroup by remember { mutableStateOf(false) }
+
+    if (pendingDeleteGroup) {
+        ConfirmDangerDialog(
+            title = "Delete model group",
+            text = "Are you sure you want to delete this model group? This action cannot be undone.",
+            confirmText = "Delete",
+            onConfirm = {
+                store.deleteModelGroup(id, true)
+                pendingDeleteGroup = false
+                onBack()
+            },
+            onDismiss = { pendingDeleteGroup = false }
+        )
+    }
+
+    SettingsPage(title = if (existing == null) "New Model Group" else existing.name, subtitle = name, onBack = onBack) {
         item {
-            HamburSection(title = "Group") {
-                OutlinedTextField(value = id, onValueChange = { id = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Group id") })
+            HamburSection(title = "Group Settings") {
+                if (existing != null) {
+                    SummaryLine(label = "Group ID", value = id)
+                }
                 OutlinedTextField(value = name, onValueChange = { name = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Name") })
-                OutlinedTextField(value = routingStrategy, onValueChange = { routingStrategy = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Routing strategy") })
-                OutlinedTextField(value = fallbackPolicy, onValueChange = { fallbackPolicy = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Fallback policy") })
-                Button(onClick = { store.saveModelGroup(id, name, routingStrategy, fallbackPolicy) }, enabled = id.isNotBlank()) {
+
+                Text("Routing Strategy", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 8.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    listOf("fallback" to "Fallback", "load_balance" to "Load Balance").forEach { (strategyKey, strategyLabel) ->
+                        val selected = routingStrategy == strategyKey
+                        OutlinedCard(
+                            onClick = { routingStrategy = strategyKey },
+                            colors = CardDefaults.outlinedCardColors(
+                                containerColor = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface
+                            ),
+                            border = BorderStroke(
+                                width = if (selected) 2.dp else 1.dp,
+                                color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
+                            ),
+                            modifier = Modifier.weight(1f).height(50.dp)
+                        ) {
+                            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                Text(strategyLabel, fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal)
+                            }
+                        }
+                    }
+                }
+
+                Text("Fallback Policy", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 8.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    listOf("default" to "Default", "always" to "Always").forEach { (policyKey, policyLabel) ->
+                        val selected = fallbackPolicy == policyKey
+                        OutlinedCard(
+                            onClick = { fallbackPolicy = policyKey },
+                            colors = CardDefaults.outlinedCardColors(
+                                containerColor = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface
+                            ),
+                            border = BorderStroke(
+                                width = if (selected) 2.dp else 1.dp,
+                                color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
+                            ),
+                            modifier = Modifier.weight(1f).height(50.dp)
+                        ) {
+                            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                Text(policyLabel, fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal)
+                            }
+                        }
+                    }
+                }
+
+                Button(
+                    onClick = {
+                        lastCommandSequence = state.lastAppliedSequence.toLong()
+                        pendingAction = "SaveGroup"
+                        Toast.makeText(context, "Saving group...", Toast.LENGTH_SHORT).show()
+                        store.saveModelGroup(id, name, routingStrategy, fallbackPolicy)
+                    },
+                    enabled = id.isNotBlank() && name.isNotBlank(),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
                     Text("Save group")
                 }
             }
         }
         item {
-            HamburSection(title = "Members") {
+            HamburSection(title = "Members", subtitle = "Routing priority of models in this group") {
                 val members = state.modelGroupMembers.filter { it.groupId == id }
                 if (members.isEmpty()) {
                     Text("No members configured", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 } else {
-                    members.forEach { member ->
-                        SummaryLine(
-                            label = "#${member.position}",
-                            value = "${member.providerName.ifBlank { member.providerId }} / ${member.modelDisplayName.ifBlank { member.modelId }}",
-                        )
+                    members.sortedBy { it.position }.forEach { member ->
+                        Surface(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                            shape = RoundedCornerShape(8.dp),
+                            color = MaterialTheme.colorScheme.surfaceVariant,
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(12.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(member.modelDisplayName.ifBlank { member.modelId }, fontWeight = FontWeight.SemiBold)
+                                    Text(member.providerName.ifBlank { member.providerId }, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                                IconButton(
+                                    onClick = { store.deleteModelGroupMember(id, member.providerId, member.modelId) }
+                                ) {
+                                    Icon(
+                                        imageVector = Lucide.Trash2,
+                                        contentDescription = "Delete member",
+                                        tint = MaterialTheme.colorScheme.error
+                                    )
+                                }
+                            }
+                        }
                     }
                 }
-                OutlinedTextField(value = providerId, onValueChange = { providerId = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Provider id") })
-                OutlinedTextField(value = modelId, onValueChange = { modelId = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Model id") })
-                OutlinedTextField(value = position, onValueChange = { position = it.filter(Char::isDigit) }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Position") })
-                SecondaryActionButton(
-                    text = "Add member",
-                    enabled = id.isNotBlank() && providerId.isNotBlank() && modelId.isNotBlank(),
-                    onClick = { store.addModelGroupMember(id, providerId, modelId, position.toUIntOrNull() ?: 0u, true) },
-                )
+
+                Button(
+                    onClick = { showAddModelDialog = true },
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+                ) {
+                    Text("Add model")
+                }
             }
         }
-        item {
-            HamburSection(title = "Default route") {
-                OutlinedTextField(value = defaultKey, onValueChange = { defaultKey = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Default key") })
-                SecondaryActionButton(
-                    text = "Set as default",
-                    enabled = id.isNotBlank() && defaultKey.isNotBlank(),
-                    onClick = { store.setDefaultModelGroup(defaultKey, id) },
-                )
+        if (existing != null) {
+            item {
+                HamburSection(title = "Danger zone") {
+                    TextButton(onClick = { pendingDeleteGroup = true }) {
+                        Text("Delete model group", color = MaterialTheme.colorScheme.error)
+                    }
+                }
             }
         }
     }
+
+    if (showAddModelDialog) {
+        val availableModels = state.providerModels.filter { model ->
+            state.modelGroupMembers.none { it.groupId == id && it.providerId == model.providerId && it.modelId == model.modelId }
+        }
+        AlertDialog(
+            onDismissRequest = { showAddModelDialog = false },
+            title = { Text("Add Model") },
+            text = {
+                if (availableModels.isEmpty()) {
+                    Text("No available models found. Please configure a provider and sync models first.")
+                } else {
+                    LazyColumn(
+                        modifier = Modifier.fillMaxWidth().height(300.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        items(availableModels) { model ->
+                            Surface(
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(8.dp),
+                                color = MaterialTheme.colorScheme.surface,
+                                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                                onClick = {
+                                    val members = state.modelGroupMembers.filter { it.groupId == id }
+                                    store.addModelGroupMember(
+                                        groupId = id,
+                                        providerId = model.providerId,
+                                        modelId = model.modelId,
+                                        position = members.size.toUInt(),
+                                        enabled = true
+                                    )
+                                    showAddModelDialog = false
+                                }
+                            ) {
+                                Column(modifier = Modifier.padding(12.dp)) {
+                                    Text(model.displayName.ifBlank { model.modelId }, fontWeight = FontWeight.SemiBold)
+                                    val providerName = state.providers.firstOrNull { it.id == model.providerId }?.name ?: model.providerId
+                                    Text(providerName, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showAddModelDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
 }
+
 
 @Composable
 fun SkillsListScreen(
@@ -675,24 +849,25 @@ fun SkillsListScreen(
     onBack: () -> Unit,
     onOpenSkill: (String) -> Unit,
 ) {
-    val skillSettings = state.appSettings.filter {
-        it.key == "skills" || it.key.startsWith("skill_enabled:")
-    }
     SettingsPage(title = "Skills", onBack = onBack) {
         item {
-            HamburSection(title = "Built-in skills") {
-                SkillListRow("system/skill-creator", "Create and maintain Codex skills", true, onOpenSkill)
-                SkillListRow("system/openai-docs", "OpenAI product and API documentation workflow", true, onOpenSkill)
-            }
-        }
-        item {
-            HamburSection(title = "Backend skill settings") {
-                if (skillSettings.isEmpty()) {
-                    Text("No skill settings exposed by backend yet", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            HamburSection(title = "Skills") {
+                if (state.skills.isEmpty()) {
+                    Text("No skills discovered", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    SecondaryActionButton(text = "Refresh", onClick = store::refreshKnowledgeSnapshots)
                 } else {
-                    skillSettings.forEach {
-                        SummaryLine(label = it.key, value = it.value)
+                    state.skills.forEach { skill ->
+                        SkillListRow(
+                            skillId = skill.path,
+                            description = listOf(
+                                skill.description.ifBlank { skill.name },
+                                if (skill.enabled) "Enabled" else "Disabled",
+                            ).joinToString(" - "),
+                            builtIn = skill.path.startsWith("system/"),
+                            onOpenSkill = onOpenSkill,
+                        )
                     }
+                    SecondaryActionButton(text = "Refresh", onClick = store::refreshKnowledgeSnapshots)
                 }
             }
         }
@@ -706,17 +881,19 @@ fun SkillDetailScreen(
     skillId: String,
     onBack: () -> Unit,
 ) {
-    var enabled by rememberSaveable(skillId) {
-        mutableStateOf(state.appSettings.firstOrNull { it.key == "skill_enabled:$skillId" }?.value != "false")
+    LaunchedEffect(skillId) {
+        store.loadSkillDetail(skillId)
     }
-    var skillsJson by rememberSaveable {
-        mutableStateOf(state.appSettings.firstOrNull { it.key == "skills" }?.value ?: """{"enabled":true,"paths":[]}""")
+    val detail = state.skillDetails[skillId]
+    var enabled by rememberSaveable(skillId) {
+        mutableStateOf(detail?.summary?.enabled ?: state.appSettings.firstOrNull { it.key == "skill_enabled:$skillId" }?.value != "false")
     }
     SettingsPage(title = "Skill Detail", subtitle = skillId, onBack = onBack) {
         item {
             HamburSection(title = "Skill") {
-                SummaryLine(label = "Path", value = skillId)
-                SummaryLine(label = "Files", value = "Backend does not expose skill file listing yet")
+                SummaryLine(label = "Name", value = detail?.summary?.name ?: skillId)
+                SummaryLine(label = "Path", value = detail?.summary?.path ?: skillId)
+                SummaryLine(label = "Files", value = detail?.summary?.files?.joinToString(", ").orEmpty().ifBlank { "No files" })
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Switch(checked = enabled, onCheckedChange = { enabled = it })
                     Text("Enabled", modifier = Modifier.padding(start = 8.dp))
@@ -724,12 +901,16 @@ fun SkillDetailScreen(
                 Button(onClick = { store.setSkillEnabled(skillId, enabled) }) {
                     Text("Save enabled flag")
                 }
+                SecondaryActionButton(text = "Delete skill", onClick = { store.deleteSkill(skillId) })
             }
         }
         item {
-            HamburSection(title = "Global skills JSON") {
-                OutlinedTextField(value = skillsJson, onValueChange = { skillsJson = it }, modifier = Modifier.fillMaxWidth(), minLines = 6, label = { Text("skills") })
-                SecondaryActionButton(text = "Save skills JSON", onClick = { store.saveAppSetting("skills", skillsJson, false) })
+            HamburSection(title = "Content") {
+                Text(
+                    text = detail?.content ?: "Loading skill...",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
     }
@@ -741,18 +922,14 @@ fun MemoryFilesListScreen(
     onBack: () -> Unit,
     onOpenMemory: (String) -> Unit,
 ) {
-    val memorySettings = state.appSettings.filter {
-        it.key == "memory_projections" || it.key.startsWith("memory")
-    }
     SettingsPage(title = "Memory", onBack = onBack) {
         item {
             HamburSection(title = "Memory files") {
-                if (memorySettings.isEmpty()) {
-                    Text("No memory file list exposed by backend yet", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    SecondaryActionButton(text = "Open memory_projections", onClick = { onOpenMemory("memory_projections") })
+                if (state.memoryFiles.isEmpty()) {
+                    Text("No memory files discovered", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 } else {
-                    memorySettings.forEach { setting ->
-                        MemoryListRow(setting.key, setting.value, onOpenMemory)
+                    state.memoryFiles.forEach { file ->
+                        MemoryListRow(file.name, file.preview.ifBlank { "${file.entryCount} entries" }, onOpenMemory)
                     }
                 }
             }
@@ -767,16 +944,20 @@ fun MemoryDetailScreen(
     memoryKey: String,
     onBack: () -> Unit,
 ) {
-    var value by rememberSaveable(memoryKey) {
-        mutableStateOf(state.appSettings.firstOrNull { it.key == memoryKey }?.value ?: """{"enabled":true,"files":[]}""")
+    LaunchedEffect(memoryKey) {
+        store.loadMemoryFileDetail(memoryKey)
     }
+    val detail = state.memoryFileDetails[memoryKey]
     SettingsPage(title = "Memory Detail", subtitle = memoryKey, onBack = onBack) {
         item {
-            HamburSection(title = "Projection") {
-                OutlinedTextField(value = value, onValueChange = { value = it }, modifier = Modifier.fillMaxWidth(), minLines = 8, label = { Text(memoryKey) })
-                Button(onClick = { store.saveAppSetting("memory_projections", value, false) }) {
-                    Text("Save memory projections")
-                }
+            HamburSection(title = "File") {
+                SummaryLine(label = "Size", value = "${detail?.sizeBytes ?: 0UL} bytes")
+                SummaryLine(label = "Entries", value = "${detail?.entryCount ?: 0u}")
+                Text(
+                    text = detail?.content ?: "Loading memory file...",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
     }
@@ -1064,23 +1245,148 @@ fun RootfsSettingsScreen(
     var value by rememberSaveable { mutableStateOf("""{"enabled":true}""") }
     var confirmReset by rememberSaveable { mutableStateOf(false) }
 
+    LaunchedEffect(Unit) {
+        store.refreshRootfsStatus()
+    }
+
     if (confirmReset) {
-        ConfirmDangerDialog(
-            title = "Reset rootfs",
-            text = "This clears the rootfs directory after explicit approval.",
-            confirmText = "Reset",
-            onConfirm = {
-                store.resetRootfs(true)
-                confirmReset = false
+        var preserveRoot by remember { mutableStateOf(true) }
+        AlertDialog(
+            onDismissRequest = { confirmReset = false },
+            title = { Text("重置 RootFS") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text("重置会重新下载并解包 Alpine rootfs。这需要一点时间并会清除现有环境。")
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("是否保留用户数据 (/root)", modifier = Modifier.weight(1f))
+                        Switch(
+                            checked = preserveRoot,
+                            onCheckedChange = { preserveRoot = it }
+                        )
+                    }
+                }
             },
-            onDismiss = { confirmReset = false },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        store.resetRootfs(preserveRoot, true)
+                        confirmReset = false
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error,
+                        contentColor = MaterialTheme.colorScheme.onError
+                    )
+                ) {
+                    Text("重置")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmReset = false }) {
+                    Text("取消")
+                }
+            }
         )
     }
 
-    SettingsPage(title = "Rootfs", onBack = onBack) {
+    SettingsPage(title = "Rootfs 管理", onBack = onBack) {
         item {
-            HamburSection(title = "Lifecycle") {
-                SummaryLine(label = "Selected session", value = state.selectedSessionId)
+            val status = state.rootfsStatus
+            HamburSection(title = "Rootfs 状态") {
+                SummaryLine(
+                    label = "RootFS 版本",
+                    value = status?.let { if (it.rootfsInstalled) it.version.ifBlank { "未知" } else "未初始化" } ?: "未知"
+                )
+                SummaryLine(
+                    label = "在线 RootFS",
+                    value = status?.let { "已配置" } ?: "未检测"
+                )
+                SummaryLine(
+                    label = "存储占用",
+                    value = status?.rootfsSizeBytes?.toLong()?.toReadableSize() ?: "未知"
+                )
+                SummaryLine(
+                    label = "root 权限",
+                    value = status?.let { if (it.rootAvailable) "是" else "否" } ?: "未知"
+                )
+                SummaryLine(
+                    label = "chroot 状态",
+                    value = status?.let { if (it.chrootAvailable) "是" else "否" } ?: "未知"
+                )
+                SummaryLine(
+                    label = "proot 状态",
+                    value = status?.let { if (it.prootAvailable) "是" else "否" } ?: "未知"
+                )
+                SummaryLine(
+                    label = "浏览路径",
+                    value = status?.rootfsPath ?: "未初始化"
+                )
+            }
+        }
+        item {
+            HamburSection(title = "后端选择") {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("当前后端", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+                    
+                    val currentBackend = state.appSettings.find { it.key == "rootfsBackend" || it.key == "rootfs_setting:rootfsBackend" }?.value?.trim('"', ' ') ?: "proot"
+                    val chrootSupported = state.rootfsStatus?.rootAvailable == true
+                    
+                    Row {
+                        OutlinedCard(
+                            onClick = {
+                                if (chrootSupported) {
+                                    store.saveRootfsSetting("rootfsBackend", "chroot", true)
+                                    store.refreshRootfsStatus()
+                                }
+                            },
+                            colors = CardDefaults.outlinedCardColors(
+                                containerColor = if (currentBackend == "chroot") MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface
+                            ),
+                            border = BorderStroke(1.dp, if (currentBackend == "chroot") MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant),
+                            modifier = Modifier.padding(end = 8.dp)
+                        ) {
+                            Text(
+                                "chroot",
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                                color = if (chrootSupported) {
+                                    if (currentBackend == "chroot") MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface
+                                } else {
+                                    MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+                                },
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                        }
+                        
+                        OutlinedCard(
+                            onClick = {
+                                store.saveRootfsSetting("rootfsBackend", "proot", true)
+                                store.refreshRootfsStatus()
+                            },
+                            colors = CardDefaults.outlinedCardColors(
+                                containerColor = if (currentBackend == "proot") MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface
+                            ),
+                            border = BorderStroke(1.dp, if (currentBackend == "proot") MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant)
+                        ) {
+                            Text(
+                                "proot",
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                                color = if (currentBackend == "proot") MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface,
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        item {
+            HamburSection(title = "控制") {
+                SummaryLine(label = "当前会话", value = state.selectedSessionId)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(onClick = { store.runRootfsWarmup(state.selectedSessionId) }) {
                         Text("Warm up")
@@ -1095,11 +1401,11 @@ fun RootfsSettingsScreen(
             }
         }
         item {
-            HamburSection(title = "Rootfs setting") {
-                OutlinedTextField(value = key, onValueChange = { key = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Setting key") })
-                OutlinedTextField(value = value, onValueChange = { value = it }, modifier = Modifier.fillMaxWidth(), minLines = 5, label = { Text("Value") })
+            HamburSection(title = "高级配置") {
+                OutlinedTextField(value = key, onValueChange = { key = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("配置项 Key") })
+                OutlinedTextField(value = value, onValueChange = { value = it }, modifier = Modifier.fillMaxWidth(), minLines = 5, label = { Text("配置项 Value (JSON/Text)") })
                 Button(onClick = { store.saveRootfsSetting(key, value, true) }, enabled = key.isNotBlank() && value.isNotBlank()) {
-                    Text("Approve and save")
+                    Text("保存并应用")
                 }
             }
         }
@@ -1344,6 +1650,12 @@ private fun ProviderListRow(
     ) {
         Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Icon(
+                    imageVector = getProviderIcon(provider.iconName),
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(24.dp)
+                )
                 Text(provider.name, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
                 StatusPill(text = if (provider.enabled) "Enabled" else "Disabled", active = provider.enabled)
             }
@@ -1490,3 +1802,21 @@ private fun CapabilitySwitch(
         Text(label, modifier = Modifier.padding(start = 8.dp))
     }
 }
+
+private fun Long.toReadableSize(): String {
+    if (this <= 0) return "0 B"
+    val units = arrayOf("B", "KB", "MB", "GB", "TB")
+    val digitGroups = (Math.log10(this.toDouble()) / Math.log10(1024.0)).toInt()
+    return String.format("%.2f %s", this / Math.pow(1024.0, digitGroups.toDouble()), units[digitGroups])
+}
+
+private fun getProviderIcon(name: String): androidx.compose.ui.graphics.vector.ImageVector {
+    return when (name) {
+        "brain" -> Lucide.Brain
+        "cloud" -> Lucide.Cloud
+        "api" -> Lucide.Settings
+        "chat" -> Lucide.MessageSquare
+        else -> Lucide.Brain
+    }
+}
+

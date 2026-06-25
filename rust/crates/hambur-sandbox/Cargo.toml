@@ -7,4 +7,11 @@ publish.workspace = true
 
 [dependencies]
 hambur-core.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+reqwest = { workspace = true }
+tar.workspace = true
+flate2.workspace = true
+sha2.workspace = true
+
 

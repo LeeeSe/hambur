@@ -68,13 +68,15 @@ sealed class HamburScreen {
 @Composable
 fun HamburApp(
     appFilesDir: String,
+    nativeLibraryDir: String,
     platformAdapter: AndroidPlatformAdapter,
-    onPickImage: ((String, String, ULong, String) -> Unit) -> Unit = {},
-    onPickFile: ((String, String, ULong, String) -> Unit) -> Unit = {},
+    onPickImage: ((String, String, ULong, String, String) -> Unit) -> Unit = {},
+    onPickFile: ((String, String, ULong, String, String) -> Unit) -> Unit = {},
 ) {
-    val store = remember(appFilesDir, platformAdapter) {
+    val store = remember(appFilesDir, nativeLibraryDir, platformAdapter) {
         HamburUiStore(
             appFilesDir = appFilesDir,
+            nativeLibraryDir = nativeLibraryDir,
             platformAdapter = platformAdapter,
         )
     }
@@ -121,13 +123,13 @@ fun HamburApp(
                         onOpenBrowser = { navigate(HamburScreen.Browser) },
                         onOpenFile = { navigate(HamburScreen.FilePreview(it)) },
                         onPickImage = { onPicked ->
-                            onPickImage { displayName, mimeType, byteSize, uri ->
-                                onPicked(displayName, mimeType, byteSize, uri)
+                            onPickImage { displayName, mimeType, byteSize, uri, sourcePath ->
+                                onPicked(displayName, mimeType, byteSize, uri, sourcePath)
                             }
                         },
                         onPickFile = { onPicked ->
-                            onPickFile { displayName, mimeType, byteSize, uri ->
-                                onPicked(displayName, mimeType, byteSize, uri)
+                            onPickFile { displayName, mimeType, byteSize, uri, sourcePath ->
+                                onPicked(displayName, mimeType, byteSize, uri, sourcePath)
                             }
                         },
                     )
@@ -176,6 +178,7 @@ fun HamburApp(
                     )
                     HamburScreen.ModelGroupsList -> ModelGroupsListScreen(
                         state = state,
+                        store = store,
                         onBack = goBack,
                         onNewGroup = { navigate(HamburScreen.ModelGroupDetail("")) },
                         onOpenGroup = { navigate(HamburScreen.ModelGroupDetail(it)) },

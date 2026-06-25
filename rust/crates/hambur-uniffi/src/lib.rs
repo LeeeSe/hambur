@@ -11,14 +11,17 @@ use hambur_markdown::{
 };
 use hambur_runtime::{
     AppBootstrap, PlatformRequest, RuntimeCommand, RuntimeCommandAck, RuntimeEngine, RuntimeEvent,
-    RuntimeMessageSnapshot, RuntimeSearchSnapshot, RuntimeSessionListSnapshot,
-    RuntimeSessionSnapshot, RuntimeSettingsSnapshot, RuntimeTimelinePage,
+    RuntimeFileResolution, RuntimeMemoryFileDetail, RuntimeMemoryFileSummary,
+    RuntimeMessageSnapshot, RuntimeRootfsStatus, RuntimeSearchSnapshot, RuntimeSessionListSnapshot,
+    RuntimeSessionSnapshot, RuntimeSettingsSnapshot, RuntimeSkillDetail, RuntimeSkillSummary,
+    RuntimeTimelinePage,
 };
 
 uniffi::include_scaffolding!("hambur_uniffi");
 
 pub struct AppBootstrapConfig {
     pub app_files_dir: String,
+    pub native_library_dir: String,
 }
 
 pub struct CommandAck {
@@ -120,6 +123,7 @@ pub struct SessionSummaryDTO {
     pub title: String,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+    pub pinned_at_ms: u64,
     pub message_count: u32,
     pub latest_preview: String,
 }
@@ -294,6 +298,7 @@ pub struct MessageDTO {
     pub model_group_id: String,
     pub finish_reason: String,
     pub native_finish_reason: String,
+    pub attachments: Vec<AttachmentDTO>,
 }
 
 pub struct MessageSnapshotDTO {
@@ -309,6 +314,69 @@ pub struct SearchSnapshotDTO {
     pub sessions: Vec<SessionSummaryDTO>,
 }
 
+pub struct FileResolutionDTO {
+    pub sandbox_path: String,
+    pub host_path: String,
+    pub relative_path: String,
+    pub root: String,
+    pub writable: bool,
+    pub exists: bool,
+    pub is_file: bool,
+    pub mime_type: String,
+    pub byte_size: u64,
+    pub file_id: String,
+}
+
+pub struct RootfsStatusDTO {
+    pub rootfs_installed: bool,
+    pub proot_available: bool,
+    pub root_available: bool,
+    pub chroot_available: bool,
+    pub backend: String,
+    pub version: String,
+    pub rootfs_size_bytes: u64,
+    pub rootfs_path: String,
+}
+
+pub struct SkillSummaryDTO {
+    pub name: String,
+    pub description: String,
+    pub path: String,
+    pub category: String,
+    pub tags: Vec<String>,
+    pub built_in: bool,
+    pub enabled: bool,
+    pub created_at_ms: u64,
+    pub modified_at_ms: u64,
+    pub files: Vec<String>,
+}
+
+pub struct SkillDetailDTO {
+    pub summary: SkillSummaryDTO,
+    pub content: String,
+    pub raw_content: String,
+    pub skill_dir_path: String,
+    pub linked_files_json: String,
+    pub selected_file_path: String,
+    pub selected_file_content: String,
+}
+
+pub struct MemoryFileSummaryDTO {
+    pub name: String,
+    pub size_bytes: u64,
+    pub modified_at_ms: u64,
+    pub entry_count: u32,
+    pub preview: String,
+}
+
+pub struct MemoryFileDetailDTO {
+    pub name: String,
+    pub size_bytes: u64,
+    pub modified_at_ms: u64,
+    pub entry_count: u32,
+    pub content: String,
+}
+
 pub struct BackendRuntime {
     engine: Arc<RuntimeEngine>,
 }
@@ -316,6 +384,7 @@ pub struct BackendRuntime {
 pub fn create_runtime(config: AppBootstrapConfig) -> Arc<BackendRuntime> {
     let bootstrap = AppBootstrap {
         app_files_dir: config.app_files_dir,
+        native_library_dir: config.native_library_dir,
     };
 
     match RuntimeEngine::create(bootstrap) {
@@ -323,6 +392,7 @@ pub fn create_runtime(config: AppBootstrapConfig) -> Arc<BackendRuntime> {
         Err(error) => {
             let fallback = RuntimeEngine::create(AppBootstrap {
                 app_files_dir: ".".to_string(),
+                native_library_dir: String::new(),
             })
             .expect("fallback runtime must be constructible");
             let _ = fallback.app_files_dir();
@@ -382,6 +452,48 @@ impl BackendRuntime {
 
     pub fn delete_session(&self, session_id: String) -> CommandAck {
         self.engine.delete_session(session_id).into()
+    }
+
+    pub fn resolve_sandbox_file(
+        &self,
+        session_id: String,
+        sandbox_path: String,
+    ) -> FileResolutionDTO {
+        self.engine
+            .resolve_sandbox_file(session_id, sandbox_path)
+            .into()
+    }
+
+    pub fn get_rootfs_status(&self) -> RootfsStatusDTO {
+        self.engine.get_rootfs_status().into()
+    }
+
+    pub fn list_skills(&self) -> Vec<SkillSummaryDTO> {
+        self.engine
+            .list_skills()
+            .into_iter()
+            .map(SkillSummaryDTO::from)
+            .collect()
+    }
+
+    pub fn get_skill_detail(&self, identifier: String, file_path: String) -> SkillDetailDTO {
+        self.engine.get_skill_detail(identifier, file_path).into()
+    }
+
+    pub fn delete_skill(&self, identifier: String) -> CommandAck {
+        self.engine.delete_skill(identifier).into()
+    }
+
+    pub fn list_memory_files(&self) -> Vec<MemoryFileSummaryDTO> {
+        self.engine
+            .list_memory_files()
+            .into_iter()
+            .map(MemoryFileSummaryDTO::from)
+            .collect()
+    }
+
+    pub fn get_memory_file_detail(&self, name: String) -> MemoryFileDetailDTO {
+        self.engine.get_memory_file_detail(name).into()
     }
 
     pub fn append_markdown_delta(
@@ -800,6 +912,7 @@ impl From<SessionSummary> for SessionSummaryDTO {
             title: value.title,
             created_at_ms: value.created_at_ms,
             updated_at_ms: value.updated_at_ms,
+            pinned_at_ms: value.pinned_at_ms,
             message_count: value.message_count,
             latest_preview: value.latest_preview,
         }
@@ -870,6 +983,98 @@ impl From<MessageRecord> for MessageDTO {
             model_group_id: value.model_group_id,
             finish_reason: value.finish_reason,
             native_finish_reason: value.native_finish_reason,
+            attachments: value
+                .attachments
+                .into_iter()
+                .map(AttachmentDTO::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<RuntimeFileResolution> for FileResolutionDTO {
+    fn from(value: RuntimeFileResolution) -> Self {
+        Self {
+            sandbox_path: value.sandbox_path,
+            host_path: value.host_path,
+            relative_path: value.relative_path,
+            root: value.root,
+            writable: value.writable,
+            exists: value.exists,
+            is_file: value.is_file,
+            mime_type: value.mime_type,
+            byte_size: value.byte_size,
+            file_id: value.file_id,
+        }
+    }
+}
+
+impl From<RuntimeRootfsStatus> for RootfsStatusDTO {
+    fn from(value: RuntimeRootfsStatus) -> Self {
+        Self {
+            rootfs_installed: value.rootfs_installed,
+            proot_available: value.proot_available,
+            root_available: value.root_available,
+            chroot_available: value.chroot_available,
+            backend: value.backend,
+            version: value.version,
+            rootfs_size_bytes: value.rootfs_size_bytes,
+            rootfs_path: value.rootfs_path,
+        }
+    }
+}
+
+impl From<RuntimeSkillSummary> for SkillSummaryDTO {
+    fn from(value: RuntimeSkillSummary) -> Self {
+        Self {
+            name: value.name,
+            description: value.description,
+            path: value.path,
+            category: value.category,
+            tags: value.tags,
+            built_in: value.built_in,
+            enabled: value.enabled,
+            created_at_ms: value.created_at_ms,
+            modified_at_ms: value.modified_at_ms,
+            files: value.files,
+        }
+    }
+}
+
+impl From<RuntimeSkillDetail> for SkillDetailDTO {
+    fn from(value: RuntimeSkillDetail) -> Self {
+        Self {
+            summary: value.summary.into(),
+            content: value.content,
+            raw_content: value.raw_content,
+            skill_dir_path: value.skill_dir_path,
+            linked_files_json: value.linked_files_json,
+            selected_file_path: value.selected_file_path,
+            selected_file_content: value.selected_file_content,
+        }
+    }
+}
+
+impl From<RuntimeMemoryFileSummary> for MemoryFileSummaryDTO {
+    fn from(value: RuntimeMemoryFileSummary) -> Self {
+        Self {
+            name: value.name,
+            size_bytes: value.size_bytes,
+            modified_at_ms: value.modified_at_ms,
+            entry_count: value.entry_count,
+            preview: value.preview,
+        }
+    }
+}
+
+impl From<RuntimeMemoryFileDetail> for MemoryFileDetailDTO {
+    fn from(value: RuntimeMemoryFileDetail) -> Self {
+        Self {
+            name: value.name,
+            size_bytes: value.size_bytes,
+            modified_at_ms: value.modified_at_ms,
+            entry_count: value.entry_count,
+            content: value.content,
         }
     }
 }

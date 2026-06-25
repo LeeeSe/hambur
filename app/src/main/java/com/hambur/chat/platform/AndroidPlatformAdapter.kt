@@ -40,6 +40,10 @@ class AndroidPlatformAdapter(
         secretStore.put(secretRef, value)
     }
 
+    fun getSecret(secretRef: String): String? {
+        return secretStore.get(secretRef)
+    }
+
     fun getOrCreateSharedWebView(): WebView {
         return browserView()
     }

@@ -43,6 +43,8 @@ import org.json.JSONObject
 data class UiSessionSummary(
     val id: String,
     val title: String,
+    val createdAtMs: ULong,
+    val updatedAtMs: ULong,
     val pinnedAtMs: ULong,
     val messageCount: UInt,
     val latestPreview: String,
@@ -1479,6 +1481,8 @@ private fun HamburUiState.applyBaseline(
             UiSessionSummary(
                 id = it.id,
                 title = it.title,
+                createdAtMs = it.createdAtMs,
+                updatedAtMs = it.updatedAtMs,
                 pinnedAtMs = it.pinnedAtMs,
                 messageCount = it.messageCount,
                 latestPreview = it.latestPreview,
@@ -1616,6 +1620,8 @@ private fun HamburUiState.reduce(event: BackendEvent): HamburUiState {
             UiSessionSummary(
                 id = it.id,
                 title = it.title,
+                createdAtMs = it.createdAtMs,
+                updatedAtMs = it.updatedAtMs,
                 pinnedAtMs = it.pinnedAtMs,
                 messageCount = it.messageCount,
                 latestPreview = it.latestPreview,

@@ -1785,6 +1785,11 @@ impl HamburDatabase {
         let record = self
             .markdown_block_by_stable_key(session_id, &stable_key)
             .await?;
+        let display_base = self
+            .message_by_id(&record.message_id)
+            .await?
+            .map(|message| message.created_at_ms)
+            .unwrap_or(record.created_at_ms);
         self.upsert_timeline_item(
             session_id,
             NewTimelineItem {
@@ -1794,7 +1799,7 @@ impl HamburDatabase {
                 } else {
                     "assistant_pending_block".to_string()
                 },
-                display_sequence: record.created_at_ms.saturating_add(record.block_id),
+                display_sequence: display_base.saturating_add(record.block_id),
                 payload_ref: record.id.clone(),
                 small_summary: record.small_summary.clone(),
                 kind: if record.committed {
@@ -5854,8 +5859,8 @@ mod tests {
     use tokio::runtime::Runtime;
 
     use super::{
-        HamburDatabase, ModelRouteSnapshot, NewTimelineItem, NewToolCall, NewToolResult,
-        NewTraceSpan,
+        HamburDatabase, ModelRouteSnapshot, NewMarkdownBlockPayload, NewTimelineItem, NewToolCall,
+        NewToolResult, NewTraceSpan, pending_markdown_stable_key,
     };
 
     #[test]
@@ -5997,6 +6002,81 @@ mod tests {
                 .expect("session snapshot");
             assert_eq!(snapshot.timeline_items.len(), 1);
             assert_eq!(snapshot.timeline_items[0].small_summary, "hello again");
+        });
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pending_markdown_block_keeps_message_block_order() {
+        let path = temp_database_path();
+        let runtime = Runtime::new().expect("tokio runtime");
+
+        runtime.block_on(async {
+            let database = HamburDatabase::open(&path).await.expect("open database");
+            let created = database
+                .create_session("Markdown")
+                .await
+                .expect("create session");
+            let session_id = created.selected_session_id;
+            let message = database
+                .insert_message(&session_id, "assistant", "first\n\nsecond")
+                .await
+                .expect("insert assistant message");
+
+            database
+                .upsert_markdown_block_payload(
+                    &session_id,
+                    "turn-1",
+                    NewMarkdownBlockPayload {
+                        id: String::new(),
+                        message_id: message.id.clone(),
+                        block_id: 1,
+                        stable_key: format!("{}:1", message.id),
+                        committed: true,
+                        payload_json: "{}".to_string(),
+                        raw: "first".to_string(),
+                        small_summary: "first".to_string(),
+                    },
+                )
+                .await
+                .expect("upsert committed block");
+            database
+                .upsert_markdown_block_payload(
+                    &session_id,
+                    "turn-1",
+                    NewMarkdownBlockPayload {
+                        id: String::new(),
+                        message_id: message.id.clone(),
+                        block_id: 2,
+                        stable_key: pending_markdown_stable_key(&message.id),
+                        committed: false,
+                        payload_json: "{}".to_string(),
+                        raw: "second".to_string(),
+                        small_summary: "second".to_string(),
+                    },
+                )
+                .await
+                .expect("upsert pending block");
+
+            let snapshot = database
+                .session_snapshot(&session_id)
+                .await
+                .expect("session snapshot");
+            let markdown_items: Vec<_> = snapshot
+                .timeline_items
+                .iter()
+                .filter(|item| {
+                    item.content_type == "assistant_markdown_block"
+                        || item.content_type == "assistant_pending_block"
+                })
+                .collect();
+
+            assert_eq!(markdown_items.len(), 2);
+            assert_eq!(markdown_items[0].content_type, "assistant_markdown_block");
+            assert_eq!(markdown_items[0].small_summary, "first");
+            assert_eq!(markdown_items[1].content_type, "assistant_pending_block");
+            assert_eq!(markdown_items[1].small_summary, "second");
         });
 
         let _ = fs::remove_file(path);

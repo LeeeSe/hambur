@@ -1,6 +1,8 @@
 package com.hambur.chat.ui.chat
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image as ComposeImage
@@ -34,6 +36,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.selection.SelectionContainer
@@ -42,15 +45,9 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalNavigationDrawer
-import androidx.compose.material3.NavigationDrawerItem
-import androidx.compose.material3.NavigationDrawerItemDefaults
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.rememberDrawerState
-import androidx.compose.material3.DrawerValue
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -64,11 +61,14 @@ import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
@@ -93,7 +93,7 @@ import com.composables.icons.lucide.MessageCirclePlus
 import com.composables.icons.lucide.RefreshCw
 import com.composables.icons.lucide.Search
 import com.composables.icons.lucide.Settings
-import com.composables.icons.lucide.Trash2
+import com.composables.icons.lucide.User
 import com.composables.icons.lucide.X
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -129,8 +129,7 @@ fun HamburChatScreen(
     onPickImage: (((String, String, ULong, String, String) -> Unit) -> Unit) = {},
     onPickFile: (((String, String, ULong, String, String) -> Unit) -> Unit) = {},
 ) {
-    val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
-    val scope = rememberCoroutineScope()
+    var drawerOpen by rememberSaveable { mutableStateOf(false) }
     var searchQuery by rememberSaveable { mutableStateOf("") }
     var draftTitle by rememberSaveable { mutableStateOf("") }
     var draftMessage by rememberSaveable { mutableStateOf("") }
@@ -142,28 +141,43 @@ fun HamburChatScreen(
     var attachmentPanelOpen by rememberSaveable { mutableStateOf(false) }
     var bottomInputHeightPx by remember { mutableStateOf(0) }
     val density = LocalDensity.current
+    val configuration = LocalConfiguration.current
+    val drawerWidth = configuration.screenWidthDp.dp * 0.82f
     val messageListBottomPadding = with(density) {
         bottomInputHeightPx.toDp()
     } + HamburTheme.tokens.chat.timelineBottomGap
+    val drawerProgress by animateFloatAsState(
+        targetValue = if (drawerOpen) 1f else 0f,
+        label = "drawerProgress",
+    )
+    val drawerOffset = with(density) { drawerWidth.toPx() * drawerProgress }
+    val mainScale = 1f - (0.08f * drawerProgress)
+    val mainCornerRadius = 30.dp * drawerProgress
+    val mainShadowElevation = 40.dp * drawerProgress
 
-    ModalNavigationDrawer(
-        drawerState = drawerState,
-        drawerContent = {
+    BackHandler(enabled = drawerOpen) {
+        drawerOpen = false
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background),
+    ) {
+        if (drawerProgress > 0.001f) {
             ChatDrawerContent(
                 sessions = state.sessions,
                 selectedSessionId = state.selectedSessionId,
                 searchQuery = searchQuery,
                 onSearchQueryChange = { searchQuery = it },
                 onNewSession = {
-                    store.createSession(draftTitle.ifBlank { "New chat" })
+                    store.createSession(draftTitle.ifBlank { "新对话" })
                     draftTitle = ""
-                    scope.launch { drawerState.close() }
+                    drawerOpen = false
                 },
-                draftTitle = draftTitle,
-                onDraftTitleChange = { draftTitle = it },
                 onOpenSession = {
                     store.openSession(it)
-                    scope.launch { drawerState.close() }
+                    drawerOpen = false
                 },
                 onDeleteSession = store::deleteSession,
                 onRenameSession = { sessionId ->
@@ -173,22 +187,50 @@ fun HamburChatScreen(
                 onSetSessionPinned = store::setSessionPinned,
                 onUnavailableAction = { unavailableAction = it },
                 onOpenSettings = {
-                    scope.launch { drawerState.close() }
+                    drawerOpen = false
                     onOpenSettings()
                 },
+                drawerWidth = drawerWidth,
+                modifier = Modifier.graphicsLayer {
+                    val drawerScale = 0.9f + (drawerProgress * 0.1f)
+                    alpha = drawerProgress
+                    scaleX = drawerScale
+                    scaleY = drawerScale
+                    translationX = -drawerWidth.toPx() * 0.2f * (1f - drawerProgress)
+                    transformOrigin = androidx.compose.ui.graphics.TransformOrigin(0f, 0.5f)
+                },
             )
-        },
-    ) {
+        }
+
         Column(
             modifier = Modifier
                 .fillMaxSize()
+                .graphicsLayer {
+                    translationX = drawerOffset
+                    scaleX = mainScale
+                    scaleY = mainScale
+                    transformOrigin = androidx.compose.ui.graphics.TransformOrigin(0f, 0.5f)
+                }
+                .shadow(
+                    elevation = mainShadowElevation,
+                    shape = RoundedCornerShape(mainCornerRadius),
+                    clip = false,
+                )
+                .clip(RoundedCornerShape(mainCornerRadius))
+                .background(MaterialTheme.colorScheme.background)
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    enabled = drawerOpen,
+                    onClick = { drawerOpen = false },
+                )
                 .statusBarsPadding()
                 .navigationBarsPadding()
                 .imePadding(),
         ) {
             ChatHeader(
                 title = state.selectedSessionTitle(),
-                onOpenDrawer = { scope.launch { drawerState.open() } },
+                onOpenDrawer = { drawerOpen = true },
                 onNewChat = { store.createSession("New chat") },
                 onOpenBrowser = onOpenBrowser,
             )
@@ -359,8 +401,6 @@ private fun ChatDrawerContent(
     selectedSessionId: String,
     searchQuery: String,
     onSearchQueryChange: (String) -> Unit,
-    draftTitle: String,
-    onDraftTitleChange: (String) -> Unit,
     onNewSession: () -> Unit,
     onOpenSession: (String) -> Unit,
     onDeleteSession: (String) -> Unit,
@@ -368,132 +408,269 @@ private fun ChatDrawerContent(
     onSetSessionPinned: (String, Boolean) -> Unit,
     onUnavailableAction: (String) -> Unit,
     onOpenSettings: () -> Unit,
+    drawerWidth: Dp,
+    modifier: Modifier = Modifier,
 ) {
-    val filtered = remember(sessions, searchQuery) {
-        if (searchQuery.isBlank()) {
-            sessions
-        } else {
-            sessions.filter {
-                it.title.contains(searchQuery, ignoreCase = true) ||
-                    it.latestPreview.contains(searchQuery, ignoreCase = true)
-            }
-        }
+    val colorScheme = MaterialTheme.colorScheme
+    val drawerBackground = colorScheme.background
+    val searchBackground = colorScheme.primaryContainer
+    val selectedBackground = colorScheme.primaryContainer
+    val mutedText = colorScheme.onSurfaceVariant
+    val groupedSessions = remember(sessions, searchQuery) {
+        groupDrawerSessions(
+            sessions = if (searchQuery.isBlank()) {
+                sessions
+            } else {
+                sessions.filter {
+                    it.title.contains(searchQuery, ignoreCase = true) ||
+                        it.latestPreview.contains(searchQuery, ignoreCase = true)
+                }
+            },
+            nowMs = System.currentTimeMillis().coerceAtLeast(0).toULong(),
+        )
     }
 
     Surface(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxHeight()
-            .widthIn(max = 340.dp),
-        color = MaterialTheme.colorScheme.surface,
+            .width(drawerWidth),
+        color = drawerBackground,
     ) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .statusBarsPadding()
                 .navigationBarsPadding()
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp),
+                .padding(horizontal = 16.dp),
         ) {
-            Text(
-                text = "Hambur",
-                style = MaterialTheme.typography.headlineSmall,
-                fontWeight = FontWeight.SemiBold,
-            )
-            OutlinedTextField(
+            Spacer(modifier = Modifier.height(16.dp))
+
+            DrawerSearchField(
                 value = searchQuery,
                 onValueChange = onSearchQueryChange,
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true,
-                leadingIcon = { Icon(imageVector = Lucide.Search, contentDescription = null) },
-                label = { Text("Search chats") },
+                background = searchBackground,
+                contentColor = colorScheme.onBackground,
+                placeholderColor = mutedText,
             )
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                OutlinedTextField(
-                    value = draftTitle,
-                    onValueChange = onDraftTitleChange,
-                    modifier = Modifier.weight(1f),
-                    singleLine = true,
-                    label = { Text("Title") },
-                )
-                IconButton(onClick = onNewSession) {
-                    Icon(imageVector = Lucide.CirclePlus, contentDescription = "Create")
-                }
-            }
+
+            Spacer(modifier = Modifier.height(22.dp))
 
             LazyColumn(
                 modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+                contentPadding = PaddingValues(bottom = 18.dp),
             ) {
-                items(filtered, key = { it.id }) { session ->
-                    NavigationDrawerItem(
-                        selected = session.id == selectedSessionId,
-                        onClick = { onOpenSession(session.id) },
-                        label = {
-                            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                                Text(
-                                    text = session.title.ifBlank { "New chat" },
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
-                                Text(
-                                    text = session.latestPreview.ifBlank {
-                                        "${session.messageCount} messages"
-                                    },
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
-                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                    TextButton(onClick = { onRenameSession(session.id) }) {
-                                        Text("Rename")
-                                    }
-                                    TextButton(onClick = { onSetSessionPinned(session.id, session.pinnedAtMs == 0UL) }) {
-                                        Text(if (session.pinnedAtMs == 0UL) "Pin" else "Unpin")
-                                    }
-                                }
-                            }
-                        },
-                        badge = {
-                            IconButton(onClick = { onDeleteSession(session.id) }) {
-                                Icon(
-                                    imageVector = Lucide.Trash2,
-                                    contentDescription = "Delete",
-                                    modifier = Modifier.size(18.dp),
-                                )
-                            }
-                        },
-                        colors = NavigationDrawerItemDefaults.colors(
-                            selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
-                            unselectedContainerColor = Color.Transparent,
-                        ),
-                    )
+                groupedSessions.forEach { group ->
+                    if (group.sessions.isNotEmpty()) {
+                        item(key = "header-${group.title}") {
+                            DrawerCategoryHeader(
+                                text = group.title,
+                                color = mutedText,
+                            )
+                        }
+                        items(group.sessions, key = { it.id }) { session ->
+                            DrawerSessionRow(
+                                title = session.title.ifBlank { "新对话" },
+                                selected = session.id == selectedSessionId,
+                                onClick = { onOpenSession(session.id) },
+                                selectedBackground = selectedBackground,
+                                contentColor = colorScheme.onBackground,
+                            )
+                        }
+                    }
                 }
             }
-            Surface(
+
+            DrawerBottomBar(
+                onOpenSettings = onOpenSettings,
+                avatarBackground = colorScheme.primaryContainer,
+                contentColor = colorScheme.onBackground,
+                mutedColor = mutedText,
+            )
+        }
+    }
+}
+
+@Composable
+private fun DrawerSearchField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    background: Color,
+    contentColor: Color,
+    placeholderColor: Color,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(52.dp)
+            .clip(RoundedCornerShape(26.dp))
+            .background(background)
+            .padding(horizontal = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            imageVector = Lucide.Search,
+            contentDescription = null,
+            tint = placeholderColor,
+            modifier = Modifier.size(22.dp),
+        )
+        Spacer(modifier = Modifier.width(10.dp))
+        Box(modifier = Modifier.weight(1f)) {
+            if (value.isEmpty()) {
+                Text(
+                    text = "搜索对话内容...",
+                    color = placeholderColor,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            BasicTextField(
+                value = value,
+                onValueChange = onValueChange,
+                singleLine = true,
+                textStyle = MaterialTheme.typography.titleMedium.copy(
+                    color = contentColor,
+                    fontWeight = FontWeight.SemiBold,
+                ),
+                cursorBrush = SolidColor(contentColor),
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+    }
+}
+
+private data class DrawerSessionGroup(
+    val title: String,
+    val sessions: List<UiSessionSummary>,
+)
+
+private fun groupDrawerSessions(
+    sessions: List<UiSessionSummary>,
+    nowMs: ULong,
+): List<DrawerSessionGroup> {
+    val dayMs = 24UL * 60UL * 60UL * 1000UL
+    val today = mutableListOf<UiSessionSummary>()
+    val week = mutableListOf<UiSessionSummary>()
+    val month = mutableListOf<UiSessionSummary>()
+    val earlier = mutableListOf<UiSessionSummary>()
+
+    sessions.forEach { session ->
+        val timestamp = session.updatedAtMs.takeIf { it > 0UL } ?: session.createdAtMs
+        val ageMs = if (timestamp > nowMs) 0UL else nowMs - timestamp
+        when {
+            ageMs < dayMs -> today += session
+            ageMs < 7UL * dayMs -> week += session
+            ageMs < 30UL * dayMs -> month += session
+            else -> earlier += session
+        }
+    }
+
+    return listOf(
+        DrawerSessionGroup("今天", today),
+        DrawerSessionGroup("7 天内", week),
+        DrawerSessionGroup("30 天内", month),
+        DrawerSessionGroup("更早", earlier),
+    )
+}
+
+@Composable
+private fun DrawerCategoryHeader(
+    text: String,
+    color: Color,
+) {
+    Text(
+        text = text,
+        color = color,
+        style = MaterialTheme.typography.titleMedium,
+        fontWeight = FontWeight.SemiBold,
+        modifier = Modifier.padding(vertical = 7.dp),
+    )
+}
+
+@Composable
+private fun DrawerSessionRow(
+    title: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    selectedBackground: Color,
+    contentColor: Color,
+) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(52.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(if (selected) selectedBackground else Color.Transparent)
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                role = Role.Button,
+                onClick = onClick,
+            )
+            .padding(horizontal = 14.dp),
+        contentAlignment = Alignment.CenterStart,
+    ) {
+        Text(
+            text = title,
+            color = contentColor.copy(alpha = if (selected) 1f else 0.82f),
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = if (selected) FontWeight.Bold else FontWeight.SemiBold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+@Composable
+private fun DrawerBottomBar(
+    onOpenSettings: () -> Unit,
+    avatarBackground: Color,
+    contentColor: Color,
+    mutedColor: Color,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(64.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(
                 modifier = Modifier
-                    .fillMaxWidth()
-                    .clickable(onClick = onOpenSettings),
-                shape = RoundedCornerShape(8.dp),
-                color = MaterialTheme.colorScheme.surfaceVariant,
+                    .size(42.dp)
+                    .clip(CircleShape)
+                    .background(avatarBackground),
+                contentAlignment = Alignment.Center,
             ) {
-                Row(
-                    modifier = Modifier.padding(12.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                ) {
-                    Icon(imageVector = Lucide.Settings, contentDescription = null)
-                    Text(
-                        text = "Settings",
-                        modifier = Modifier.weight(1f),
-                        fontWeight = FontWeight.Medium,
-                    )
-                }
+                Icon(
+                    imageVector = Lucide.User,
+                    contentDescription = null,
+                    tint = mutedColor,
+                    modifier = Modifier.size(24.dp),
+                )
             }
+            Spacer(modifier = Modifier.width(12.dp))
+            Text(
+                text = "153******85",
+                color = contentColor,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+            )
+        }
+
+        ChatIconButton(
+            onClick = onOpenSettings,
+            size = 48.dp,
+        ) {
+            Icon(
+                imageVector = Lucide.Settings,
+                contentDescription = "Settings",
+                tint = contentColor,
+                modifier = Modifier.size(32.dp),
+            )
         }
     }
 }
@@ -710,7 +887,7 @@ private fun MessageTimelineItem(
     Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
         Surface(
             modifier = Modifier.widthIn(max = 324.dp),
-            shape = RoundedCornerShape(26.dp),
+            shape = RoundedCornerShape(18.dp),
             color = MaterialTheme.colorScheme.primaryContainer,
         ) {
             Column(
@@ -743,8 +920,7 @@ private fun MessageTimelineItem(
                 Text(
                     text = message?.contentText?.ifBlank { item.smallSummary }
                         ?: item.smallSummary.ifBlank { "Loading message..." },
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold,
+                    style = MaterialTheme.typography.bodyLarge,
                 )
             }
         }
@@ -805,7 +981,8 @@ private fun AssistantMarkdownTimelineItem(
                     Icon(
                         imageVector = Lucide.Copy,
                         contentDescription = null,
-                        modifier = Modifier.size(19.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(16.dp),
                     )
                 }
                 ChatInlineActionButton(
@@ -815,7 +992,8 @@ private fun AssistantMarkdownTimelineItem(
                     Icon(
                         imageVector = Lucide.RefreshCw,
                         contentDescription = null,
-                        modifier = Modifier.size(19.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(16.dp),
                     )
                 }
             }
@@ -831,7 +1009,7 @@ private fun ChatInlineActionButton(
 ) {
     IconButton(
         onClick = onClick,
-        modifier = Modifier.size(34.dp),
+        modifier = Modifier.size(28.dp),
     ) {
         Box(
             modifier = Modifier.fillMaxSize(),

@@ -138,7 +138,7 @@ fun rememberMarkdownStyle(styleVersion: Int = 1): MarkdownStyle {
     return remember(colors, typography, styleVersion) {
         MarkdownStyle(
             styleVersion = styleVersion,
-            paragraphTextStyle = typography.bodyMedium,
+            paragraphTextStyle = typography.bodyLarge,
             heading1TextStyle = typography.headlineSmall.copy(fontWeight = FontWeight.SemiBold),
             heading2TextStyle = typography.titleLarge.copy(fontWeight = FontWeight.SemiBold),
             headingTextStyle = typography.titleMedium.copy(fontWeight = FontWeight.SemiBold),

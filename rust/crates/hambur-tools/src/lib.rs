@@ -287,24 +287,48 @@ impl ToolSchemaCompiler {
         })?;
         compiler.register(ToolSchema {
             name: "skills_list".to_string(),
-            description: "List available Hambur skills with compact metadata.".to_string(),
+            description: "List available skills with minimal metadata. Use skill_view(name) to load full content, tags, and linked files.".to_string(),
             parameters_json_schema: json!({
                 "type": "object",
                 "properties": {
-                    "category": {"type": "string"}
+                    "category": {
+                        "type": "string",
+                        "description": "Optional category filter to narrow results."
+                    }
+                },
+                "additionalProperties": false
+            }),
+        })?;
+        compiler.register(ToolSchema {
+            name: "skill_list".to_string(),
+            description: "Alias for skills_list. List available skills with minimal metadata."
+                .to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "description": "Optional category filter to narrow results."
+                    }
                 },
                 "additionalProperties": false
             }),
         })?;
         compiler.register(ToolSchema {
             name: "skill_view".to_string(),
-            description: "Load a Hambur skill main content or a linked file inside that skill."
+            description: "Skills load information about specific tasks and workflows, plus references, templates, scripts, and assets. Load a skill's main SKILL.md content or a linked file inside the skill directory."
                 .to_string(),
             parameters_json_schema: json!({
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string"},
-                    "file_path": {"type": "string"}
+                    "name": {
+                        "type": "string",
+                        "description": "Skill name or path. Use skills_list to see available skills. Absolute /var/hambur/skills/... paths are accepted."
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "Optional path to a linked file inside the skill, such as references/api.md, templates/config.yaml, or scripts/setup.sh. Omit to get SKILL.md."
+                    }
                 },
                 "required": ["name"],
                 "additionalProperties": false
@@ -1036,6 +1060,7 @@ fn is_parallel_tool(name: &str) -> bool {
             | "search_files"
             | "terminal"
             | "session_search"
+            | "skill_list"
             | "skills_list"
             | "skill_view"
             | "get_current_time"

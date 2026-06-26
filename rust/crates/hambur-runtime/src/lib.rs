@@ -16,9 +16,8 @@ use hambur_core::{DTO_SCHEMA_VERSION, HamburError, HamburResult, new_id, now_ms}
 use hambur_db::{
     AppSnapshot, AttachmentRecord, HamburDatabase, MarkdownBlockPayloadRecord, MessageRecord,
     ModelRouteSnapshot, NewAttachment, NewFileRecord, NewMarkdownBlockPayload, NewTimelineItem,
-    NewToolCall, NewToolResult, NewTraceSpan,
-    ProviderModelOverride, ProviderModelUpsert, ProviderUpsert, SessionSummary, SettingsSnapshot,
-    TimelineItemSnapshot,
+    NewToolCall, NewToolResult, NewTraceSpan, ProviderModelOverride, ProviderModelUpsert,
+    ProviderUpsert, SessionSummary, SettingsSnapshot, TimelineItemSnapshot,
 };
 use hambur_filestore::FileStore;
 use hambur_llm::{
@@ -480,6 +479,12 @@ impl RuntimeEngine {
         let sandbox = SandboxService::new_with_native_library_dir(
             &bootstrap.app_files_dir,
             &bootstrap.native_library_dir,
+        )?;
+        seed_bundled_skills(
+            &PathBuf::from(&bootstrap.app_files_dir)
+                .join("sandbox")
+                .join("global")
+                .join("skills"),
         )?;
         let jobs = tokio.block_on(database.cleanup_pending_attachments(0))?;
         for job in jobs {
@@ -1865,6 +1870,7 @@ impl RuntimeEngine {
         };
         let fallback_policy = plan.fallback_policy;
         let tools_json = self.tools.schemas().compile_openai_tools_json();
+        let skills_index_prompt = self.build_skills_index_prompt();
         let stream_sources_by_route = route_snapshots
             .iter()
             .map(|route| {
@@ -1873,6 +1879,7 @@ impl RuntimeEngine {
                     &content,
                     route,
                     &tools_json,
+                    &skills_index_prompt,
                     send_options.deep_thinking_enabled,
                     send_options.search_enabled,
                 )
@@ -2271,113 +2278,17 @@ impl RuntimeEngine {
         let mut current_stream_sources_by_route = stream_sources_by_route;
         let mut current_tool_iteration = tool_iteration;
         'agent_loop: loop {
-        let target_count = current_routes.len();
-        let route_candidates = current_routes.clone();
-        let mut last_error = None;
+            let target_count = current_routes.len();
+            let route_candidates = current_routes.clone();
+            let mut last_error = None;
 
-        for (attempt_index, route) in current_routes.iter().cloned().enumerate() {
-            if attempt_index > 0 {
-                if let Err(error) = self
-                    .database
-                    .update_turn_route_snapshot(&turn_id, &route)
-                    .await
-                {
-                    self.finish_failed_turn(
-                        &session_id,
-                        &turn_id,
-                        &current_assistant_message_id,
-                        "",
-                        "",
-                        error,
-                    )
-                    .await;
-                    return;
-                }
-                if let Err(error) = self
-                    .database
-                    .update_message_route_snapshot(&current_assistant_message_id, &route)
-                    .await
-                {
-                    self.finish_failed_turn(
-                        &session_id,
-                        &turn_id,
-                        &current_assistant_message_id,
-                        "",
-                        "",
-                        error,
-                    )
-                    .await;
-                    return;
-                }
-
-                let snapshot = self
-                    .database
-                    .session_snapshot(&session_id)
-                    .await
-                    .unwrap_or_default();
-                let _ = self.emit_session_event(
-                    RuntimeEventKind::TurnStateChanged,
-                    session_id.clone(),
-                    turn_id.clone(),
-                    snapshot,
-                    format!("Fallback to {}", route.model_display_name),
-                    None,
-                );
-            }
-
-            let stream_source = current_stream_sources_by_route
-                .get(attempt_index)
-                .cloned()
-                .unwrap_or_else(|| {
-                    let tools_json = self.tools.schemas().compile_openai_tools_json();
-                    provider_stream_source(
-                        &session_id,
-                        &turn_id,
-                        "",
-                        &route,
-                        &tools_json,
-                        false,
-                        false,
-                    )
-                });
-            match self
-                .clone()
-                .run_chat_stream_attempt(
-                    session_id.clone(),
-                    turn_id.clone(),
-                    current_assistant_message_id.clone(),
-                    route,
-                    route_candidates.clone(),
-                    cancel.clone(),
-                    stream_source,
-                    current_tool_iteration,
-                )
-                .await
-            {
-                StreamAttemptResult::Completed | StreamAttemptResult::Cancelled => return,
-                StreamAttemptResult::Continue(continuation) => {
-                    current_assistant_message_id = continuation.assistant_message_id;
-                    current_routes = vec![continuation.route];
-                    current_stream_sources_by_route = vec![continuation.stream_source];
-                    current_tool_iteration = continuation.tool_iteration;
-                    continue 'agent_loop;
-                }
-                StreamAttemptResult::Failed {
-                    error,
-                    semantic_delta_started,
-                } => {
-                    let can_fallback = should_fallback(
-                        fallback_policy,
-                        semantic_delta_started,
-                        attempt_index,
-                        target_count,
-                        fallback_error_code(&error),
-                    );
-                    if can_fallback {
-                        last_error = Some(error);
-                        continue;
-                    }
-                    if !semantic_delta_started {
+            for (attempt_index, route) in current_routes.iter().cloned().enumerate() {
+                if attempt_index > 0 {
+                    if let Err(error) = self
+                        .database
+                        .update_turn_route_snapshot(&turn_id, &route)
+                        .await
+                    {
                         self.finish_failed_turn(
                             &session_id,
                             &turn_id,
@@ -2387,24 +2298,121 @@ impl RuntimeEngine {
                             error,
                         )
                         .await;
+                        return;
                     }
-                    return;
+                    if let Err(error) = self
+                        .database
+                        .update_message_route_snapshot(&current_assistant_message_id, &route)
+                        .await
+                    {
+                        self.finish_failed_turn(
+                            &session_id,
+                            &turn_id,
+                            &current_assistant_message_id,
+                            "",
+                            "",
+                            error,
+                        )
+                        .await;
+                        return;
+                    }
+
+                    let snapshot = self
+                        .database
+                        .session_snapshot(&session_id)
+                        .await
+                        .unwrap_or_default();
+                    let _ = self.emit_session_event(
+                        RuntimeEventKind::TurnStateChanged,
+                        session_id.clone(),
+                        turn_id.clone(),
+                        snapshot,
+                        format!("Fallback to {}", route.model_display_name),
+                        None,
+                    );
+                }
+
+                let stream_source = current_stream_sources_by_route
+                    .get(attempt_index)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        let tools_json = self.tools.schemas().compile_openai_tools_json();
+                        provider_stream_source(
+                            &session_id,
+                            &turn_id,
+                            "",
+                            &route,
+                            &tools_json,
+                            "",
+                            false,
+                            false,
+                        )
+                    });
+                match self
+                    .clone()
+                    .run_chat_stream_attempt(
+                        session_id.clone(),
+                        turn_id.clone(),
+                        current_assistant_message_id.clone(),
+                        route,
+                        route_candidates.clone(),
+                        cancel.clone(),
+                        stream_source,
+                        current_tool_iteration,
+                    )
+                    .await
+                {
+                    StreamAttemptResult::Completed | StreamAttemptResult::Cancelled => return,
+                    StreamAttemptResult::Continue(continuation) => {
+                        current_assistant_message_id = continuation.assistant_message_id;
+                        current_routes = vec![continuation.route];
+                        current_stream_sources_by_route = vec![continuation.stream_source];
+                        current_tool_iteration = continuation.tool_iteration;
+                        continue 'agent_loop;
+                    }
+                    StreamAttemptResult::Failed {
+                        error,
+                        semantic_delta_started,
+                    } => {
+                        let can_fallback = should_fallback(
+                            fallback_policy,
+                            semantic_delta_started,
+                            attempt_index,
+                            target_count,
+                            fallback_error_code(&error),
+                        );
+                        if can_fallback {
+                            last_error = Some(error);
+                            continue;
+                        }
+                        if !semantic_delta_started {
+                            self.finish_failed_turn(
+                                &session_id,
+                                &turn_id,
+                                &current_assistant_message_id,
+                                "",
+                                "",
+                                error,
+                            )
+                            .await;
+                        }
+                        return;
+                    }
                 }
             }
-        }
 
-        if let Some(error) = last_error {
-            self.finish_failed_turn(
-                &session_id,
-                &turn_id,
-                &current_assistant_message_id,
-                "",
-                "",
-                error,
-            )
+            if let Some(error) = last_error {
+                self.finish_failed_turn(
+                    &session_id,
+                    &turn_id,
+                    &current_assistant_message_id,
+                    "",
+                    "",
+                    error,
+                )
                 .await;
-        }
-        return;
+            }
+            return;
         }
     }
 
@@ -2925,8 +2933,7 @@ impl RuntimeEngine {
                 .await;
         }
 
-        self
-            .database
+        self.database
             .update_message_stream_result(
                 assistant_message_id,
                 content,
@@ -3278,7 +3285,7 @@ impl RuntimeEngine {
                 "read_file" | "write_file" | "patch" | "search_files" => {
                     records.push(self.execute_file_tool(invocation).await);
                 }
-                "memory" | "skills_list" | "skill_view" => {
+                "memory" | "skill_list" | "skills_list" | "skill_view" => {
                     records.push(self.execute_knowledge_tool(invocation).await);
                 }
                 "browser_use" => {
@@ -3839,7 +3846,10 @@ impl RuntimeEngine {
     async fn execute_knowledge_tool(&self, invocation: ToolInvocation) -> ToolExecutionRecord {
         let started_at_ms = now_ms();
         let result = match invocation.arguments_value() {
-            Ok(arguments) => self.resolve_knowledge_tool_result(&invocation, &arguments),
+            Ok(arguments) => {
+                self.resolve_knowledge_tool_result(&invocation, &arguments)
+                    .await
+            }
             Err(error) => ToolResult::failed(
                 &invocation.tool_call_id,
                 &invocation.name,
@@ -3854,15 +3864,16 @@ impl RuntimeEngine {
         }
     }
 
-    fn resolve_knowledge_tool_result(
+    async fn resolve_knowledge_tool_result(
         &self,
         invocation: &ToolInvocation,
         arguments: &Value,
     ) -> ToolResult {
+        let tool_name = normalize_knowledge_tool_name(&invocation.name);
         if let Err(error) = self
             .tools
             .schemas()
-            .validate_arguments(&invocation.name, arguments)
+            .validate_arguments(tool_name, arguments)
         {
             return ToolResult::failed(
                 &invocation.tool_call_id,
@@ -3870,26 +3881,41 @@ impl RuntimeEngine {
                 error.to_string(),
             );
         }
-        let result = match invocation.name.as_str() {
+        let result = match tool_name {
             "skills_list" => {
                 let category = arguments
                     .get("category")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .trim();
-                let skills = self
-                    .list_skills_internal()
+                let disabled = self.disabled_skill_paths_async().await;
+                let all_skills = self
+                    .list_skills_with_disabled(&disabled)
                     .unwrap_or_default()
                     .into_iter()
                     .filter(|skill| skill.enabled)
+                    .collect::<Vec<_>>();
+                let mut categories = all_skills
+                    .iter()
+                    .filter_map(|skill| {
+                        (!skill.category.is_empty()).then(|| skill.category.clone())
+                    })
+                    .collect::<Vec<_>>();
+                categories.sort();
+                categories.dedup();
+                let skills = all_skills
+                    .into_iter()
                     .filter(|skill| category.is_empty() || skill.category == category)
                     .map(skill_summary_json)
                     .collect::<Vec<_>>();
+                let count = skills.len();
                 Ok(json!({
                     "success": true,
                     "skills": skills,
-                    "count": skills.len(),
-                    "summary": format!("{} skills", skills.len())
+                    "categories": categories,
+                    "count": count,
+                    "hint": "Use skill_view(name) to see full content, tags, and linked files.",
+                    "summary": format!("{count} skills")
                 }))
             }
             "skill_view" => {
@@ -3901,8 +3927,9 @@ impl RuntimeEngine {
                     .get("file_path")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                self.get_skill_detail_internal(name, file_path)
-                    .map(skill_detail_json)
+                let disabled = self.disabled_skill_paths_async().await;
+                self.get_skill_detail_with_disabled(name, file_path, &disabled)
+                    .map(|detail| skill_detail_json(detail, !file_path.trim().is_empty()))
             }
             "memory" => self.memory_tool_result(arguments),
             _ => Err(HamburError::InvalidCommand(format!(
@@ -5033,6 +5060,7 @@ impl RuntimeEngine {
             ..RuntimeCommand::default()
         };
         let tools_json = self.tools.schemas().compile_openai_tools_json();
+        let skills_index_prompt = self.build_skills_index_prompt_async().await;
         let stream_sources_by_route = route_candidates
             .iter()
             .map(|candidate| {
@@ -5041,6 +5069,7 @@ impl RuntimeEngine {
                     &child_content,
                     candidate,
                     &tools_json,
+                    &skills_index_prompt,
                     false,
                     false,
                 )
@@ -5741,7 +5770,12 @@ impl RuntimeEngine {
                 }
             })
             .unwrap_or_default();
-        self.emit_markdown_event_with_snapshot(session_id, turn_id, snapshot, markdown_render_update)
+        self.emit_markdown_event_with_snapshot(
+            session_id,
+            turn_id,
+            snapshot,
+            markdown_render_update,
+        )
     }
 
     async fn emit_markdown_event_async(
@@ -5753,18 +5787,19 @@ impl RuntimeEngine {
         if self.shutdown.load(Ordering::SeqCst) {
             return Err(HamburError::RuntimeClosed);
         }
-        self.persist_markdown_update_for_timeline(
-            &session_id,
-            &turn_id,
-            &markdown_render_update,
-        )
-        .await?;
+        self.persist_markdown_update_for_timeline(&session_id, &turn_id, &markdown_render_update)
+            .await?;
         let snapshot = if session_id.is_empty() {
             self.database.bootstrap_snapshot().await?
         } else {
             self.database.session_snapshot(&session_id).await?
         };
-        self.emit_markdown_event_with_snapshot(session_id, turn_id, snapshot, markdown_render_update)
+        self.emit_markdown_event_with_snapshot(
+            session_id,
+            turn_id,
+            snapshot,
+            markdown_render_update,
+        )
     }
 
     fn emit_markdown_event_with_snapshot(
@@ -5987,6 +6022,30 @@ fn strip_frontmatter(raw: &str) -> String {
     raw[4 + end + 4..].trim_start_matches('\n').to_string()
 }
 
+fn seed_bundled_skills(root: &Path) -> HamburResult<()> {
+    fs::create_dir_all(root)
+        .map_err(|error| HamburError::Internal(format!("create skills root: {error}")))?;
+    for bundled in BUNDLED_SKILLS {
+        let destination = safe_join(root, bundled.relative_path)?;
+        if destination.exists() {
+            continue;
+        }
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| HamburError::Internal(format!("create skill dir: {error}")))?;
+        }
+        fs::write(&destination, bundled.content)
+            .map_err(|error| HamburError::Internal(format!("seed skill: {error}")))?;
+    }
+    Ok(())
+}
+
+fn is_bundled_skill_path(path: &str) -> bool {
+    BUNDLED_SKILLS
+        .iter()
+        .any(|bundled| bundled.relative_path == path)
+}
+
 fn linked_skill_files_json(skill_dir: &Path) -> String {
     let mut groups = serde_json::Map::new();
     for child in ["references", "templates", "scripts", "assets"] {
@@ -6176,34 +6235,86 @@ fn skill_summary_json(skill: RuntimeSkillSummary) -> Value {
     json!({
         "name": skill.name,
         "description": skill.description,
-        "path": format!("{SANDBOX_SKILLS_PATH}/{}", skill.path),
         "category": skill.category,
-        "tags": skill.tags,
-        "builtIn": skill.built_in,
-        "enabled": skill.enabled,
-        "createdAtMs": skill.created_at_ms,
-        "modifiedAtMs": skill.modified_at_ms,
-        "files": skill.files
+        "path": format!("{SANDBOX_SKILLS_PATH}/{}", skill.path),
+        "tags": skill.tags
     })
 }
 
-fn skill_detail_json(detail: RuntimeSkillDetail) -> Value {
+fn skill_detail_json(detail: RuntimeSkillDetail, selected_file: bool) -> Value {
+    if selected_file {
+        return json!({
+            "success": true,
+            "name": detail.summary.name,
+            "file_path": detail.selected_file_path,
+            "path": format!("{SANDBOX_SKILLS_PATH}/{}/{}", detail.skill_dir_path, detail.selected_file_path),
+            "content": detail.selected_file_content,
+            "summary": "skill file loaded"
+        });
+    }
+    let linked_files =
+        serde_json::from_str::<Value>(&detail.linked_files_json).unwrap_or_else(|_| json!({}));
     json!({
         "success": true,
         "name": detail.summary.name,
         "description": detail.summary.description,
-        "path": format!("{SANDBOX_SKILLS_PATH}/{}", detail.summary.path),
-        "skillDir": format!("{SANDBOX_SKILLS_PATH}/{}", detail.skill_dir_path),
         "category": detail.summary.category,
-        "tags": detail.summary.tags,
-        "enabled": detail.summary.enabled,
-        "files": detail.summary.files,
-        "linkedFiles": serde_json::from_str::<Value>(&detail.linked_files_json).unwrap_or_else(|_| json!({})),
+        "path": format!("{SANDBOX_SKILLS_PATH}/{}", detail.summary.path),
+        "skill_dir": format!("{SANDBOX_SKILLS_PATH}/{}", detail.skill_dir_path),
+        "linked_files": linked_files,
         "content": detail.content,
-        "filePath": detail.selected_file_path,
-        "fileContent": detail.selected_file_content,
-        "summary": "skill loaded"
+        "hint": "To view linked files, call skill_view(name, file_path) where file_path is e.g. references/api.md, templates/config.yaml, or scripts/setup.sh."
     })
+}
+
+fn normalize_knowledge_tool_name(name: &str) -> &str {
+    match name {
+        "skill_list" => "skills_list",
+        other => other,
+    }
+}
+
+fn disabled_skill_paths_from_snapshot(snapshot: SettingsSnapshot) -> HashSet<String> {
+    snapshot
+        .settings
+        .into_iter()
+        .filter_map(|setting| {
+            setting
+                .key
+                .strip_prefix("skill_enabled:")
+                .filter(|_| setting.value == "false")
+                .map(ToString::to_string)
+        })
+        .collect()
+}
+
+fn format_skills_index_prompt(skills: Vec<RuntimeSkillSummary>) -> String {
+    if skills.is_empty() {
+        return String::new();
+    }
+    let mut prompt = String::new();
+    prompt.push_str("Hambur has a local Skills system at /var/hambur/skills. This directory is shared by all chat sessions and visible inside the Linux sandbox.\n");
+    prompt.push_str("Skills are reusable task instructions, references, scripts, and templates. They are loaded through progressive disclosure: use `skills_list` for compact metadata, then `skill_view` to inspect a skill before following its detailed workflow.\n");
+    prompt.push_str("Available skills:\n");
+    for skill in skills {
+        prompt.push_str("- ");
+        prompt.push_str(&skill.name);
+        if !skill.category.is_empty() {
+            prompt.push_str(" [");
+            prompt.push_str(&skill.category);
+            prompt.push(']');
+        }
+        prompt.push_str(": ");
+        prompt.push_str(
+            &skill
+                .description
+                .chars()
+                .take(SKILL_MAX_DESCRIPTION_CHARS)
+                .collect::<String>(),
+        );
+        prompt.push('\n');
+    }
+    prompt.trim().to_string()
 }
 
 fn database_path(bootstrap: &AppBootstrap) -> PathBuf {
@@ -6212,9 +6323,19 @@ fn database_path(bootstrap: &AppBootstrap) -> PathBuf {
 
 const SANDBOX_SKILLS_PATH: &str = "/var/hambur/skills";
 const SKILL_MAX_LINKED_FILE_BYTES: u64 = 512_000;
+const SKILL_MAX_DESCRIPTION_CHARS: usize = 320;
 const MEMORY_FILE_NAME: &str = "MEMORY.md";
 const USER_FILE_NAME: &str = "USER.md";
 const MEMORY_ENTRY_DELIMITER: &str = "\n§\n";
+const BUNDLED_SKILLS: &[BundledSkillFile] = &[BundledSkillFile {
+    relative_path: "system/skill-creator/SKILL.md",
+    content: include_str!("../assets/skills/system/skill-creator/SKILL.md"),
+}];
+
+struct BundledSkillFile {
+    relative_path: &'static str,
+    content: &'static str,
+}
 
 impl RuntimeEngine {
     fn skills_root(&self) -> PathBuf {
@@ -6231,16 +6352,26 @@ impl RuntimeEngine {
             .join("memory")
     }
 
+    fn ensure_seeded_skills(&self) -> HamburResult<()> {
+        seed_bundled_skills(&self.skills_root())
+    }
+
     fn list_skills_internal(&self) -> HamburResult<Vec<RuntimeSkillSummary>> {
-        let root = self.skills_root();
-        fs::create_dir_all(&root)
-            .map_err(|error| HamburError::Internal(format!("create skills root: {error}")))?;
         let disabled = self.disabled_skill_paths();
+        self.list_skills_with_disabled(&disabled)
+    }
+
+    fn list_skills_with_disabled(
+        &self,
+        disabled: &HashSet<String>,
+    ) -> HamburResult<Vec<RuntimeSkillSummary>> {
+        let root = self.skills_root();
+        self.ensure_seeded_skills()?;
         let mut skill_files = Vec::new();
         collect_named_files(&root, "SKILL.md", &mut skill_files)?;
         let mut skills = skill_files
             .into_iter()
-            .filter_map(|path| self.load_skill_from_file(&root, &path, &disabled).ok())
+            .filter_map(|path| self.load_skill_from_file(&root, &path, disabled).ok())
             .map(|detail| detail.summary)
             .collect::<Vec<_>>();
         skills.sort_by(|a, b| {
@@ -6257,12 +6388,20 @@ impl RuntimeEngine {
         identifier: &str,
         selected_file_path: &str,
     ) -> HamburResult<RuntimeSkillDetail> {
-        let root = self.skills_root();
-        fs::create_dir_all(&root)
-            .map_err(|error| HamburError::Internal(format!("create skills root: {error}")))?;
         let disabled = self.disabled_skill_paths();
-        let skill_file = self.resolve_skill_file(&root, identifier)?;
-        let mut detail = self.load_skill_from_file(&root, &skill_file, &disabled)?;
+        self.get_skill_detail_with_disabled(identifier, selected_file_path, &disabled)
+    }
+
+    fn get_skill_detail_with_disabled(
+        &self,
+        identifier: &str,
+        selected_file_path: &str,
+        disabled: &HashSet<String>,
+    ) -> HamburResult<RuntimeSkillDetail> {
+        let root = self.skills_root();
+        self.ensure_seeded_skills()?;
+        let skill_file = self.resolve_skill_file(&root, identifier, disabled)?;
+        let mut detail = self.load_skill_from_file(&root, &skill_file, disabled)?;
         let file_path = selected_file_path.trim().trim_start_matches('/');
         if !file_path.is_empty() {
             let skill_dir = root.join(&detail.skill_dir_path);
@@ -6290,7 +6429,9 @@ impl RuntimeEngine {
 
     fn delete_skill_internal(&self, identifier: &str) -> HamburResult<String> {
         let root = self.skills_root();
-        let skill_file = self.resolve_skill_file(&root, identifier)?;
+        self.ensure_seeded_skills()?;
+        let disabled = self.disabled_skill_paths();
+        let skill_file = self.resolve_skill_file(&root, identifier, &disabled)?;
         let skill_dir = skill_file.parent().ok_or_else(|| {
             HamburError::InvalidCommand(format!("skill directory not found: {identifier}"))
         })?;
@@ -6305,7 +6446,12 @@ impl RuntimeEngine {
         Ok(relative)
     }
 
-    fn resolve_skill_file(&self, root: &PathBuf, identifier: &str) -> HamburResult<PathBuf> {
+    fn resolve_skill_file(
+        &self,
+        root: &PathBuf,
+        identifier: &str,
+        disabled: &HashSet<String>,
+    ) -> HamburResult<PathBuf> {
         let raw = identifier.trim();
         let normalized = raw
             .strip_prefix(SANDBOX_SKILLS_PATH)
@@ -6339,7 +6485,7 @@ impl RuntimeEngine {
             }
         }
         let lowered = normalized.to_ascii_lowercase();
-        for skill in self.list_skills_internal()? {
+        for skill in self.list_skills_with_disabled(disabled)? {
             let path_without_file = skill.path.trim_end_matches("/SKILL.md");
             if skill.name.eq_ignore_ascii_case(&lowered)
                 || skill.name.eq_ignore_ascii_case(normalized)
@@ -6409,11 +6555,14 @@ impl RuntimeEngine {
         Ok(RuntimeSkillDetail {
             summary: RuntimeSkillSummary {
                 name,
-                description: description.chars().take(320).collect(),
+                description: description
+                    .chars()
+                    .take(SKILL_MAX_DESCRIPTION_CHARS)
+                    .collect(),
                 path: path.clone(),
                 category,
                 tags,
-                built_in: path.starts_with("system/"),
+                built_in: is_bundled_skill_path(&path),
                 enabled: !disabled.contains(&path),
                 created_at_ms,
                 modified_at_ms,
@@ -6431,20 +6580,37 @@ impl RuntimeEngine {
     fn disabled_skill_paths(&self) -> HashSet<String> {
         self.tokio
             .block_on(self.database.settings_snapshot())
-            .map(|snapshot| {
-                snapshot
-                    .settings
-                    .into_iter()
-                    .filter_map(|setting| {
-                        setting
-                            .key
-                            .strip_prefix("skill_enabled:")
-                            .filter(|_| setting.value == "false")
-                            .map(ToString::to_string)
-                    })
-                    .collect()
-            })
+            .map(disabled_skill_paths_from_snapshot)
             .unwrap_or_default()
+    }
+
+    async fn disabled_skill_paths_async(&self) -> HashSet<String> {
+        self.database
+            .settings_snapshot()
+            .await
+            .map(disabled_skill_paths_from_snapshot)
+            .unwrap_or_default()
+    }
+
+    fn build_skills_index_prompt(&self) -> String {
+        let skills = self
+            .list_skills_internal()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|skill| skill.enabled)
+            .collect::<Vec<_>>();
+        format_skills_index_prompt(skills)
+    }
+
+    async fn build_skills_index_prompt_async(&self) -> String {
+        let disabled = self.disabled_skill_paths_async().await;
+        let skills = self
+            .list_skills_with_disabled(&disabled)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|skill| skill.enabled)
+            .collect::<Vec<_>>();
+        format_skills_index_prompt(skills)
     }
 
     fn list_memory_files_internal(&self) -> HamburResult<Vec<RuntimeMemoryFileSummary>> {
@@ -6529,7 +6695,6 @@ impl RuntimeEngine {
             content: raw,
         })
     }
-
     fn resolve_tool_sandbox_path(
         &self,
         session_id: &str,
@@ -7211,6 +7376,7 @@ fn stream_source_for_command(
     content: &str,
     route: &ModelRouteSnapshot,
     tools_json: &str,
+    skills_index_prompt: &str,
     deep_thinking_enabled: bool,
     search_enabled: bool,
 ) -> RouteStreamSource {
@@ -7220,6 +7386,7 @@ fn stream_source_for_command(
         content,
         route,
         tools_json,
+        skills_index_prompt,
         deep_thinking_enabled,
         search_enabled,
     );
@@ -7312,10 +7479,14 @@ fn provider_stream_source(
     content: &str,
     route: &ModelRouteSnapshot,
     tools_json: &str,
+    skills_index_prompt: &str,
     deep_thinking_enabled: bool,
     search_enabled: bool,
 ) -> RouteStreamSource {
     let mut system_blocks = vec!["You are Hambur, a concise assistant.".to_string()];
+    if !skills_index_prompt.trim().is_empty() {
+        system_blocks.push(skills_index_prompt.to_string());
+    }
     if search_enabled {
         system_blocks.push(
             "Web/search assistance is enabled for this turn. Use available search or fetch tools when current external information is needed."
@@ -8399,10 +8570,114 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::{
-        AppBootstrap, BackgroundProcessSession, DelegateTaskState, NewTraceSpan,
-        ProcessOutputBuffer, RuntimeCommand, RuntimeEngine, RuntimeEvent, platform_shell,
-        spawn_process_pipe_reader, validate_web_fetch_url,
+        AppBootstrap, BackgroundProcessSession, DelegateTaskState, ModelRouteSnapshot,
+        NewTraceSpan, ProcessOutputBuffer, RouteStreamSource, RuntimeCommand, RuntimeEngine,
+        RuntimeEvent, platform_shell, provider_stream_source, spawn_process_pipe_reader,
+        validate_web_fetch_url,
     };
+
+    #[test]
+    fn bundled_skills_are_seeded_and_exposed_by_tools() {
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+
+        let skills = runtime.list_skills();
+        let skill = skills
+            .iter()
+            .find(|skill| skill.name == "skill-creator")
+            .expect("seeded skill");
+        assert_eq!(skill.path, "system/skill-creator/SKILL.md");
+        assert!(skill.built_in);
+        assert!(skill.enabled);
+
+        let list_invocation = ToolInvocation::from_model_call(
+            0,
+            "call_skills".to_string(),
+            "turn".to_string(),
+            "session".to_string(),
+            "skills_list".to_string(),
+            "{}".to_string(),
+        )
+        .expect("invocation");
+        let list = runtime
+            .tokio
+            .block_on(
+                runtime.resolve_knowledge_tool_result(&list_invocation, &serde_json::json!({})),
+            )
+            .content_json;
+        let list_json: Value = serde_json::from_str(&list).expect("skills list json");
+        assert_eq!(list_json["success"], true);
+        assert_eq!(list_json["count"], 1);
+        assert_eq!(list_json["categories"][0], "system");
+        assert_eq!(
+            list_json["hint"],
+            "Use skill_view(name) to see full content, tags, and linked files."
+        );
+
+        let alias_invocation = ToolInvocation::from_model_call(
+            0,
+            "call_skill_list_alias".to_string(),
+            "turn".to_string(),
+            "session".to_string(),
+            "skill_list".to_string(),
+            "{}".to_string(),
+        )
+        .expect("alias invocation");
+        let alias = runtime.tokio.block_on(
+            runtime.resolve_knowledge_tool_result(&alias_invocation, &serde_json::json!({})),
+        );
+        assert!(!alias.is_error, "alias failed: {}", alias.summary);
+
+        let detail = runtime.get_skill_detail("skill-creator".to_string(), String::new());
+        assert!(detail.content.contains("# Skill Creator"));
+        assert_eq!(detail.skill_dir_path, "system/skill-creator");
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
+    fn skills_index_prompt_is_injected_into_initial_request() {
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+
+        let prompt = runtime.build_skills_index_prompt();
+        assert!(prompt.contains("Hambur has a local Skills system at /var/hambur/skills."));
+        assert!(prompt.contains("- skill-creator [system]: Create or update Hambur skills"));
+
+        let route = ModelRouteSnapshot {
+            supports_tool_call: true,
+            supports_reasoning: true,
+            output_limit: 1024,
+            ..Default::default()
+        };
+        let source = provider_stream_source(
+            "session", "turn", "hello", &route, "[]", &prompt, false, false,
+        );
+        let RouteStreamSource::Provider(request) = source else {
+            panic!("expected provider source");
+        };
+        assert!(request.system_blocks.iter().any(|block| {
+            block.contains("Skills are reusable task instructions")
+                && block.contains("skill_view")
+                && block.contains("skill-creator")
+        }));
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
 
     #[test]
     fn bootstrap_snapshot_survives_restart_without_replayed_session_event() {

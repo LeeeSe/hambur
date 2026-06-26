@@ -153,12 +153,15 @@ data class UiSkillSummary(
     val path: String,
     val category: String,
     val tags: List<String>,
+    val builtIn: Boolean,
     val enabled: Boolean,
+    val createdAtMs: ULong,
+    val modifiedAtMs: ULong,
     val files: List<String>,
 )
 
 data class UiSkillDetail(
-    val summary: UiSkillSummary = UiSkillSummary("", "", "", "", emptyList(), true, emptyList()),
+    val summary: UiSkillSummary = UiSkillSummary("", "", "", "", emptyList(), false, true, 0u, 0u, emptyList()),
     val content: String = "",
     val linkedFilesJson: String = "",
     val selectedFilePath: String = "",
@@ -1745,7 +1748,10 @@ private fun SkillSummaryDto.toUiSkillSummary(): UiSkillSummary {
         path = path,
         category = category,
         tags = tags,
+        builtIn = builtIn,
         enabled = enabled,
+        createdAtMs = createdAtMs,
+        modifiedAtMs = modifiedAtMs,
         files = files,
     )
 }

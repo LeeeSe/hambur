@@ -64,6 +64,7 @@ import com.hambur.chat.reducer.UiConfigAudit
 import com.hambur.chat.reducer.UiModelGroupSettings
 import com.hambur.chat.reducer.UiProviderModelSettings
 import com.hambur.chat.reducer.UiProviderSettings
+import com.hambur.chat.reducer.UiSkillSummary
 import com.hambur.chat.ui.components.ConfirmDangerDialog
 import com.hambur.chat.ui.components.HamburSection
 import com.hambur.chat.ui.components.HamburTopBar
@@ -71,6 +72,8 @@ import com.hambur.chat.ui.components.SecondaryActionButton
 import com.hambur.chat.ui.components.SettingsNavigationRow
 import com.hambur.chat.ui.components.StatusPill
 import com.hambur.chat.ui.components.SummaryLine
+import java.text.DateFormat
+import java.util.Date
 
 @Composable
 fun HamburSettingsHomeScreen(
@@ -850,25 +853,29 @@ fun SkillsListScreen(
     onOpenSkill: (String) -> Unit,
 ) {
     SettingsPage(title = "Skills", onBack = onBack) {
+        val builtInSkills = state.skills.filter { it.builtIn }
+        val userSkills = state.skills.filterNot { it.builtIn }
         item {
-            HamburSection(title = "Skills") {
-                if (state.skills.isEmpty()) {
-                    Text("No skills discovered", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    SecondaryActionButton(text = "Refresh", onClick = store::refreshKnowledgeSnapshots)
-                } else {
-                    state.skills.forEach { skill ->
-                        SkillListRow(
-                            skillId = skill.path,
-                            description = listOf(
-                                skill.description.ifBlank { skill.name },
-                                if (skill.enabled) "Enabled" else "Disabled",
-                            ).joinToString(" - "),
-                            builtIn = skill.path.startsWith("system/"),
-                            onOpenSkill = onOpenSkill,
-                        )
-                    }
-                    SecondaryActionButton(text = "Refresh", onClick = store::refreshKnowledgeSnapshots)
-                }
+            SkillSection(
+                title = "Built-in skills",
+                emptyText = "No built-in skills discovered",
+                skills = builtInSkills,
+                store = store,
+                onOpenSkill = onOpenSkill,
+            )
+        }
+        item {
+            SkillSection(
+                title = "User skills",
+                emptyText = "No user skills discovered",
+                skills = userSkills,
+                store = store,
+                onOpenSkill = onOpenSkill,
+            )
+        }
+        item {
+            HamburSection(title = "Actions") {
+                SecondaryActionButton(text = "Refresh", onClick = store::refreshKnowledgeSnapshots)
             }
         }
     }
@@ -885,23 +892,53 @@ fun SkillDetailScreen(
         store.loadSkillDetail(skillId)
     }
     val detail = state.skillDetails[skillId]
-    var enabled by rememberSaveable(skillId) {
-        mutableStateOf(detail?.summary?.enabled ?: state.appSettings.firstOrNull { it.key == "skill_enabled:$skillId" }?.value != "false")
+    val selectedSkill = detail?.summary ?: state.skills.firstOrNull { it.path == skillId }
+    var showDeleteDialog by rememberSaveable(skillId) { mutableStateOf(false) }
+    if (showDeleteDialog) {
+        ConfirmDangerDialog(
+            title = "Delete skill",
+            text = "Delete ${selectedSkill?.name ?: skillId}? This removes the skill directory and all files inside it.",
+            confirmText = "Delete",
+            onConfirm = {
+                showDeleteDialog = false
+                store.deleteSkill(skillId)
+                onBack()
+            },
+            onDismiss = { showDeleteDialog = false },
+        )
     }
     SettingsPage(title = "Skill Detail", subtitle = skillId, onBack = onBack) {
         item {
             HamburSection(title = "Skill") {
-                SummaryLine(label = "Name", value = detail?.summary?.name ?: skillId)
-                SummaryLine(label = "Path", value = detail?.summary?.path ?: skillId)
-                SummaryLine(label = "Files", value = detail?.summary?.files?.joinToString(", ").orEmpty().ifBlank { "No files" })
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Switch(checked = enabled, onCheckedChange = { enabled = it })
-                    Text("Enabled", modifier = Modifier.padding(start = 8.dp))
+                SummaryLine(label = "Name", value = selectedSkill?.name ?: skillId)
+                SummaryLine(label = "Path", value = selectedSkill?.path ?: skillId)
+                SummaryLine(label = "Created", value = selectedSkill?.createdAtMs?.toDateTimeText().orEmpty())
+                SummaryLine(label = "Modified", value = selectedSkill?.modifiedAtMs?.toDateTimeText().orEmpty())
+                CapabilitySwitch("Enabled", selectedSkill?.enabled ?: true) { checked ->
+                    store.setSkillEnabled(skillId, checked)
                 }
-                Button(onClick = { store.setSkillEnabled(skillId, enabled) }) {
-                    Text("Save enabled flag")
+                SecondaryActionButton(text = "Delete skill", onClick = { showDeleteDialog = true })
+            }
+        }
+        item {
+            HamburSection(title = "Description") {
+                Text(
+                    text = selectedSkill?.description.orEmpty().ifBlank { "No description" },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        item {
+            HamburSection(title = "Files") {
+                val files = selectedSkill?.files.orEmpty()
+                if (files.isEmpty()) {
+                    Text("No files", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                } else {
+                    files.forEach { file ->
+                        Text(file, style = MaterialTheme.typography.bodySmall)
+                    }
                 }
-                SecondaryActionButton(text = "Delete skill", onClick = { store.deleteSkill(skillId) })
             }
         }
         item {
@@ -1708,10 +1745,32 @@ private fun ModelGroupListRow(
 }
 
 @Composable
+private fun SkillSection(
+    title: String,
+    emptyText: String,
+    skills: List<UiSkillSummary>,
+    store: HamburUiStore,
+    onOpenSkill: (String) -> Unit,
+) {
+    HamburSection(title = title) {
+        if (skills.isEmpty()) {
+            Text(emptyText, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        } else {
+            skills.forEach { skill ->
+                SkillListRow(
+                    skill = skill,
+                    onToggle = { checked -> store.setSkillEnabled(skill.path, checked) },
+                    onOpenSkill = onOpenSkill,
+                )
+            }
+        }
+    }
+}
+
+@Composable
 private fun SkillListRow(
-    skillId: String,
-    description: String,
-    builtIn: Boolean,
+    skill: UiSkillSummary,
+    onToggle: (Boolean) -> Unit,
     onOpenSkill: (String) -> Unit,
 ) {
     Surface(
@@ -1719,14 +1778,29 @@ private fun SkillListRow(
         shape = RoundedCornerShape(8.dp),
         color = MaterialTheme.colorScheme.surfaceVariant,
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
-        onClick = { onOpenSkill(skillId) },
+        onClick = { onOpenSkill(skill.path) },
     ) {
-        Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text(skillId, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                StatusPill(text = if (builtIn) "Built-in" else "User", active = builtIn)
+        Row(
+            modifier = Modifier.padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(skill.name, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    StatusPill(text = if (skill.builtIn) "Built-in" else "User", active = skill.builtIn)
+                }
+                Text(
+                    skill.description.ifBlank { "No description" },
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
             }
-            Text(description, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Switch(checked = skill.enabled, onCheckedChange = onToggle)
+            }
         }
     }
 }
@@ -1810,6 +1884,12 @@ private fun Long.toReadableSize(): String {
     return String.format("%.2f %s", this / Math.pow(1024.0, digitGroups.toDouble()), units[digitGroups])
 }
 
+private fun ULong.toDateTimeText(): String {
+    if (this == 0uL) return ""
+    return DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT)
+        .format(Date(this.toLong()))
+}
+
 private fun getProviderIcon(name: String): androidx.compose.ui.graphics.vector.ImageVector {
     return when (name) {
         "brain" -> Lucide.Brain
@@ -1819,4 +1899,3 @@ private fun getProviderIcon(name: String): androidx.compose.ui.graphics.vector.I
         else -> Lucide.Brain
     }
 }
-

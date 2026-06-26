@@ -2297,6 +2297,9 @@ impl HamburDatabase {
         message_id: &str,
         now: u64,
     ) -> HamburResult<()> {
+        let message = self.message_snapshot(message_id).await?.ok_or_else(|| {
+            HamburError::InvalidCommand(format!("message not found: {message_id}"))
+        })?;
         self.connection
             .execute(
                 "UPDATE timeline_items
@@ -2337,15 +2340,27 @@ impl HamburDatabase {
                    AND payload_ref IN (
                        SELECT ts.id
                        FROM trace_spans ts
-                       JOIN tool_calls tc ON tc.id = ts.tool_call_id
+                       LEFT JOIN tool_calls tc ON tc.id = ts.tool_call_id
                        LEFT JOIN messages tm ON tm.tool_call_id = tc.id
                        WHERE ts.session_id = ?2
                          AND (
                              tc.assistant_message_id = ?3
                              OR tm.id = ?3
+                             OR (
+                                 ?4 = 'assistant'
+                                 AND ts.turn_id = ?5
+                                 AND ts.started_at_ms >= ?6
+                             )
                          )
                    )",
-                params![now as i64, session_id, message_id],
+                params![
+                    now as i64,
+                    session_id,
+                    message_id,
+                    message.role.as_str(),
+                    message.turn_id.as_str(),
+                    message.created_at_ms as i64
+                ],
             )
             .await
             .map_err(database_error)?;
@@ -6260,6 +6275,108 @@ mod tests {
             assert_eq!(trace_item.trace_status, "completed");
             assert_eq!(trace_item.tool_call_id, "call_1");
             assert_eq!(trace_item.tool_name, "echo");
+        });
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn hiding_assistant_message_hides_same_turn_tool_traces() {
+        let path = temp_database_path();
+        let runtime = Runtime::new().expect("tokio runtime");
+
+        runtime.block_on(async {
+            let database = HamburDatabase::open(&path).await.expect("open database");
+            let created = database
+                .create_session("Tools")
+                .await
+                .expect("create session");
+            let session_id = created.selected_session_id;
+            let route = ModelRouteSnapshot {
+                provider_id: "provider".to_string(),
+                provider_name: "Provider".to_string(),
+                provider_protocol: "OpenAiCompatible".to_string(),
+                model_id: "model".to_string(),
+                model_display_name: "Model".to_string(),
+                model_group_id: "grp".to_string(),
+                ..Default::default()
+            };
+            let turn = database
+                .create_turn_with_route(&session_id, "ExecutingTools", &route)
+                .await
+                .expect("turn");
+            let assistant = database
+                .insert_message_with_route(
+                    &session_id,
+                    "assistant",
+                    "old assistant",
+                    "",
+                    "completed",
+                    &turn.id,
+                    &route,
+                )
+                .await
+                .expect("assistant");
+            database
+                .upsert_markdown_block_payload(
+                    &session_id,
+                    &turn.id,
+                    NewMarkdownBlockPayload {
+                        id: String::new(),
+                        message_id: assistant.id.clone(),
+                        block_id: 1,
+                        stable_key: format!("{}:1", assistant.id),
+                        committed: true,
+                        payload_json: "{}".to_string(),
+                        raw: "old assistant".to_string(),
+                        small_summary: "old assistant".to_string(),
+                    },
+                )
+                .await
+                .expect("assistant markdown");
+            database
+                .insert_trace_span(NewTraceSpan {
+                    session_id: session_id.clone(),
+                    turn_id: turn.id.clone(),
+                    kind: "tool".to_string(),
+                    title: "Tool without persisted call".to_string(),
+                    content: "running".to_string(),
+                    status: "running".to_string(),
+                    visible: true,
+                    ..Default::default()
+                })
+                .await
+                .expect("trace");
+
+            let before = database
+                .timeline_page(&session_id, 0, 20)
+                .await
+                .expect("timeline before");
+            assert!(
+                before.items.iter().any(|item| item.kind == "ToolTrace"),
+                "missing trace before hide"
+            );
+
+            database
+                .hide_visible_timeline_after_message(&session_id, &assistant.id, true)
+                .await
+                .expect("hide assistant branch");
+
+            let after = database
+                .timeline_page(&session_id, 0, 20)
+                .await
+                .expect("timeline after");
+            assert!(
+                !after.items.iter().any(|item| item.kind == "ToolTrace"),
+                "tool trace remained visible after assistant hide"
+            );
+            assert!(
+                !after
+                    .items
+                    .iter()
+                    .any(|item| item.content_type == "assistant_markdown_block"),
+                "assistant markdown remained visible after assistant hide"
+            );
         });
 
         let _ = fs::remove_file(path);

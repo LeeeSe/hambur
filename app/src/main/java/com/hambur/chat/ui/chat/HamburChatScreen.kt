@@ -937,7 +937,7 @@ private fun ChatTimeline(
                                 onSelectText = onSelectText,
                                 onRetryMessage = {
                                     message?.let {
-                                        store.retryMessage(state.selectedSessionId, it.id)
+                                        store.regenerateMessage(state.selectedSessionId, it.id)
                                     }
                                 },
                                 onEditMessage = { message?.let(onEditMessage) },
@@ -1186,7 +1186,7 @@ private fun MessageLongPressMenuBox(
                     ContextMenuDivider()
                     ContextMenuActionRow(
                         icon = Lucide.RefreshCw,
-                        label = "重试",
+                        label = "重新生成",
                         onClick = {
                             showMenu = false
                             retry()

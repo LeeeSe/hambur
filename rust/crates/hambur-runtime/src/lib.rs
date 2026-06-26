@@ -1896,7 +1896,7 @@ impl RuntimeEngine {
                     &user_message,
                     &pending_attachments,
                     &route,
-                    !reuse_existing_user,
+                    true,
                 )
                 .await?;
             let snapshot = self.database.session_snapshot(&command.session_id).await?;
@@ -2079,6 +2079,14 @@ impl RuntimeEngine {
                 Ok(None)
             }
             "RetryTurn" | "RegenerateMessage" => {
+                let source_message = self
+                    .database
+                    .message_snapshot(&source_message_id)
+                    .await?
+                    .ok_or_else(|| {
+                        HamburError::InvalidCommand(format!("message not found: {source_message_id}"))
+                    })?;
+                let is_user = source_message.role == "user";
                 let source_user = self
                     .database
                     .source_user_message_for(&command.session_id, &source_message_id)
@@ -2087,7 +2095,7 @@ impl RuntimeEngine {
                     .hide_visible_timeline_after_message(
                         &command.session_id,
                         &source_message_id,
-                        true,
+                        !is_user,
                     )
                     .await?;
                 Ok(Some(source_user))
@@ -12553,6 +12561,202 @@ mod tests {
             .expect("latest assistant message");
         assert_eq!(message.content_text, "regenerated answer");
         assert_eq!(message.reasoning_content, "regen reasoning");
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
+    fn scripted_stream_regenerate_from_user_message_keeps_user_message_visible() {
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+        let session_id = create_test_session(&runtime);
+        configure_test_provider(&runtime, "gpt-test");
+
+        let first = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_regenerate_seed".to_string(),
+            idempotency_key: "message:regenerate:seed".to_string(),
+            kind: "SendMessage".to_string(),
+            session_id: session_id.clone(),
+            content: "seed prompt".to_string(),
+            payload_json: r#"{"content":"first answer","reasoning":"seed reasoning"}"#.to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(first.accepted, "seed rejected: {}", first.message);
+        wait_for_session_event(&runtime, "TurnFinished", &session_id);
+
+        let timeline = runtime.get_timeline_page(session_id.clone(), 0, 20);
+        let user_message_id = timeline
+            .items
+            .iter()
+            .find(|item| item.kind == "UserMessage")
+            .expect("user message timeline item")
+            .payload_ref
+            .clone();
+
+        let regenerate = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_regenerate".to_string(),
+            idempotency_key: format!("{user_message_id}:regenerate:test"),
+            kind: "RegenerateMessage".to_string(),
+            session_id: session_id.clone(),
+            source_message_id: user_message_id,
+            payload_json: r#"{"content":"regenerated answer","reasoning":"regen reasoning"}"#
+                .to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(
+            regenerate.accepted,
+            "regenerate rejected: {}",
+            regenerate.message
+        );
+        wait_for_session_event(&runtime, "TurnFinished", &session_id);
+
+        let timeline = runtime.get_timeline_page(session_id.clone(), 0, 20);
+        let assistant_count = timeline
+            .items
+            .iter()
+            .filter(|item| item.content_type == "assistant_markdown_block")
+            .count();
+        let user_count = timeline
+            .items
+            .iter()
+            .filter(|item| item.kind == "UserMessage")
+            .count();
+        assert_eq!(assistant_count, 1);
+        assert_eq!(user_count, 1);
+
+        let message = runtime
+            .get_message_snapshot(latest_assistant_message_id(&runtime, &session_id))
+            .message
+            .expect("latest assistant message");
+        assert_eq!(message.content_text, "regenerated answer");
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
+    fn regenerate_from_user_message_includes_that_user_message_in_provider_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider server");
+        let addr = listener.local_addr().expect("local addr");
+        let captured_request = Arc::new(Mutex::new(String::new()));
+        let captured = captured_request.clone();
+        let server = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let text = read_http_request(&mut stream);
+                *captured.lock().expect("capture request") = text;
+                let body = concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"regenerated second answer\"}}]}\n\n",
+                    "data: [DONE]\n\n"
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:X}\r\n{}\r\n0\r\n\r\n",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write provider response");
+            }
+        });
+
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+        let session_id = create_test_session(&runtime);
+        configure_test_provider(&runtime, "gpt-scripted");
+
+        let first = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_regenerate_context_first".to_string(),
+            idempotency_key: "message:regenerate-context:first".to_string(),
+            kind: "SendMessage".to_string(),
+            session_id: session_id.clone(),
+            content: "hello".to_string(),
+            payload_json: r#"{"content":"hello answer"}"#.to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(first.accepted, "first rejected: {}", first.message);
+        wait_for_session_event(&runtime, "TurnFinished", &session_id);
+
+        let second = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_regenerate_context_second".to_string(),
+            idempotency_key: "message:regenerate-context:second".to_string(),
+            kind: "SendMessage".to_string(),
+            session_id: session_id.clone(),
+            content: "how many cats do I have?".to_string(),
+            payload_json: r#"{"content":"old second answer"}"#.to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(second.accepted, "second rejected: {}", second.message);
+        wait_for_session_event(&runtime, "TurnFinished", &session_id);
+
+        let timeline = runtime.get_timeline_page(session_id.clone(), 0, 20);
+        let user_message_id = timeline
+            .items
+            .iter()
+            .filter(|item| item.kind == "UserMessage")
+            .last()
+            .expect("second user message timeline item")
+            .payload_ref
+            .clone();
+
+        configure_http_test_provider(
+            &runtime,
+            "provider_test",
+            "gpt-regenerate-context",
+            &format!("http://{addr}/v1"),
+        );
+        let regenerate = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_regenerate_context".to_string(),
+            idempotency_key: format!("{user_message_id}:regenerate:context"),
+            kind: "RegenerateMessage".to_string(),
+            session_id: session_id.clone(),
+            source_message_id: user_message_id,
+            ..RuntimeCommand::default()
+        });
+        assert!(
+            regenerate.accepted,
+            "regenerate rejected: {}",
+            regenerate.message
+        );
+        wait_for_session_event(&runtime, "TurnFinished", &session_id);
+        server.join().expect("provider server");
+
+        let request = captured_request.lock().expect("captured request").clone();
+        let body = request.split("\r\n\r\n").nth(1).expect("request body");
+        let value: Value = serde_json::from_str(body).expect("request JSON");
+        let messages = value
+            .get("messages")
+            .and_then(Value::as_array)
+            .expect("messages array");
+        let projected = messages
+            .iter()
+            .filter(|message| message.get("role").and_then(Value::as_str) != Some("system"))
+            .map(|message| {
+                (
+                    message.get("role").and_then(Value::as_str).unwrap_or(""),
+                    message.get("content").and_then(Value::as_str).unwrap_or(""),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            projected,
+            vec![
+                ("user", "hello"),
+                ("assistant", "hello answer"),
+                ("user", "how many cats do I have?"),
+            ]
+        );
 
         let _ = fs::remove_dir_all(app_files_dir);
     }

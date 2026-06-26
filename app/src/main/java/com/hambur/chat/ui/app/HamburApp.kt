@@ -2,25 +2,17 @@ package com.hambur.chat.ui.app
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
-import androidx.compose.material3.darkColorScheme
-import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.unit.Density
 import com.hambur.chat.platform.AndroidPlatformAdapter
 import com.hambur.chat.reducer.HamburUiState
 import com.hambur.chat.reducer.HamburUiStore
@@ -45,6 +37,9 @@ import com.hambur.chat.ui.settings.StartupTaskDetailScreen
 import com.hambur.chat.ui.settings.StartupTasksListScreen
 import com.hambur.chat.ui.settings.ToolDetailScreen
 import com.hambur.chat.ui.settings.ToolsListScreen
+import com.hambur.chat.ui.theme.HamburThemeDefaults
+import com.hambur.chat.ui.theme.HamburThemeProvider
+import com.hambur.chat.ui.theme.HamburThemeSettingKeys
 
 sealed class HamburScreen {
     data object Chat : HamburScreen()
@@ -296,65 +291,18 @@ private fun HamburTheme(
     state: HamburUiState,
     content: @Composable () -> Unit,
 ) {
-    val themeMode = state.settingValue("themeMode", "dark")
-    val darkTheme = when (themeMode) {
-        "light" -> false
-        "system" -> isSystemInDarkTheme()
-        else -> true
-    }
-    val fontScale = when (state.settingValue("fontScale", "default")) {
-        "small" -> 0.90f
-        "large" -> 1.15f
-        "extra_large" -> 1.30f
-        else -> 1.00f
-    }
-    val density = LocalDensity.current
-    CompositionLocalProvider(
-        LocalDensity provides Density(
-            density = density.density,
-            fontScale = density.fontScale * fontScale,
+    HamburThemeProvider(
+        themeMode = state.settingValue(
+            HamburThemeSettingKeys.ThemeMode,
+            HamburThemeDefaults.ThemeMode,
         ),
-    ) {
-        MaterialTheme(
-            colorScheme = if (darkTheme) hamburDarkColorScheme() else hamburLightColorScheme(),
-            content = content,
-        )
-    }
+        fontScale = state.settingValue(
+            HamburThemeSettingKeys.FontScale,
+            HamburThemeDefaults.FontScale,
+        ),
+        content = content,
+    )
 }
-
-private fun hamburDarkColorScheme(): ColorScheme = darkColorScheme(
-    primary = Color(0xFF7DD3C7),
-    onPrimary = Color(0xFF06201D),
-    primaryContainer = Color(0xFF143F39),
-    onPrimaryContainer = Color(0xFFD3F8F1),
-    secondary = Color(0xFFB8C8C3),
-    tertiary = Color(0xFFF6C56B),
-    background = Color(0xFF111312),
-    surface = Color(0xFF181B1A),
-    surfaceVariant = Color(0xFF252A28),
-    onSurface = Color(0xFFE6E9E7),
-    onSurfaceVariant = Color(0xFFB9C1BE),
-    outline = Color(0xFF717A76),
-    outlineVariant = Color(0xFF343B38),
-    error = Color(0xFFFFB4AB),
-)
-
-private fun hamburLightColorScheme(): ColorScheme = lightColorScheme(
-    primary = Color(0xFF006A60),
-    onPrimary = Color(0xFFFFFFFF),
-    primaryContainer = Color(0xFF9EF2E5),
-    onPrimaryContainer = Color(0xFF00201C),
-    secondary = Color(0xFF4A635E),
-    tertiary = Color(0xFF765B00),
-    background = Color(0xFFFAFDFB),
-    surface = Color(0xFFFAFDFB),
-    surfaceVariant = Color(0xFFDCE5E1),
-    onSurface = Color(0xFF191C1B),
-    onSurfaceVariant = Color(0xFF404947),
-    outline = Color(0xFF707977),
-    outlineVariant = Color(0xFFC0C9C5),
-    error = Color(0xFFBA1A1A),
-)
 
 private fun HamburUiState.settingValue(key: String, fallback: String): String {
     return appSettings.firstOrNull { it.key == key }?.value ?: fallback

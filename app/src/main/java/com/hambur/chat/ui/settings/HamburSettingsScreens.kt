@@ -72,6 +72,8 @@ import com.hambur.chat.ui.components.SecondaryActionButton
 import com.hambur.chat.ui.components.SettingsNavigationRow
 import com.hambur.chat.ui.components.StatusPill
 import com.hambur.chat.ui.components.SummaryLine
+import com.hambur.chat.ui.theme.HamburThemeDefaults
+import com.hambur.chat.ui.theme.HamburThemeSettingKeys
 import java.text.DateFormat
 import java.util.Date
 
@@ -1231,8 +1233,14 @@ fun AppearanceSettingsScreen(
     store: HamburUiStore,
     onBack: () -> Unit,
 ) {
-    val themeMode = state.settingValue("themeMode", "dark")
-    val fontScale = state.settingValue("fontScale", "default")
+    val themeMode = state.settingValue(
+        HamburThemeSettingKeys.ThemeMode,
+        HamburThemeDefaults.ThemeMode,
+    )
+    val fontScale = state.settingValue(
+        HamburThemeSettingKeys.FontScale,
+        HamburThemeDefaults.FontScale,
+    )
     val startupChatMode = state.settingValue("startupChatMode", "last_chat")
 
     SettingsPage(title = "Appearance", onBack = onBack) {

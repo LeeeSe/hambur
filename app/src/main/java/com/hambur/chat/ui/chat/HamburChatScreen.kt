@@ -3,10 +3,13 @@ package com.hambur.chat.ui.chat
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.Image as ComposeImage
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -18,6 +21,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -30,7 +34,6 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.selection.SelectionContainer
@@ -60,37 +63,43 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.composables.icons.lucide.Brain
+import com.composables.icons.lucide.ChartNoAxesGantt
+import com.composables.icons.lucide.CircleArrowUp
 import com.composables.icons.lucide.CirclePause
 import com.composables.icons.lucide.CirclePlus
+import com.composables.icons.lucide.CircleX
 import com.composables.icons.lucide.Copy
 import com.composables.icons.lucide.FileText
 import com.composables.icons.lucide.Globe
 import com.composables.icons.lucide.Image
 import com.composables.icons.lucide.Lucide
-import com.composables.icons.lucide.Menu
 import com.composables.icons.lucide.MessageCirclePlus
-import com.composables.icons.lucide.Paperclip
-import com.composables.icons.lucide.Pencil
 import com.composables.icons.lucide.RefreshCw
 import com.composables.icons.lucide.Search
-import com.composables.icons.lucide.SendHorizontal
 import com.composables.icons.lucide.Settings
 import com.composables.icons.lucide.Trash2
-import com.composables.icons.lucide.Type
 import com.composables.icons.lucide.X
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.widget.Toast
+import com.hambur.chat.R
 import com.hambur.chat.reducer.HamburUiState
 import com.hambur.chat.reducer.HamburUiStore
 import com.hambur.chat.reducer.UiMessageSnapshot
@@ -98,15 +107,14 @@ import com.hambur.chat.reducer.UiPendingAttachment
 import com.hambur.chat.reducer.UiSessionSummary
 import com.hambur.chat.reducer.UiTimelineItem
 import com.hambur.chat.uniffi.MarkdownBlockNodeDto
-import com.hambur.chat.ui.components.HamburTopBar
 import com.hambur.chat.ui.components.SecondaryActionButton
-import com.hambur.chat.ui.components.StatusPill
 import com.hambur.chat.ui.components.SummaryLine
 import com.hambur.chat.ui.markdown.MarkdownBlock
 import com.hambur.chat.ui.markdown.MarkdownRenderCache
 import com.hambur.chat.ui.markdown.MarkdownStyle
 import com.hambur.chat.ui.markdown.rememberMarkdownRenderCache
 import com.hambur.chat.ui.markdown.rememberMarkdownStyle
+import com.hambur.chat.ui.theme.HamburTheme
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 
@@ -132,6 +140,11 @@ fun HamburChatScreen(
     var thinkingEnabled by rememberSaveable { mutableStateOf(false) }
     var searchEnabled by rememberSaveable { mutableStateOf(false) }
     var attachmentPanelOpen by rememberSaveable { mutableStateOf(false) }
+    var bottomInputHeightPx by remember { mutableStateOf(0) }
+    val density = LocalDensity.current
+    val messageListBottomPadding = with(density) {
+        bottomInputHeightPx.toDp()
+    } + HamburTheme.tokens.chat.timelineBottomGap
 
     ModalNavigationDrawer(
         drawerState = drawerState,
@@ -175,16 +188,17 @@ fun HamburChatScreen(
         ) {
             ChatHeader(
                 title = state.selectedSessionTitle(),
-                runtimeStatus = state.runtimeStatus,
-                latestEvent = state.latestEventKind,
                 onOpenDrawer = { scope.launch { drawerState.open() } },
                 onNewChat = { store.createSession("New chat") },
-                onOpenSettings = onOpenSettings,
                 onOpenBrowser = onOpenBrowser,
             )
 
-            Box(modifier = Modifier.weight(1f)) {
-            ChatTimeline(
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth(),
+            ) {
+                ChatTimeline(
                     state = state,
                     store = store,
                     onOpenFile = onOpenFile,
@@ -193,70 +207,76 @@ fun HamburChatScreen(
                         draftMessage = message.contentText
                     },
                     onSelectText = { selectingText = it },
+                    bottomPadding = messageListBottomPadding,
                     modifier = Modifier.fillMaxSize(),
                 )
-            }
 
-            ChatInputPanel(
-                message = draftMessage,
-                onMessageChange = { draftMessage = it },
-                enabled = state.selectedSessionId.isNotBlank() || state.runtimeStatus == "Ready",
-                generating = state.activeTurnIds.containsKey(state.selectedSessionId),
-                thinkingEnabled = thinkingEnabled,
-                searchEnabled = searchEnabled,
-                attachmentPanelOpen = attachmentPanelOpen,
-                pendingAttachments = state.pendingAttachments,
-                editing = editingMessageId.isNotBlank(),
-                onToggleThinking = { thinkingEnabled = !thinkingEnabled },
-                onToggleSearch = { searchEnabled = !searchEnabled },
-                onToggleAttachmentPanel = { attachmentPanelOpen = !attachmentPanelOpen },
-                onAddImage = {
-                    onPickImage { displayName, mimeType, byteSize, uri, sourcePath ->
-                        store.importAttachmentMetadata(
-                            sessionId = state.selectedSessionId,
-                            displayName = displayName,
-                            mimeType = mimeType.ifBlank { "image/*" },
-                            byteSize = byteSize,
-                            originalUri = uri,
-                            sourcePath = sourcePath,
-                        )
-                    }
-                },
-                onAddFile = {
-                    onPickFile { displayName, mimeType, byteSize, uri, sourcePath ->
-                        store.importAttachmentMetadata(
-                            sessionId = state.selectedSessionId,
-                            displayName = displayName,
-                            mimeType = mimeType.ifBlank { "application/octet-stream" },
-                            byteSize = byteSize,
-                            originalUri = uri,
-                            sourcePath = sourcePath,
-                        )
-                    }
-                },
-                onRemoveAttachment = { store.removePendingAttachment(state.selectedSessionId, it) },
-                onClearAttachments = { store.clearPendingAttachments(state.selectedSessionId) },
-                onStop = { store.cancelActiveTurn(state.selectedSessionId) },
-                onCancelEdit = {
-                    editingMessageId = ""
-                    draftMessage = ""
-                },
-                onSend = {
-                    if (editingMessageId.isNotBlank()) {
-                        store.editMessage(state.selectedSessionId, editingMessageId, draftMessage)
+                ChatInputPanel(
+                    message = draftMessage,
+                    onMessageChange = { draftMessage = it },
+                    enabled = state.selectedSessionId.isNotBlank() || state.runtimeStatus == "Ready",
+                    generating = state.activeTurnIds.containsKey(state.selectedSessionId),
+                    thinkingEnabled = thinkingEnabled,
+                    attachmentPanelOpen = attachmentPanelOpen,
+                    pendingAttachments = state.pendingAttachments,
+                    editing = editingMessageId.isNotBlank(),
+                    onToggleThinking = { thinkingEnabled = !thinkingEnabled },
+                    onToggleAttachmentPanel = { attachmentPanelOpen = !attachmentPanelOpen },
+                    onAddImage = {
+                        onPickImage { displayName, mimeType, byteSize, uri, sourcePath ->
+                            store.importAttachmentMetadata(
+                                sessionId = state.selectedSessionId,
+                                displayName = displayName,
+                                mimeType = mimeType.ifBlank { "image/*" },
+                                byteSize = byteSize,
+                                originalUri = uri,
+                                sourcePath = sourcePath,
+                            )
+                        }
+                    },
+                    onAddFile = {
+                        onPickFile { displayName, mimeType, byteSize, uri, sourcePath ->
+                            store.importAttachmentMetadata(
+                                sessionId = state.selectedSessionId,
+                                displayName = displayName,
+                                mimeType = mimeType.ifBlank { "application/octet-stream" },
+                                byteSize = byteSize,
+                                originalUri = uri,
+                                sourcePath = sourcePath,
+                            )
+                        }
+                    },
+                    onRemoveAttachment = { store.removePendingAttachment(state.selectedSessionId, it) },
+                    onClearAttachments = { store.clearPendingAttachments(state.selectedSessionId) },
+                    onStop = { store.cancelActiveTurn(state.selectedSessionId) },
+                    onCancelEdit = {
                         editingMessageId = ""
-                    } else {
-                        store.sendMessage(
-                            sessionId = state.selectedSessionId,
-                            content = draftMessage,
-                            deepThinkingEnabled = thinkingEnabled,
-                            searchEnabled = searchEnabled,
-                        )
-                    }
-                    draftMessage = ""
-                    attachmentPanelOpen = false
-                },
-            )
+                        draftMessage = ""
+                    },
+                    onSend = {
+                        if (editingMessageId.isNotBlank()) {
+                            store.editMessage(state.selectedSessionId, editingMessageId, draftMessage)
+                            editingMessageId = ""
+                        } else {
+                            store.sendMessage(
+                                sessionId = state.selectedSessionId,
+                                content = draftMessage,
+                                deepThinkingEnabled = thinkingEnabled,
+                                searchEnabled = searchEnabled,
+                            )
+                        }
+                        draftMessage = ""
+                        attachmentPanelOpen = false
+                    },
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .onSizeChanged { size ->
+                            if (bottomInputHeightPx != size.height) {
+                                bottomInputHeightPx = size.height
+                            }
+                        },
+                )
+            }
         }
     }
 
@@ -277,43 +297,59 @@ fun HamburChatScreen(
 @Composable
 private fun ChatHeader(
     title: String,
-    runtimeStatus: String,
-    latestEvent: String,
     onOpenDrawer: () -> Unit,
     onNewChat: () -> Unit,
-    onOpenSettings: () -> Unit,
     onOpenBrowser: () -> Unit,
 ) {
-    HamburTopBar(
-        title = title,
-        subtitle = "$runtimeStatus / $latestEvent",
-        actions = {
-            IconButton(onClick = onOpenBrowser) {
-                Icon(imageVector = Lucide.Globe, contentDescription = "Browser")
-            }
-            IconButton(onClick = onNewChat) {
-                Icon(imageVector = Lucide.MessageCirclePlus, contentDescription = "New chat")
-            }
-            IconButton(onClick = onOpenSettings) {
-                Icon(imageVector = Lucide.Settings, contentDescription = "Settings")
-            }
-        },
-    )
+    val tokens = HamburTheme.tokens.chat
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(start = 12.dp, end = 12.dp, bottom = 6.dp),
+            .height(tokens.headerHeight)
+            .padding(horizontal = tokens.headerHorizontalPadding),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
     ) {
-        IconButton(onClick = onOpenDrawer) {
-            Icon(imageVector = Lucide.Menu, contentDescription = "Conversations")
+        ChatIconButton(onClick = onOpenDrawer, size = tokens.headerIconButtonSize) {
+            Icon(
+                imageVector = Lucide.ChartNoAxesGantt,
+                contentDescription = "Conversations",
+                tint = MaterialTheme.colorScheme.onBackground,
+                modifier = Modifier.size(tokens.headerMenuIconSize),
+            )
         }
+
         Text(
-            text = "Conversations",
-            style = MaterialTheme.typography.labelMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            text = title.ifBlank { "新对话" },
+            color = MaterialTheme.colorScheme.onBackground,
+            fontSize = tokens.headerTitleFontSize,
+            fontWeight = FontWeight.Bold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            textAlign = TextAlign.Center,
+            modifier = Modifier
+                .weight(1f)
+                .padding(horizontal = tokens.headerTitleHorizontalPadding),
         )
+
+        Row {
+            ChatIconButton(onClick = onOpenBrowser, size = tokens.headerIconButtonSize) {
+                Icon(
+                    imageVector = Lucide.Globe,
+                    contentDescription = "Browser",
+                    tint = MaterialTheme.colorScheme.onBackground,
+                    modifier = Modifier.size(tokens.headerBrowserIconSize),
+                )
+            }
+            ChatIconButton(onClick = onNewChat, size = tokens.headerIconButtonSize) {
+                Icon(
+                    imageVector = Lucide.MessageCirclePlus,
+                    contentDescription = "New chat",
+                    tint = MaterialTheme.colorScheme.onBackground,
+                    modifier = Modifier.size(tokens.headerNewChatIconSize),
+                )
+            }
+        }
     }
 }
 
@@ -491,11 +527,25 @@ private fun ChatTimeline(
     onOpenFile: (String) -> Unit,
     onEditMessage: (UiMessageSnapshot) -> Unit,
     onSelectText: (String) -> Unit,
+    bottomPadding: Dp,
     modifier: Modifier = Modifier,
 ) {
     val listState = rememberLazyListState()
     var followTail by remember(state.selectedSessionId) { mutableStateOf(true) }
-    val visibleCount = state.timelineItems.size + 1
+    val displayItems = remember(
+        state.timelineItems,
+        state.markdownBlocksByPayloadRef,
+    ) {
+        state.timelineItems.toChatDisplayItems(state.markdownBlocksByPayloadRef)
+    }
+    val latestAssistantMessageId = remember(displayItems) {
+        displayItems
+            .filterIsInstance<ChatDisplayItem.AssistantMarkdownGroup>()
+            .lastOrNull { group -> group.nodes.any { it.raw.isNotBlank() || it.text.isNotBlank() } }
+            ?.messageId
+            .orEmpty()
+    }
+    val visibleCount = displayItems.size + 1
 
     LaunchedEffect(listState, state.selectedSessionId) {
         snapshotFlow { listState.isNearBottom() }
@@ -505,8 +555,8 @@ private fun ChatTimeline(
 
     LaunchedEffect(
         state.selectedSessionId,
-        state.timelineItems.size,
-        state.timelineItems.lastOrNull()?.versionSequence,
+        displayItems.size,
+        displayItems.lastOrNull()?.versionSequence,
         followTail,
     ) {
         if (followTail && visibleCount > 0) {
@@ -517,7 +567,7 @@ private fun ChatTimeline(
 
     if (state.selectedSessionId.isBlank() || state.timelineItems.isEmpty()) {
         EmptyChatState(
-            selected = state.selectedSessionId.isNotBlank(),
+            bottomPadding = bottomPadding,
             modifier = modifier,
         )
         return
@@ -528,56 +578,50 @@ private fun ChatTimeline(
     LazyColumn(
         state = listState,
         modifier = modifier,
-        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
+        contentPadding = PaddingValues(
+            start = 14.dp,
+            top = 12.dp,
+            end = 14.dp,
+            bottom = bottomPadding,
+        ),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         itemsIndexed(
-            items = state.timelineItems,
+            items = displayItems,
             key = { _, item -> item.stableKey },
             contentType = { _, item -> item.contentType },
         ) { _, item ->
-            when {
-                item.contentType == "user_message" -> {
-                    val message = state.messagesById[item.payloadRef]
-                    MessageTimelineItem(
-                        item = item,
-                        message = message,
-                        onOpenFile = onOpenFile,
-                        onRetry = {
-                            store.retryMessage(state.selectedSessionId, item.payloadRef)
-                        },
-                        onEdit = { message ->
-                            onEditMessage(message)
-                        },
-                        onSelectText = onSelectText,
-                    )
-                }
-                item.isAssistantMarkdownBlock() -> {
-                    val node = state.markdownBlocksByPayloadRef[item.payloadRef]
-                    if (node != null) {
-                        AssistantMarkdownTimelineItem(
-                            item = item,
-                            node = node,
-                            markdownStyle = markdownStyle,
-                            markdownCache = markdownCache,
-                            onOpenFile = onOpenFile,
-                            onRegenerate = {
-                                store.regenerateMessage(state.selectedSessionId, node.messageId)
-                            },
-                            onRetry = {
-                                store.retryMessage(state.selectedSessionId, node.messageId)
-                            },
-                            onSelectText = onSelectText,
-                        )
-                    } else {
-                        TimelineSummaryItem(item = item)
+            when (item) {
+                is ChatDisplayItem.Timeline -> {
+                    val timelineItem = item.item
+                    when {
+                        timelineItem.contentType == "user_message" -> {
+                            val message = state.messagesById[timelineItem.payloadRef]
+                            MessageTimelineItem(
+                                item = timelineItem,
+                                message = message,
+                                onOpenFile = onOpenFile,
+                            )
+                        }
+                        timelineItem.contentType == "trace" || timelineItem.kind.contains("Trace") -> {
+                            ToolTraceItem(item = timelineItem)
+                        }
+                        else -> {
+                            TimelineSummaryItem(item = timelineItem)
+                        }
                     }
                 }
-                item.contentType == "trace" || item.kind.contains("Trace") -> {
-                    ToolTraceItem(item = item)
-                }
-                else -> {
-                    TimelineSummaryItem(item = item)
+                is ChatDisplayItem.AssistantMarkdownGroup -> {
+                    AssistantMarkdownTimelineItem(
+                        group = item,
+                        markdownStyle = markdownStyle,
+                        markdownCache = markdownCache,
+                        onOpenFile = onOpenFile,
+                        showActions = item.messageId == latestAssistantMessageId,
+                        onRegenerate = {
+                            store.regenerateMessage(state.selectedSessionId, item.messageId)
+                        },
+                    )
                 }
             }
         }
@@ -589,45 +633,39 @@ private fun ChatTimeline(
 
 @Composable
 private fun EmptyChatState(
-    selected: Boolean,
+    bottomPadding: Dp,
     modifier: Modifier = Modifier,
 ) {
+    val tokens = HamburTheme.tokens.chat
     Box(
-        modifier = modifier.fillMaxSize(),
+        modifier = modifier
+            .fillMaxSize()
+            .padding(bottom = bottomPadding),
         contentAlignment = Alignment.Center,
     ) {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-            modifier = Modifier.padding(24.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = tokens.emptyStateHorizontalPadding),
         ) {
-            Surface(
-                modifier = Modifier.size(86.dp),
-                shape = CircleShape,
-                color = MaterialTheme.colorScheme.primaryContainer,
-            ) {
-                Icon(
-                    imageVector = Lucide.MessageCirclePlus,
-                    contentDescription = null,
-                    modifier = Modifier.padding(22.dp),
-                    tint = MaterialTheme.colorScheme.onPrimaryContainer,
-                )
-            }
-            Text(
-                text = if (selected) "How can I help?" else "Create or select a chat",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.SemiBold,
-                textAlign = TextAlign.Center,
+            ComposeImage(
+                painter = painterResource(id = R.drawable.hambur_empty_icon_vector),
+                contentDescription = null,
+                contentScale = ContentScale.Fit,
+                colorFilter = ColorFilter.tint(MaterialTheme.colorScheme.onBackground),
+                modifier = Modifier.size(tokens.emptyStateIconSize),
             )
+            Spacer(modifier = Modifier.height(tokens.emptyStateIconTextGap))
             Text(
-                text = if (selected) {
-                    "Send a message to exercise the new Rust backend."
-                } else {
-                    "Open the conversation drawer to create a session."
-                },
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                text = "我是 Hambur，有什么我可以帮您的？",
+                color = MaterialTheme.colorScheme.onBackground,
+                fontSize = tokens.emptyStateTitleFontSize,
+                lineHeight = tokens.emptyStateTitleLineHeight,
+                fontWeight = FontWeight.Medium,
                 textAlign = TextAlign.Center,
+                maxLines = 2,
+                modifier = Modifier.fillMaxWidth(),
             )
         }
     }
@@ -665,84 +703,19 @@ private fun MessageTimelineItem(
     item: UiTimelineItem,
     message: UiMessageSnapshot?,
     onOpenFile: (String) -> Unit,
-    onRetry: () -> Unit,
-    onEdit: (UiMessageSnapshot) -> Unit,
-    onSelectText: (String) -> Unit,
 ) {
     val role = message?.role ?: item.kind
     val isUser = role == "user"
-    val context = LocalContext.current
-    val clipboard = remember(context) {
-        context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-    }
 
     Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
         Surface(
-            modifier = Modifier.fillMaxWidth(0.86f),
-            shape = RoundedCornerShape(8.dp),
+            modifier = Modifier.widthIn(max = 324.dp),
+            shape = RoundedCornerShape(26.dp),
             color = MaterialTheme.colorScheme.primaryContainer,
-            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
         ) {
             Column(
-                modifier = Modifier.padding(12.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.padding(horizontal = 18.dp, vertical = 13.dp),
             ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        text = if (isUser) "You" else item.kind.ifBlank { "Message" },
-                        style = MaterialTheme.typography.labelLarge,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                    StatusPill(
-                        text = message?.status ?: item.kind,
-                        active = message?.status == "streaming" || message?.status == "complete",
-                    )
-                    Spacer(modifier = Modifier.weight(1f))
-                    if (message != null) {
-                        IconButton(
-                            onClick = {
-                                clipboard.setPrimaryClip(
-                                    ClipData.newPlainText("message", message.contentText),
-                                )
-                                Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
-                            },
-                            modifier = Modifier.size(32.dp),
-                        ) {
-                            Icon(
-                                imageVector = Lucide.Copy,
-                                contentDescription = "Copy",
-                                modifier = Modifier.size(17.dp),
-                            )
-                        }
-                        IconButton(onClick = { onSelectText(message.contentText) }, modifier = Modifier.size(32.dp)) {
-                            Icon(
-                                imageVector = Lucide.Type,
-                                contentDescription = "Select text",
-                                modifier = Modifier.size(17.dp),
-                            )
-                        }
-                    }
-                    if (message != null) {
-                        IconButton(onClick = { onEdit(message) }, modifier = Modifier.size(32.dp)) {
-                            Icon(
-                                imageVector = Lucide.Pencil,
-                                contentDescription = "Edit",
-                                modifier = Modifier.size(17.dp),
-                            )
-                        }
-                        IconButton(onClick = onRetry, modifier = Modifier.size(32.dp)) {
-                            Icon(
-                                imageVector = Lucide.RefreshCw,
-                                contentDescription = "Retry",
-                                modifier = Modifier.size(17.dp),
-                            )
-                        }
-                    }
-                }
                 if (!message?.reasoningContent.isNullOrBlank()) {
                     Surface(
                         modifier = Modifier.fillMaxWidth(),
@@ -770,19 +743,79 @@ private fun MessageTimelineItem(
                 Text(
                     text = message?.contentText?.ifBlank { item.smallSummary }
                         ?: item.smallSummary.ifBlank { "Loading message..." },
-                    style = MaterialTheme.typography.bodyMedium,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
                 )
-                val model = listOfNotNull(
-                    message?.providerName?.takeIf { it.isNotBlank() },
-                    message?.modelName?.takeIf { it.isNotBlank() },
-                ).joinToString(" / ")
-                if (model.isNotBlank() || !message?.finishReason.isNullOrBlank()) {
-                    Text(
-                        text = listOf(model, message?.finishReason.orEmpty())
-                            .filter { it.isNotBlank() }
-                            .joinToString(" - "),
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+            }
+        }
+    }
+}
+
+@Composable
+private fun AssistantMarkdownTimelineItem(
+    group: ChatDisplayItem.AssistantMarkdownGroup,
+    markdownStyle: MarkdownStyle,
+    markdownCache: MarkdownRenderCache,
+    onOpenFile: (String) -> Unit,
+    showActions: Boolean,
+    onRegenerate: () -> Unit,
+) {
+    val context = LocalContext.current
+    val clipboard = remember(context) {
+        context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+    }
+    val assistantText = remember(group.nodes) {
+        group.nodes.joinToString(separator = "\n\n") { node ->
+            node.raw.ifBlank { node.text }
+        }.trim()
+    }
+
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            group.nodes.forEach { node ->
+                MarkdownBlock(
+                    node = node,
+                    style = markdownStyle,
+                    renderCache = markdownCache,
+                    onOpenDestination = onOpenFile,
+                )
+            }
+        }
+        if (showActions && assistantText.isNotBlank()) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                ChatInlineActionButton(
+                    onClick = {
+                        clipboard.setPrimaryClip(
+                            ClipData.newPlainText("assistant message", assistantText),
+                        )
+                        Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
+                    },
+                    contentDescription = "Copy",
+                ) {
+                    Icon(
+                        imageVector = Lucide.Copy,
+                        contentDescription = null,
+                        modifier = Modifier.size(19.dp),
+                    )
+                }
+                ChatInlineActionButton(
+                    onClick = onRegenerate,
+                    contentDescription = "Regenerate",
+                ) {
+                    Icon(
+                        imageVector = Lucide.RefreshCw,
+                        contentDescription = null,
+                        modifier = Modifier.size(19.dp),
                     )
                 }
             }
@@ -791,96 +824,20 @@ private fun MessageTimelineItem(
 }
 
 @Composable
-private fun AssistantMarkdownTimelineItem(
-    item: UiTimelineItem,
-    node: MarkdownBlockNodeDto,
-    markdownStyle: MarkdownStyle,
-    markdownCache: MarkdownRenderCache,
-    onOpenFile: (String) -> Unit,
-    onRegenerate: () -> Unit,
-    onRetry: () -> Unit,
-    onSelectText: (String) -> Unit,
+private fun ChatInlineActionButton(
+    onClick: () -> Unit,
+    contentDescription: String,
+    content: @Composable () -> Unit,
 ) {
-    val context = LocalContext.current
-    val clipboard = remember(context) {
-        context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-    }
-    val blockText = node.raw.ifBlank { node.text }.ifBlank { item.smallSummary }
-
-    Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterStart) {
-        Surface(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(8.dp),
-            color = MaterialTheme.colorScheme.surface,
-            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+    IconButton(
+        onClick = onClick,
+        modifier = Modifier.size(34.dp),
+    ) {
+        Box(
+            modifier = Modifier.fillMaxSize(),
+            contentAlignment = Alignment.Center,
         ) {
-            Column(
-                modifier = Modifier.padding(12.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        text = "Assistant",
-                        style = MaterialTheme.typography.labelLarge,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                    StatusPill(
-                        text = if (item.contentType == "assistant_pending_block") {
-                            "streaming"
-                        } else {
-                            node.nodeKind.ifBlank { item.kind }
-                        },
-                        active = item.contentType == "assistant_pending_block",
-                    )
-                    Spacer(modifier = Modifier.weight(1f))
-                    IconButton(
-                        onClick = {
-                            clipboard.setPrimaryClip(
-                                ClipData.newPlainText("assistant block", blockText),
-                            )
-                            Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
-                        },
-                        modifier = Modifier.size(32.dp),
-                    ) {
-                        Icon(
-                            imageVector = Lucide.Copy,
-                            contentDescription = "Copy",
-                            modifier = Modifier.size(17.dp),
-                        )
-                    }
-                    IconButton(onClick = { onSelectText(blockText) }, modifier = Modifier.size(32.dp)) {
-                        Icon(
-                            imageVector = Lucide.Type,
-                            contentDescription = "Select text",
-                            modifier = Modifier.size(17.dp),
-                        )
-                    }
-                    IconButton(onClick = onRegenerate, modifier = Modifier.size(32.dp)) {
-                        Icon(
-                            imageVector = Lucide.RefreshCw,
-                            contentDescription = "Regenerate",
-                            modifier = Modifier.size(17.dp),
-                        )
-                    }
-                    IconButton(onClick = onRetry, modifier = Modifier.size(32.dp)) {
-                        Icon(
-                            imageVector = Lucide.RefreshCw,
-                            contentDescription = "Retry",
-                            modifier = Modifier.size(17.dp),
-                        )
-                    }
-                }
-                MarkdownBlock(
-                    node = node,
-                    style = markdownStyle,
-                    renderCache = markdownCache,
-                    onOpenDestination = onOpenFile,
-                )
-            }
+            content()
         }
     }
 }
@@ -1007,12 +964,10 @@ private fun ChatInputPanel(
     enabled: Boolean,
     generating: Boolean,
     thinkingEnabled: Boolean,
-    searchEnabled: Boolean,
     attachmentPanelOpen: Boolean,
     pendingAttachments: List<UiPendingAttachment>,
     editing: Boolean,
     onToggleThinking: () -> Unit,
-    onToggleSearch: () -> Unit,
     onToggleAttachmentPanel: () -> Unit,
     onAddImage: () -> Unit,
     onAddFile: () -> Unit,
@@ -1021,13 +976,26 @@ private fun ChatInputPanel(
     onStop: () -> Unit,
     onCancelEdit: () -> Unit,
     onSend: () -> Unit,
+    modifier: Modifier = Modifier,
 ) {
+    val tokens = HamburTheme.tokens.chat
+    val panelShape = RoundedCornerShape(tokens.inputCornerRadius)
+    val panelBorder = MaterialTheme.colorScheme.outlineVariant.copy(alpha = tokens.inputBorderAlpha)
+    val primaryText = MaterialTheme.colorScheme.onSurface
+    val secondaryText = MaterialTheme.colorScheme.onSurfaceVariant
+    val canSend = enabled && !generating && (message.isNotBlank() || pendingAttachments.isNotEmpty())
+
     Column(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .background(MaterialTheme.colorScheme.background)
-            .padding(horizontal = 12.dp, vertical = 10.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
+            .padding(
+                start = tokens.inputOuterStartPadding,
+                end = tokens.inputOuterEndPadding,
+                top = tokens.inputOuterTopPadding,
+                bottom = tokens.inputOuterBottomPadding,
+            ),
+        verticalArrangement = Arrangement.spacedBy(tokens.inputOuterGap),
     ) {
         if (pendingAttachments.isNotEmpty()) {
             LazyRow(
@@ -1070,25 +1038,38 @@ private fun ChatInputPanel(
         }
         Surface(
             modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(8.dp),
+            shape = panelShape,
             color = MaterialTheme.colorScheme.surface,
-            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+            border = BorderStroke(tokens.inputBorderWidth, panelBorder),
+            shadowElevation = tokens.inputShadowElevation,
         ) {
             Column(
-                modifier = Modifier.padding(10.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.padding(
+                    start = tokens.inputInnerStartPadding,
+                    top = tokens.inputInnerTopPadding,
+                    end = tokens.inputInnerEndPadding,
+                    bottom = tokens.inputInnerBottomPadding,
+                ),
+                verticalArrangement = Arrangement.spacedBy(tokens.inputContentGap),
             ) {
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .heightIn(min = 44.dp, max = 150.dp)
+                        .heightIn(
+                            min = tokens.inputTextMinHeight,
+                            max = tokens.inputTextMaxHeight,
+                        )
                         .verticalScroll(rememberScrollState()),
                     contentAlignment = Alignment.CenterStart,
                 ) {
                     if (message.isBlank()) {
                         Text(
-                            text = "Message Hambur",
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            text = "发消息或按住说话",
+                            color = secondaryText.copy(alpha = tokens.inputPlaceholderAlpha),
+                            style = MaterialTheme.typography.bodyLarge.copy(
+                                color = secondaryText.copy(alpha = tokens.inputPlaceholderAlpha),
+                            ),
+                            modifier = Modifier.padding(start = tokens.inputTextStartPadding),
                         )
                     }
                     BasicTextField(
@@ -1096,48 +1077,89 @@ private fun ChatInputPanel(
                         onValueChange = onMessageChange,
                         enabled = enabled && !generating,
                         textStyle = MaterialTheme.typography.bodyLarge.copy(
-                            color = MaterialTheme.colorScheme.onSurface,
+                            color = primaryText,
                         ),
                         cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = tokens.inputTextStartPadding),
                     )
                 }
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    InputToggle(
-                        icon = Lucide.Brain,
-                        text = "Think",
-                        active = thinkingEnabled,
-                        enabled = enabled && !generating,
+                    ChatIconButton(
                         onClick = onToggleThinking,
-                    )
-                    InputToggle(
-                        icon = Lucide.Globe,
-                        text = "Search",
-                        active = searchEnabled,
                         enabled = enabled && !generating,
-                        onClick = onToggleSearch,
-                    )
-                    IconButton(
-                        enabled = enabled && !generating,
-                        onClick = onToggleAttachmentPanel,
+                        size = tokens.inputIconButtonSize,
+                        modifier = Modifier.offset(
+                            x = tokens.inputLeftIconOffsetX,
+                            y = tokens.inputIconOffsetY,
+                        ),
                     ) {
-                        Icon(imageVector = Lucide.Paperclip, contentDescription = "Attachments")
+                        Icon(
+                            imageVector = Lucide.Brain,
+                            contentDescription = "Think",
+                            tint = if (thinkingEnabled) MaterialTheme.colorScheme.primary else primaryText,
+                            modifier = Modifier.size(tokens.inputIconSize),
+                        )
                     }
                     Spacer(modifier = Modifier.weight(1f))
+                    ChatIconButton(
+                        onClick = onToggleAttachmentPanel,
+                        enabled = enabled && !generating,
+                        size = tokens.inputIconButtonSize,
+                        modifier = Modifier.offset(
+                            x = tokens.inputIconOffsetX,
+                            y = tokens.inputIconOffsetY,
+                        ),
+                    ) {
+                        Icon(
+                            imageVector = if (attachmentPanelOpen) Lucide.CircleX else Lucide.CirclePlus,
+                            contentDescription = "Attachments",
+                            tint = primaryText,
+                            modifier = Modifier.size(tokens.inputIconSize),
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(tokens.inputRightIconGap))
                     if (generating) {
-                        IconButton(onClick = onStop, enabled = enabled) {
-                            Icon(imageVector = Lucide.CirclePause, contentDescription = "Stop")
+                        ChatIconButton(
+                            onClick = onStop,
+                            enabled = enabled,
+                            size = tokens.inputIconButtonSize,
+                            modifier = Modifier.offset(
+                                x = tokens.inputIconOffsetX,
+                                y = tokens.inputIconOffsetY,
+                            ),
+                        ) {
+                            Icon(
+                                imageVector = Lucide.CirclePause,
+                                contentDescription = "Stop",
+                                tint = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.size(tokens.inputIconSize),
+                            )
                         }
                     } else {
-                        IconButton(
+                        ChatIconButton(
                             onClick = onSend,
-                            enabled = enabled && (message.isNotBlank() || pendingAttachments.isNotEmpty()),
+                            enabled = canSend,
+                            size = tokens.inputIconButtonSize,
+                            modifier = Modifier.offset(
+                                x = tokens.inputIconOffsetX,
+                                y = tokens.inputIconOffsetY,
+                            ),
                         ) {
-                            Icon(imageVector = Lucide.SendHorizontal, contentDescription = "Send")
+                            Icon(
+                                imageVector = Lucide.CircleArrowUp,
+                                contentDescription = "Send",
+                                tint = if (canSend) {
+                                    primaryText
+                                } else {
+                                    secondaryText.copy(alpha = tokens.inputPlaceholderAlpha)
+                                },
+                                modifier = Modifier.size(tokens.inputIconSize),
+                            )
                         }
                     }
                 }
@@ -1166,6 +1188,29 @@ private fun ChatInputPanel(
             }
         }
     }
+}
+
+@Composable
+private fun ChatIconButton(
+    onClick: () -> Unit,
+    enabled: Boolean = true,
+    size: Dp = 48.dp,
+    modifier: Modifier = Modifier,
+    content: @Composable BoxScope.() -> Unit,
+) {
+    Box(
+        modifier = modifier
+            .size(size)
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                enabled = enabled,
+                role = Role.Button,
+                onClick = onClick,
+            ),
+        contentAlignment = Alignment.Center,
+        content = content,
+    )
 }
 
 @Composable
@@ -1257,8 +1302,80 @@ private fun PendingAttachmentChip(
 }
 
 private fun HamburUiState.selectedSessionTitle(): String {
-    return sessions.firstOrNull { it.id == selectedSessionId }?.title?.ifBlank { "Hambur Chat" }
-        ?: "Hambur Chat"
+    val title = sessions.firstOrNull { it.id == selectedSessionId }?.title.orEmpty()
+    return when {
+        title.isBlank() || title == "New chat" || title == "Hambur Chat" -> "新对话"
+        else -> title
+    }
+}
+
+private sealed interface ChatDisplayItem {
+    val stableKey: String
+    val contentType: String
+    val versionSequence: ULong
+
+    data class Timeline(
+        val item: UiTimelineItem,
+    ) : ChatDisplayItem {
+        override val stableKey: String = item.stableKey
+        override val contentType: String = item.contentType
+        override val versionSequence: ULong = item.versionSequence
+    }
+
+    data class AssistantMarkdownGroup(
+        val messageId: String,
+        val items: List<UiTimelineItem>,
+        val nodes: List<MarkdownBlockNodeDto>,
+    ) : ChatDisplayItem {
+        override val stableKey: String = "assistant-group:$messageId:${items.firstOrNull()?.stableKey.orEmpty()}"
+        override val contentType: String = "assistant_markdown_group"
+        override val versionSequence: ULong = items.maxOfOrNull { it.versionSequence } ?: 0UL
+    }
+}
+
+private fun List<UiTimelineItem>.toChatDisplayItems(
+    markdownBlocksByPayloadRef: Map<String, MarkdownBlockNodeDto>,
+): List<ChatDisplayItem> {
+    val displayItems = mutableListOf<ChatDisplayItem>()
+    val groupItems = mutableListOf<UiTimelineItem>()
+    val groupNodes = mutableListOf<MarkdownBlockNodeDto>()
+    var groupMessageId = ""
+
+    fun flushGroup() {
+        if (groupItems.isNotEmpty() && groupNodes.isNotEmpty()) {
+            displayItems += ChatDisplayItem.AssistantMarkdownGroup(
+                messageId = groupMessageId,
+                items = groupItems.toList(),
+                nodes = groupNodes.toList(),
+            )
+        } else {
+            groupItems.forEach { displayItems += ChatDisplayItem.Timeline(it) }
+        }
+        groupItems.clear()
+        groupNodes.clear()
+        groupMessageId = ""
+    }
+
+    for (item in this) {
+        val node = if (item.isAssistantMarkdownBlock()) {
+            markdownBlocksByPayloadRef[item.payloadRef]
+        } else {
+            null
+        }
+        if (node == null) {
+            flushGroup()
+            displayItems += ChatDisplayItem.Timeline(item)
+            continue
+        }
+        if (groupItems.isNotEmpty() && node.messageId != groupMessageId) {
+            flushGroup()
+        }
+        groupMessageId = node.messageId
+        groupItems += item
+        groupNodes += node
+    }
+    flushGroup()
+    return displayItems
 }
 
 private fun UiTimelineItem.isAssistantMarkdownBlock(): Boolean {

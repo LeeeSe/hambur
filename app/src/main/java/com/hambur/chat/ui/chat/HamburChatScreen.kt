@@ -7,8 +7,9 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image as ComposeImage
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.FlingBehavior
 import androidx.compose.foundation.gestures.Orientation
 import androidx.compose.foundation.gestures.ScrollScope
@@ -49,6 +50,9 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -75,21 +79,32 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntRect
+import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupPositionProvider
+import androidx.compose.ui.window.PopupProperties
 import com.composables.icons.lucide.Brain
 import com.composables.icons.lucide.ChartNoAxesGantt
 import com.composables.icons.lucide.CircleArrowUp
@@ -102,14 +117,19 @@ import com.composables.icons.lucide.Globe
 import com.composables.icons.lucide.Image
 import com.composables.icons.lucide.Lucide
 import com.composables.icons.lucide.MessageCirclePlus
+import com.composables.icons.lucide.Pencil
+import com.composables.icons.lucide.Pin
 import com.composables.icons.lucide.RefreshCw
 import com.composables.icons.lucide.Search
 import com.composables.icons.lucide.Settings
+import com.composables.icons.lucide.Trash2
+import com.composables.icons.lucide.Type
 import com.composables.icons.lucide.User
 import com.composables.icons.lucide.X
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.view.HapticFeedbackConstants
 import android.widget.Toast
 import com.hambur.chat.R
 import com.hambur.chat.reducer.HamburUiState
@@ -154,7 +174,6 @@ fun HamburChatScreen(
     var bottomInputHeightPx by remember { mutableStateOf(0) }
     val density = LocalDensity.current
     val configuration = LocalConfiguration.current
-    val isDarkTheme = isSystemInDarkTheme()
     val drawerBackgroundColor = MaterialTheme.colorScheme.background
     val drawerWidth = configuration.screenWidthDp.dp * 0.82f
     val maxDrawerOffset = with(density) { drawerWidth.toPx() }
@@ -207,18 +226,11 @@ fun HamburChatScreen(
         0f
     }
     val mainScale = 1f - (0.08f * drawerProgress)
+    val mainContentAlpha = 1f - (0.55f * drawerProgress)
     val mainCornerRadius = if (drawerOffset > 0f) 30.dp else 0.dp
-    val mainShadowElevation = 40.dp * drawerProgress
-    val mainAmbientShadowColor = if (isDarkTheme) {
-        Color.White.copy(alpha = 0.14f * drawerProgress)
-    } else {
-        Color.Black.copy(alpha = 0.20f * drawerProgress)
-    }
-    val mainSpotShadowColor = if (isDarkTheme) {
-        Color.White.copy(alpha = 0.30f * drawerProgress)
-    } else {
-        Color.Black.copy(alpha = 0.42f * drawerProgress)
-    }
+    val mainShadowElevation = 56.dp * drawerProgress
+    val mainAmbientShadowColor = Color.Black.copy(alpha = 0.34f * drawerProgress)
+    val mainSpotShadowColor = Color.Black.copy(alpha = 0.68f * drawerProgress)
 
     LaunchedEffect(maxDrawerOffset) {
         drawerOffset = drawerOffset.coerceIn(0f, maxDrawerOffset)
@@ -301,17 +313,6 @@ fun HamburChatScreen(
                 )
                 .clip(RoundedCornerShape(mainCornerRadius))
                 .background(MaterialTheme.colorScheme.background)
-                .graphicsLayer {
-                    compositingStrategy = androidx.compose.ui.graphics.CompositingStrategy.Offscreen
-                }
-                .drawWithContent {
-                    drawContent()
-                    if (drawerProgress > 0f) {
-                        val scrimColor = if (isDarkTheme) Color.Black else Color.White
-                        val scrimAlpha = if (isDarkTheme) 0.35f * drawerProgress else 0.45f * drawerProgress
-                        drawRect(scrimColor.copy(alpha = scrimAlpha))
-                    }
-                }
                 .clickable(
                     interactionSource = remember { MutableInteractionSource() },
                     indication = null,
@@ -328,7 +329,13 @@ fun HamburChatScreen(
                 modifier = Modifier
                     .fillMaxSize(),
             ) {
-                Column(modifier = Modifier.fillMaxSize()) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer {
+                            alpha = mainContentAlpha
+                        },
+                ) {
                     ChatHeader(
                         title = state.selectedSessionTitle(),
                         onOpenDrawer = {
@@ -575,9 +582,11 @@ private fun ChatDrawerContent(
                         }
                         items(group.sessions, key = { it.id }) { session ->
                             DrawerSessionRow(
-                                title = session.title.ifBlank { "新对话" },
+                                session = session,
                                 selected = session.id == selectedSessionId,
                                 onClick = { onOpenSession(session.id) },
+                                onDelete = { onDeleteSession(session.id) },
+                                onPin = { onSetSessionPinned(session.id, session.pinnedAtMs == 0UL) },
                                 selectedBackground = selectedBackground,
                                 contentColor = colorScheme.onBackground,
                             )
@@ -696,35 +705,73 @@ private fun DrawerCategoryHeader(
 
 @Composable
 private fun DrawerSessionRow(
-    title: String,
+    session: UiSessionSummary,
     selected: Boolean,
     onClick: () -> Unit,
+    onDelete: () -> Unit,
+    onPin: () -> Unit,
     selectedBackground: Color,
     contentColor: Color,
 ) {
+    var showMenu by remember { mutableStateOf(false) }
+    var pressOffset by remember { mutableStateOf(Offset.Zero) }
+    val density = LocalDensity.current
+    val longPressHaptic = rememberSystemLongPressHapticFeedback()
+
     Box(
         modifier = Modifier
             .fillMaxWidth()
             .height(52.dp)
             .clip(RoundedCornerShape(12.dp))
             .background(if (selected) selectedBackground else Color.Transparent)
-            .clickable(
-                interactionSource = remember { MutableInteractionSource() },
-                indication = null,
-                role = Role.Button,
-                onClick = onClick,
-            )
+            .pointerInput(Unit) {
+                detectTapGestures(
+                    onTap = { onClick() },
+                    onLongPress = { offset ->
+                        longPressHaptic()
+                        pressOffset = offset
+                        showMenu = true
+                    },
+                )
+            }
             .padding(horizontal = 14.dp),
         contentAlignment = Alignment.CenterStart,
     ) {
         Text(
-            text = title,
+            text = session.title.ifBlank { "新对话" },
             color = contentColor.copy(alpha = if (selected) 1f else 0.82f),
             style = MaterialTheme.typography.titleMedium,
             fontWeight = if (selected) FontWeight.Bold else FontWeight.SemiBold,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
+
+        if (showMenu) {
+            HamburContextMenu(
+                pressOffset = pressOffset,
+                density = density,
+                onDismiss = { showMenu = false },
+            ) {
+                ContextMenuActionRow(
+                    icon = Lucide.Pin,
+                    label = if (session.pinnedAtMs > 0UL) "取消置顶" else "置顶",
+                    onClick = {
+                        showMenu = false
+                        onPin()
+                    },
+                )
+                ContextMenuDivider()
+                ContextMenuActionRow(
+                    icon = Lucide.Trash2,
+                    label = "删除",
+                    danger = true,
+                    onClick = {
+                        showMenu = false
+                        onDelete()
+                    },
+                )
+            }
+        }
     }
 }
 
@@ -883,6 +930,11 @@ private fun ChatTimeline(
                                 item = timelineItem,
                                 message = message,
                                 onOpenFile = onOpenFile,
+                                onSelectText = onSelectText,
+                                onRetryMessage = {
+                                    store.retryMessage(state.selectedSessionId, timelineItem.payloadRef)
+                                },
+                                onEditMessage = { message?.let(onEditMessage) },
                             )
                         }
                         timelineItem.contentType == "trace" || timelineItem.kind.contains("Trace") -> {
@@ -903,6 +955,7 @@ private fun ChatTimeline(
                         onRegenerate = {
                             store.regenerateMessage(state.selectedSessionId, item.messageId)
                         },
+                        onSelectText = onSelectText,
                     )
                 }
             }
@@ -985,48 +1038,153 @@ private fun MessageTimelineItem(
     item: UiTimelineItem,
     message: UiMessageSnapshot?,
     onOpenFile: (String) -> Unit,
+    onSelectText: (String) -> Unit,
+    onRetryMessage: () -> Unit,
+    onEditMessage: () -> Unit,
 ) {
     val role = message?.role ?: item.kind
     val isUser = role == "user"
+    val context = LocalContext.current
+    val messageText = message?.contentText?.ifBlank { item.smallSummary }
+        ?: item.smallSummary.ifBlank { "Loading message..." }
 
     Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
-        Surface(
-            modifier = Modifier.widthIn(max = 324.dp),
-            shape = RoundedCornerShape(18.dp),
-            color = MaterialTheme.colorScheme.primaryContainer,
+        MessageLongPressMenuBox(
+            enabled = isUser && message != null && messageText.isNotBlank(),
+            onCopy = {
+                copyTextToClipboard(context = context, text = messageText)
+            },
+            onSelectText = { onSelectText(messageText) },
+            onRetry = onRetryMessage,
+            onEdit = onEditMessage,
         ) {
-            Column(
-                modifier = Modifier.padding(horizontal = 18.dp, vertical = 13.dp),
+            Surface(
+                modifier = Modifier.widthIn(max = 324.dp),
+                shape = RoundedCornerShape(18.dp),
+                color = MaterialTheme.colorScheme.primaryContainer,
             ) {
-                if (!message?.reasoningContent.isNullOrBlank()) {
-                    Surface(
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(8.dp),
-                        color = MaterialTheme.colorScheme.surfaceVariant,
-                    ) {
-                        Text(
-                            text = message.reasoningContent,
-                            modifier = Modifier.padding(10.dp),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                }
-                if (!message?.attachments.isNullOrEmpty()) {
-                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        message.attachments.forEach { attachment ->
-                            MessageAttachmentRow(
-                                attachment = attachment,
-                                onOpen = { onOpenFile(attachment.sandboxPath) },
+                Column(
+                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 13.dp),
+                ) {
+                    if (!message?.reasoningContent.isNullOrBlank()) {
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(8.dp),
+                            color = MaterialTheme.colorScheme.surfaceVariant,
+                        ) {
+                            Text(
+                                text = message.reasoningContent,
+                                modifier = Modifier.padding(10.dp),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
                     }
+                    if (!message?.attachments.isNullOrEmpty()) {
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            message.attachments.forEach { attachment ->
+                                MessageAttachmentRow(
+                                    attachment = attachment,
+                                    onOpen = { onOpenFile(attachment.sandboxPath) },
+                                )
+                            }
+                        }
+                    }
+                    Text(
+                        text = messageText,
+                        style = MaterialTheme.typography.bodyLarge,
+                    )
                 }
-                Text(
-                    text = message?.contentText?.ifBlank { item.smallSummary }
-                        ?: item.smallSummary.ifBlank { "Loading message..." },
-                    style = MaterialTheme.typography.bodyLarge,
+            }
+        }
+    }
+}
+
+@Composable
+private fun MessageLongPressMenuBox(
+    enabled: Boolean,
+    onCopy: () -> Unit,
+    onSelectText: () -> Unit,
+    onRetry: (() -> Unit)? = null,
+    onEdit: (() -> Unit)? = null,
+    onRegenerate: (() -> Unit)? = null,
+    content: @Composable () -> Unit,
+) {
+    var showMenu by remember { mutableStateOf(false) }
+    var pressOffset by remember { mutableStateOf(Offset.Zero) }
+    val density = LocalDensity.current
+    val longPressHaptic = rememberSystemLongPressHapticFeedback()
+
+    Box(
+        modifier = Modifier.pointerInput(enabled) {
+            detectTapGestures(
+                onLongPress = { offset ->
+                    if (enabled) {
+                        longPressHaptic()
+                        pressOffset = offset
+                        showMenu = true
+                    }
+                },
+            )
+        },
+    ) {
+        content()
+        if (showMenu) {
+            HamburContextMenu(
+                pressOffset = pressOffset,
+                density = density,
+                onDismiss = { showMenu = false },
+            ) {
+                ContextMenuActionRow(
+                    icon = Lucide.Copy,
+                    label = "复制",
+                    onClick = {
+                        showMenu = false
+                        onCopy()
+                    },
                 )
+                ContextMenuDivider()
+                ContextMenuActionRow(
+                    icon = Lucide.Type,
+                    label = "选择文本",
+                    onClick = {
+                        showMenu = false
+                        onSelectText()
+                    },
+                )
+                onRetry?.let { retry ->
+                    ContextMenuDivider()
+                    ContextMenuActionRow(
+                        icon = Lucide.RefreshCw,
+                        label = "重试",
+                        onClick = {
+                            showMenu = false
+                            retry()
+                        },
+                    )
+                }
+                onRegenerate?.let { regenerate ->
+                    ContextMenuDivider()
+                    ContextMenuActionRow(
+                        icon = Lucide.RefreshCw,
+                        label = "重新生成",
+                        onClick = {
+                            showMenu = false
+                            regenerate()
+                        },
+                    )
+                }
+                onEdit?.let { edit ->
+                    ContextMenuDivider()
+                    ContextMenuActionRow(
+                        icon = Lucide.Pencil,
+                        label = "编辑",
+                        onClick = {
+                            showMenu = false
+                            edit()
+                        },
+                    )
+                }
             }
         }
     }
@@ -1040,6 +1198,7 @@ private fun AssistantMarkdownTimelineItem(
     onOpenFile: (String) -> Unit,
     showActions: Boolean,
     onRegenerate: () -> Unit,
+    onSelectText: (String) -> Unit,
 ) {
     val context = LocalContext.current
     val clipboard = remember(context) {
@@ -1055,17 +1214,26 @@ private fun AssistantMarkdownTimelineItem(
         modifier = Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        Column(
-            modifier = Modifier.fillMaxWidth(),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
+        MessageLongPressMenuBox(
+            enabled = assistantText.isNotBlank(),
+            onCopy = {
+                copyTextToClipboard(context = context, text = assistantText)
+            },
+            onSelectText = { onSelectText(assistantText) },
+            onRegenerate = onRegenerate,
         ) {
-            group.nodes.forEach { node ->
-                MarkdownBlock(
-                    node = node,
-                    style = markdownStyle,
-                    renderCache = markdownCache,
-                    onOpenDestination = onOpenFile,
-                )
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                group.nodes.forEach { node ->
+                    MarkdownBlock(
+                        node = node,
+                        style = markdownStyle,
+                        renderCache = markdownCache,
+                        onOpenDestination = onOpenFile,
+                    )
+                }
             }
         }
         if (showActions && assistantText.isNotBlank()) {
@@ -1104,6 +1272,129 @@ private fun AssistantMarkdownTimelineItem(
             }
         }
     }
+}
+
+@Composable
+private fun HamburContextMenu(
+    pressOffset: Offset,
+    density: Density,
+    onDismiss: () -> Unit,
+    content: @Composable () -> Unit,
+) {
+    val isDark = MaterialTheme.colorScheme.background.luminance() <= 0.5f
+    val popupBgColor = if (isDark) Color(0xFF2C2C2E) else Color.White
+    val popupBorderColor = if (isDark) Color.White.copy(alpha = 0.08f) else Color(0xFFE5E5EA)
+
+    Popup(
+        popupPositionProvider = ContextMenuPositionProvider(pressOffset, density),
+        onDismissRequest = onDismiss,
+        properties = PopupProperties(focusable = true),
+    ) {
+        Card(
+            shape = RoundedCornerShape(16.dp),
+            colors = CardDefaults.cardColors(containerColor = popupBgColor),
+            modifier = Modifier
+                .width(160.dp)
+                .border(0.5.dp, popupBorderColor, RoundedCornerShape(16.dp)),
+        ) {
+            Column(modifier = Modifier.fillMaxWidth()) {
+                content()
+            }
+        }
+    }
+}
+
+@Composable
+private fun ContextMenuActionRow(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    danger: Boolean = false,
+    onClick: () -> Unit,
+) {
+    val color = if (danger) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onBackground
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(44.dp)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = color,
+            modifier = Modifier.size(16.dp),
+        )
+        Spacer(modifier = Modifier.width(12.dp))
+        Text(
+            text = label,
+            color = color,
+            style = MaterialTheme.typography.bodyMedium,
+            maxLines = 1,
+        )
+    }
+}
+
+@Composable
+private fun ContextMenuDivider() {
+    val isDark = MaterialTheme.colorScheme.background.luminance() <= 0.5f
+    HorizontalDivider(
+        thickness = 0.5.dp,
+        color = if (isDark) Color(0xFF3E3E40) else Color(0xFFE5E5EA),
+    )
+}
+
+private class ContextMenuPositionProvider(
+    private val pressOffset: Offset,
+    private val density: Density,
+) : PopupPositionProvider {
+    override fun calculatePosition(
+        anchorBounds: IntRect,
+        windowSize: IntSize,
+        layoutDirection: LayoutDirection,
+        popupContentSize: IntSize,
+    ): IntOffset {
+        val touchX = anchorBounds.left + pressOffset.x
+        val touchY = anchorBounds.top + pressOffset.y
+        val marginPx = with(density) { 16.dp.toPx() }.toInt()
+        val gapPx = with(density) { 10.dp.toPx() }
+
+        var x = (touchX - popupContentSize.width / 2f).toInt()
+        if (x < marginPx) x = marginPx
+        if (x + popupContentSize.width > windowSize.width - marginPx) {
+            x = windowSize.width - popupContentSize.width - marginPx
+        }
+
+        var y = if (touchY - popupContentSize.height - gapPx > 0f) {
+            (touchY - popupContentSize.height - gapPx).toInt()
+        } else {
+            (touchY + gapPx).toInt()
+        }
+        if (y < marginPx) y = marginPx
+        if (y + popupContentSize.height > windowSize.height - marginPx) {
+            y = windowSize.height - popupContentSize.height - marginPx
+        }
+
+        return IntOffset(x, y)
+    }
+}
+
+@Composable
+private fun rememberSystemLongPressHapticFeedback(): () -> Unit {
+    val view = LocalView.current
+    return remember(view) {
+        { view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS) }
+    }
+}
+
+private fun copyTextToClipboard(
+    context: Context,
+    text: String,
+) {
+    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+    clipboard.setPrimaryClip(ClipData.newPlainText("text", text))
+    Toast.makeText(context, "已复制到剪贴板", Toast.LENGTH_SHORT).show()
 }
 
 @Composable

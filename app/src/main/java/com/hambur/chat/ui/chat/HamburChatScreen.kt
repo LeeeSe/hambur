@@ -2,12 +2,18 @@ package com.hambur.chat.ui.chat
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.Animatable
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image as ComposeImage
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.gestures.FlingBehavior
+import androidx.compose.foundation.gestures.Orientation
+import androidx.compose.foundation.gestures.ScrollScope
+import androidx.compose.foundation.gestures.rememberScrollableState
+import androidx.compose.foundation.gestures.scrollable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -41,6 +47,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -51,6 +58,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -62,10 +70,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalConfiguration
@@ -129,7 +141,7 @@ fun HamburChatScreen(
     onPickImage: (((String, String, ULong, String, String) -> Unit) -> Unit) = {},
     onPickFile: (((String, String, ULong, String, String) -> Unit) -> Unit) = {},
 ) {
-    var drawerOpen by rememberSaveable { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
     var searchQuery by rememberSaveable { mutableStateOf("") }
     var draftTitle by rememberSaveable { mutableStateOf("") }
     var draftMessage by rememberSaveable { mutableStateOf("") }
@@ -142,27 +154,96 @@ fun HamburChatScreen(
     var bottomInputHeightPx by remember { mutableStateOf(0) }
     val density = LocalDensity.current
     val configuration = LocalConfiguration.current
+    val isDarkTheme = isSystemInDarkTheme()
+    val drawerBackgroundColor = MaterialTheme.colorScheme.background
     val drawerWidth = configuration.screenWidthDp.dp * 0.82f
+    val maxDrawerOffset = with(density) { drawerWidth.toPx() }
+    var drawerOffset by remember { mutableFloatStateOf(0f) }
+    val drawerAnimation = remember { Animatable(0f) }
     val messageListBottomPadding = with(density) {
         bottomInputHeightPx.toDp()
     } + HamburTheme.tokens.chat.timelineBottomGap
-    val drawerProgress by animateFloatAsState(
-        targetValue = if (drawerOpen) 1f else 0f,
-        label = "drawerProgress",
-    )
-    val drawerOffset = with(density) { drawerWidth.toPx() * drawerProgress }
+    val consumeDrawerDelta: (Float) -> Float = { delta ->
+        val previousOffset = drawerOffset
+        drawerOffset = (drawerOffset + delta).coerceIn(0f, maxDrawerOffset)
+        drawerOffset - previousOffset
+    }
+    val animateDrawerTo: suspend (Float) -> Unit = { targetOffset ->
+        drawerAnimation.snapTo(drawerOffset)
+        drawerAnimation.animateTo(targetOffset) {
+            drawerOffset = value
+        }
+        drawerOffset = targetOffset
+    }
+    val drawerScrollableState = rememberScrollableState { delta ->
+        consumeDrawerDelta(delta)
+    }
+    val drawerNestedScrollConnection = remember {
+        object : NestedScrollConnection {
+            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                if (source != NestedScrollSource.UserInput || drawerOffset <= 0f || available.x == 0f) {
+                    return Offset.Zero
+                }
+                val consumed = consumeDrawerDelta(available.x)
+                return Offset(consumed, 0f)
+            }
+        }
+    }
+    val drawerFlingBehavior = object : FlingBehavior {
+        override suspend fun ScrollScope.performFling(initialVelocity: Float): Float {
+            val targetOffset = when {
+                initialVelocity > 600f -> maxDrawerOffset
+                initialVelocity < -600f -> 0f
+                drawerOffset > maxDrawerOffset * 0.3f -> maxDrawerOffset
+                else -> 0f
+            }
+            animateDrawerTo(targetOffset)
+            return 0f
+        }
+    }
+    val drawerProgress = if (maxDrawerOffset > 0f) {
+        (drawerOffset / maxDrawerOffset).coerceIn(0f, 1f)
+    } else {
+        0f
+    }
     val mainScale = 1f - (0.08f * drawerProgress)
-    val mainCornerRadius = 30.dp * drawerProgress
+    val mainCornerRadius = if (drawerOffset > 0f) 30.dp else 0.dp
     val mainShadowElevation = 40.dp * drawerProgress
+    val mainAmbientShadowColor = if (isDarkTheme) {
+        Color.White.copy(alpha = 0.14f * drawerProgress)
+    } else {
+        Color.Black.copy(alpha = 0.20f * drawerProgress)
+    }
+    val mainSpotShadowColor = if (isDarkTheme) {
+        Color.White.copy(alpha = 0.30f * drawerProgress)
+    } else {
+        Color.Black.copy(alpha = 0.42f * drawerProgress)
+    }
 
-    BackHandler(enabled = drawerOpen) {
-        drawerOpen = false
+    LaunchedEffect(maxDrawerOffset) {
+        drawerOffset = drawerOffset.coerceIn(0f, maxDrawerOffset)
+    }
+
+    BackHandler(enabled = drawerOffset > 0f) {
+        scope.launch {
+            animateDrawerTo(0f)
+        }
     }
 
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background),
+            .background(drawerBackgroundColor)
+            .drawWithContent {
+                drawRect(drawerBackgroundColor)
+                drawContent()
+            }
+            .nestedScroll(drawerNestedScrollConnection)
+            .scrollable(
+                state = drawerScrollableState,
+                orientation = Orientation.Horizontal,
+                flingBehavior = drawerFlingBehavior,
+            ),
     ) {
         if (drawerProgress > 0.001f) {
             ChatDrawerContent(
@@ -173,11 +254,11 @@ fun HamburChatScreen(
                 onNewSession = {
                     store.createSession(draftTitle.ifBlank { "新对话" })
                     draftTitle = ""
-                    drawerOpen = false
+                    scope.launch { animateDrawerTo(0f) }
                 },
                 onOpenSession = {
                     store.openSession(it)
-                    drawerOpen = false
+                    scope.launch { animateDrawerTo(0f) }
                 },
                 onDeleteSession = store::deleteSession,
                 onRenameSession = { sessionId ->
@@ -187,7 +268,7 @@ fun HamburChatScreen(
                 onSetSessionPinned = store::setSessionPinned,
                 onUnavailableAction = { unavailableAction = it },
                 onOpenSettings = {
-                    drawerOpen = false
+                    scope.launch { animateDrawerTo(0f) }
                     onOpenSettings()
                 },
                 drawerWidth = drawerWidth,
@@ -215,109 +296,134 @@ fun HamburChatScreen(
                     elevation = mainShadowElevation,
                     shape = RoundedCornerShape(mainCornerRadius),
                     clip = false,
+                    ambientColor = mainAmbientShadowColor,
+                    spotColor = mainSpotShadowColor,
                 )
                 .clip(RoundedCornerShape(mainCornerRadius))
                 .background(MaterialTheme.colorScheme.background)
+                .graphicsLayer {
+                    compositingStrategy = androidx.compose.ui.graphics.CompositingStrategy.Offscreen
+                }
+                .drawWithContent {
+                    drawContent()
+                    if (drawerProgress > 0f) {
+                        val scrimColor = if (isDarkTheme) Color.Black else Color.White
+                        val scrimAlpha = if (isDarkTheme) 0.35f * drawerProgress else 0.45f * drawerProgress
+                        drawRect(scrimColor.copy(alpha = scrimAlpha))
+                    }
+                }
                 .clickable(
                     interactionSource = remember { MutableInteractionSource() },
                     indication = null,
-                    enabled = drawerOpen,
-                    onClick = { drawerOpen = false },
+                    enabled = drawerOffset > 0f,
+                    onClick = {
+                        scope.launch { animateDrawerTo(0f) }
+                    },
                 )
                 .statusBarsPadding()
                 .navigationBarsPadding()
                 .imePadding(),
         ) {
-            ChatHeader(
-                title = state.selectedSessionTitle(),
-                onOpenDrawer = { drawerOpen = true },
-                onNewChat = { store.createSession("New chat") },
-                onOpenBrowser = onOpenBrowser,
-            )
-
             Box(
                 modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth(),
+                    .fillMaxSize(),
             ) {
-                ChatTimeline(
-                    state = state,
-                    store = store,
-                    onOpenFile = onOpenFile,
-                    onEditMessage = { message ->
-                        editingMessageId = message.id
-                        draftMessage = message.contentText
-                    },
-                    onSelectText = { selectingText = it },
-                    bottomPadding = messageListBottomPadding,
-                    modifier = Modifier.fillMaxSize(),
-                )
-
-                ChatInputPanel(
-                    message = draftMessage,
-                    onMessageChange = { draftMessage = it },
-                    enabled = state.selectedSessionId.isNotBlank() || state.runtimeStatus == "Ready",
-                    generating = state.activeTurnIds.containsKey(state.selectedSessionId),
-                    thinkingEnabled = thinkingEnabled,
-                    attachmentPanelOpen = attachmentPanelOpen,
-                    pendingAttachments = state.pendingAttachments,
-                    editing = editingMessageId.isNotBlank(),
-                    onToggleThinking = { thinkingEnabled = !thinkingEnabled },
-                    onToggleAttachmentPanel = { attachmentPanelOpen = !attachmentPanelOpen },
-                    onAddImage = {
-                        onPickImage { displayName, mimeType, byteSize, uri, sourcePath ->
-                            store.importAttachmentMetadata(
-                                sessionId = state.selectedSessionId,
-                                displayName = displayName,
-                                mimeType = mimeType.ifBlank { "image/*" },
-                                byteSize = byteSize,
-                                originalUri = uri,
-                                sourcePath = sourcePath,
-                            )
-                        }
-                    },
-                    onAddFile = {
-                        onPickFile { displayName, mimeType, byteSize, uri, sourcePath ->
-                            store.importAttachmentMetadata(
-                                sessionId = state.selectedSessionId,
-                                displayName = displayName,
-                                mimeType = mimeType.ifBlank { "application/octet-stream" },
-                                byteSize = byteSize,
-                                originalUri = uri,
-                                sourcePath = sourcePath,
-                            )
-                        }
-                    },
-                    onRemoveAttachment = { store.removePendingAttachment(state.selectedSessionId, it) },
-                    onClearAttachments = { store.clearPendingAttachments(state.selectedSessionId) },
-                    onStop = { store.cancelActiveTurn(state.selectedSessionId) },
-                    onCancelEdit = {
-                        editingMessageId = ""
-                        draftMessage = ""
-                    },
-                    onSend = {
-                        if (editingMessageId.isNotBlank()) {
-                            store.editMessage(state.selectedSessionId, editingMessageId, draftMessage)
-                            editingMessageId = ""
-                        } else {
-                            store.sendMessage(
-                                sessionId = state.selectedSessionId,
-                                content = draftMessage,
-                                deepThinkingEnabled = thinkingEnabled,
-                                searchEnabled = searchEnabled,
-                            )
-                        }
-                        draftMessage = ""
-                        attachmentPanelOpen = false
-                    },
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .onSizeChanged { size ->
-                            if (bottomInputHeightPx != size.height) {
-                                bottomInputHeightPx = size.height
-                            }
+                Column(modifier = Modifier.fillMaxSize()) {
+                    ChatHeader(
+                        title = state.selectedSessionTitle(),
+                        onOpenDrawer = {
+                            scope.launch { animateDrawerTo(maxDrawerOffset) }
                         },
-                )
+                        onNewChat = { store.createSession("New chat") },
+                        onOpenBrowser = onOpenBrowser,
+                    )
+
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth(),
+                    ) {
+                        ChatTimeline(
+                            state = state,
+                            store = store,
+                            onOpenFile = onOpenFile,
+                            onEditMessage = { message ->
+                                editingMessageId = message.id
+                                draftMessage = message.contentText
+                            },
+                            onSelectText = { selectingText = it },
+                            bottomPadding = messageListBottomPadding,
+                            modifier = Modifier.fillMaxSize(),
+                        )
+
+                        ChatInputPanel(
+                            message = draftMessage,
+                            onMessageChange = { draftMessage = it },
+                            enabled = state.selectedSessionId.isNotBlank() || state.runtimeStatus == "Ready",
+                            generating = state.activeTurnIds.containsKey(state.selectedSessionId),
+                            thinkingEnabled = thinkingEnabled,
+                            attachmentPanelOpen = attachmentPanelOpen,
+                            pendingAttachments = state.pendingAttachments,
+                            editing = editingMessageId.isNotBlank(),
+                            onToggleThinking = { thinkingEnabled = !thinkingEnabled },
+                            onToggleAttachmentPanel = { attachmentPanelOpen = !attachmentPanelOpen },
+                            onAddImage = {
+                                onPickImage { displayName, mimeType, byteSize, uri, sourcePath ->
+                                    store.importAttachmentMetadata(
+                                        sessionId = state.selectedSessionId,
+                                        displayName = displayName,
+                                        mimeType = mimeType.ifBlank { "image/*" },
+                                        byteSize = byteSize,
+                                        originalUri = uri,
+                                        sourcePath = sourcePath,
+                                    )
+                                }
+                            },
+                            onAddFile = {
+                                onPickFile { displayName, mimeType, byteSize, uri, sourcePath ->
+                                    store.importAttachmentMetadata(
+                                        sessionId = state.selectedSessionId,
+                                        displayName = displayName,
+                                        mimeType = mimeType.ifBlank { "application/octet-stream" },
+                                        byteSize = byteSize,
+                                        originalUri = uri,
+                                        sourcePath = sourcePath,
+                                    )
+                                }
+                            },
+                            onRemoveAttachment = { store.removePendingAttachment(state.selectedSessionId, it) },
+                            onClearAttachments = { store.clearPendingAttachments(state.selectedSessionId) },
+                            onStop = { store.cancelActiveTurn(state.selectedSessionId) },
+                            onCancelEdit = {
+                                editingMessageId = ""
+                                draftMessage = ""
+                            },
+                            onSend = {
+                                if (editingMessageId.isNotBlank()) {
+                                    store.editMessage(state.selectedSessionId, editingMessageId, draftMessage)
+                                    editingMessageId = ""
+                                } else {
+                                    store.sendMessage(
+                                        sessionId = state.selectedSessionId,
+                                        content = draftMessage,
+                                        deepThinkingEnabled = thinkingEnabled,
+                                        searchEnabled = searchEnabled,
+                                    )
+                                }
+                                draftMessage = ""
+                                attachmentPanelOpen = false
+                            },
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .onSizeChanged { size ->
+                                    if (bottomInputHeightPx != size.height) {
+                                        bottomInputHeightPx = size.height
+                                    }
+                                },
+                        )
+                    }
+                }
+
             }
         }
     }
@@ -335,7 +441,6 @@ fun HamburChatScreen(
         )
     }
 }
-
 @Composable
 private fun ChatHeader(
     title: String,

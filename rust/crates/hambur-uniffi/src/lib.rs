@@ -124,6 +124,7 @@ pub struct SessionSummaryDTO {
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub pinned_at_ms: u64,
+    pub memory_reviewed: bool,
     pub message_count: u32,
     pub latest_preview: String,
 }
@@ -957,6 +958,7 @@ impl From<SessionSummary> for SessionSummaryDTO {
             created_at_ms: value.created_at_ms,
             updated_at_ms: value.updated_at_ms,
             pinned_at_ms: value.pinned_at_ms,
+            memory_reviewed: value.memory_reviewed,
             message_count: value.message_count,
             latest_preview: value.latest_preview,
         }

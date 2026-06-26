@@ -23,6 +23,7 @@ pub struct SessionSummary {
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub pinned_at_ms: u64,
+    pub memory_reviewed: bool,
     pub message_count: u32,
     pub latest_preview: String,
 }
@@ -79,7 +80,21 @@ pub struct MessageRecord {
     pub model_group_id: String,
     pub finish_reason: String,
     pub native_finish_reason: String,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub tool_title: String,
     pub attachments: Vec<AttachmentRecord>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionReviewRecord {
+    pub id: String,
+    pub title: String,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub memory_reviewed: bool,
+    pub messages: Vec<MessageRecord>,
+    pub trace_spans: Vec<TraceSpanRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -673,6 +688,9 @@ impl HamburDatabase {
             model_group_id: String::new(),
             finish_reason: String::new(),
             native_finish_reason: String::new(),
+            tool_call_id: String::new(),
+            tool_name: String::new(),
+            tool_title: String::new(),
             attachments: Vec::new(),
         })
     }
@@ -756,6 +774,9 @@ impl HamburDatabase {
             model_group_id: route.model_group_id.clone(),
             finish_reason: String::new(),
             native_finish_reason: String::new(),
+            tool_call_id: String::new(),
+            tool_name: String::new(),
+            tool_title: String::new(),
             attachments: Vec::new(),
         })
     }
@@ -2105,6 +2126,92 @@ impl HamburDatabase {
         self.session_summary_by_id(session_id).await
     }
 
+    pub async fn unreviewed_sessions(&self, limit: u32) -> HamburResult<Vec<SessionSummary>> {
+        let limit = clamp_limit(limit, 1, 100);
+        let mut rows = self
+            .connection
+            .query(
+                "
+                SELECT
+                    s.id,
+                    s.title,
+                    s.created_at_ms,
+                    s.updated_at_ms,
+                    s.pinned_at_ms,
+                    s.memory_reviewed,
+                    (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count,
+                    COALESCE(
+                        (
+                            SELECT ti.small_summary
+                            FROM timeline_items ti
+                            WHERE ti.session_id = s.id AND ti.visible = 1
+                            ORDER BY ti.display_sequence DESC, ti.id DESC
+                            LIMIT 1
+                        ),
+                        ''
+                    ) AS latest_preview
+                FROM sessions s
+                WHERE s.deleted_at_ms IS NULL
+                  AND s.memory_reviewed = 0
+                ORDER BY s.updated_at_ms ASC, s.created_at_ms ASC, s.id ASC
+                LIMIT ?1
+                ",
+                params![limit as i64],
+            )
+            .await
+            .map_err(database_error)?;
+
+        let mut sessions = Vec::new();
+        while let Some(row) = rows.next().await.map_err(database_error)? {
+            sessions.push(session_summary_from_row(&row)?);
+        }
+        Ok(sessions)
+    }
+
+    pub async fn mark_session_memory_reviewed(
+        &self,
+        session_id: &str,
+        reviewed: bool,
+    ) -> HamburResult<()> {
+        self.ensure_session_exists(session_id).await?;
+        self.connection
+            .execute(
+                "UPDATE sessions SET memory_reviewed = ?1 WHERE id = ?2 AND deleted_at_ms IS NULL",
+                params![reviewed, session_id],
+            )
+            .await
+            .map(|_| ())
+            .map_err(database_error)
+    }
+
+    pub async fn mark_session_memory_dirty(&self, session_id: &str) -> HamburResult<()> {
+        self.ensure_session_exists(session_id).await?;
+        self.connection
+            .execute(
+                "UPDATE sessions SET memory_reviewed = 0 WHERE id = ?1 AND deleted_at_ms IS NULL",
+                params![session_id],
+            )
+            .await
+            .map(|_| ())
+            .map_err(database_error)
+    }
+
+    pub async fn session_review_record(
+        &self,
+        session_id: &str,
+    ) -> HamburResult<SessionReviewRecord> {
+        let summary = self.session_summary(session_id).await?;
+        Ok(SessionReviewRecord {
+            id: summary.id.clone(),
+            title: summary.title,
+            created_at_ms: summary.created_at_ms,
+            updated_at_ms: summary.updated_at_ms,
+            memory_reviewed: summary.memory_reviewed,
+            messages: self.messages_for_session(session_id).await?,
+            trace_spans: self.trace_spans_for_session(session_id).await?,
+        })
+    }
+
     pub async fn timeline_page(
         &self,
         session_id: &str,
@@ -2173,7 +2280,10 @@ impl HamburDatabase {
                     model_name_snapshot,
                     model_group_id,
                     finish_reason,
-                    native_finish_reason
+                    native_finish_reason,
+                    tool_call_id,
+                    tool_name,
+                    tool_title
                 FROM messages
                 WHERE session_id = ?1
                   AND role = 'user'
@@ -2217,6 +2327,7 @@ impl HamburDatabase {
                     s.created_at_ms,
                     s.updated_at_ms,
                     s.pinned_at_ms,
+                    s.memory_reviewed,
                     (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count,
                     COALESCE(
                         (
@@ -2887,6 +2998,18 @@ impl HamburDatabase {
     }
 
     pub async fn primary_chat_route(&self) -> HamburResult<Vec<ModelRouteSnapshot>> {
+        self.default_model_group_route("primary").await
+    }
+
+    pub async fn memory_review_route(&self) -> HamburResult<Vec<ModelRouteSnapshot>> {
+        self.default_model_group_route("secondary").await
+    }
+
+    async fn default_model_group_route(
+        &self,
+        default_key: &str,
+    ) -> HamburResult<Vec<ModelRouteSnapshot>> {
+        let default_key = normalize_default_group_key(default_key)?;
         let mut rows = self
             .connection
             .query(
@@ -2917,12 +3040,12 @@ impl HamburDatabase {
                 JOIN model_group_members mgm ON mgm.group_id = mg.id
                 JOIN providers p ON p.id = mgm.provider_id
                 JOIN provider_models pm ON pm.provider_id = p.id AND pm.model_id = mgm.model_id
-                WHERE d.key = 'primary'
+                WHERE d.key = ?1
                   AND p.enabled = 1
                   AND mgm.enabled = 1
                 ORDER BY mgm.position ASC, p.id ASC, pm.model_id ASC
                 ",
-                params![],
+                params![default_key],
             )
             .await
             .map_err(database_error)?;
@@ -2996,6 +3119,7 @@ impl HamburDatabase {
                     created_at_ms INTEGER NOT NULL,
                     updated_at_ms INTEGER NOT NULL,
                     pinned_at_ms INTEGER NOT NULL DEFAULT 0,
+                    memory_reviewed INTEGER NOT NULL DEFAULT 0,
                     deleted_at_ms INTEGER
                 );
 
@@ -3362,6 +3486,8 @@ impl HamburDatabase {
             .await?;
         self.add_column_if_missing("turns", "error_message", "TEXT NOT NULL DEFAULT ''")
             .await?;
+        self.add_column_if_missing("sessions", "memory_reviewed", "INTEGER NOT NULL DEFAULT 0")
+            .await?;
 
         Ok(())
     }
@@ -3463,6 +3589,7 @@ impl HamburDatabase {
                     s.created_at_ms,
                     s.updated_at_ms,
                     s.pinned_at_ms,
+                    s.memory_reviewed,
                     (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count,
                     COALESCE(
                         (
@@ -3668,6 +3795,7 @@ impl HamburDatabase {
                     s.created_at_ms,
                     s.updated_at_ms,
                     s.pinned_at_ms,
+                    s.memory_reviewed,
                     (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count,
                     COALESCE(
                         (
@@ -3710,7 +3838,10 @@ impl HamburDatabase {
     async fn touch_session(&self, session_id: &str, now: u64) -> HamburResult<()> {
         self.connection
             .execute(
-                "UPDATE sessions SET updated_at_ms = ?1 WHERE id = ?2 AND deleted_at_ms IS NULL",
+                "UPDATE sessions
+                 SET updated_at_ms = ?1,
+                     memory_reviewed = 0
+                 WHERE id = ?2 AND deleted_at_ms IS NULL",
                 params![now as i64, session_id],
             )
             .await
@@ -3832,7 +3963,10 @@ impl HamburDatabase {
                     model_name_snapshot,
                     model_group_id,
                     finish_reason,
-                    native_finish_reason
+                    native_finish_reason,
+                    tool_call_id,
+                    tool_name,
+                    tool_title
                 FROM messages
                 WHERE id = ?1
                 LIMIT 1
@@ -3847,6 +3981,50 @@ impl HamburDatabase {
         };
 
         Ok(Some(message_from_row(&row)?))
+    }
+
+    async fn messages_for_session(&self, session_id: &str) -> HamburResult<Vec<MessageRecord>> {
+        let mut rows = self
+            .connection
+            .query(
+                "
+                SELECT
+                    id,
+                    session_id,
+                    role,
+                    content_text,
+                    reasoning_content,
+                    status,
+                    turn_id,
+                    created_at_ms,
+                    version_sequence,
+                    provider_id_snapshot,
+                    provider_name_snapshot,
+                    provider_protocol,
+                    model_id_snapshot,
+                    model_name_snapshot,
+                    model_group_id,
+                    finish_reason,
+                    native_finish_reason,
+                    tool_call_id,
+                    tool_name,
+                    tool_title
+                FROM messages
+                WHERE session_id = ?1
+                ORDER BY created_at_ms ASC, id ASC
+                ",
+                params![session_id],
+            )
+            .await
+            .map_err(database_error)?;
+
+        let mut messages = Vec::new();
+        while let Some(row) = rows.next().await.map_err(database_error)? {
+            let mut message = message_from_row(&row)?;
+            message.attachments = self.attachments_for_message(&message.id).await?;
+            messages.push(message);
+        }
+        Ok(messages)
     }
 
     async fn turn_by_id(&self, turn_id: &str) -> HamburResult<TurnRecord> {
@@ -3939,6 +4117,43 @@ impl HamburDatabase {
             )));
         };
         trace_span_from_row(&row)
+    }
+
+    async fn trace_spans_for_session(
+        &self,
+        session_id: &str,
+    ) -> HamburResult<Vec<TraceSpanRecord>> {
+        let mut rows = self
+            .connection
+            .query(
+                "
+                SELECT
+                    id,
+                    session_id,
+                    turn_id,
+                    parent_span_id,
+                    kind,
+                    title,
+                    content,
+                    status,
+                    started_at_ms,
+                    ended_at_ms,
+                    tool_call_id,
+                    payload_json
+                FROM trace_spans
+                WHERE session_id = ?1
+                ORDER BY started_at_ms ASC, id ASC
+                ",
+                params![session_id],
+            )
+            .await
+            .map_err(database_error)?;
+
+        let mut traces = Vec::new();
+        while let Some(row) = rows.next().await.map_err(database_error)? {
+            traces.push(trace_span_from_row(&row)?);
+        }
+        Ok(traces)
     }
 
     async fn tool_call_by_id(&self, tool_call_id: &str) -> HamburResult<ToolCallRecord> {
@@ -4876,8 +5091,9 @@ fn session_summary_from_row(row: &Row) -> HamburResult<SessionSummary> {
         created_at_ms: unsigned_ms(row.get::<i64>(2).map_err(database_error)?),
         updated_at_ms: unsigned_ms(row.get::<i64>(3).map_err(database_error)?),
         pinned_at_ms: unsigned_ms(row.get::<i64>(4).map_err(database_error)?),
-        message_count: unsigned_count(row.get::<i64>(5).map_err(database_error)?),
-        latest_preview: row.get::<String>(6).map_err(database_error)?,
+        memory_reviewed: sql_bool(row.get::<i64>(5).map_err(database_error)?),
+        message_count: unsigned_count(row.get::<i64>(6).map_err(database_error)?),
+        latest_preview: row.get::<String>(7).map_err(database_error)?,
     })
 }
 
@@ -5062,6 +5278,9 @@ fn message_from_row(row: &Row) -> HamburResult<MessageRecord> {
         model_group_id: row.get::<String>(14).map_err(database_error)?,
         finish_reason: row.get::<String>(15).map_err(database_error)?,
         native_finish_reason: row.get::<String>(16).map_err(database_error)?,
+        tool_call_id: row.get::<String>(17).map_err(database_error)?,
+        tool_name: row.get::<String>(18).map_err(database_error)?,
+        tool_title: row.get::<String>(19).map_err(database_error)?,
         attachments: Vec::new(),
     })
 }

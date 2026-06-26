@@ -276,10 +276,24 @@ impl ToolSchemaCompiler {
             parameters_json_schema: json!({
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["add", "replace", "remove", "read"]},
-                    "target": {"type": "string", "enum": ["memory", "user"]},
-                    "content": {"type": "string"},
-                    "old_text": {"type": "string"}
+                    "action": {
+                        "type": "string",
+                        "enum": ["add", "replace", "remove", "read"],
+                        "description": "Use add for new atomic facts, replace for stale or contradicted entries, remove for obsolete entries, and read to inspect current entries."
+                    },
+                    "target": {
+                        "type": "string",
+                        "enum": ["memory", "user"],
+                        "description": "Use user for user profile/preferences. Use memory for assistant notes about environment, conventions, and durable facts."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Entry content. Required for add and replace. Keep entries short, declarative, and durable."
+                    },
+                    "old_text": {
+                        "type": "string",
+                        "description": "Short unique substring identifying the entry to replace or remove."
+                    }
                 },
                 "required": ["action", "target"],
                 "additionalProperties": false
@@ -1155,6 +1169,8 @@ mod tests {
         assert!(json.contains("submit_delegate_result"));
         assert!(json.contains("web_search"));
         assert!(json.contains("web_fetch"));
+        assert!(json.contains("Use user for user profile/preferences"));
+        assert!(json.contains("old_text"));
     }
 
     #[test]

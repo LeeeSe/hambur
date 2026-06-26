@@ -17,7 +17,7 @@ use hambur_db::{
     AppSnapshot, AttachmentRecord, HamburDatabase, MarkdownBlockPayloadRecord, MessageRecord,
     ModelRouteSnapshot, NewAttachment, NewFileRecord, NewMarkdownBlockPayload, NewTimelineItem,
     NewToolCall, NewToolResult, NewTraceSpan, ProviderModelOverride, ProviderModelUpsert,
-    ProviderUpsert, SessionSummary, SettingsSnapshot, TimelineItemSnapshot,
+    ProviderUpsert, SessionReviewRecord, SessionSummary, SettingsSnapshot, TimelineItemSnapshot,
 };
 use hambur_filestore::FileStore;
 use hambur_llm::{
@@ -306,6 +306,7 @@ pub struct RuntimeEngine {
     delegate_tasks: Mutex<HashMap<String, DelegateTaskState>>,
     delegate_sessions: Mutex<HashSet<String>>,
     process_sessions: Mutex<HashMap<String, BackgroundProcessSession>>,
+    memory_review_sessions: Mutex<HashSet<String>>,
     router: Mutex<ModelRouter>,
     tools: ToolScheduler,
     idempotency: Mutex<HashMap<String, RuntimeCommandAck>>,
@@ -422,6 +423,24 @@ struct ProcessOutputSnapshot {
     stderr_total_bytes: u64,
 }
 
+#[derive(Debug, Clone, Default)]
+struct MemorySnapshot {
+    memory_block: String,
+    user_block: String,
+}
+
+impl MemorySnapshot {
+    fn is_empty(&self) -> bool {
+        self.memory_block.trim().is_empty() && self.user_block.trim().is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct MemoryReviewAssistantMessage {
+    content: String,
+    tool_calls: Vec<CompleteToolCall>,
+}
+
 enum StreamAttemptResult {
     Completed,
     Cancelled,
@@ -510,6 +529,7 @@ impl RuntimeEngine {
             delegate_tasks: Mutex::new(HashMap::new()),
             delegate_sessions: Mutex::new(HashSet::new()),
             process_sessions: Mutex::new(HashMap::new()),
+            memory_review_sessions: Mutex::new(HashSet::new()),
             router: Mutex::new(ModelRouter::default()),
             tools,
             idempotency: Mutex::new(HashMap::new()),
@@ -523,6 +543,7 @@ impl RuntimeEngine {
             *self_ref = Arc::downgrade(&engine);
         }
         engine.emit(RuntimeEventKind::RuntimeReady, snapshot, None)?;
+        engine.schedule_startup_memory_review_check();
         Ok(engine)
     }
 
@@ -686,6 +707,11 @@ impl RuntimeEngine {
             );
         }
 
+        let previous_session_id = self
+            .tokio
+            .block_on(self.database.bootstrap_snapshot())
+            .map(|snapshot| snapshot.selected_session_id)
+            .unwrap_or_default();
         match self
             .tokio
             .block_on(self.database.create_session(&command.title))
@@ -697,7 +723,13 @@ impl RuntimeEngine {
                     let _ = self.emit_error(error.clone());
                     return rejected_ack(command.command_id, command.idempotency_key, error);
                 }
+                let new_session_id = snapshot.selected_session_id.clone();
                 let _ = self.emit(RuntimeEventKind::SessionCreated, snapshot, None);
+                self.spawn_memory_review_if_session_changed(
+                    previous_session_id,
+                    new_session_id,
+                    "session_switch",
+                );
                 accepted_ack(command.command_id, command.idempotency_key)
             }
             Err(error) => {
@@ -716,12 +748,22 @@ impl RuntimeEngine {
             );
         }
 
+        let previous_session_id = self
+            .tokio
+            .block_on(self.database.bootstrap_snapshot())
+            .map(|snapshot| snapshot.selected_session_id)
+            .unwrap_or_default();
         match self
             .tokio
             .block_on(self.database.open_session(&command.session_id))
         {
             Ok(snapshot) => {
                 let _ = self.emit(RuntimeEventKind::SessionOpened, snapshot, None);
+                self.spawn_memory_review_if_session_changed(
+                    previous_session_id,
+                    command.session_id.clone(),
+                    "session_switch",
+                );
                 accepted_ack(command.command_id, command.idempotency_key)
             }
             Err(error) => {
@@ -1871,6 +1913,7 @@ impl RuntimeEngine {
         let fallback_policy = plan.fallback_policy;
         let tools_json = self.tools.schemas().compile_openai_tools_json();
         let skills_index_prompt = self.build_skills_index_prompt();
+        let memory_system_prompt = self.build_memory_system_prompt();
         let stream_sources_by_route = route_snapshots
             .iter()
             .map(|route| {
@@ -1880,6 +1923,7 @@ impl RuntimeEngine {
                     route,
                     &tools_json,
                     &skills_index_prompt,
+                    &memory_system_prompt,
                     send_options.deep_thinking_enabled,
                     send_options.search_enabled,
                 )
@@ -2343,6 +2387,7 @@ impl RuntimeEngine {
                             "",
                             &route,
                             &tools_json,
+                            "",
                             "",
                             false,
                             false,
@@ -3246,6 +3291,274 @@ impl RuntimeEngine {
             .update_trace_span_status(trace_id, status, summary, true)
             .await?;
         Ok(())
+    }
+
+    fn spawn_memory_review_if_session_changed(
+        &self,
+        previous_session_id: String,
+        current_session_id: String,
+        reason: &str,
+    ) {
+        if previous_session_id.trim().is_empty() || previous_session_id == current_session_id {
+            return;
+        }
+        if let Some(engine) = self.self_ref.lock().ok().and_then(|value| value.upgrade()) {
+            engine.maybe_spawn_memory_review_for_session(previous_session_id, reason);
+        }
+    }
+
+    fn schedule_startup_memory_review_check(self: &Arc<Self>) {
+        let Some(engine) = self.self_ref.lock().ok().and_then(|value| value.upgrade()) else {
+            return;
+        };
+        let handle = self.tokio.handle().clone();
+        handle.spawn(async move {
+            sleep(Duration::from_secs(30)).await;
+            if engine.shutdown.load(Ordering::SeqCst) {
+                return;
+            }
+            let sessions = engine
+                .database
+                .unreviewed_sessions(50)
+                .await
+                .unwrap_or_default();
+            for session in sessions {
+                engine
+                    .clone()
+                    .maybe_spawn_memory_review_for_session(session.id, "app_startup");
+            }
+        });
+    }
+
+    fn maybe_spawn_memory_review_for_session(self: Arc<Self>, session_id: String, reason: &str) {
+        if session_id.trim().is_empty() || self.shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        let inserted = self
+            .memory_review_sessions
+            .lock()
+            .map(|mut sessions| sessions.insert(session_id.clone()))
+            .unwrap_or(false);
+        if !inserted {
+            return;
+        }
+        let reason = reason.to_string();
+        let engine = self.clone();
+        let handle = self.tokio.handle().clone();
+        handle.spawn(async move {
+            engine
+                .clone()
+                .review_memory_session_if_needed(session_id.clone(), reason)
+                .await;
+            if let Ok(mut sessions) = engine.memory_review_sessions.lock() {
+                sessions.remove(&session_id);
+            }
+        });
+    }
+
+    async fn review_memory_session_if_needed(self: Arc<Self>, session_id: String, reason: String) {
+        if self.active_turn_for_session(&session_id).is_some() {
+            return;
+        }
+        let review = match self.database.session_review_record(&session_id).await {
+            Ok(review) => review,
+            Err(_) => return,
+        };
+        if self
+            .delegate_sessions
+            .lock()
+            .map(|sessions| sessions.contains(&session_id))
+            .unwrap_or(false)
+            || review.title.starts_with("Delegate:")
+        {
+            let _ = self
+                .database
+                .mark_session_memory_reviewed(&session_id, true)
+                .await;
+            return;
+        }
+        if review.memory_reviewed {
+            return;
+        }
+        if review.messages.is_empty() && review.trace_spans.is_empty() {
+            let _ = self
+                .database
+                .mark_session_memory_reviewed(&session_id, true)
+                .await;
+            return;
+        }
+        if self
+            .clone()
+            .run_automatic_memory_review(review, &reason)
+            .await
+            .unwrap_or(false)
+        {
+            let _ = self
+                .database
+                .mark_session_memory_reviewed(&session_id, true)
+                .await;
+            let snapshot = self
+                .database
+                .session_snapshot(&session_id)
+                .await
+                .unwrap_or_default();
+            let _ = self.emit_session_event(
+                RuntimeEventKind::SettingsChanged,
+                session_id,
+                String::new(),
+                snapshot,
+                "Memory reviewed".to_string(),
+                None,
+            );
+        }
+    }
+
+    async fn run_automatic_memory_review(
+        self: Arc<Self>,
+        review: SessionReviewRecord,
+        reason: &str,
+    ) -> HamburResult<bool> {
+        let routes = self.database.memory_review_route().await?;
+        let mut plan = route_plan_from_records(routes);
+        plan.targets
+            .retain(|target| target.model.capabilities.supports_tool_call);
+        if plan.targets.is_empty() {
+            return Ok(false);
+        }
+        let requirements = RouteRequirements {
+            requires_tool_protocol: true,
+            ..Default::default()
+        };
+        let route_plan = self
+            .router
+            .lock()
+            .map_err(|_| HamburError::Internal("router registry poisoned".to_string()))?
+            .resolve(plan, requirements)?;
+        let memory_snapshot = self.memory_snapshot_async().await.unwrap_or_default();
+        let initial_messages = build_memory_review_messages(&review, reason, &memory_snapshot);
+        for target in route_plan.targets {
+            let route = route_snapshot_from_target(&target);
+            if !route.supports_tool_call {
+                continue;
+            }
+            if self
+                .clone()
+                .run_memory_review_on_route(&review.id, &route, initial_messages.clone())
+                .await
+                .unwrap_or(false)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn run_memory_review_on_route(
+        self: Arc<Self>,
+        session_id: &str,
+        route: &ModelRouteSnapshot,
+        mut messages: Vec<ModelMessage>,
+    ) -> HamburResult<bool> {
+        let mut executed_memory_tool = false;
+        let tools_json = compile_named_tools_json(
+            &self.tools.schemas().compile_openai_tools_json(),
+            &["memory"],
+        )?;
+        for _ in 0..MAX_MEMORY_REVIEW_TOOL_ITERATIONS {
+            let request = ModelRequest {
+                request_id: new_id("llm_req"),
+                session_id: session_id.to_string(),
+                turn_id: new_id("memory_review"),
+                purpose: "memory_review".to_string(),
+                stream: false,
+                system_blocks: Vec::new(),
+                messages: messages.clone(),
+                reasoning_mode: ReasoningMode::Disabled,
+                max_output_tokens: route.output_limit.min(2048),
+                temperature: Some(0.0),
+                tools_json: tools_json.clone(),
+            };
+            let assistant = self.memory_review_completion(&request, route).await?;
+            if assistant.tool_calls.is_empty() {
+                return Ok(true);
+            }
+            executed_memory_tool = true;
+            messages.push(ModelMessage {
+                role: "assistant".to_string(),
+                content: assistant.content,
+                tool_calls_json: complete_tool_calls_json(&assistant.tool_calls)?,
+                tool_call_id: String::new(),
+            });
+            for call in assistant.tool_calls {
+                let invocation = ToolInvocation::from_model_call(
+                    call.index,
+                    call.id,
+                    request.turn_id.clone(),
+                    session_id.to_string(),
+                    call.name,
+                    call.arguments_json,
+                )?;
+                let result = self.execute_memory_review_tool(invocation).await;
+                messages.push(ModelMessage {
+                    role: "tool".to_string(),
+                    content: result.context_stub,
+                    tool_calls_json: String::new(),
+                    tool_call_id: result.tool_call_id,
+                });
+            }
+        }
+        Ok(executed_memory_tool)
+    }
+
+    async fn memory_review_completion(
+        &self,
+        request: &ModelRequest,
+        route: &ModelRouteSnapshot,
+    ) -> HamburResult<MemoryReviewAssistantMessage> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let api_key = self
+            .resolve_provider_api_key(&request.session_id, &request.turn_id, route, &cancel)
+            .await?;
+        let target = provider_target_from_route(route.clone());
+        let spec = openai_non_stream_request(request, &target, &api_key)?;
+        let body = reqwest_json(spec).await?;
+        parse_openai_non_stream_message(&body)
+    }
+
+    async fn execute_memory_review_tool(&self, invocation: ToolInvocation) -> ToolResult {
+        if invocation.name != "memory" {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                "Only the memory tool is enabled during automatic memory review.",
+            );
+        }
+        let arguments = match invocation.arguments_value() {
+            Ok(arguments) => arguments,
+            Err(error) => {
+                return ToolResult::failed(
+                    &invocation.tool_call_id,
+                    &invocation.name,
+                    error.to_string(),
+                );
+            }
+        };
+        let content = arguments
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let old_text = arguments
+            .get("old_text")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if is_review_status_entry(content) || is_review_status_entry(old_text) {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                "Review status JSON is not memory. Return it as final assistant content without calling tools.",
+            );
+        }
+        self.execute_knowledge_tool(invocation).await.result
     }
 
     async fn execute_runtime_tool_batch(
@@ -5061,6 +5374,7 @@ impl RuntimeEngine {
         };
         let tools_json = self.tools.schemas().compile_openai_tools_json();
         let skills_index_prompt = self.build_skills_index_prompt_async().await;
+        let memory_system_prompt = self.build_memory_system_prompt_async().await;
         let stream_sources_by_route = route_candidates
             .iter()
             .map(|candidate| {
@@ -5070,6 +5384,7 @@ impl RuntimeEngine {
                     candidate,
                     &tools_json,
                     &skills_index_prompt,
+                    &memory_system_prompt,
                     false,
                     false,
                 )
@@ -6089,6 +6404,259 @@ fn read_memory_file_content(path: &Path) -> HamburResult<String> {
     }
 }
 
+fn memory_snapshot_from_root(root: &Path) -> HamburResult<MemorySnapshot> {
+    fs::create_dir_all(root)
+        .map_err(|error| HamburError::Internal(format!("create memory root: {error}")))?;
+    let memory_entries =
+        parse_memory_entries(&read_memory_file_content(&root.join(MEMORY_FILE_NAME))?);
+    let user_entries = parse_memory_entries(&read_memory_file_content(&root.join(USER_FILE_NAME))?);
+    Ok(MemorySnapshot {
+        memory_block: render_memory_block("memory", &memory_entries, MEMORY_CHAR_LIMIT),
+        user_block: render_memory_block("user", &user_entries, USER_MEMORY_CHAR_LIMIT),
+    })
+}
+
+fn render_memory_block(target: &str, entries: &[String], limit: usize) -> String {
+    if entries.is_empty() {
+        return String::new();
+    }
+    let content = entries.join(MEMORY_ENTRY_DELIMITER);
+    let pct = if limit == 0 {
+        0
+    } else {
+        ((content.len() as f32 / limit as f32) * 100.0) as u32
+    }
+    .min(100);
+    let header = if target == "user" {
+        format!(
+            "USER PROFILE (who the user is) [{pct}% - {}/{} chars]",
+            content.len(),
+            limit
+        )
+    } else {
+        format!(
+            "MEMORY (your personal notes) [{pct}% - {}/{} chars]",
+            content.len(),
+            limit
+        )
+    };
+    let separator = "=".repeat(46);
+    format!("{separator}\n{header}\n{separator}\n{content}")
+}
+
+fn format_memory_system_prompt(snapshot: &MemorySnapshot) -> String {
+    if snapshot.is_empty() {
+        return String::new();
+    }
+    let mut prompt = String::new();
+    prompt.push_str("You have persistent memory across chats. Use it as durable background context, not as a new user message.\n");
+    prompt.push_str("Save stable preferences, corrections, environment facts, and recurring conventions with the memory tool. Do not save temporary task progress or short-lived todos.\n");
+    if !snapshot.memory_block.trim().is_empty() {
+        prompt.push('\n');
+        prompt.push_str(&snapshot.memory_block);
+        prompt.push('\n');
+    }
+    if !snapshot.user_block.trim().is_empty() {
+        prompt.push('\n');
+        prompt.push_str(&snapshot.user_block);
+        prompt.push('\n');
+    }
+    prompt.trim().to_string()
+}
+
+fn build_memory_review_messages(
+    review: &SessionReviewRecord,
+    reason: &str,
+    memory_snapshot: &MemorySnapshot,
+) -> Vec<ModelMessage> {
+    vec![
+        ModelMessage {
+            role: "system".to_string(),
+            content: build_memory_review_system_prompt(),
+            ..Default::default()
+        },
+        ModelMessage {
+            role: "user".to_string(),
+            content: build_memory_review_user_prompt(review, reason, memory_snapshot),
+            ..Default::default()
+        },
+    ]
+}
+
+fn build_memory_review_system_prompt() -> String {
+    r#"You are Hambur's background memory curator. The assistant's answer has already been shown to the user, so never answer the user's task, never ask follow-up questions, and never mention that you are reviewing memory.
+
+Your only side effect is the memory tool. Use it to keep durable, future-useful memory accurate and compact.
+
+Save these when they are stable and likely useful later:
+- User identity, preferences, standing instructions, corrections, communication style, accessibility needs, and long-term goals.
+- Stable project, app, repository, workspace, device, model, or tool conventions that will matter across chats.
+- Recurring constraints the user expects the assistant to remember.
+
+Do not save these:
+- Temporary task progress, plans, one-off debugging details, transient todos, ephemeral files, branch names, commit hashes, or facts likely to expire soon.
+- Secrets, API keys, tokens, passwords, private credentials, or sensitive data that the user did not explicitly ask to remember.
+- Inferences about the user that are not directly supported by the transcript.
+- Anything already represented well in current memory, even if the wording is not identical.
+
+Target selection:
+- Use target="user" for facts about the user as a person or their stable preferences.
+- Use target="memory" for durable assistant/workspace/project/app operating notes.
+
+Editing policy:
+- Compare the transcript with the provided current memory before writing.
+- Do not store duplicate memories. If a fact is already present, make no change for that fact.
+- Prefer replace/remove when a current entry is stale, duplicated, or contradicted.
+- Prefer add only for new atomic facts. Keep each entry short, declarative, and specific.
+- It is allowed and often correct to make no modifications. If nothing durable should change, call no tools and return only: no_changes.
+- Never pass "no_changes", review summaries, or JSON containing "memory_review", "changed_targets", or "action_counts" as memory tool content or old_text.
+- After tool calls, return a short plain-text summary of changed targets and action counts."#
+        .to_string()
+}
+
+fn build_memory_review_user_prompt(
+    review: &SessionReviewRecord,
+    reason: &str,
+    memory_snapshot: &MemorySnapshot,
+) -> String {
+    let memory_block = if memory_snapshot.memory_block.trim().is_empty() {
+        "MEMORY (your personal notes): empty".to_string()
+    } else {
+        memory_snapshot.memory_block.clone()
+    };
+    let user_block = if memory_snapshot.user_block.trim().is_empty() {
+        "USER PROFILE (who the user is): empty".to_string()
+    } else {
+        memory_snapshot.user_block.clone()
+    };
+    format!(
+        "Review trigger: {reason}.\nSession id: {}\n\nCurrent persistent memory snapshot:\n{memory_block}\n\n{user_block}\n\nRecent conversation transcript and tool traces:\n{}\n\nReview the transcript deeply but write conservatively. Use the memory tool only if the update is durable, clearly supported, and not already present in current memory. Making no changes is acceptable.",
+        review.id,
+        build_memory_review_transcript(review)
+    )
+}
+
+fn build_memory_review_transcript(review: &SessionReviewRecord) -> String {
+    let mut output = String::new();
+    let start = review
+        .messages
+        .len()
+        .saturating_sub(MAX_MEMORY_REVIEW_TRANSCRIPT_MESSAGES);
+    for (index, message) in review.messages.iter().skip(start).enumerate() {
+        output.push_str(&format!(
+            "[{index}] role={} id={} turn={}\n",
+            message.role, message.id, message.turn_id
+        ));
+        if !message.provider_name_snapshot.trim().is_empty()
+            || !message.provider_id_snapshot.trim().is_empty()
+            || !message.model_id_snapshot.trim().is_empty()
+        {
+            output.push_str(&format!(
+                "model={}/{}\n",
+                message
+                    .clone()
+                    .provider_name_snapshot
+                    .if_blank(message.provider_id_snapshot.clone()),
+                message
+                    .clone()
+                    .model_id_snapshot
+                    .if_blank(message.model_name_snapshot.clone())
+            ));
+        }
+        if !message.attachments.is_empty() {
+            let attachments = message
+                .attachments
+                .iter()
+                .map(|attachment| {
+                    format!("{}:{}", attachment.kind, attachment.display_name)
+                        .chars()
+                        .take(MAX_MEMORY_REVIEW_ATTACHMENT_CHARS)
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            output.push_str("attachments=");
+            output.push_str(&attachments);
+            output.push('\n');
+        }
+        if !message.tool_name.trim().is_empty() {
+            output.push_str(&format!(
+                "tool_result={} title={}\n",
+                message.tool_name,
+                message.tool_title.clone().if_blank("(none)".to_string())
+            ));
+        }
+        let content = message.content_text.trim();
+        output.push_str("content:\n");
+        if content.is_empty() {
+            output.push_str("(empty)\n");
+        } else {
+            output.push_str(
+                &content
+                    .chars()
+                    .take(MAX_MEMORY_REVIEW_MESSAGE_CHARS)
+                    .collect::<String>(),
+            );
+            output.push('\n');
+            if content.chars().count() > MAX_MEMORY_REVIEW_MESSAGE_CHARS {
+                output.push_str("[message truncated]\n");
+            }
+        }
+        output.push('\n');
+    }
+
+    let trace_start = review
+        .trace_spans
+        .len()
+        .saturating_sub(MAX_MEMORY_REVIEW_TRACE_EVENTS);
+    let traces = review
+        .trace_spans
+        .iter()
+        .skip(trace_start)
+        .collect::<Vec<_>>();
+    if !traces.is_empty() {
+        output.push_str("Latest turn trace events:\n");
+        for (index, event) in traces.iter().enumerate() {
+            output.push_str(&format!(
+                "[{index}] kind={} status={} title={} tool={}\n",
+                event.kind,
+                event.status,
+                event.title,
+                if event.tool_call_id.trim().is_empty() {
+                    "(none)"
+                } else {
+                    event.tool_call_id.as_str()
+                }
+            ));
+            if !event.content.trim().is_empty() {
+                output.push_str(
+                    &event
+                        .content
+                        .trim()
+                        .chars()
+                        .take(MAX_MEMORY_REVIEW_TRACE_CHARS)
+                        .collect::<String>(),
+                );
+                output.push('\n');
+            }
+        }
+    }
+
+    let transcript = output.trim().to_string();
+    if transcript.chars().count() <= MAX_MEMORY_REVIEW_TRANSCRIPT_CHARS {
+        return transcript;
+    }
+    let tail = transcript
+        .chars()
+        .rev()
+        .take(MAX_MEMORY_REVIEW_TRANSCRIPT_CHARS)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("[older transcript omitted]\n{tail}")
+}
+
 fn parse_memory_entries(raw: &str) -> Vec<String> {
     raw.split(MEMORY_ENTRY_DELIMITER)
         .map(str::trim)
@@ -6327,6 +6895,15 @@ const SKILL_MAX_DESCRIPTION_CHARS: usize = 320;
 const MEMORY_FILE_NAME: &str = "MEMORY.md";
 const USER_FILE_NAME: &str = "USER.md";
 const MEMORY_ENTRY_DELIMITER: &str = "\n§\n";
+const MEMORY_CHAR_LIMIT: usize = 2200;
+const USER_MEMORY_CHAR_LIMIT: usize = 1375;
+const MAX_MEMORY_REVIEW_TOOL_ITERATIONS: u32 = 8;
+const MAX_MEMORY_REVIEW_TRANSCRIPT_MESSAGES: usize = 40;
+const MAX_MEMORY_REVIEW_TRACE_EVENTS: usize = 24;
+const MAX_MEMORY_REVIEW_TRANSCRIPT_CHARS: usize = 24_000;
+const MAX_MEMORY_REVIEW_MESSAGE_CHARS: usize = 3_000;
+const MAX_MEMORY_REVIEW_TRACE_CHARS: usize = 1_000;
+const MAX_MEMORY_REVIEW_ATTACHMENT_CHARS: usize = 200;
 const BUNDLED_SKILLS: &[BundledSkillFile] = &[BundledSkillFile {
     relative_path: "system/skill-creator/SKILL.md",
     content: include_str!("../assets/skills/system/skill-creator/SKILL.md"),
@@ -6611,6 +7188,31 @@ impl RuntimeEngine {
             .filter(|skill| skill.enabled)
             .collect::<Vec<_>>();
         format_skills_index_prompt(skills)
+    }
+
+    fn build_memory_system_prompt(&self) -> String {
+        self.memory_snapshot()
+            .map(|snapshot| format_memory_system_prompt(&snapshot))
+            .unwrap_or_default()
+    }
+
+    async fn build_memory_system_prompt_async(&self) -> String {
+        self.memory_snapshot_async()
+            .await
+            .map(|snapshot| format_memory_system_prompt(&snapshot))
+            .unwrap_or_default()
+    }
+
+    fn memory_snapshot(&self) -> HamburResult<MemorySnapshot> {
+        let root = self.memory_root();
+        memory_snapshot_from_root(&root)
+    }
+
+    async fn memory_snapshot_async(&self) -> HamburResult<MemorySnapshot> {
+        let root = self.memory_root();
+        tokio::task::spawn_blocking(move || memory_snapshot_from_root(&root))
+            .await
+            .map_err(|error| HamburError::Internal(format!("memory snapshot task: {error}")))?
     }
 
     fn list_memory_files_internal(&self) -> HamburResult<Vec<RuntimeMemoryFileSummary>> {
@@ -7377,6 +7979,7 @@ fn stream_source_for_command(
     route: &ModelRouteSnapshot,
     tools_json: &str,
     skills_index_prompt: &str,
+    memory_system_prompt: &str,
     deep_thinking_enabled: bool,
     search_enabled: bool,
 ) -> RouteStreamSource {
@@ -7387,6 +7990,7 @@ fn stream_source_for_command(
         route,
         tools_json,
         skills_index_prompt,
+        memory_system_prompt,
         deep_thinking_enabled,
         search_enabled,
     );
@@ -7480,12 +8084,16 @@ fn provider_stream_source(
     route: &ModelRouteSnapshot,
     tools_json: &str,
     skills_index_prompt: &str,
+    memory_system_prompt: &str,
     deep_thinking_enabled: bool,
     search_enabled: bool,
 ) -> RouteStreamSource {
     let mut system_blocks = vec!["You are Hambur, a concise assistant.".to_string()];
     if !skills_index_prompt.trim().is_empty() {
         system_blocks.push(skills_index_prompt.to_string());
+    }
+    if !memory_system_prompt.trim().is_empty() {
+        system_blocks.push(memory_system_prompt.to_string());
     }
     if search_enabled {
         system_blocks.push(
@@ -7582,6 +8190,136 @@ fn complete_tool_calls_json(calls: &[CompleteToolCall]) -> HamburResult<String> 
         .collect::<HamburResult<Vec<_>>>()?;
     serde_json::to_string(&values)
         .map_err(|error| HamburError::Internal(format!("serialize tool calls: {error}")))
+}
+
+fn openai_non_stream_request(
+    request: &ModelRequest,
+    target: &ProviderTarget,
+    api_key: &str,
+) -> HamburResult<hambur_llm::HttpRequestSpec> {
+    let mut spec = OpenAiCompatibleAdapter::build_stream_request(request, target, api_key)?;
+    let mut body: Value = serde_json::from_str(&spec.body_json)
+        .map_err(|error| HamburError::InvalidCommand(format!("invalid request body: {error}")))?;
+    body["stream"] = json!(false);
+    if request.reasoning_mode == ReasoningMode::Disabled {
+        body["thinking"] = json!({"type": "disabled"});
+    }
+    spec.body_json = body.to_string();
+    Ok(spec)
+}
+
+async fn reqwest_json(spec: hambur_llm::HttpRequestSpec) -> HamburResult<String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|error| {
+            HamburError::ProviderUnavailable(format!("NetworkError: build HTTP client: {error}"))
+        })?;
+    let method = reqwest::Method::from_bytes(spec.method.as_bytes()).map_err(|error| {
+        HamburError::ProviderUnavailable(format!("NetworkError: invalid HTTP method: {error}"))
+    })?;
+    let mut request = client.request(method, &spec.url);
+    for (name, value) in spec.headers {
+        request = request.header(name, value);
+    }
+    let response = request.body(spec.body_json).send().await.map_err(|error| {
+        if error.is_timeout() {
+            HamburError::ProviderUnavailable(format!("NetworkTimeout: {error}"))
+        } else {
+            HamburError::ProviderUnavailable(format!("NetworkError: {error}"))
+        }
+    })?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(map_provider_http_status(status));
+    }
+    response
+        .text()
+        .await
+        .map_err(|error| HamburError::ProviderUnavailable(format!("NetworkError: {error}")))
+}
+
+fn parse_openai_non_stream_message(body: &str) -> HamburResult<MemoryReviewAssistantMessage> {
+    let value: Value = serde_json::from_str(body)
+        .map_err(|error| HamburError::SseParse(format!("parse chat completion JSON: {error}")))?;
+    if let Some(error) = value.get("error") {
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("provider error");
+        return Err(HamburError::ProviderUnavailable(message.to_string()));
+    }
+    let message = value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .ok_or_else(|| HamburError::SseParse("chat completion missing message".to_string()))?;
+    let content = message
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let mut tool_calls = Vec::new();
+    if let Some(items) = message.get("tool_calls").and_then(Value::as_array) {
+        for (fallback_index, item) in items.iter().enumerate() {
+            let index = item
+                .get("index")
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .unwrap_or(fallback_index as u32);
+            let id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let function = item.get("function").unwrap_or(&Value::Null);
+            let name = function
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let arguments_json = function
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("{}")
+                .to_string();
+            if !id.is_empty() && !name.is_empty() {
+                tool_calls.push(CompleteToolCall {
+                    index,
+                    id,
+                    name,
+                    arguments_json,
+                });
+            }
+        }
+    }
+    Ok(MemoryReviewAssistantMessage {
+        content,
+        tool_calls,
+    })
+}
+
+fn compile_named_tools_json(tools_json: &str, names: &[&str]) -> HamburResult<String> {
+    let allowed = names.iter().copied().collect::<HashSet<_>>();
+    let value: Value = serde_json::from_str(tools_json.trim()).map_err(|error| {
+        HamburError::InvalidCommand(format!("invalid OpenAI tools JSON: {error}"))
+    })?;
+    let Value::Array(items) = value else {
+        return Err(HamburError::InvalidCommand(
+            "OpenAI tools JSON must be an array".to_string(),
+        ));
+    };
+    let filtered = items
+        .into_iter()
+        .filter(|item| {
+            item.get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .is_some_and(|name| allowed.contains(name))
+        })
+        .collect::<Vec<_>>();
+    Ok(Value::Array(filtered).to_string())
 }
 
 async fn reqwest_stream(spec: hambur_llm::HttpRequestSpec) -> HamburResult<reqwest::Response> {
@@ -8665,7 +9403,7 @@ mod tests {
             ..Default::default()
         };
         let source = provider_stream_source(
-            "session", "turn", "hello", &route, "[]", &prompt, false, false,
+            "session", "turn", "hello", &route, "[]", &prompt, "", false, false,
         );
         let RouteStreamSource::Provider(request) = source else {
             panic!("expected provider source");
@@ -8675,6 +9413,58 @@ mod tests {
                 && block.contains("skill_view")
                 && block.contains("skill-creator")
         }));
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
+    fn memory_prompt_is_injected_into_initial_request() {
+        let app_files_dir = temp_app_dir();
+        let memory_dir = app_files_dir.join("sandbox").join("global").join("memory");
+        fs::create_dir_all(&memory_dir).expect("create memory dir");
+        fs::write(
+            memory_dir.join("MEMORY.md"),
+            "Project uses Rust backend and Compose frontend.",
+        )
+        .expect("write memory");
+        fs::write(memory_dir.join("USER.md"), "User prefers concise Chinese.")
+            .expect("write user memory");
+
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+
+        let memory_prompt = runtime.build_memory_system_prompt();
+        assert!(memory_prompt.contains("You have persistent memory across chats."));
+        assert!(memory_prompt.contains("Project uses Rust backend and Compose frontend."));
+        assert!(memory_prompt.contains("User prefers concise Chinese."));
+
+        let route = ModelRouteSnapshot {
+            supports_tool_call: true,
+            output_limit: 1024,
+            ..Default::default()
+        };
+        let source = provider_stream_source(
+            "session",
+            "turn",
+            "hello",
+            &route,
+            "[]",
+            "",
+            &memory_prompt,
+            false,
+            false,
+        );
+        let RouteStreamSource::Provider(request) = source else {
+            panic!("expected provider source");
+        };
+        assert!(request
+            .system_blocks
+            .iter()
+            .any(|block| block.contains("MEMORY (your personal notes)") && block.contains("USER PROFILE")));
 
         let _ = fs::remove_dir_all(app_files_dir);
     }

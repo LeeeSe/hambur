@@ -803,18 +803,19 @@ class HamburUiStore(
         deepThinkingEnabled: Boolean = false,
         searchEnabled: Boolean = false,
     ) {
-        if (sessionId.isBlank()) return
         val attachmentIds = _state.value.pendingAttachments.map { it.id }
         if (content.isBlank() && attachmentIds.isEmpty()) return
 
         scope.launch {
+            val targetSessionId = sessionId.ifBlank { ensureSessionForNewMessage() }
+            if (targetSessionId.isBlank()) return@launch
             ensureDefaultTextProvider()
             val payload = sendPayloadJson(attachmentIds, deepThinkingEnabled, searchEnabled)
             val ack = runtime.dispatch(
                 backendCommand(
                     kind = "SendMessage",
                     idempotencyKey = "message:${System.currentTimeMillis()}:${nextCommandOrdinal()}",
-                    sessionId = sessionId,
+                    sessionId = targetSessionId,
                     content = content,
                     reasoning = "Routing through the configured OpenAI-compatible text provider.",
                     payloadJson = payload,
@@ -1010,7 +1011,7 @@ class HamburUiStore(
     }
 
     private fun applyInitialSnapshotBaseline() {
-        val sessionSnapshot = runCatching {
+        var sessionSnapshot = runCatching {
             runtime.getSessionListSnapshot(limit = 100u, offset = 0u)
         }.getOrElse { error ->
             _state.update {
@@ -1021,9 +1022,14 @@ class HamburUiStore(
             }
             return
         }
+        val settingsSnapshot = runCatching {
+            runtime.getSettingsSnapshot()
+        }.getOrNull()
 
-        val selectedSessionId = sessionSnapshot.selectedSessionId.ifBlank {
-            sessionSnapshot.sessions.firstOrNull()?.id.orEmpty()
+        val selectedSessionId = selectStartupSessionId(sessionSnapshot, settingsSnapshot).also {
+            sessionSnapshot = runCatching {
+                runtime.getSessionListSnapshot(limit = 100u, offset = 0u)
+            }.getOrDefault(sessionSnapshot)
         }
         val timelinePage = if (selectedSessionId.isBlank()) {
             null
@@ -1042,9 +1048,6 @@ class HamburUiStore(
         )
         val timelineItems = timelinePage?.items.orEmpty()
         val markdownBlockPayloads = timelinePage?.markdownBlockPayloads.orEmpty()
-        val settingsSnapshot = runCatching {
-            runtime.getSettingsSnapshot()
-        }.getOrNull()
 
         val bufferedEvents = synchronized(startupLock) {
             _state.update {
@@ -1070,6 +1073,47 @@ class HamburUiStore(
         refreshVisibleMessageSnapshots()
         refreshKnowledgeSnapshots()
         runRootfsWarmup(selectedSessionId)
+    }
+
+    private fun selectStartupSessionId(
+        sessionSnapshot: SessionListSnapshotDto,
+        settingsSnapshot: SettingsSnapshotDto?,
+    ): String {
+        val defaultSessionId = sessionSnapshot.selectedSessionId.ifBlank {
+            sessionSnapshot.sessions.firstOrNull()?.id.orEmpty()
+        }
+        if (settingsSnapshot.settingValue("startupChatMode", "last_chat") != "new_chat") {
+            return defaultSessionId
+        }
+
+        val emptySessionId = sessionSnapshot.sessions.firstOrNull { it.messageCount == 0u }?.id
+        if (!emptySessionId.isNullOrBlank()) {
+            if (emptySessionId != sessionSnapshot.selectedSessionId) {
+                applyRejectedAck(
+                    runtime.dispatch(
+                        backendCommand(
+                            kind = "OpenSession",
+                            idempotencyKey = "$emptySessionId:open:startup",
+                            sessionId = emptySessionId,
+                        ),
+                    ),
+                )
+            }
+            return emptySessionId
+        }
+
+        applyRejectedAck(
+            runtime.dispatch(
+                backendCommand(
+                    kind = "CreateSession",
+                    idempotencyKey = "session:create:startup:${nextCommandOrdinal()}",
+                    title = "New chat",
+                ),
+            ),
+        )
+        return runCatching {
+            runtime.getSessionListSnapshot(limit = 1u, offset = 0u).selectedSessionId
+        }.getOrDefault(defaultSessionId)
     }
 
     private fun runCommand(block: () -> CommandAck) {
@@ -1225,6 +1269,37 @@ class HamburUiStore(
                 footer = ack.message.ifBlank { ack.rejectionCode },
             )
         }
+    }
+
+    private fun ensureSessionForNewMessage(): String {
+        val currentState = _state.value
+        currentState.selectedSessionId.ifBlank {
+            currentState.sessions.firstOrNull { it.messageCount == 0u }?.id.orEmpty()
+        }.takeIf { it.isNotBlank() }?.let { sessionId ->
+            val ack = runtime.dispatch(
+                backendCommand(
+                    kind = "OpenSession",
+                    idempotencyKey = "$sessionId:open:send",
+                    sessionId = sessionId,
+                ),
+            )
+            applyRejectedAck(ack)
+            return if (ack.accepted) sessionId else ""
+        }
+
+        val ack = runtime.dispatch(
+            backendCommand(
+                kind = "CreateSession",
+                idempotencyKey = "session:create:send:${nextCommandOrdinal()}",
+                title = "New chat",
+            ),
+        )
+        applyRejectedAck(ack)
+        if (!ack.accepted) return ""
+
+        return runCatching {
+            runtime.getSessionListSnapshot(limit = 1u, offset = 0u).selectedSessionId
+        }.getOrDefault("")
     }
 
     private fun refreshSettingsSnapshot() {
@@ -1853,4 +1928,12 @@ private fun sendPayloadJson(
 
 private fun maxSequence(first: ULong, second: ULong): ULong {
     return if (first >= second) first else second
+}
+
+private fun SettingsSnapshotDto?.settingValue(key: String, fallback: String): String {
+    return this
+        ?.settings
+        ?.firstOrNull { it.key == key }
+        ?.value
+        ?: fallback
 }

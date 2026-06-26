@@ -21,6 +21,46 @@ pub struct ToolSchema {
     pub parameters_json_schema: Value,
 }
 
+const MAIN_OPENAI_TOOL_NAMES: &[&str] = &[
+    "get_current_time",
+    "skills_list",
+    "skill_view",
+    "terminal",
+    "process",
+    "read_file",
+    "write_file",
+    "patch",
+    "search_files",
+    "hambur_config",
+    "web_search",
+    "web_fetch",
+    "browser_use",
+    "session_search",
+    "memory",
+    "delegate_task",
+    "view_image",
+];
+
+const DELEGATE_OPENAI_TOOL_NAMES: &[&str] = &[
+    "get_current_time",
+    "skills_list",
+    "skill_view",
+    "terminal",
+    "process",
+    "read_file",
+    "write_file",
+    "patch",
+    "search_files",
+    "hambur_config",
+    "web_search",
+    "web_fetch",
+    "browser_use",
+    "session_search",
+    "memory",
+    "view_image",
+    "submit_delegate_result",
+];
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ToolSchemaCompiler {
     schemas: BTreeMap<String, ToolSchema>,
@@ -31,25 +71,29 @@ impl ToolSchemaCompiler {
         let mut compiler = Self::default();
         compiler.register(ToolSchema {
             name: "get_current_time".to_string(),
-            description: "Return the current backend clock in milliseconds since Unix epoch."
-                .to_string(),
-            parameters_json_schema: json!({
+            description: "Get the current date and time from the user's device.".to_string(),
+            parameters_json_schema: object_schema(json!({
                 "type": "object",
                 "properties": {},
                 "additionalProperties": false
-            }),
+            })),
         })?;
         compiler.register(ToolSchema {
             name: "session_search".to_string(),
-            description: "Search the current Hambur session index.".to_string(),
-            parameters_json_schema: json!({
+            description: "Search past chat sessions stored locally on this phone, or read/scroll inside one. Calling shapes: (1) pass query for discovery; (2) pass session_id + around_message_id to scroll around a message; (3) pass session_id only to read a session; (4) pass no args to browse recent sessions. Use this for questions like what did we discuss about X, where did we leave Y, or find the session where Z.".to_string(),
+            parameters_json_schema: object_schema(json!({
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 20}
+                    "query": {"type": "string", "description": "Search query for discovery. Omit to browse recent sessions. Ignored when session_id + around_message_id are set."},
+                    "limit": {"type": "integer", "description": "Max sessions to return. Default 3, max 10.", "default": 3},
+                    "sort": {"type": "string", "enum": ["newest", "oldest"], "description": "Optional temporal bias for discovery results."},
+                    "session_id": {"type": "string", "description": "Session to read or scroll inside. Use a session_id returned from discovery or browse."},
+                    "around_message_id": {"type": "string", "description": "Message id to center the scroll window on. To scroll forward pass the last window message id; to scroll backward pass the first."},
+                    "window": {"type": "integer", "description": "Messages to return on each side of around_message_id. Default 5, max 20.", "default": 5},
+                    "role_filter": {"type": "string", "description": "Optional comma-separated roles to include, e.g. 'user,assistant'."}
                 },
                 "additionalProperties": false
-            }),
+            })),
         })?;
         compiler.register(ToolSchema {
             name: "echo".to_string(),
@@ -65,157 +109,247 @@ impl ToolSchemaCompiler {
         })?;
         compiler.register(ToolSchema {
             name: "view_image".to_string(),
-            description: "Resolve an image file path for model vision handoff.".to_string(),
-            parameters_json_schema: json!({
+            description: "View a local image file from the sandbox. Returns detail (high/original), width, height, and resolved path. The app attaches the image to the next model request as image_url. Relative paths resolve under /var/hambur/workspace.".to_string(),
+            parameters_json_schema: object_schema(json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
-                    "detail": {"type": "string", "enum": ["low", "high", "auto"]}
+                    "path": {"type": "string", "description": "Path to the image file, absolute or relative to /var/hambur/workspace."},
+                    "detail": {
+                        "type": "string",
+                        "enum": ["high", "original"],
+                        "description": "Optional. Detail mode for the image. If 'high', resizes to fit max 1024px. If 'original', returns full resolution. Omit to use the user's default setting."
+                    }
                 },
                 "required": ["path"],
                 "additionalProperties": false
-            }),
+            })),
         })?;
         compiler.register(ToolSchema {
             name: "read_file".to_string(),
-            description:
-                "Read a text file with line numbers and pagination from the Hambur sandbox."
-                    .to_string(),
-            parameters_json_schema: json!({
+            description: "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format is 'LINE_NUM|CONTENT'. Use offset and limit for large files. Relative paths resolve under /var/hambur/workspace. Cannot read images or binary files.".to_string(),
+            parameters_json_schema: object_schema(json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
-                    "offset": {"type": "integer", "minimum": 1},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 2000}
+                    "path": {"type": "string", "description": "Path to the file to read, absolute or relative to /var/hambur/workspace."},
+                    "offset": {
+                        "type": "integer",
+                        "description": "Line number to start reading from. 1-indexed, default 1.",
+                        "default": 1,
+                        "minimum": 1
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of lines to read. Default 500, max 2000.",
+                        "default": 500,
+                        "maximum": 2000
+                    }
                 },
                 "required": ["path"],
                 "additionalProperties": false
-            }),
+            })),
         })?;
         compiler.register(ToolSchema {
             name: "write_file".to_string(),
-            description:
-                "Write content to a file in the Hambur sandbox, replacing existing content."
-                    .to_string(),
-            parameters_json_schema: json!({
+            description: "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. Use patch for targeted edits. Relative paths resolve under /var/hambur/workspace.".to_string(),
+            parameters_json_schema: object_schema(json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
-                    "content": {"type": "string"}
+                    "path": {"type": "string", "description": "File path to write."},
+                    "content": {"type": "string", "description": "Complete content to write to the file."}
                 },
                 "required": ["path", "content"],
                 "additionalProperties": false
-            }),
+            })),
         })?;
         compiler.register(ToolSchema {
             name: "patch".to_string(),
-            description: "Apply a targeted find-and-replace edit in a Hambur sandbox text file."
-                .to_string(),
-            parameters_json_schema: json!({
+            description: "Targeted find-and-replace edits in files. Use this instead of sed/awk in terminal. REPLACE MODE (mode='replace', default): find a unique old_string and replace it with new_string. Include surrounding context lines to ensure uniqueness. PATCH MODE (mode='patch') is reserved for multi-file patches and is not implemented yet on this phone agent; use replace mode or write_file instead.".to_string(),
+            parameters_json_schema: object_schema(json!({
                 "type": "object",
                 "properties": {
-                    "mode": {"type": "string", "enum": ["replace", "patch"]},
-                    "path": {"type": "string"},
-                    "old_string": {"type": "string"},
-                    "new_string": {"type": "string"},
-                    "replace_all": {"type": "boolean"},
-                    "patch": {"type": "string"}
+                    "mode": {
+                        "type": "string",
+                        "enum": ["replace", "patch"],
+                        "description": "Edit mode. 'replace' requires path + old_string + new_string. 'patch' is not implemented yet in this app.",
+                        "default": "replace"
+                    },
+                    "path": {"type": "string", "description": "Required when mode='replace'. File path to edit."},
+                    "old_string": {"type": "string", "description": "Required when mode='replace'. Exact text to find and replace. Must be unique unless replace_all=true. Include surrounding context lines."},
+                    "new_string": {"type": "string", "description": "Required when mode='replace'. Replacement text. Pass empty string to delete the matched text."},
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "Replace all occurrences instead of requiring a unique match. Defaults to false.",
+                        "default": false
+                    },
+                    "patch": {"type": "string", "description": "Reserved for V4A multi-file patch content. Not implemented yet on this phone agent."}
                 },
                 "required": ["mode"],
                 "additionalProperties": false
-            }),
+            })),
         })?;
         compiler.register(ToolSchema {
             name: "search_files".to_string(),
-            description: "Search file names or text contents inside the Hambur sandbox."
-                .to_string(),
-            parameters_json_schema: json!({
+            description: "Search file contents or find files by name. Use this instead of grep/rg/find/ls in terminal. Content search (target='content') treats pattern as a regex when possible and returns matching lines with line numbers. File search (target='files') treats pattern as a glob or filename fragment. Relative paths resolve under /var/hambur/workspace.".to_string(),
+            parameters_json_schema: object_schema(json!({
                 "type": "object",
                 "properties": {
-                    "pattern": {"type": "string"},
-                    "target": {"type": "string", "enum": ["content", "files"]},
-                    "path": {"type": "string"},
-                    "file_glob": {"type": "string"},
-                    "limit": {"type": "integer", "minimum": 1},
-                    "offset": {"type": "integer", "minimum": 0},
-                    "output_mode": {"type": "string", "enum": ["content", "files_only", "count"]},
-                    "context": {"type": "integer", "minimum": 0}
+                    "pattern": {"type": "string", "description": "Regex pattern for content search, or glob/filename pattern for file search."},
+                    "target": {
+                        "type": "string",
+                        "enum": ["content", "files"],
+                        "description": "'content' searches inside file contents, 'files' searches for files by name.",
+                        "default": "content"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Directory or file to search in. Defaults to /var/hambur/workspace.",
+                        "default": "/var/hambur/workspace"
+                    },
+                    "file_glob": {"type": "string", "description": "Filter files by glob pattern in content mode, e.g. '*.kt'."},
+                    "limit": {"type": "integer", "description": "Maximum number of results to return. Default 50.", "default": 50},
+                    "offset": {"type": "integer", "description": "Skip first N results for pagination. Default 0.", "default": 0},
+                    "output_mode": {
+                        "type": "string",
+                        "enum": ["content", "files_only", "count"],
+                        "description": "For content mode: 'content' shows matching lines, 'files_only' lists file paths, 'count' shows match counts per file.",
+                        "default": "content"
+                    },
+                    "context": {"type": "integer", "description": "Number of context lines before and after each match. Default 0.", "default": 0}
                 },
                 "required": ["pattern"],
                 "additionalProperties": false
-            }),
+            })),
         })?;
         compiler.register(ToolSchema {
             name: "terminal".to_string(),
-            description: "Run a foreground terminal command inside the Hambur sandbox.".to_string(),
-            parameters_json_schema: json!({
+            description: "Run a shell command inside the user's Linux sandbox. Use this for commands, package managers, builds, tests, and one-off shell work. Prefer read_file/write_file/patch/search_files for file operations. Short commands should run in the foreground with a generous timeout; long-running servers, watchers, and jobs should use background=true and then be managed with the process tool. The default working directory is /var/hambur/workspace.".to_string(),
+            parameters_json_schema: object_schema(json!({
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string"},
-                    "cwd": {"type": "string"},
-                    "timeout_ms": {"type": "integer", "minimum": 1000, "maximum": 300000},
-                    "background": {"type": "boolean"}
+                    "command": {"type": "string", "description": "The shell command to execute inside the Linux sandbox."},
+                    "background": {
+                        "type": "boolean",
+                        "description": "Run the command in the background and return a process_session_id. Use process(action='poll'|'log'|'wait'|'kill') afterwards. Use this for servers, watchers, and long-running bounded tasks.",
+                        "default": false
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 300,
+                        "description": "Max seconds to wait for a foreground command. Returns as soon as the command finishes. Defaults to 30; max 300. Use background=true for longer work."
+                    },
+                    "workdir": {"type": "string", "description": "Absolute working directory inside the sandbox. Defaults to /var/hambur/workspace."}
                 },
                 "required": ["command"],
                 "additionalProperties": false
-            }),
+            })),
         })?;
         compiler.register(ToolSchema {
             name: "process".to_string(),
-            description: "Manage a sandbox-scoped background process session.".to_string(),
-            parameters_json_schema: json!({
+            description: "Manage background processes started with terminal(background=true). Actions: list, poll, log, wait, kill, write, submit, close.".to_string(),
+            parameters_json_schema: object_schema(json!({
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["list", "poll", "log", "wait", "kill", "write", "submit", "close"]
+                        "enum": ["list", "poll", "log", "wait", "kill", "write", "submit", "close"],
+                        "description": "Action to perform."
                     },
-                    "process_session_id": {"type": "string"},
-                    "input": {"type": "string"},
-                    "timeout_ms": {"type": "integer", "minimum": 1000, "maximum": 300000}
+                    "session_id": {"type": "string", "description": "Process session ID returned by terminal(background=true). Required except for list."},
+                    "data": {"type": "string", "description": "Text to send to stdin for write or submit."},
+                    "timeout": {"type": "integer", "minimum": 1, "description": "Seconds to wait for wait action."},
+                    "offset": {"type": "integer", "description": "Line offset for log action. Omit or use 0 for latest lines."},
+                    "limit": {"type": "integer", "minimum": 1, "description": "Maximum lines for log action."}
                 },
                 "required": ["action"],
                 "additionalProperties": false
-            }),
+            })),
+        })?;
+        compiler.register(ToolSchema {
+            name: "hambur_config".to_string(),
+            description: "Read and update Hambur app configuration as a native tool. Use this instead of editing app prefs or running shell commands. Supports provider/model/model-group/default/tool/appearance/log/network settings plus audit history and revert.".to_string(),
+            parameters_json_schema: object_schema(json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "list_topics",
+                            "topic_help",
+                            "get",
+                            "set",
+                            "append",
+                            "remove",
+                            "set_batch",
+                            "audit_list",
+                            "audit_get",
+                            "audit_revert"
+                        ],
+                        "description": "Configuration action to run."
+                    },
+                    "topic": {"type": "string", "description": "Topic for topic_help, for example providers, models, model_groups, defaults, appearance, tools, sandbox, network, logs."},
+                    "path": {"type": "string", "description": "Config path, for example appearance.theme, providers.<id>.enabled, models.<entry_id>.displayName, model_groups.<id>.models.append."},
+                    "value_json": {"type": "string", "description": "New value encoded as a JSON literal. Examples: \"dark\", true, [\"a\"], {\"provider_id\":\"...\",\"model_id\":\"...\"}. Required for set/append/remove unless batch is used."},
+                    "batch": {
+                        "type": "array",
+                        "description": "Batch items for set_batch. Each item has path and value_json. Paths may end with .append or .remove.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string", "description": "Config path."},
+                                "value_json": {"type": "string", "description": "JSON literal for the new value."},
+                                "caption": {"type": "string", "description": "Optional per-item audit caption."}
+                            },
+                            "required": ["path", "value_json"]
+                        }
+                    },
+                    "filter": {"type": "string", "description": "Keyword filter for collection reads. Space-separated terms are AND matched case-insensitively."},
+                    "page": {"type": "integer", "description": "Collection page number. Default 1.", "default": 1},
+                    "page_size": {"type": "integer", "description": "Collection page size. Default 20, max 100.", "default": 20},
+                    "limit": {"type": "integer", "description": "Audit list limit. Default 50, max 200.", "default": 50},
+                    "scope": {"type": "string", "description": "Optional audit topic filter."},
+                    "audit_id": {"type": "string", "description": "Audit id for audit_get or audit_revert."},
+                    "actor": {"type": "string", "description": "Audit actor. Default agent."},
+                    "caption": {"type": "string", "description": "Human-readable audit caption."}
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            })),
         })?;
         compiler.register(ToolSchema {
             name: "web_search".to_string(),
-            description: "Search the web using the configured Hambur web provider.".to_string(),
-            parameters_json_schema: json!({
+            description: "Search the web for information. Returns results with titles, URLs, snippets, and full page contents fetched concurrently.".to_string(),
+            parameters_json_schema: object_schema(json!({
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 10},
-                    "fetch_content": {"type": "boolean"}
+                    "query": {"type": "string", "description": "The search query to look up on the web. You may include backend-supported operators such as site:example.com, filetype:pdf, intitle:word, -term, or \"exact phrase\"."}
                 },
                 "required": ["query"],
                 "additionalProperties": false
-            }),
+            })),
         })?;
         compiler.register(ToolSchema {
             name: "web_fetch".to_string(),
-            description: "Fetch up to five URLs through the configured Hambur web provider."
-                .to_string(),
-            parameters_json_schema: json!({
+            description: "Extract readable text from web page URLs. Returns simplified text from HTML or raw text for non-HTML responses. Pass up to 5 URLs per call. PDF conversion is not implemented yet on this phone agent.".to_string(),
+            parameters_json_schema: object_schema(json!({
                 "type": "object",
                 "properties": {
                     "urls": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "minItems": 1,
+                        "description": "List of HTTP or HTTPS URLs to extract content from. Max 5 URLs per call.",
                         "maxItems": 5
                     },
-                    "max_bytes": {"type": "integer", "minimum": 1024, "maximum": 10000000}
+                    "max_chars": {"type": "integer", "minimum": 1000, "maximum": 50000}
                 },
                 "required": ["urls"],
                 "additionalProperties": false
-            }),
+            })),
         })?;
         compiler.register(ToolSchema {
             name: "browser_use".to_string(),
-            description: "Schedule an Android WebView browser action through a platform request."
-                .to_string(),
-            parameters_json_schema: json!({
+            description: "Control the shared Android WebView browser. Actions: navigate, screenshot, click, type, get_text, scroll, get_page_info, execute_js, find_elements, hover, get_readable, get_backbone, fetch, get_cookies, scroll_and_collect, wait_for_dom_stable. Browser output files are saved under /var/hambur/browser and can be shown with hambur:// file links or view_image.".to_string(),
+            parameters_json_schema: object_schema(json!({
                 "type": "object",
                 "properties": {
                     "action": {
@@ -237,49 +371,71 @@ impl ToolSchemaCompiler {
                             "get_cookies",
                             "scroll_and_collect",
                             "wait_for_dom_stable"
-                        ]
+                        ],
+                        "description": "Browser action to perform."
                     },
-                    "url": {"type": "string"},
-                    "selector": {"type": "string"},
-                    "text": {"type": "string"},
-                    "script": {"type": "string"},
-                    "timeout_ms": {"type": "integer", "minimum": 1000, "maximum": 120000}
+                    "url": {"type": "string", "description": "URL to navigate to or download. Supports http, https, hambur://, and minis://workspace|browser|attachments preview URLs."},
+                    "selector": {"type": "string", "description": "CSS selector for targeting elements."},
+                    "text": {"type": "string", "description": "Text to type into the target element."},
+                    "coordinate_x": {"type": "integer", "description": "Viewport X coordinate for coordinate-based click."},
+                    "coordinate_y": {"type": "integer", "description": "Viewport Y coordinate for coordinate-based click."},
+                    "direction": {"type": "string", "enum": ["up", "down"], "description": "Scroll direction."},
+                    "amount": {"type": "integer", "description": "Scroll amount in CSS pixels."},
+                    "script": {"type": "string", "description": "JavaScript to execute in an async function wrapper. Supports await and return."},
+                    "max_depth": {"type": "integer", "description": "Maximum DOM tree depth for get_backbone."},
+                    "scroll_count": {"type": "integer", "description": "Number of scroll steps for scroll_and_collect. Max 20."},
+                    "item_selector": {"type": "string", "description": "CSS selector for items collected by scroll_and_collect."},
+                    "keywords": {"type": "string", "description": "Cookie name filter. Split multiple keywords with spaces."},
+                    "fuzzy": {"type": "boolean", "description": "Cookie keyword matching mode. true means contains match; false means exact match."},
+                    "timeout": {"type": "integer", "description": "Timeout in seconds for wait_for_dom_stable or long JavaScript actions."}
                 },
                 "required": ["action"],
                 "additionalProperties": false
-            }),
+            })),
         })?;
         compiler.register(ToolSchema {
             name: "delegate_task".to_string(),
-            description: "Create an isolated Hambur delegate session for a bounded subtask."
-                .to_string(),
-            parameters_json_schema: json!({
+            description: "Spawn one or more isolated leaf subagents using the current model. Use this for separable research, code investigation, or long subtasks where an isolated context helps. Batch mode runs up to 3 children in parallel. Each child receives a fresh conversation and an isolated workspace snapshot; child file edits are not applied back to the parent automatically.".to_string(),
+            parameters_json_schema: object_schema(json!({
                 "type": "object",
                 "properties": {
-                    "task": {"type": "string"},
+                    "goal": {"type": "string", "description": "Self-contained task goal for the subagent."},
+                    "context": {"type": "string", "description": "Relevant background, paths, constraints, and prior findings."},
                     "toolsets": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "maxItems": 8
+                        "description": "Toolsets to enable for this subagent. Currently advisory; unavailable tools are ignored. Common: ['terminal','file'], ['web'], ['terminal','file','web']."
                     },
-                    "timeout_ms": {"type": "integer", "minimum": 1000, "maximum": 600000},
-                    "payload_json": {"type": "string"}
+                    "tasks": {
+                        "type": "array",
+                        "description": "Optional list of subagent tasks. Use this instead of goal when launching multiple independent subtasks. Max 3 tasks per call; split larger batches across calls.",
+                        "maxItems": 3,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "goal": {"type": "string", "description": "Task goal"},
+                                "context": {"type": "string", "description": "Task-specific context"},
+                                "toolsets": {"type": "array", "items": {"type": "string"}},
+                                "role": {"type": "string", "enum": ["leaf"], "description": "Currently only leaf subagents are supported."}
+                            },
+                            "required": ["goal"]
+                        }
+                    },
+                    "role": {"type": "string", "enum": ["leaf"], "description": "Currently only leaf subagents are supported."}
                 },
-                "required": ["task"],
                 "additionalProperties": false
-            }),
+            })),
         })?;
         compiler.register(ToolSchema {
             name: "memory".to_string(),
-            description: "Read or update durable Hambur memory shared across all chats."
-                .to_string(),
-            parameters_json_schema: json!({
+            description: "Save durable information to persistent memory shared across all chats. Use this proactively for stable user preferences, environment facts, recurring corrections, and durable project conventions. Do not save short-lived task progress, completed-work logs, or temporary todos; use session_search for past conversation recall.".to_string(),
+            parameters_json_schema: object_schema(json!({
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
                         "enum": ["add", "replace", "remove", "read"],
-                        "description": "Use add for new atomic facts, replace for stale or contradicted entries, remove for obsolete entries, and read to inspect current entries."
+                        "description": "Action to perform."
                     },
                     "target": {
                         "type": "string",
@@ -288,7 +444,7 @@ impl ToolSchemaCompiler {
                     },
                     "content": {
                         "type": "string",
-                        "description": "Entry content. Required for add and replace. Keep entries short, declarative, and durable."
+                        "description": "Entry content. Required for add and replace."
                     },
                     "old_text": {
                         "type": "string",
@@ -297,12 +453,12 @@ impl ToolSchemaCompiler {
                 },
                 "required": ["action", "target"],
                 "additionalProperties": false
-            }),
+            })),
         })?;
         compiler.register(ToolSchema {
             name: "skills_list".to_string(),
             description: "List available skills with minimal metadata. Use skill_view(name) to load full content, tags, and linked files.".to_string(),
-            parameters_json_schema: json!({
+            parameters_json_schema: object_schema(json!({
                 "type": "object",
                 "properties": {
                     "category": {
@@ -311,7 +467,7 @@ impl ToolSchemaCompiler {
                     }
                 },
                 "additionalProperties": false
-            }),
+            })),
         })?;
         compiler.register(ToolSchema {
             name: "skill_list".to_string(),
@@ -332,7 +488,7 @@ impl ToolSchemaCompiler {
             name: "skill_view".to_string(),
             description: "Skills load information about specific tasks and workflows, plus references, templates, scripts, and assets. Load a skill's main SKILL.md content or a linked file inside the skill directory."
                 .to_string(),
-            parameters_json_schema: json!({
+            parameters_json_schema: object_schema(json!({
                 "type": "object",
                 "properties": {
                     "name": {
@@ -346,7 +502,7 @@ impl ToolSchemaCompiler {
                 },
                 "required": ["name"],
                 "additionalProperties": false
-            }),
+            })),
         })?;
         compiler.register(ToolSchema {
             name: "submit_delegate_result".to_string(),
@@ -385,16 +541,23 @@ impl ToolSchemaCompiler {
     }
 
     pub fn compile_openai_tools_json(&self) -> String {
+        self.compile_named_openai_tools_json(MAIN_OPENAI_TOOL_NAMES)
+    }
+
+    pub fn compile_delegate_openai_tools_json(&self) -> String {
+        self.compile_named_openai_tools_json(DELEGATE_OPENAI_TOOL_NAMES)
+    }
+
+    pub fn compile_named_openai_tools_json(&self, names: &[&str]) -> String {
         let tools = self
-            .schemas
-            .values()
+            .schemas_for_names(names)
             .map(|schema| {
                 json!({
                     "type": "function",
                     "function": {
                         "name": schema.name,
                         "description": schema.description,
-                        "parameters": schema.parameters_json_schema,
+                        "parameters": with_tool_call_title(&schema.parameters_json_schema),
                     }
                 })
             })
@@ -404,6 +567,10 @@ impl ToolSchemaCompiler {
 
     pub fn schema(&self, name: &str) -> Option<&ToolSchema> {
         self.schemas.get(name)
+    }
+
+    fn schemas_for_names<'a>(&'a self, names: &'a [&str]) -> impl Iterator<Item = &'a ToolSchema> {
+        names.iter().filter_map(|name| self.schemas.get(*name))
     }
 
     pub fn validate_arguments(&self, name: &str, arguments: &Value) -> HamburResult<()> {
@@ -438,6 +605,38 @@ impl ToolSchemaCompiler {
         }
         Ok(())
     }
+}
+
+fn object_schema(schema: Value) -> Value {
+    schema
+}
+
+fn with_tool_call_title(schema: &Value) -> Value {
+    let mut schema = schema.clone();
+    if let Some(object) = schema.as_object_mut() {
+        let properties = object
+            .entry("properties".to_string())
+            .or_insert_with(|| json!({}));
+        if let Some(properties) = properties.as_object_mut() {
+            properties.insert(
+                "title".to_string(),
+                json!({
+                    "type": "string",
+                    "description": "Short user-visible title describing this specific tool call. Use concise Chinese when the user is chatting in Chinese."
+                }),
+            );
+        }
+
+        let required = object
+            .entry("required".to_string())
+            .or_insert_with(|| json!([]));
+        if let Some(required) = required.as_array_mut() {
+            if !required.iter().any(|value| value.as_str() == Some("title")) {
+                required.push(json!("title"));
+            }
+        }
+    }
+    schema
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1161,16 +1360,24 @@ mod tests {
         let compiler = ToolSchemaCompiler::with_builtin_tools().expect("compiler");
         let json = compiler.compile_openai_tools_json();
         let value: Value = serde_json::from_str(&json).expect("tools json");
-        assert!(value.as_array().expect("array").len() >= 2);
+        assert_eq!(value.as_array().expect("array").len(), 17);
         assert!(json.contains("get_current_time"));
+        assert!(json.contains("hambur_config"));
         assert!(json.contains("terminal"));
         assert!(json.contains("browser_use"));
         assert!(json.contains("delegate_task"));
-        assert!(json.contains("submit_delegate_result"));
         assert!(json.contains("web_search"));
         assert!(json.contains("web_fetch"));
         assert!(json.contains("Use user for user profile/preferences"));
         assert!(json.contains("old_text"));
+        assert!(json.contains("Short user-visible title describing this specific tool call"));
+        assert!(!json.contains("submit_delegate_result"));
+        assert!(!json.contains("\"name\":\"echo\""));
+        assert!(!json.contains("\"name\":\"skill_list\""));
+
+        let delegate_json = compiler.compile_delegate_openai_tools_json();
+        assert!(delegate_json.contains("submit_delegate_result"));
+        assert!(!delegate_json.contains("\"name\":\"delegate_task\""));
     }
 
     #[test]

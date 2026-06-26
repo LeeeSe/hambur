@@ -86,6 +86,12 @@ pub struct MessageRecord {
     pub attachments: Vec<AttachmentRecord>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatTranscriptEntry {
+    pub message: MessageRecord,
+    pub tool_calls: Vec<ToolCallRecord>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionReviewRecord {
     pub id: String,
@@ -178,6 +184,7 @@ pub struct NewToolCall {
     pub display_title: String,
     pub status: String,
     pub requires_approval: bool,
+    pub call_index: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -197,6 +204,7 @@ pub struct ToolCallRecord {
     pub result_id: String,
     pub error_code: String,
     pub error_message: String,
+    pub call_index: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1066,14 +1074,16 @@ impl HamburDatabase {
                         ended_at_ms,
                         result_id,
                         error_code,
-                        error_message
+                        error_message,
+                        call_index
                     )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'not_required', ?10, NULL, '', '', '')
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'not_required', ?10, NULL, '', '', '', ?11)
                  ON CONFLICT(id) DO UPDATE SET
                     status = excluded.status,
                     display_title = excluded.display_title,
                     arguments_json = excluded.arguments_json,
                     requires_approval = excluded.requires_approval,
+                    call_index = excluded.call_index,
                     started_at_ms = CASE
                         WHEN tool_calls.started_at_ms = 0 THEN excluded.started_at_ms
                         ELSE tool_calls.started_at_ms
@@ -1089,6 +1099,7 @@ impl HamburDatabase {
                     status,
                     input.requires_approval,
                     now as i64,
+                    input.call_index as i64,
                 ],
             )
             .await
@@ -1771,7 +1782,9 @@ impl HamburDatabase {
             .map_err(database_error)?;
         self.touch_session(session_id, now).await?;
 
-        let record = self.markdown_block_by_stable_key(session_id, &stable_key).await?;
+        let record = self
+            .markdown_block_by_stable_key(session_id, &stable_key)
+            .await?;
         self.upsert_timeline_item(
             session_id,
             NewTimelineItem {
@@ -2219,12 +2232,249 @@ impl HamburDatabase {
         limit: u32,
     ) -> HamburResult<TimelinePageData> {
         self.ensure_session_exists(session_id).await?;
-        let mut page = self.timeline_items_page(session_id, before_cursor, limit).await?;
+        let mut page = self
+            .timeline_items_page(session_id, before_cursor, limit)
+            .await?;
         let payload_refs = markdown_payload_refs(&page.items);
         page.markdown_block_payloads = self
             .markdown_blocks_for_payload_refs(session_id, &payload_refs)
             .await?;
         Ok(page)
+    }
+
+    pub async fn hide_visible_timeline_after_message(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        include_message: bool,
+    ) -> HamburResult<()> {
+        self.ensure_session_exists(session_id).await?;
+        let message = self.message_snapshot(message_id).await?.ok_or_else(|| {
+            HamburError::InvalidCommand(format!("message not found: {message_id}"))
+        })?;
+        if message.session_id != session_id {
+            return Err(HamburError::InvalidCommand(format!(
+                "message does not belong to session: {message_id}"
+            )));
+        }
+        let comparator = if include_message { ">=" } else { ">" };
+        let mut rows = self
+            .connection
+            .query(
+                format!(
+                    "SELECT id FROM messages
+                     WHERE session_id = ?1
+                       AND created_at_ms {comparator} ?2"
+                )
+                .as_str(),
+                params![session_id, message.created_at_ms as i64],
+            )
+            .await
+            .map_err(database_error)?;
+        let mut message_ids = Vec::new();
+        while let Some(row) = rows.next().await.map_err(database_error)? {
+            message_ids.push(row.get::<String>(0).map_err(database_error)?);
+        }
+        if message_ids.is_empty() {
+            return Ok(());
+        }
+        let now = now_ms();
+        for hidden_message_id in message_ids {
+            self.hide_timeline_for_message_id(session_id, &hidden_message_id, now)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn hide_timeline_for_message_id(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        now: u64,
+    ) -> HamburResult<()> {
+        self.connection
+            .execute(
+                "UPDATE timeline_items
+                 SET visible = 0,
+                     version_sequence = version_sequence + 1,
+                     updated_at_ms = ?1
+                 WHERE session_id = ?2
+                   AND visible = 1
+                   AND payload_ref = ?3",
+                params![now as i64, session_id, message_id],
+            )
+            .await
+            .map_err(database_error)?;
+        self.connection
+            .execute(
+                "UPDATE timeline_items
+                 SET visible = 0,
+                     version_sequence = version_sequence + 1,
+                     updated_at_ms = ?1
+                 WHERE session_id = ?2
+                   AND visible = 1
+                   AND payload_ref IN (
+                       SELECT id FROM markdown_blocks
+                       WHERE session_id = ?2 AND message_id = ?3
+                   )",
+                params![now as i64, session_id, message_id],
+            )
+            .await
+            .map_err(database_error)?;
+        self.connection
+            .execute(
+                "UPDATE timeline_items
+                 SET visible = 0,
+                     version_sequence = version_sequence + 1,
+                     updated_at_ms = ?1
+                 WHERE session_id = ?2
+                   AND visible = 1
+                   AND payload_ref IN (
+                       SELECT ts.id
+                       FROM trace_spans ts
+                       JOIN tool_calls tc ON tc.id = ts.tool_call_id
+                       LEFT JOIN messages tm ON tm.tool_call_id = tc.id
+                       WHERE ts.session_id = ?2
+                         AND (
+                             tc.assistant_message_id = ?3
+                             OR tm.id = ?3
+                         )
+                   )",
+                params![now as i64, session_id, message_id],
+            )
+            .await
+            .map_err(database_error)?;
+        Ok(())
+    }
+
+    pub async fn visible_chat_transcript_before_message(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> HamburResult<Vec<ChatTranscriptEntry>> {
+        self.ensure_session_exists(session_id).await?;
+        let boundary = self.message_snapshot(message_id).await?.ok_or_else(|| {
+            HamburError::InvalidCommand(format!("message not found: {message_id}"))
+        })?;
+        if boundary.session_id != session_id {
+            return Err(HamburError::InvalidCommand(format!(
+                "message does not belong to session: {message_id}"
+            )));
+        }
+
+        let mut rows = self
+            .connection
+            .query(
+                "
+                SELECT
+                    m.id,
+                    m.session_id,
+                    m.role,
+                    m.content_text,
+                    m.reasoning_content,
+                    m.status,
+                    m.turn_id,
+                    m.created_at_ms,
+                    m.version_sequence,
+                    m.provider_id_snapshot,
+                    m.provider_name_snapshot,
+                    m.provider_protocol,
+                    m.model_id_snapshot,
+                    m.model_name_snapshot,
+                    m.model_group_id,
+                    m.finish_reason,
+                    m.native_finish_reason,
+                    m.tool_call_id,
+                    m.tool_name,
+                    m.tool_title
+                FROM messages m
+                WHERE m.session_id = ?1
+                  AND (
+                      m.created_at_ms < ?2
+                      OR (m.created_at_ms = ?2 AND m.id < ?3)
+                  )
+                  AND (
+                      (
+                          m.role = 'user'
+                          AND EXISTS (
+                              SELECT 1
+                              FROM timeline_items ti
+                              WHERE ti.session_id = m.session_id
+                                AND ti.payload_ref = m.id
+                                AND ti.visible = 1
+                                AND ti.content_type = 'user_message'
+                          )
+                      )
+                      OR (
+                          m.role = 'assistant'
+                          AND (
+                              EXISTS (
+                                  SELECT 1
+                                  FROM markdown_blocks mb
+                                  JOIN timeline_items ti
+                                    ON ti.session_id = mb.session_id
+                                   AND ti.payload_ref = mb.id
+                                   AND ti.visible = 1
+                                   AND ti.content_type = 'assistant_markdown_block'
+                                  WHERE mb.session_id = m.session_id
+                                    AND mb.message_id = m.id
+                              )
+                              OR EXISTS (
+                                  SELECT 1
+                                  FROM tool_calls tc
+                                  JOIN trace_spans ts
+                                    ON ts.tool_call_id = tc.id
+                                  JOIN timeline_items ti
+                                    ON ti.session_id = ts.session_id
+                                   AND ti.payload_ref = ts.id
+                                   AND ti.visible = 1
+                                   AND ti.content_type = 'trace'
+                                  WHERE tc.assistant_message_id = m.id
+                              )
+                          )
+                      )
+                      OR (
+                          m.role = 'tool'
+                          AND EXISTS (
+                              SELECT 1
+                              FROM tool_calls tc
+                              JOIN trace_spans ts
+                                ON ts.tool_call_id = tc.id
+                              JOIN timeline_items ti
+                                ON ti.session_id = ts.session_id
+                               AND ti.payload_ref = ts.id
+                               AND ti.visible = 1
+                               AND ti.content_type = 'trace'
+                              WHERE tc.id = m.tool_call_id
+                          )
+                      )
+                  )
+                ORDER BY m.created_at_ms ASC, m.id ASC
+                ",
+                params![
+                    session_id,
+                    boundary.created_at_ms as i64,
+                    boundary.id.clone()
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+
+        let mut entries = Vec::new();
+        while let Some(row) = rows.next().await.map_err(database_error)? {
+            let mut message = message_from_row(&row)?;
+            message.attachments = self.attachments_for_message(&message.id).await?;
+            let tool_calls = if message.role == "assistant" {
+                self.tool_calls_for_assistant_message(&message.id).await?
+            } else {
+                Vec::new()
+            };
+            entries.push(ChatTranscriptEntry {
+                message,
+                tool_calls,
+            });
+        }
+        Ok(entries)
     }
 
     pub async fn message_snapshot(&self, message_id: &str) -> HamburResult<Option<MessageRecord>> {
@@ -3250,7 +3500,8 @@ impl HamburDatabase {
                     ended_at_ms INTEGER,
                     result_id TEXT NOT NULL DEFAULT '',
                     error_code TEXT NOT NULL DEFAULT '',
-                    error_message TEXT NOT NULL DEFAULT ''
+                    error_message TEXT NOT NULL DEFAULT '',
+                    call_index INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_tool_calls_turn_started
@@ -3487,6 +3738,8 @@ impl HamburDatabase {
         self.add_column_if_missing("turns", "error_message", "TEXT NOT NULL DEFAULT ''")
             .await?;
         self.add_column_if_missing("sessions", "memory_reviewed", "INTEGER NOT NULL DEFAULT 0")
+            .await?;
+        self.add_column_if_missing("tool_calls", "call_index", "INTEGER NOT NULL DEFAULT 0")
             .await?;
 
         Ok(())
@@ -4176,7 +4429,8 @@ impl HamburDatabase {
                     ended_at_ms,
                     result_id,
                     error_code,
-                    error_message
+                    error_message,
+                    call_index
                 FROM tool_calls
                 WHERE id = ?1
                 LIMIT 1
@@ -4192,6 +4446,47 @@ impl HamburDatabase {
             )));
         };
         tool_call_from_row(&row)
+    }
+
+    async fn tool_calls_for_assistant_message(
+        &self,
+        assistant_message_id: &str,
+    ) -> HamburResult<Vec<ToolCallRecord>> {
+        let mut rows = self
+            .connection
+            .query(
+                "
+                SELECT
+                    id,
+                    session_id,
+                    turn_id,
+                    assistant_message_id,
+                    name,
+                    arguments_json,
+                    display_title,
+                    status,
+                    requires_approval,
+                    approval_status,
+                    started_at_ms,
+                    ended_at_ms,
+                    result_id,
+                    error_code,
+                    error_message,
+                    call_index
+                FROM tool_calls
+                WHERE assistant_message_id = ?1
+                ORDER BY call_index ASC, started_at_ms ASC, id ASC
+                ",
+                params![assistant_message_id],
+            )
+            .await
+            .map_err(database_error)?;
+
+        let mut calls = Vec::new();
+        while let Some(row) = rows.next().await.map_err(database_error)? {
+            calls.push(tool_call_from_row(&row)?);
+        }
+        Ok(calls)
     }
 
     async fn tool_result_by_id(&self, result_id: &str) -> HamburResult<ToolResultRecord> {
@@ -4861,7 +5156,7 @@ fn normalize_browser_tool_settings(value: &str) -> HamburResult<String> {
         .get("maxFetchBytes")
         .or_else(|| parsed.get("max_fetch_bytes"))
         .and_then(serde_json::Value::as_u64)
-        .unwrap_or(1_000_000);
+        .unwrap_or(2_000_000);
     if !(250_000..=10_000_000).contains(&max_fetch_bytes) {
         return Err(HamburError::InvalidCommand(
             "browser maxFetchBytes must be between 250000 and 10000000".to_string(),
@@ -4871,7 +5166,7 @@ fn normalize_browser_tool_settings(value: &str) -> HamburResult<String> {
         .get("autoCloseMinutes")
         .or_else(|| parsed.get("auto_close_minutes"))
         .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
+        .unwrap_or(15);
     if auto_close_minutes > 240 {
         return Err(HamburError::InvalidCommand(
             "browser autoCloseMinutes must be between 0 and 240".to_string(),
@@ -4886,7 +5181,7 @@ fn normalize_browser_tool_settings(value: &str) -> HamburResult<String> {
         .get("acceptThirdPartyCookies")
         .or_else(|| parsed.get("accept_third_party_cookies"))
         .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+        .unwrap_or(true);
     if !accept_cookies && accept_third_party {
         return Err(HamburError::InvalidCommand(
             "browser acceptThirdPartyCookies must be false when acceptCookies is false".to_string(),
@@ -5327,6 +5622,7 @@ fn tool_call_from_row(row: &Row) -> HamburResult<ToolCallRecord> {
         result_id: row.get::<String>(12).map_err(database_error)?,
         error_code: row.get::<String>(13).map_err(database_error)?,
         error_message: row.get::<String>(14).map_err(database_error)?,
+        call_index: unsigned_count(row.get::<i64>(15).map_err(database_error)?),
     })
 }
 
@@ -5817,6 +6113,7 @@ mod tests {
                     display_title: "Echo".to_string(),
                     status: "running".to_string(),
                     requires_approval: false,
+                    call_index: 0,
                 })
                 .await
                 .expect("tool call");

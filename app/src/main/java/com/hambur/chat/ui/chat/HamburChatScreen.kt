@@ -200,7 +200,7 @@ fun HamburChatScreen(
             ChatInputPanel(
                 message = draftMessage,
                 onMessageChange = { draftMessage = it },
-                enabled = state.selectedSessionId.isNotBlank(),
+                enabled = state.selectedSessionId.isNotBlank() || state.runtimeStatus == "Ready",
                 generating = state.activeTurnIds.containsKey(state.selectedSessionId),
                 thinkingEnabled = thinkingEnabled,
                 searchEnabled = searchEnabled,

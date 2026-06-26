@@ -343,7 +343,13 @@ class AndroidPlatformAdapter(
         return evaluateJson(
             webView,
             """
-            const value = eval(${JSONObject.quote(script)});
+            const source = ${JSONObject.quote(script)};
+            let value;
+            try {
+              value = new Function("return (" + source + ");")();
+            } catch (expressionError) {
+              value = new Function(source)();
+            }
             return {
               url: location.href,
               value: value === undefined ? null : value

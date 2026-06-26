@@ -306,6 +306,7 @@ pub struct RuntimeEngine {
     delegate_tasks: Mutex<HashMap<String, DelegateTaskState>>,
     delegate_sessions: Mutex<HashSet<String>>,
     process_sessions: Mutex<HashMap<String, BackgroundProcessSession>>,
+    completed_process_sessions: Mutex<HashMap<String, CompletedProcessSession>>,
     memory_review_sessions: Mutex<HashSet<String>>,
     router: Mutex<ModelRouter>,
     tools: ToolScheduler,
@@ -380,6 +381,20 @@ struct BackgroundProcessSession {
     pid_file: Option<PathBuf>,
     child: Child,
     output: Arc<Mutex<ProcessOutputBuffer>>,
+    exit_code: Option<i32>,
+    finished_at_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct CompletedProcessSession {
+    session_id: String,
+    process_session_id: String,
+    backend: String,
+    command: String,
+    cwd: String,
+    started_at_ms: u64,
+    pid: u32,
+    output: ProcessOutputSnapshot,
     exit_code: Option<i32>,
     finished_at_ms: u64,
 }
@@ -529,6 +544,7 @@ impl RuntimeEngine {
             delegate_tasks: Mutex::new(HashMap::new()),
             delegate_sessions: Mutex::new(HashSet::new()),
             process_sessions: Mutex::new(HashMap::new()),
+            completed_process_sessions: Mutex::new(HashMap::new()),
             memory_review_sessions: Mutex::new(HashSet::new()),
             router: Mutex::new(ModelRouter::default()),
             tools,
@@ -1802,47 +1818,64 @@ impl RuntimeEngine {
         };
 
         let user_content = format_user_content_with_attachments(&content, &pending_attachments);
+        let can_reuse_source_user = matches!(command_kind, "RetryTurn" | "RegenerateMessage")
+            && command.content.trim().is_empty()
+            && command.chunk.trim().is_empty()
+            && pending_attachments.is_empty();
         let setup = self.tokio.block_on(async {
+            let reusable_user_message = self
+                .prepare_visible_branch_for_command(&command, command_kind)
+                .await?;
             let turn = self
                 .database
                 .create_turn_with_route(&command.session_id, "StreamingAssistant", &route)
                 .await?;
-            let user_message = self
-                .database
-                .insert_message_with_route(
-                    &command.session_id,
-                    "user",
-                    &user_content,
-                    "",
-                    "completed",
-                    &turn.id,
-                    &route,
-                )
-                .await?;
-            let attachment_ids = pending_attachments
-                .iter()
-                .map(|attachment| attachment.id.clone())
-                .collect::<Vec<_>>();
-            self.database
-                .attach_pending_to_message(&command.session_id, &user_message.id, &attachment_ids)
-                .await?;
-            self.database
-                .upsert_timeline_item(
-                    &command.session_id,
-                    NewTimelineItem {
-                        stable_key: user_message.id.clone(),
-                        content_type: "user_message".to_string(),
-                        display_sequence: user_message.created_at_ms,
-                        payload_ref: user_message.id.clone(),
-                        small_summary: user_content.chars().take(160).collect(),
-                        kind: if command_kind == "EditMessage" {
-                            "EditedUserMessage".to_string()
-                        } else {
-                            "UserMessage".to_string()
+            let reuse_existing_user = can_reuse_source_user && reusable_user_message.is_some();
+            let user_message = if reuse_existing_user {
+                reusable_user_message.expect("checked reusable user message")
+            } else {
+                let user_message = self
+                    .database
+                    .insert_message_with_route(
+                        &command.session_id,
+                        "user",
+                        &user_content,
+                        "",
+                        "completed",
+                        &turn.id,
+                        &route,
+                    )
+                    .await?;
+                let attachment_ids = pending_attachments
+                    .iter()
+                    .map(|attachment| attachment.id.clone())
+                    .collect::<Vec<_>>();
+                self.database
+                    .attach_pending_to_message(
+                        &command.session_id,
+                        &user_message.id,
+                        &attachment_ids,
+                    )
+                    .await?;
+                self.database
+                    .upsert_timeline_item(
+                        &command.session_id,
+                        NewTimelineItem {
+                            stable_key: user_message.id.clone(),
+                            content_type: "user_message".to_string(),
+                            display_sequence: user_message.created_at_ms,
+                            payload_ref: user_message.id.clone(),
+                            small_summary: user_content.chars().take(160).collect(),
+                            kind: if command_kind == "EditMessage" {
+                                "EditedUserMessage".to_string()
+                            } else {
+                                "UserMessage".to_string()
+                            },
                         },
-                    },
-                )
-                .await?;
+                    )
+                    .await?;
+                user_message
+            };
             let assistant_message = self
                 .database
                 .insert_message_with_route(
@@ -1855,17 +1888,34 @@ impl RuntimeEngine {
                     &route,
                 )
                 .await?;
+            let chat_context = self
+                .build_chat_context_messages(
+                    &command.session_id,
+                    &user_message,
+                    &pending_attachments,
+                    &route,
+                    !reuse_existing_user,
+                )
+                .await?;
             let snapshot = self.database.session_snapshot(&command.session_id).await?;
-            Ok::<_, HamburError>((turn, assistant_message, snapshot))
+            Ok::<_, HamburError>((
+                turn,
+                user_message,
+                assistant_message,
+                chat_context,
+                snapshot,
+                !reuse_existing_user,
+            ))
         });
 
-        let (turn, assistant_message, snapshot) = match setup {
-            Ok(value) => value,
-            Err(error) => {
-                let _ = self.emit_error(error.clone());
-                return rejected_ack(command.command_id, command.idempotency_key, error);
-            }
-        };
+        let (turn, _user_message, assistant_message, chat_context, snapshot, user_was_inserted) =
+            match setup {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = self.emit_error(error.clone());
+                    return rejected_ack(command.command_id, command.idempotency_key, error);
+                }
+            };
 
         let cancel = Arc::new(AtomicBool::new(false));
         if let Ok(mut active_turns) = self.active_turns.lock() {
@@ -1886,14 +1936,16 @@ impl RuntimeEngine {
             command_kind.to_string(),
             None,
         );
-        let _ = self.emit_session_event(
-            RuntimeEventKind::MessageUpserted,
-            command.session_id.clone(),
-            turn.id.clone(),
-            snapshot.clone(),
-            user_content.clone(),
-            None,
-        );
+        if user_was_inserted {
+            let _ = self.emit_session_event(
+                RuntimeEventKind::MessageUpserted,
+                command.session_id.clone(),
+                turn.id.clone(),
+                snapshot.clone(),
+                user_content.clone(),
+                None,
+            );
+        }
         let _ = self.emit_session_event(
             RuntimeEventKind::AssistantMessageStarted,
             command.session_id.clone(),
@@ -1919,7 +1971,9 @@ impl RuntimeEngine {
             .map(|route| {
                 stream_source_for_command(
                     &command,
+                    &turn.id,
                     &content,
+                    chat_context.clone(),
                     route,
                     &tools_json,
                     &skills_index_prompt,
@@ -1977,6 +2031,91 @@ impl RuntimeEngine {
                     .source_user_message_for(&command.session_id, &source_message_id),
             )
             .map(|message| message.content_text)
+    }
+
+    async fn prepare_visible_branch_for_command(
+        &self,
+        command: &RuntimeCommand,
+        command_kind: &str,
+    ) -> HamburResult<Option<MessageRecord>> {
+        let source_message_id = command
+            .source_message_id
+            .clone()
+            .if_blank(command.message_id.clone());
+        if source_message_id.trim().is_empty() {
+            return Ok(None);
+        }
+
+        match command_kind {
+            "EditMessage" => {
+                self.database
+                    .hide_visible_timeline_after_message(
+                        &command.session_id,
+                        &source_message_id,
+                        true,
+                    )
+                    .await?;
+                Ok(None)
+            }
+            "RetryTurn" | "RegenerateMessage" => {
+                let source_user = self
+                    .database
+                    .source_user_message_for(&command.session_id, &source_message_id)
+                    .await?;
+                self.database
+                    .hide_visible_timeline_after_message(
+                        &command.session_id,
+                        &source_message_id,
+                        true,
+                    )
+                    .await?;
+                Ok(Some(source_user))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    async fn build_chat_context_messages(
+        &self,
+        session_id: &str,
+        current_user_message: &MessageRecord,
+        _current_attachments: &[AttachmentRecord],
+        route: &ModelRouteSnapshot,
+        append_current_user: bool,
+    ) -> HamburResult<Vec<ModelMessage>> {
+        let transcript = self
+            .database
+            .visible_chat_transcript_before_message(session_id, &current_user_message.id)
+            .await?;
+        let mut messages = Vec::new();
+        let mut open_tool_call_ids = HashSet::<String>::new();
+
+        for entry in transcript {
+            append_transcript_entry_to_context(&mut messages, &mut open_tool_call_ids, entry)?;
+        }
+
+        if !open_tool_call_ids.is_empty() {
+            return Err(HamburError::InvalidCommand(format!(
+                "visible transcript has assistant tool calls without tool results: {}",
+                open_tool_call_ids.len()
+            )));
+        }
+
+        if append_current_user {
+            messages.push(ModelMessage {
+                role: "user".to_string(),
+                content: current_user_message.content_text.clone(),
+                ..Default::default()
+            });
+        }
+
+        if !route.supports_tool_call {
+            messages.retain(|message| {
+                message.role != "tool" && message.tool_calls_json.trim().is_empty()
+            });
+        }
+
+        Ok(messages)
     }
 
     fn load_pending_attachments(
@@ -2384,7 +2523,7 @@ impl RuntimeEngine {
                         provider_stream_source(
                             &session_id,
                             &turn_id,
-                            "",
+                            Vec::new(),
                             &route,
                             &tools_json,
                             "",
@@ -3029,6 +3168,7 @@ impl RuntimeEngine {
                     display_title: invocation.display_title.clone(),
                     status: "running".to_string(),
                     requires_approval: invocation.requires_approval,
+                    call_index: invocation.index,
                 })
                 .await?;
             let trace = self
@@ -3601,6 +3741,9 @@ impl RuntimeEngine {
                 "memory" | "skill_list" | "skills_list" | "skill_view" => {
                     records.push(self.execute_knowledge_tool(invocation).await);
                 }
+                "hambur_config" => {
+                    records.push(self.execute_hambur_config_tool(invocation).await);
+                }
                 "browser_use" => {
                     records.push(
                         self.execute_browser_tool(session_id, turn_id, invocation)
@@ -3836,7 +3979,8 @@ impl RuntimeEngine {
             );
         }
         let cwd = arguments
-            .get("cwd")
+            .get("workdir")
+            .or_else(|| arguments.get("cwd"))
             .and_then(Value::as_str)
             .unwrap_or("/var/hambur/workspace");
         let cwd = match self
@@ -3860,10 +4004,7 @@ impl RuntimeEngine {
             return self.start_background_process(invocation, command, &cwd.sandbox_path);
         }
 
-        let timeout_ms = arguments
-            .get("timeout_ms")
-            .and_then(Value::as_u64)
-            .unwrap_or(30_000)
+        let timeout_ms = argument_seconds_or_ms(arguments, "timeout", "timeout_ms", 30_000)
             .clamp(1_000, 300_000);
         let raw = match self.execute_sandbox_command(
             &invocation.session_id,
@@ -4058,17 +4199,15 @@ impl RuntimeEngine {
             .and_then(Value::as_str)
             .unwrap_or_default();
         let process_session_id = arguments
-            .get("process_session_id")
+            .get("session_id")
+            .or_else(|| arguments.get("process_session_id"))
             .and_then(Value::as_str)
             .unwrap_or_default();
         match action {
             "list" => self.list_process_sessions(invocation),
             "poll" | "log" => self.snapshot_process_session(invocation, process_session_id, false),
             "wait" => {
-                let timeout_ms = arguments
-                    .get("timeout_ms")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(30_000)
+                let timeout_ms = argument_seconds_or_ms(arguments, "timeout", "timeout_ms", 30_000)
                     .clamp(1_000, 300_000);
                 self.wait_process_session(invocation, process_session_id, timeout_ms)
             }
@@ -4175,6 +4314,330 @@ impl RuntimeEngine {
             started_at_ms,
             ended_at_ms: now_ms(),
         }
+    }
+
+    async fn execute_hambur_config_tool(&self, invocation: ToolInvocation) -> ToolExecutionRecord {
+        let started_at_ms = now_ms();
+        let result = match invocation.arguments_value() {
+            Ok(arguments) => {
+                self.resolve_hambur_config_tool_result(&invocation, &arguments)
+                    .await
+            }
+            Err(error) => ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                error.to_string(),
+            ),
+        };
+        ToolExecutionRecord {
+            invocation,
+            result,
+            started_at_ms,
+            ended_at_ms: now_ms(),
+        }
+    }
+
+    async fn resolve_hambur_config_tool_result(
+        &self,
+        invocation: &ToolInvocation,
+        arguments: &Value,
+    ) -> ToolResult {
+        if let Err(error) = self
+            .tools
+            .schemas()
+            .validate_arguments(&invocation.name, arguments)
+        {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                error.to_string(),
+            );
+        }
+
+        let value = match self.hambur_config_response(arguments).await {
+            Ok(value) => value,
+            Err(error) => json!({
+                "ok": false,
+                "error": "validation_failed",
+                "reason": error.to_string()
+            }),
+        };
+        ToolResult {
+            tool_call_id: invocation.tool_call_id.clone(),
+            tool_name: invocation.name.clone(),
+            is_error: value
+                .get("ok")
+                .and_then(Value::as_bool)
+                .map(|ok| !ok)
+                .unwrap_or(false),
+            summary: value
+                .get("user_message")
+                .or_else(|| value.get("reason"))
+                .or_else(|| value.get("summary"))
+                .and_then(Value::as_str)
+                .unwrap_or("hambur_config completed")
+                .to_string(),
+            content_json: value.to_string(),
+            artifacts_json: "[]".to_string(),
+            trust_level: "trusted".to_string(),
+            truncated: false,
+            offloaded_file_id: String::new(),
+            offloaded_path: String::new(),
+            context_stub: value.to_string(),
+        }
+    }
+
+    async fn hambur_config_response(&self, arguments: &Value) -> HamburResult<Value> {
+        let action = config_string(arguments, "action");
+        match action.as_str() {
+            "list_topics" => Ok(json!({
+                "ok": true,
+                "data": {
+                    "topics": hambur_config_topics()
+                }
+            })),
+            "topic_help" => {
+                let topic = normalize_hambur_config_topic(
+                    &config_string(arguments, "topic")
+                        .if_blank(config_string(arguments, "path")),
+                );
+                if topic.is_empty() {
+                    return Ok(config_error("validation_failed", "topic is required."));
+                }
+                let fields = hambur_config_fields()
+                    .into_iter()
+                    .filter(|field| field.topic == topic)
+                    .map(HamburConfigFieldSpec::to_json)
+                    .collect::<Vec<_>>();
+                if fields.is_empty() {
+                    return Ok(config_error(
+                        "unknown_path",
+                        &format!("No registered topic '{topic}'."),
+                    ));
+                }
+                Ok(json!({
+                    "ok": true,
+                    "data": {
+                        "topic": topic,
+                        "fields": fields
+                    }
+                }))
+            }
+            "get" => {
+                let path = normalize_hambur_config_path(&config_string(arguments, "path"));
+                if path.is_empty() {
+                    return Ok(config_error("validation_failed", "path is required."));
+                }
+                let field = hambur_config_field_for(&path);
+                let Some(field) = field else {
+                    return Ok(config_error(
+                        "unknown_path",
+                        &format!("No registered field at '{path}'."),
+                    ));
+                };
+                if field.access == "write-only" {
+                    return Ok(config_error(
+                        "permission_denied",
+                        &format!(
+                            "permission_denied: {} is write-only and cannot be read back.",
+                            field.path
+                        ),
+                    ));
+                }
+                let snapshot = self.database.settings_snapshot().await?;
+                Ok(read_hambur_config_path(
+                    &snapshot,
+                    &path,
+                    &field,
+                    &config_string(arguments, "filter"),
+                    config_u32(arguments, "page", 1),
+                    config_u32(arguments, "page_size", 20),
+                ))
+            }
+            "set" | "append" | "remove" => {
+                let mut path = config_string(arguments, "path");
+                if action == "append" && !path.ends_with(".append") {
+                    path.push_str(".append");
+                }
+                if action == "remove" && !path.ends_with(".remove") {
+                    path.push_str(".remove");
+                }
+                let result = self
+                    .apply_hambur_config_mutation(
+                        &path,
+                        &config_string(arguments, "value_json"),
+                        &config_string(arguments, "actor").if_blank("agent".to_string()),
+                        &config_string(arguments, "caption"),
+                    )
+                    .await?;
+                Ok(result)
+            }
+            "set_batch" => {
+                let Some(items) = arguments.get("batch").and_then(Value::as_array) else {
+                    return Ok(config_error(
+                        "validation_failed",
+                        "batch is required and cannot be empty.",
+                    ));
+                };
+                if items.is_empty() {
+                    return Ok(config_error(
+                        "validation_failed",
+                        "batch is required and cannot be empty.",
+                    ));
+                }
+                let actor = config_string(arguments, "actor").if_blank("agent".to_string());
+                let caption = config_string(arguments, "caption");
+                let mut results = Vec::new();
+                for item in items {
+                    let item_path = config_string(item, "path");
+                    let item_caption = config_string(item, "caption").if_blank(caption.clone());
+                    let outcome = self
+                        .apply_hambur_config_mutation(
+                            &item_path,
+                            &config_string(item, "value_json"),
+                            &actor,
+                            &item_caption,
+                        )
+                        .await?;
+                    if !outcome.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+                        return Ok(json!({
+                            "ok": false,
+                            "error": outcome.get("error").cloned().unwrap_or_else(|| json!("validation_failed")),
+                            "reason": format!("Batch failed at '{}': {}", item_path, outcome.get("reason").and_then(Value::as_str).unwrap_or("unknown error")),
+                            "results": results
+                        }));
+                    }
+                    results.push(outcome);
+                }
+                Ok(json!({
+                    "ok": true,
+                    "count": results.len(),
+                    "results": results,
+                    "user_message": format!("已更新 {} 项 Hambur 配置。", results.len())
+                }))
+            }
+            "audit_list" => {
+                let snapshot = self.database.settings_snapshot().await?;
+                let scope = normalize_hambur_config_topic(&config_string(arguments, "scope"));
+                let limit = config_u32(arguments, "limit", 50).clamp(1, 200) as usize;
+                let entries = snapshot
+                    .config_audits
+                    .iter()
+                    .filter(|entry| scope.is_empty() || normalize_hambur_config_topic(&entry.target_kind) == scope)
+                    .take(limit)
+                    .map(config_audit_json)
+                    .collect::<Vec<_>>();
+                Ok(json!({
+                    "ok": true,
+                    "count": entries.len(),
+                    "capacity": 40,
+                    "total_used": snapshot.config_audits.len(),
+                    "entries": entries
+                }))
+            }
+            "audit_get" => {
+                let audit_id = config_string(arguments, "audit_id");
+                if audit_id.is_empty() {
+                    return Ok(config_error("validation_failed", "audit_id is required."));
+                }
+                let snapshot = self.database.settings_snapshot().await?;
+                let Some(entry) = snapshot.config_audits.iter().find(|entry| entry.id == audit_id) else {
+                    return Ok(config_error(
+                        "unknown_path",
+                        &format!("No audit entry '{audit_id}'."),
+                    ));
+                };
+                Ok(json!({
+                    "ok": true,
+                    "entry": config_audit_json(entry)
+                }))
+            }
+            "audit_revert" => Ok(config_error(
+                "permission_denied",
+                "audit_revert is not implemented in the Rust settings backend yet.",
+            )),
+            _ => Ok(config_error(
+                "validation_failed",
+                &format!("Unknown hambur_config action: {action}"),
+            )),
+        }
+    }
+
+    async fn apply_hambur_config_mutation(
+        &self,
+        raw_path: &str,
+        value_json: &str,
+        actor: &str,
+        caption: &str,
+    ) -> HamburResult<Value> {
+        let (path, operation) = parse_hambur_config_operation(raw_path);
+        if path.is_empty() {
+            return Ok(config_error("validation_failed", "path is required."));
+        }
+        let Some(field) = hambur_config_field_for(&path) else {
+            return Ok(config_error(
+                "unknown_path",
+                &format!("No registered field at '{raw_path}'."),
+            ));
+        };
+        if field.access == "readonly" {
+            return Ok(config_error(
+                "permission_denied",
+                &format!("Field '{path}' is readonly."),
+            ));
+        }
+        if operation != ConfigOperation::Set {
+            return Ok(config_error(
+                "validation_failed",
+                &format!("'{path}' does not support {}.", operation.as_str()),
+            ));
+        }
+
+        let snapshot = self.database.settings_snapshot().await?;
+        let old = read_hambur_config_raw_value(&snapshot, &path);
+        let setting = match app_setting_for_hambur_config_path(&path, value_json) {
+            Some(setting) => setting,
+            None => {
+                return Ok(config_error(
+                    "unknown_path",
+                    &format!("No writable field at '{path}'."),
+                ));
+            }
+        };
+        let record = self
+            .database
+            .upsert_app_setting(&setting.0, &setting.1)
+            .await?;
+        let new_value = serde_json::to_string(&record.value).unwrap_or_else(|_| record.value);
+        let summary = format!(
+            "{} {}\nPath: {}\nOld: {}\nNew: {}",
+            operation.as_str(),
+            field.display_name,
+            path,
+            old.chars().take(240).collect::<String>(),
+            new_value.chars().take(240).collect::<String>()
+        );
+        let audit = self
+            .database
+            .insert_config_audit(
+                &new_id("config_tool"),
+                if actor.trim().is_empty() { "agent" } else { actor },
+                "HamburConfigTool",
+                field.topic,
+                &path,
+                if caption.trim().is_empty() { &summary } else { caption },
+                false,
+                "",
+            )
+            .await?;
+        Ok(json!({
+            "ok": true,
+            "path": path,
+            "old": old,
+            "new": new_value,
+            "audit_id": audit.id,
+            "user_message": format!("已更新 Hambur 配置：{}", path)
+        }))
     }
 
     async fn resolve_knowledge_tool_result(
@@ -4299,6 +4762,14 @@ impl RuntimeEngine {
             refresh_process_exit(state);
             values.push(process_status_json(state, None));
         }
+        if let Ok(completed_sessions) = self.completed_process_sessions.lock() {
+            values.extend(
+                completed_sessions
+                    .values()
+                    .filter(|state| state.session_id == invocation.session_id)
+                    .map(completed_process_status_json),
+            );
+        }
         let content = json!({ "processes": values });
         ToolResult {
             tool_call_id: invocation.tool_call_id.clone(),
@@ -4332,6 +4803,12 @@ impl RuntimeEngine {
             }
         };
         let Some(state) = sessions.get_mut(process_session_id) else {
+            drop(sessions);
+            if let Some(completed) =
+                self.completed_process_snapshot(invocation, process_session_id)
+            {
+                return completed;
+            }
             return ToolResult::failed(
                 &invocation.tool_call_id,
                 &invocation.name,
@@ -4411,6 +4888,16 @@ impl RuntimeEngine {
                         .map(|buffer| buffer.snapshot())
                         .unwrap_or_default();
                     let content = process_status_json(state, Some(output));
+                    if let Some(completed) =
+                        completed_process_session_from_state(state, process_session_id)
+                    {
+                        if let Ok(mut completed_sessions) =
+                            self.completed_process_sessions.lock()
+                        {
+                            completed_sessions
+                                .insert(process_session_id.to_string(), completed);
+                        }
+                    }
                     sessions.remove(process_session_id);
                     return ToolResult {
                         tool_call_id: invocation.tool_call_id.clone(),
@@ -4436,6 +4923,36 @@ impl RuntimeEngine {
             }
             thread::sleep(StdDuration::from_millis(20));
         }
+    }
+
+    fn completed_process_snapshot(
+        &self,
+        invocation: &ToolInvocation,
+        process_session_id: &str,
+    ) -> Option<ToolResult> {
+        let sessions = self.completed_process_sessions.lock().ok()?;
+        let state = sessions.get(process_session_id)?;
+        if state.session_id != invocation.session_id {
+            return Some(ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                "process session belongs to a different session",
+            ));
+        }
+        let content = completed_process_status_json(state);
+        Some(ToolResult {
+            tool_call_id: invocation.tool_call_id.clone(),
+            tool_name: invocation.name.clone(),
+            is_error: false,
+            content_json: content.to_string(),
+            summary: "process session snapshot".to_string(),
+            artifacts_json: "[]".to_string(),
+            trust_level: "untrusted".to_string(),
+            truncated: false,
+            offloaded_file_id: String::new(),
+            offloaded_path: String::new(),
+            context_stub: content.to_string(),
+        })
     }
 
     fn kill_process_session(
@@ -4564,10 +5081,7 @@ impl RuntimeEngine {
         }
 
         let request_id = new_id("platform_req");
-        let timeout_ms = arguments
-            .get("timeout_ms")
-            .and_then(Value::as_u64)
-            .unwrap_or(60_000)
+        let timeout_ms = argument_seconds_or_ms(arguments, "timeout", "timeout_ms", 60_000)
             .clamp(1_000, 120_000);
         let request = PlatformRequest {
             request_id: request_id.clone(),
@@ -4762,7 +5276,7 @@ impl RuntimeEngine {
     async fn execute_web_tool(&self, invocation: ToolInvocation) -> ToolExecutionRecord {
         let started_at_ms = now_ms();
         let result = match invocation.arguments_value() {
-            Ok(arguments) => self.resolve_web_tool_result(&invocation, &arguments),
+            Ok(arguments) => self.resolve_web_tool_result(&invocation, &arguments).await,
             Err(error) => ToolResult::failed(
                 &invocation.tool_call_id,
                 &invocation.name,
@@ -4777,7 +5291,7 @@ impl RuntimeEngine {
         }
     }
 
-    fn resolve_web_tool_result(
+    async fn resolve_web_tool_result(
         &self,
         invocation: &ToolInvocation,
         arguments: &Value,
@@ -4795,7 +5309,16 @@ impl RuntimeEngine {
         }
 
         let raw = match invocation.name.as_str() {
-            "web_fetch" => run_web_fetch(invocation, arguments),
+            "web_fetch" => {
+                let backend = self
+                    .database
+                    .settings_snapshot()
+                    .await
+                    .ok()
+                    .map(|snapshot| setting_value(&snapshot, "webFetchBackend", "local"))
+                    .unwrap_or_else(|| "local".to_string());
+                run_web_fetch(invocation, arguments, &backend)
+            }
             "web_search" => RawToolOutput {
                 tool_call_id: invocation.tool_call_id.clone(),
                 tool_name: invocation.name.clone(),
@@ -5102,18 +5625,179 @@ impl RuntimeEngine {
             );
         }
 
-        let task = arguments
-            .get("task")
+        let top_role = arguments
+            .get("role")
             .and_then(Value::as_str)
-            .unwrap_or_default()
+            .unwrap_or("leaf")
             .trim();
-        if task.is_empty() {
+        if top_role != "leaf" {
             return ToolResult::failed(
                 &invocation.tool_call_id,
                 &invocation.name,
-                "delegate task must not be empty",
+                "delegate_task currently supports role='leaf' only",
             );
         }
+
+        if let Some(tasks) = arguments.get("tasks").and_then(Value::as_array) {
+            if !tasks.is_empty() {
+                if tasks.len() > 3 {
+                    return ToolResult::failed(
+                        &invocation.tool_call_id,
+                        &invocation.name,
+                        "delegate_task supports at most 3 parallel tasks per call. Split larger batches into multiple calls.",
+                    );
+                }
+                return self
+                    .resolve_delegate_task_batch_result(
+                        session_id,
+                        turn_id,
+                        route,
+                        route_candidates,
+                        invocation,
+                        arguments,
+                        tasks,
+                    )
+                    .await;
+            }
+        }
+
+        let task = delegate_task_prompt(arguments, None, 0, 1);
+        if task.trim().is_empty() {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                "delegate_task requires goal",
+            );
+        }
+        self.resolve_single_delegate_task_result(
+            session_id,
+            turn_id,
+            route,
+            route_candidates,
+            invocation,
+            arguments,
+            task,
+            arguments
+                .get("toolsets")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+        )
+        .await
+    }
+
+    async fn resolve_delegate_task_batch_result(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        route: &ModelRouteSnapshot,
+        route_candidates: &[ModelRouteSnapshot],
+        invocation: &ToolInvocation,
+        arguments: &Value,
+        tasks: &[Value],
+    ) -> ToolResult {
+        let batch_started_at = now_ms();
+        let mut results = Vec::new();
+        for (index, task_value) in tasks.iter().enumerate() {
+            let started_at = now_ms();
+            let role = task_value
+                .get("role")
+                .and_then(Value::as_str)
+                .or_else(|| arguments.get("role").and_then(Value::as_str))
+                .unwrap_or("leaf")
+                .trim();
+            let goal = task_value
+                .get("goal")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim();
+            if goal.is_empty() {
+                results.push(json!({
+                    "index": index,
+                    "status": "error",
+                    "error": "task goal is required",
+                    "duration_ms": now_ms().saturating_sub(started_at)
+                }));
+                continue;
+            }
+            if role != "leaf" {
+                results.push(json!({
+                    "index": index,
+                    "goal": goal,
+                    "status": "error",
+                    "error": "delegate_task currently supports role='leaf' only",
+                    "duration_ms": now_ms().saturating_sub(started_at)
+                }));
+                continue;
+            }
+            let task = delegate_task_prompt(arguments, Some(task_value), index, tasks.len());
+            let task_toolsets = task_value
+                .get("toolsets")
+                .cloned()
+                .or_else(|| arguments.get("toolsets").cloned())
+                .unwrap_or_else(|| json!([]));
+            let result = self
+                .resolve_single_delegate_task_result(
+                    session_id,
+                    turn_id,
+                    route,
+                    route_candidates,
+                    invocation,
+                    arguments,
+                    task,
+                    task_toolsets,
+                )
+                .await;
+            let parsed_result =
+                serde_json::from_str::<Value>(&result.content_json).unwrap_or_else(|_| {
+                    json!({
+                        "summary": result.summary,
+                        "content": result.content_json
+                    })
+                });
+            results.push(json!({
+                "index": index,
+                "goal": goal,
+                "status": if result.is_error { "error" } else { "completed" },
+                "is_error": result.is_error,
+                "duration_ms": now_ms().saturating_sub(started_at),
+                "result": parsed_result
+            }));
+        }
+
+        let content = json!({
+            "mode": "batch",
+            "parallel": true,
+            "max_concurrent_children": 3,
+            "duration_ms": now_ms().saturating_sub(batch_started_at),
+            "tasks": results
+        });
+        ToolResult {
+            tool_call_id: invocation.tool_call_id.clone(),
+            tool_name: invocation.name.clone(),
+            is_error: false,
+            content_json: content.to_string(),
+            summary: "Delegate batch completed".to_string(),
+            artifacts_json: "[]".to_string(),
+            trust_level: "trusted".to_string(),
+            truncated: false,
+            offloaded_file_id: String::new(),
+            offloaded_path: String::new(),
+            context_stub: content.to_string(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_single_delegate_task_result(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        route: &ModelRouteSnapshot,
+        route_candidates: &[ModelRouteSnapshot],
+        invocation: &ToolInvocation,
+        arguments: &Value,
+        task: String,
+        toolsets: Value,
+    ) -> ToolResult {
         let timeout_ms = arguments
             .get("timeout_ms")
             .and_then(Value::as_u64)
@@ -5170,7 +5854,7 @@ impl RuntimeEngine {
                 payload_json: json!({
                     "delegateSessionId": delegate_session_id,
                     "task": task,
-                    "toolsets": arguments.get("toolsets").cloned().unwrap_or_else(|| json!([]))
+                    "toolsets": toolsets
                 })
                 .to_string(),
                 visible: true,
@@ -5193,7 +5877,7 @@ impl RuntimeEngine {
                 session_id,
                 turn_id,
                 &delegate_session_id,
-                task,
+                &task,
                 payload_json,
                 route.clone(),
                 route_candidates.to_vec(),
@@ -5372,7 +6056,7 @@ impl RuntimeEngine {
             payload_json,
             ..RuntimeCommand::default()
         };
-        let tools_json = self.tools.schemas().compile_openai_tools_json();
+        let tools_json = self.tools.schemas().compile_delegate_openai_tools_json();
         let skills_index_prompt = self.build_skills_index_prompt_async().await;
         let memory_system_prompt = self.build_memory_system_prompt_async().await;
         let stream_sources_by_route = route_candidates
@@ -5380,7 +6064,13 @@ impl RuntimeEngine {
             .map(|candidate| {
                 stream_source_for_command(
                     &stream_command,
+                    &turn.id,
                     &child_content,
+                    vec![ModelMessage {
+                        role: "user".to_string(),
+                        content: child_content.clone(),
+                        ..Default::default()
+                    }],
                     candidate,
                     &tools_json,
                     &skills_index_prompt,
@@ -5474,8 +6164,21 @@ impl RuntimeEngine {
         let detail = arguments
             .get("detail")
             .and_then(Value::as_str)
-            .unwrap_or("auto")
+            .unwrap_or_default()
             .trim();
+        let detail = if detail.is_empty() {
+            match self.database.settings_snapshot().await {
+                Ok(snapshot) => match setting_value(&snapshot, "viewImageScaleMode", "resize_fit")
+                    .as_str()
+                {
+                    "original" => "original",
+                    _ => "high",
+                },
+                Err(_) => "high",
+            }
+        } else {
+            detail
+        };
         if path.is_empty() {
             return ToolResult::failed(
                 &invocation.tool_call_id,
@@ -7973,9 +8676,106 @@ fn route_snapshot_from_target(target: &ProviderTarget) -> ModelRouteSnapshot {
     }
 }
 
+fn append_transcript_entry_to_context(
+    messages: &mut Vec<ModelMessage>,
+    open_tool_call_ids: &mut HashSet<String>,
+    entry: hambur_db::ChatTranscriptEntry,
+) -> HamburResult<()> {
+    let message = entry.message;
+    match message.role.as_str() {
+        "user" => {
+            if message.status == "completed" && !message.content_text.trim().is_empty() {
+                messages.push(ModelMessage {
+                    role: "user".to_string(),
+                    content: message.content_text,
+                    ..Default::default()
+                });
+            }
+        }
+        "assistant" => {
+            if !assistant_message_is_context_eligible(&message, &entry.tool_calls) {
+                return Ok(());
+            }
+            let tool_calls_json = if entry.tool_calls.is_empty() {
+                String::new()
+            } else {
+                tool_calls_json_from_records(&entry.tool_calls)?
+            };
+            for call in &entry.tool_calls {
+                open_tool_call_ids.insert(call.id.clone());
+            }
+            messages.push(ModelMessage {
+                role: "assistant".to_string(),
+                content: message.content_text,
+                tool_calls_json,
+                tool_call_id: String::new(),
+            });
+        }
+        "tool" => {
+            if message.status != "completed"
+                || message.tool_call_id.trim().is_empty()
+                || !open_tool_call_ids.remove(&message.tool_call_id)
+            {
+                return Ok(());
+            }
+            messages.push(ModelMessage {
+                role: "tool".to_string(),
+                content: message.content_text,
+                tool_calls_json: String::new(),
+                tool_call_id: message.tool_call_id,
+            });
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn assistant_message_is_context_eligible(
+    message: &MessageRecord,
+    tool_calls: &[hambur_db::ToolCallRecord],
+) -> bool {
+    if matches!(
+        message.status.as_str(),
+        "failed" | "failed_partial" | "cancelled" | "deleted"
+    ) {
+        return false;
+    }
+    !message.content_text.trim().is_empty() || !tool_calls.is_empty()
+}
+
+fn tool_calls_json_from_records(calls: &[hambur_db::ToolCallRecord]) -> HamburResult<String> {
+    let values = calls
+        .iter()
+        .map(|call| {
+            if call.id.trim().is_empty() || call.name.trim().is_empty() {
+                return Err(HamburError::InvalidCommand(
+                    "stored tool call is missing id or name".to_string(),
+                ));
+            }
+            let arguments = if call.arguments_json.trim().is_empty() {
+                "{}"
+            } else {
+                call.arguments_json.trim()
+            };
+            Ok(json!({
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.name,
+                    "arguments": arguments,
+                }
+            }))
+        })
+        .collect::<HamburResult<Vec<_>>>()?;
+    serde_json::to_string(&values)
+        .map_err(|error| HamburError::Internal(format!("serialize stored tool calls: {error}")))
+}
+
 fn stream_source_for_command(
     command: &RuntimeCommand,
+    turn_id: &str,
     content: &str,
+    messages: Vec<ModelMessage>,
     route: &ModelRouteSnapshot,
     tools_json: &str,
     skills_index_prompt: &str,
@@ -7985,8 +8785,8 @@ fn stream_source_for_command(
 ) -> RouteStreamSource {
     let provider_source = provider_stream_source(
         &command.session_id,
-        &command.turn_id,
-        content,
+        turn_id,
+        messages,
         route,
         tools_json,
         skills_index_prompt,
@@ -8046,6 +8846,20 @@ fn stream_source_for_command(
     provider_source
 }
 
+const HAMBUR_FILE_LINK_SYSTEM_PROMPT: &str = r#"Hambur can render local file links sent in Markdown image syntax.
+To send any file to the user, write `![title](hambur://PATH)`, where PATH is the absolute file path, for example `![report.pdf](hambur:///var/hambur/report.pdf)`.
+Images, audio, and video render inline in the conversation. Other file types open a preview page with share and download actions.
+Always use Markdown image syntax with the leading exclamation mark for hambur file links; do not write `[title](hambur://PATH)`.
+Use a clear title as the visible link text. Do not use this for normal web links.
+
+Directory structure and attachments:
+- User uploaded files and images are stored under `/var/hambur/attachments/uploads/`.
+- The directory `/var/hambur/shared/` is a shared folder that can be read and written across chat sessions.
+- When the user uploads attachments/images, their sandbox paths are supplied at the end of the user message inside a `<user_attach_files>path1,path2,...</user_attach_files>` tag. Use these paths with `view_image` or other tools to access the files."#;
+
+const HAMBUR_CONFIG_SYSTEM_PROMPT: &str = r#"Use the `hambur_config` tool to inspect or change Hambur app settings, providers, models, model groups, default routing, startup tasks, tool options, network toggles, sandbox backend, and logging.
+Do not edit Android preference files or use terminal commands for Hambur app configuration. Start with `action=list_topics` or `action=topic_help` if you need to discover available config paths."#;
+
 fn scripted_stream_source(
     request: ModelRequest,
     sse: String,
@@ -8080,7 +8894,7 @@ fn scripted_continuation_sse(value: &Value) -> Vec<String> {
 fn provider_stream_source(
     session_id: &str,
     turn_id: &str,
-    content: &str,
+    messages: Vec<ModelMessage>,
     route: &ModelRouteSnapshot,
     tools_json: &str,
     skills_index_prompt: &str,
@@ -8088,7 +8902,11 @@ fn provider_stream_source(
     deep_thinking_enabled: bool,
     search_enabled: bool,
 ) -> RouteStreamSource {
-    let mut system_blocks = vec!["You are Hambur, a concise assistant.".to_string()];
+    let mut system_blocks = vec![
+        "You are Hambur, a concise assistant.".to_string(),
+        HAMBUR_FILE_LINK_SYSTEM_PROMPT.to_string(),
+        HAMBUR_CONFIG_SYSTEM_PROMPT.to_string(),
+    ];
     if !skills_index_prompt.trim().is_empty() {
         system_blocks.push(skills_index_prompt.to_string());
     }
@@ -8108,11 +8926,7 @@ fn provider_stream_source(
         purpose: "chat".to_string(),
         stream: true,
         system_blocks,
-        messages: vec![ModelMessage {
-            role: "user".to_string(),
-            content: content.to_string(),
-            ..Default::default()
-        }],
+        messages,
         reasoning_mode: if route.supports_reasoning && deep_thinking_enabled {
             ReasoningMode::Enabled
         } else {
@@ -8737,6 +9551,43 @@ fn process_status_json(
     value
 }
 
+fn completed_process_session_from_state(
+    state: &BackgroundProcessSession,
+    process_session_id: &str,
+) -> Option<CompletedProcessSession> {
+    let output = state.output.lock().ok().map(|buffer| buffer.snapshot())?;
+    Some(CompletedProcessSession {
+        session_id: state.session_id.clone(),
+        process_session_id: process_session_id.to_string(),
+        backend: state.backend.clone(),
+        command: state.command.clone(),
+        cwd: state.cwd.clone(),
+        started_at_ms: state.started_at_ms,
+        pid: state.pid,
+        output,
+        exit_code: state.exit_code,
+        finished_at_ms: state.finished_at_ms,
+    })
+}
+
+fn completed_process_status_json(state: &CompletedProcessSession) -> Value {
+    json!({
+        "processSessionId": state.process_session_id,
+        "backend": state.backend,
+        "command": state.command,
+        "cwd": state.cwd,
+        "startedAt": state.started_at_ms,
+        "pid": state.pid,
+        "running": false,
+        "exitCode": state.exit_code,
+        "finishedAt": state.finished_at_ms,
+        "stdout": state.output.stdout,
+        "stderr": state.output.stderr,
+        "stdoutTotalBytes": state.output.stdout_total_bytes,
+        "stderrTotalBytes": state.output.stderr_total_bytes
+    })
+}
+
 fn markdown_block_summary(node: &hambur_markdown::MarkdownBlockNode) -> String {
     node.text
         .trim()
@@ -8747,7 +9598,9 @@ fn markdown_block_summary(node: &hambur_markdown::MarkdownBlockNode) -> String {
         .collect()
 }
 
-fn run_web_fetch(invocation: &ToolInvocation, arguments: &Value) -> RawToolOutput {
+const TINYFISH_API_KEY: &str = "sk-tinyfish-nOfH8Vi9QMLd88_lfB0MKZbWg_O23YN-";
+
+fn run_web_fetch(invocation: &ToolInvocation, arguments: &Value, backend: &str) -> RawToolOutput {
     let urls = arguments
         .get("urls")
         .and_then(Value::as_array)
@@ -8780,21 +9633,49 @@ fn run_web_fetch(invocation: &ToolInvocation, arguments: &Value) -> RawToolOutpu
             status: "InvalidCommand".to_string(),
         };
     }
+    let max_chars = arguments
+        .get("max_chars")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(20_000)
+        .clamp(1_000, 50_000);
     let max_bytes = arguments
         .get("max_bytes")
         .and_then(Value::as_u64)
         .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or(1_000_000)
+        .unwrap_or(max_chars.saturating_mul(4))
         .clamp(1_024, 10_000_000);
     let mut fetched = Vec::new();
     let mut errors = Vec::new();
     for url in urls {
         let fetch_url = url.clone();
-        let result = thread::spawn(move || fetch_http_url(&fetch_url, max_bytes))
-            .join()
-            .unwrap_or_else(|_| Err("web_fetch worker panicked".to_string()));
+        let backend = backend.to_string();
+        let result = thread::spawn(move || {
+            if backend == "tinyfish" {
+                fetch_tinyfish_url(&fetch_url)
+            } else {
+                fetch_http_url(&fetch_url, max_bytes)
+            }
+        })
+        .join()
+        .unwrap_or_else(|_| Err("web_fetch worker panicked".to_string()));
         match result {
-            Ok(value) => fetched.push(value),
+            Ok(mut value) => {
+                let content_key = if value.get("content").is_some() {
+                    "content"
+                } else {
+                    "text"
+                };
+                if let Some(content) = value.get(content_key).and_then(Value::as_str) {
+                    let truncated = content.chars().count() > max_chars;
+                    value["content"] = Value::String(content.chars().take(max_chars).collect());
+                    value["truncated"] = Value::Bool(truncated);
+                    if content_key == "text" {
+                        value.as_object_mut().map(|object| object.remove("text"));
+                    }
+                }
+                fetched.push(value);
+            }
             Err(error) => errors.push(json!({
                 "url": url,
                 "error": error
@@ -8817,6 +9698,51 @@ fn run_web_fetch(invocation: &ToolInvocation, arguments: &Value) -> RawToolOutpu
         command_or_url: arguments.to_string(),
         status: if error_count == 0 { "ok" } else { "partial" }.to_string(),
     }
+}
+
+fn fetch_tinyfish_url(url: &str) -> Result<Value, String> {
+    validate_web_fetch_url(url)?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(StdDuration::from_secs(30))
+        .build()
+        .map_err(|error| format!("build TinyFish client failed: {error}"))?;
+    let body = serde_json::to_string(&json!({ "urls": [url] }))
+        .map_err(|error| format!("serialize TinyFish request failed: {error}"))?;
+    let response = client
+        .post("https://api.fetch.tinyfish.ai")
+        .header("X-API-Key", TINYFISH_API_KEY)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .map_err(|error| format!("TinyFish request failed: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("TinyFish HTTP {}", status.as_u16()));
+    }
+    let body = response
+        .text()
+        .map_err(|error| format!("TinyFish response read failed: {error}"))?;
+    let value: Value = serde_json::from_str(&body)
+        .map_err(|error| format!("TinyFish response JSON parse failed: {error}"))?;
+    let text = value
+        .get("results")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if text.is_empty() {
+        return Err("Empty result from TinyFish".to_string());
+    }
+    Ok(json!({
+        "url": url,
+        "transport": "tinyfish",
+        "content_type": "text/html",
+        "content": text,
+        "truncated": false
+    }))
 }
 
 fn fetch_http_url(url: &str, max_bytes: usize) -> Result<Value, String> {
@@ -8905,9 +9831,8 @@ impl Write for LimitedWrite<'_> {
 
 fn normalize_image_detail(detail: &str) -> &'static str {
     match detail {
-        "low" => "low",
-        "high" => "high",
-        _ => "auto",
+        "original" => "original",
+        _ => "high",
     }
 }
 
@@ -9014,6 +9939,621 @@ fn config_payload_value(payload_json: &str) -> Value {
         .unwrap_or_else(|_| Value::Object(Default::default()))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigOperation {
+    Set,
+    Append,
+    Remove,
+}
+
+impl ConfigOperation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Set => "set",
+            Self::Append => "append",
+            Self::Remove => "remove",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HamburConfigFieldSpec {
+    path: &'static str,
+    display_name: &'static str,
+    description: &'static str,
+    schema: &'static str,
+    access: &'static str,
+    risk: &'static str,
+    revertable: bool,
+    topic: &'static str,
+}
+
+impl HamburConfigFieldSpec {
+    fn to_json(self) -> Value {
+        json!({
+            "path": self.path,
+            "display_name": self.display_name,
+            "description": self.description,
+            "schema": self.schema,
+            "access": self.access,
+            "risk": self.risk,
+            "revertable": self.revertable
+        })
+    }
+}
+
+fn hambur_config_fields() -> Vec<HamburConfigFieldSpec> {
+    const RAW: &[(&str, &str, &str, &str, &str, &str, bool)] = &[
+        ("appearance.theme", "Theme", "App color theme.", "one of: system, light, dark", "readwrite", "normal", true),
+        ("appearance.fontScale", "Font scale", "App text scale.", "one of: small, default, large, extraLarge", "readwrite", "normal", true),
+        ("defaults.primaryModelGroup", "Primary model group", "Default model group used for normal chat.", "string model group id", "readwrite", "sensitive", true),
+        ("defaults.secondaryModelGroup", "Secondary model group", "Default model group used for title generation and memory review.", "string model group id", "readwrite", "sensitive", true),
+        ("defaults.deepThinking", "Deep thinking default", "Default deep-thinking state for new chats.", "bool", "readwrite", "normal", true),
+        ("defaults.startupChatMode", "Startup chat mode", "Which chat to open on app start.", "one of: newChat, lastChat", "readwrite", "normal", true),
+        ("logs.enabled", "Logging enabled", "Hambur logcat logging switch.", "bool", "readwrite", "normal", true),
+        ("permissions.hamburConfig.enabled", "Allow hambur_config", "Native config tool availability. Currently always enabled.", "bool", "readonly", "destructive", false),
+        ("providers", "LLM providers", "Provider summary collection. Supports append/remove.", "json", "readwrite", "sensitive", false),
+        ("providers.<provider_id>.name", "Provider name", "User-visible provider name.", "string max 200 chars", "readwrite", "normal", true),
+        ("providers.<provider_id>.iconName", "Provider icon", "Provider icon key.", "string max 64 chars", "readwrite", "normal", true),
+        ("providers.<provider_id>.apiType", "Provider API type", "Provider API protocol.", "one of: openAI, gemini, anthropic", "readwrite", "sensitive", true),
+        ("providers.<provider_id>.baseUrl", "Provider base URL", "API base URL.", "string max 1000 chars", "readwrite", "sensitive", true),
+        ("providers.<provider_id>.apiKey", "Provider API key", "Provider credential. Write-only and redacted in audit.", "string max 10000 chars", "write-only", "destructive", false),
+        ("providers.<provider_id>.enabled", "Provider enabled", "Whether provider can be used for routing.", "bool", "readwrite", "sensitive", true),
+        ("providers.<provider_id>.selectedModel", "Provider selected model", "Provider default selected model.", "string", "readwrite", "sensitive", true),
+        ("providers.<provider_id>.models", "Provider models", "Model ids available on this provider.", "[string]", "readwrite", "sensitive", true),
+        ("models", "Model entries", "Flattened provider model collection. Supports append/remove.", "json", "readwrite", "sensitive", false),
+        ("models.<entry_id>.displayName", "Model display name", "Custom display name for a provider model.", "string max 200 chars", "readwrite", "normal", true),
+        ("models.<entry_id>.notes", "Model notes", "Custom notes for a provider model.", "string max 1000 chars", "readwrite", "normal", true),
+        ("models.<entry_id>.modelId", "Model id", "API model id.", "string", "readonly", "normal", false),
+        ("models.<entry_id>.providerId", "Provider id", "Owning provider id.", "string", "readonly", "normal", false),
+        ("models.<entry_id>.contextWindow", "Context window", "Catalog context window when known.", "int|null", "readonly", "normal", false),
+        ("models.<entry_id>.maxOutputTokens", "Max output tokens", "Catalog output limit when known.", "int|null", "readonly", "normal", false),
+        ("models.<entry_id>.supportsTools", "Supports tools", "Catalog tool-call support when known.", "bool", "readonly", "normal", false),
+        ("models.<entry_id>.supportsVision", "Supports vision", "Catalog image input support when known.", "bool", "readonly", "normal", false),
+        ("model_groups", "Model groups", "Model routing group collection. Supports append/remove.", "json", "readwrite", "sensitive", false),
+        ("model_groups.<group_id>.name", "Model group name", "User-visible group name.", "string max 200 chars", "readwrite", "normal", true),
+        ("model_groups.<group_id>.routingStrategy", "Routing strategy", "How to choose among group models.", "one of: fallback, loadBalance", "readwrite", "sensitive", true),
+        ("model_groups.<group_id>.fallbackPolicy", "Fallback policy", "When to fall back to another model.", "one of: default, always", "readwrite", "sensitive", true),
+        ("model_groups.<group_id>.models", "Group models", "Group model entries. Supports append/remove.", "[{provider_id, model_id}]", "readwrite", "sensitive", true),
+        ("sandbox.rootfsBackend", "Linux sandbox backend", "Rootfs execution backend.", "one of: chroot, proot", "readwrite", "sensitive", true),
+        ("startup_tasks", "Startup tasks", "App-start shell task collection. Supports append/remove.", "json; append object {name, script, enabled}; remove string task id", "readwrite", "destructive", false),
+        ("startup_tasks.enabled", "Startup tasks enabled", "Master switch for all App-start shell tasks.", "bool", "readwrite", "destructive", true),
+        ("startup_tasks.<task_id>.name", "Startup task name", "User-visible startup task name.", "string max 200 chars", "readwrite", "normal", true),
+        ("startup_tasks.<task_id>.script", "Startup task script", "Shell script content executed from /var/minis/autostart on sandbox initialization.", "string max 200000 chars", "readwrite", "destructive", true),
+        ("startup_tasks.<task_id>.enabled", "Startup task enabled", "Whether this startup task runs when the master switch is enabled.", "bool", "readwrite", "destructive", true),
+        ("startup_tasks.<task_id>.createdAt", "Startup task created at", "Creation timestamp in epoch milliseconds.", "long", "readonly", "normal", false),
+        ("startup_tasks.<task_id>.updatedAt", "Startup task updated at", "Update timestamp in epoch milliseconds.", "long", "readonly", "normal", false),
+        ("startup_tasks.<task_id>.path", "Startup task path", "Sandbox .sh path.", "string", "readonly", "normal", false),
+        ("tools.webFetchBackend", "Web fetch backend", "Backend used by web_fetch.", "one of: local, tinyfish", "readwrite", "normal", true),
+        ("tools.viewImageScaleMode", "View image scale mode", "Image preprocessing mode for view_image.", "one of: resizeFit, original", "readwrite", "normal", true),
+    ];
+    RAW.iter()
+        .map(|(path, display_name, description, schema, access, risk, revertable)| {
+            HamburConfigFieldSpec {
+                path,
+                display_name,
+                description,
+                schema,
+                access,
+                risk,
+                revertable: *revertable,
+                topic: path.split('.').next().unwrap_or(""),
+            }
+        })
+        .collect()
+}
+
+fn hambur_config_topics() -> Vec<&'static str> {
+    let mut topics = hambur_config_fields()
+        .into_iter()
+        .map(|field| field.topic)
+        .collect::<Vec<_>>();
+    topics.sort();
+    topics.dedup();
+    topics
+}
+
+fn hambur_config_field_for(path: &str) -> Option<HamburConfigFieldSpec> {
+    let normalized = normalize_hambur_config_path(path);
+    for field in hambur_config_fields() {
+        if field.path == normalized || config_path_matches(field.path, &normalized) {
+            return Some(field);
+        }
+    }
+    None
+}
+
+fn config_path_matches(pattern: &str, path: &str) -> bool {
+    let pattern_parts = pattern.split('.').collect::<Vec<_>>();
+    let path_parts = path.split('.').collect::<Vec<_>>();
+    pattern_parts.len() == path_parts.len()
+        && pattern_parts
+            .iter()
+            .zip(path_parts.iter())
+            .all(|(pattern, actual)| {
+                (pattern.starts_with('<') && pattern.ends_with('>')) || pattern == actual
+            })
+}
+
+fn normalize_hambur_config_topic(topic: &str) -> String {
+    topic.trim().trim_matches('.').to_ascii_lowercase()
+}
+
+fn normalize_hambur_config_path(path: &str) -> String {
+    path.trim().trim_matches('.').to_string()
+}
+
+fn parse_hambur_config_operation(path: &str) -> (String, ConfigOperation) {
+    let path = normalize_hambur_config_path(path);
+    if let Some(base) = path.strip_suffix(".append") {
+        return (base.to_string(), ConfigOperation::Append);
+    }
+    if let Some(base) = path.strip_suffix(".remove") {
+        return (base.to_string(), ConfigOperation::Remove);
+    }
+    (path, ConfigOperation::Set)
+}
+
+fn config_error(error: &str, reason: &str) -> Value {
+    json!({
+        "ok": false,
+        "error": error,
+        "reason": reason
+    })
+}
+
+fn read_hambur_config_path(
+    snapshot: &SettingsSnapshot,
+    path: &str,
+    field: &HamburConfigFieldSpec,
+    filter: &str,
+    page: u32,
+    page_size: u32,
+) -> Value {
+    match path {
+        "providers" => config_collection_response(
+            field,
+            snapshot.providers.iter().map(provider_config_json).collect(),
+            filter,
+            page,
+            page_size,
+        ),
+        "models" => config_collection_response(
+            field,
+            snapshot.provider_models.iter().map(model_config_json).collect(),
+            filter,
+            page,
+            page_size,
+        ),
+        "model_groups" => config_collection_response(
+            field,
+            model_group_config_json(snapshot),
+            filter,
+            page,
+            page_size,
+        ),
+        "startup_tasks" => config_collection_response(
+            field,
+            startup_task_config_json(snapshot),
+            filter,
+            page,
+            page_size,
+        ),
+        _ => {
+            let value = read_hambur_config_value(snapshot, path);
+            if value.is_null() {
+                config_error("unknown_path", &format!("No registered field at '{path}'."))
+            } else {
+                json!({
+                    "ok": true,
+                    "value": value.to_string(),
+                    "schema": field.schema,
+                    "display_name": field.display_name
+                })
+            }
+        }
+    }
+}
+
+fn config_collection_response(
+    field: &HamburConfigFieldSpec,
+    items: Vec<Value>,
+    filter: &str,
+    page: u32,
+    page_size: u32,
+) -> Value {
+    let terms = filter
+        .split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .filter(|term| !term.is_empty())
+        .collect::<Vec<_>>();
+    let filtered = if terms.is_empty() {
+        items.clone()
+    } else {
+        items
+            .iter()
+            .filter(|item| {
+                let text = item.to_string().to_ascii_lowercase();
+                terms.iter().all(|term| text.contains(term))
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let page_size = page_size.clamp(1, 100) as usize;
+    let page = page.max(1) as usize;
+    let total_pages = filtered.len().div_ceil(page_size).max(1);
+    let from = ((page - 1) * page_size).min(filtered.len());
+    let to = (from + page_size).min(filtered.len());
+    let page_items = filtered[from..to].to_vec();
+    json!({
+        "ok": true,
+        "value": Value::Array(page_items.clone()).to_string(),
+        "schema": field.schema,
+        "display_name": field.display_name,
+        "filtered": !terms.is_empty(),
+        "filter": if terms.is_empty() { Value::Null } else { json!(filter) },
+        "total": items.len(),
+        "matched": filtered.len(),
+        "pagination": {
+            "page": page,
+            "page_size": page_size,
+            "total": filtered.len(),
+            "total_pages": total_pages,
+            "has_next": page < total_pages,
+            "has_prev": page > 1
+        },
+        "agent_hint": if page < total_pages {
+            format!("Showing page {page} of {total_pages}. To get more, use action=get path={} page={} page_size={page_size}.", field.path, page + 1)
+        } else {
+            format!("Showing all {} item(s) on page {page}.", page_items.len())
+        }
+    })
+}
+
+fn read_hambur_config_value(snapshot: &SettingsSnapshot, path: &str) -> Value {
+    match path {
+        "appearance.theme" => json!(setting_value(snapshot, "themeMode", "light")),
+        "appearance.fontScale" => json!(setting_value(snapshot, "fontScale", "default")),
+        "defaults.primaryModelGroup" => json!(default_group(snapshot, "primary")),
+        "defaults.secondaryModelGroup" => json!(default_group(snapshot, "secondary")),
+        "defaults.deepThinking" => json!(setting_bool(snapshot, "defaultDeepThinkingEnabled", false)),
+        "defaults.startupChatMode" => json!(setting_value(snapshot, "startupChatMode", "new_chat")),
+        "logs.enabled" => json!(setting_bool(snapshot, "loggingEnabled", true)),
+        "permissions.hamburConfig.enabled" => json!(true),
+        "sandbox.rootfsBackend" => json!(setting_value(snapshot, "rootfsBackend", "chroot")),
+        "startup_tasks.enabled" => json!(setting_bool(snapshot, "startupTasksEnabled", true)),
+        "tools.webFetchBackend" => json!(setting_value(snapshot, "webFetchBackend", "local")),
+        "tools.viewImageScaleMode" => json!(setting_value(snapshot, "viewImageScaleMode", "resize_fit")),
+        _ => dynamic_hambur_config_value(snapshot, path),
+    }
+}
+
+fn read_hambur_config_raw_value(snapshot: &SettingsSnapshot, path: &str) -> String {
+    read_hambur_config_value(snapshot, path).to_string()
+}
+
+fn dynamic_hambur_config_value(snapshot: &SettingsSnapshot, path: &str) -> Value {
+    let parts = path.split('.').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["providers", provider_id, field] => snapshot
+            .providers
+            .iter()
+            .find(|provider| provider.id == *provider_id)
+            .map(|provider| match *field {
+                "name" => json!(provider.name),
+                "iconName" => json!(provider.icon_name),
+                "apiType" => json!(provider.api_type),
+                "baseUrl" => json!(provider.base_url),
+                "enabled" => json!(provider.enabled),
+                "apiKey" => Value::Null,
+                _ => Value::Null,
+            })
+            .unwrap_or(Value::Null),
+        ["models", entry_id, field] => decode_model_entry_id(entry_id)
+            .and_then(|(provider_id, model_id)| {
+                snapshot.provider_models.iter().find(|model| {
+                    model.provider_id == provider_id && model.model_id == model_id
+                })
+            })
+            .map(|model| match *field {
+                "displayName" => json!(model.display_name),
+                "modelId" => json!(model.model_id),
+                "providerId" => json!(model.provider_id),
+                "contextWindow" => json!(model.context_limit),
+                "maxOutputTokens" => json!(model.output_limit),
+                "supportsTools" => json!(model.supports_tool_call),
+                "supportsVision" => json!(model.supports_image_input),
+                "notes" => json!(""),
+                _ => Value::Null,
+            })
+            .unwrap_or(Value::Null),
+        ["model_groups", group_id, field] => snapshot
+            .model_groups
+            .iter()
+            .find(|group| group.id == *group_id)
+            .map(|group| match *field {
+                "name" => json!(group.name),
+                "routingStrategy" => json!(group.routing_strategy),
+                "fallbackPolicy" => json!(group.fallback_policy),
+                "models" => json!(
+                    snapshot
+                        .model_group_members
+                        .iter()
+                        .filter(|member| member.group_id == *group_id)
+                        .map(group_member_config_json)
+                        .collect::<Vec<_>>()
+                ),
+                _ => Value::Null,
+            })
+            .unwrap_or(Value::Null),
+        _ => Value::Null,
+    }
+}
+
+fn setting_value(snapshot: &SettingsSnapshot, key: &str, fallback: &str) -> String {
+    snapshot
+        .settings
+        .iter()
+        .find(|setting| setting.key == key)
+        .map(|setting| setting.value.clone())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn setting_bool(snapshot: &SettingsSnapshot, key: &str, fallback: bool) -> bool {
+    setting_value(snapshot, key, if fallback { "true" } else { "false" }) == "true"
+}
+
+fn default_group(snapshot: &SettingsSnapshot, key: &str) -> String {
+    snapshot
+        .default_model_groups
+        .iter()
+        .find(|default| default.key == key)
+        .map(|default| default.group_id.clone())
+        .unwrap_or_default()
+}
+
+fn app_setting_for_hambur_config_path(path: &str, value_json: &str) -> Option<(String, String)> {
+    let value = parse_config_literal(value_json);
+    let string_value = config_literal_string(&value);
+    let mapped = match path {
+        "appearance.theme" => ("themeMode", normalize_theme_value(&string_value)),
+        "appearance.fontScale" => ("fontScale", normalize_font_scale_value(&string_value)),
+        "defaults.deepThinking" => ("defaultDeepThinkingEnabled", string_value),
+        "defaults.startupChatMode" => ("startupChatMode", normalize_startup_chat_value(&string_value)),
+        "logs.enabled" => ("loggingEnabled", string_value),
+        "sandbox.rootfsBackend" => ("rootfsBackend", string_value),
+        "startup_tasks.enabled" => ("startupTasksEnabled", string_value),
+        "tools.webFetchBackend" => ("webFetchBackend", normalize_web_fetch_backend_value(&string_value)),
+        "tools.viewImageScaleMode" => ("viewImageScaleMode", normalize_view_image_scale_value(&string_value)),
+        _ => return None,
+    };
+    Some((mapped.0.to_string(), mapped.1))
+}
+
+fn parse_config_literal(raw: &str) -> Value {
+    serde_json::from_str::<Value>(raw.trim()).unwrap_or_else(|_| json!(raw.trim()))
+}
+
+fn config_literal_string(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.trim().to_string(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::Null => String::new(),
+        Value::Array(_) | Value::Object(_) => value.to_string(),
+    }
+}
+
+fn normalize_theme_value(value: &str) -> String {
+    match value {
+        "system" | "light" | "dark" => value.to_string(),
+        "SYSTEM" => "system".to_string(),
+        "LIGHT" => "light".to_string(),
+        "DARK" => "dark".to_string(),
+        _ => value.to_string(),
+    }
+}
+
+fn normalize_font_scale_value(value: &str) -> String {
+    match value {
+        "extraLarge" => "extra_large".to_string(),
+        "SMALL" => "small".to_string(),
+        "DEFAULT" => "default".to_string(),
+        "LARGE" => "large".to_string(),
+        "EXTRA_LARGE" => "extra_large".to_string(),
+        _ => value.to_string(),
+    }
+}
+
+fn normalize_startup_chat_value(value: &str) -> String {
+    match value {
+        "newChat" => "new_chat".to_string(),
+        "lastChat" => "last_chat".to_string(),
+        "NEW_CHAT" => "new_chat".to_string(),
+        "LAST_CHAT" => "last_chat".to_string(),
+        _ => value.to_string(),
+    }
+}
+
+fn normalize_web_fetch_backend_value(value: &str) -> String {
+    match value {
+        "LOCAL" => "local".to_string(),
+        "TINYFISH" => "tinyfish".to_string(),
+        _ => value.to_string(),
+    }
+}
+
+fn normalize_view_image_scale_value(value: &str) -> String {
+    match value {
+        "resizeFit" | "RESIZE_FIT" => "resize_fit".to_string(),
+        "ORIGINAL" => "original".to_string(),
+        _ => value.to_string(),
+    }
+}
+
+fn delegate_task_prompt(
+    arguments: &Value,
+    task_value: Option<&Value>,
+    task_index: usize,
+    task_count: usize,
+) -> String {
+    let source = task_value.unwrap_or(arguments);
+    let explicit_task = source
+        .get("task")
+        .and_then(Value::as_str)
+        .or_else(|| arguments.get("task").and_then(Value::as_str))
+        .unwrap_or_default()
+        .trim();
+    if !explicit_task.is_empty() {
+        return explicit_task.to_string();
+    }
+
+    let goal = source
+        .get("goal")
+        .and_then(Value::as_str)
+        .or_else(|| arguments.get("goal").and_then(Value::as_str))
+        .unwrap_or_default()
+        .trim();
+    let context = source
+        .get("context")
+        .and_then(Value::as_str)
+        .or_else(|| arguments.get("context").and_then(Value::as_str))
+        .unwrap_or_default()
+        .trim();
+    if goal.is_empty() {
+        return String::new();
+    }
+
+    let mut lines = Vec::new();
+    if task_count > 1 {
+        lines.push(format!("Batch task {} of {}", task_index + 1, task_count));
+        lines.push(String::new());
+    }
+    lines.push("Goal:".to_string());
+    lines.push(goal.to_string());
+    if !context.is_empty() {
+        lines.push(String::new());
+        lines.push("Context:".to_string());
+        lines.push(context.to_string());
+    }
+    lines.join("\n")
+}
+
+fn provider_config_json(provider: &hambur_db::PublicProviderRecord) -> Value {
+    json!({
+        "id": provider.id,
+        "name": provider.name,
+        "label": provider.name,
+        "api_type": provider.api_type,
+        "providerType": provider.api_type,
+        "base_url": provider.base_url,
+        "enabled": provider.enabled,
+        "isEnabled": provider.enabled,
+        "selected_model": "",
+        "model_count": 0
+    })
+}
+
+fn model_config_json(model: &hambur_db::ProviderModelRecord) -> Value {
+    json!({
+        "entry_id": encode_model_entry_id(&model.provider_id, &model.model_id),
+        "display_name": model.display_name,
+        "model_id": model.model_id,
+        "provider_id": model.provider_id,
+        "provider_label": "",
+        "provider_type": "",
+        "context_window": model.context_limit,
+        "max_output_tokens": model.output_limit,
+        "supports_tools": model.supports_tool_call,
+        "supports_vision": model.supports_image_input,
+        "input_modalities": if model.supports_image_input { json!(["text", "image"]) } else { json!(["text"]) },
+        "output_modalities": json!(["text"])
+    })
+}
+
+fn model_group_config_json(snapshot: &SettingsSnapshot) -> Vec<Value> {
+    snapshot
+        .model_groups
+        .iter()
+        .map(|group| {
+            json!({
+                "id": group.id,
+                "name": group.name,
+                "routing_strategy": group.routing_strategy,
+                "fallback_policy": group.fallback_policy,
+                "models": snapshot
+                    .model_group_members
+                    .iter()
+                    .filter(|member| member.group_id == group.id)
+                    .map(group_member_config_json)
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect()
+}
+
+fn group_member_config_json(member: &hambur_db::ModelGroupMemberRecord) -> Value {
+    json!({
+        "id": member.id,
+        "provider_id": member.provider_id,
+        "provider_label": member.provider_name,
+        "model_id": member.model_id,
+        "missing": false
+    })
+}
+
+fn startup_task_config_json(snapshot: &SettingsSnapshot) -> Vec<Value> {
+    snapshot
+        .settings
+        .iter()
+        .filter(|setting| setting.key.starts_with("startup_task:"))
+        .map(|setting| {
+            json!({
+                "id": setting.key.trim_start_matches("startup_task:"),
+                "name": setting.key.trim_start_matches("startup_task:"),
+                "enabled": true,
+                "created_at": setting.updated_at_ms,
+                "updated_at": setting.updated_at_ms,
+                "path": format!("/var/minis/autostart/{}.sh", setting.key.trim_start_matches("startup_task:")),
+                "script_preview": setting.value.lines().take(4).collect::<Vec<_>>().join("\n").chars().take(400).collect::<String>(),
+                "script_size": setting.value.len()
+            })
+        })
+        .collect()
+}
+
+fn config_audit_json(entry: &hambur_db::ConfigAuditRecord) -> Value {
+    json!({
+        "id": entry.id,
+        "at": entry.created_at_ms,
+        "actor": entry.actor,
+        "action": entry.action,
+        "scope": normalize_hambur_config_topic(&entry.target_kind),
+        "key": entry.target_id,
+        "old": "",
+        "new": entry.redacted_summary,
+        "status": "applied",
+        "confirmed_at": entry.created_at_ms,
+        "caption": entry.redacted_summary
+    })
+}
+
+fn encode_model_entry_id(provider_id: &str, model_id: &str) -> String {
+    format!(
+        "{}__{}",
+        provider_id.replace('_', "_u").replace('/', "_s"),
+        model_id.replace('_', "_u").replace('/', "_s")
+    )
+}
+
+fn decode_model_entry_id(entry_id: &str) -> Option<(String, String)> {
+    let (provider_id, model_id) = entry_id.split_once("__")?;
+    Some((
+        provider_id.replace("_s", "/").replace("_u", "_"),
+        model_id.replace("_s", "/").replace("_u", "_"),
+    ))
+}
+
 fn config_payload_string(payload_json: &str, key: &str) -> String {
     let value = config_payload_value(payload_json);
     config_string(&value, key)
@@ -9065,6 +10605,16 @@ fn config_u32(value: &Value, key: &str, fallback: u32) -> u32 {
         .and_then(Value::as_u64)
         .and_then(|value| u32::try_from(value).ok())
         .unwrap_or(fallback)
+}
+
+fn argument_seconds_or_ms(value: &Value, seconds_key: &str, millis_key: &str, fallback_ms: u64) -> u64 {
+    if let Some(seconds) = value.get(seconds_key).and_then(Value::as_u64) {
+        return seconds.saturating_mul(1_000);
+    }
+    value
+        .get(millis_key)
+        .and_then(Value::as_u64)
+        .unwrap_or(fallback_ms)
 }
 
 fn config_object_string(value: &Value, key: &str) -> String {
@@ -9292,7 +10842,7 @@ mod tests {
         collections::HashSet,
         fs,
         io::{Read, Write},
-        net::TcpListener,
+        net::{TcpListener, TcpStream},
         path::PathBuf,
         process::{Command, Stdio},
         sync::{Arc, Mutex},
@@ -9302,6 +10852,7 @@ mod tests {
 
     use base64::Engine;
     use hambur_core::{new_id, now_ms};
+    use hambur_llm::ModelMessage;
     use hambur_sandbox::SandboxAccess;
     use hambur_tools::ToolInvocation;
     use serde_json::Value;
@@ -9403,7 +10954,19 @@ mod tests {
             ..Default::default()
         };
         let source = provider_stream_source(
-            "session", "turn", "hello", &route, "[]", &prompt, "", false, false,
+            "session",
+            "turn",
+            vec![ModelMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+                ..Default::default()
+            }],
+            &route,
+            "[]",
+            &prompt,
+            "",
+            false,
+            false,
         );
         let RouteStreamSource::Provider(request) = source else {
             panic!("expected provider source");
@@ -9450,7 +11013,11 @@ mod tests {
         let source = provider_stream_source(
             "session",
             "turn",
-            "hello",
+            vec![ModelMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+                ..Default::default()
+            }],
             &route,
             "[]",
             "",
@@ -9461,10 +11028,13 @@ mod tests {
         let RouteStreamSource::Provider(request) = source else {
             panic!("expected provider source");
         };
-        assert!(request
-            .system_blocks
-            .iter()
-            .any(|block| block.contains("MEMORY (your personal notes)") && block.contains("USER PROFILE")));
+        assert!(
+            request
+                .system_blocks
+                .iter()
+                .any(|block| block.contains("MEMORY (your personal notes)")
+                    && block.contains("USER PROFILE"))
+        );
 
         let _ = fs::remove_dir_all(app_files_dir);
     }
@@ -9685,19 +11255,7 @@ mod tests {
         let captured = captured_request.clone();
         let server = thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
-                let mut request = Vec::new();
-                let mut buffer = [0u8; 1024];
-                loop {
-                    let read = stream.read(&mut buffer).expect("read provider request");
-                    if read == 0 {
-                        break;
-                    }
-                    request.extend_from_slice(&buffer[..read]);
-                    if String::from_utf8_lossy(&request).contains("\r\n\r\n") {
-                        break;
-                    }
-                }
-                let text = String::from_utf8_lossy(&request).to_string();
+                let text = read_http_request(&mut stream);
                 *captured.lock().expect("capture request") = text;
                 let body = concat!(
                     "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"real reasoning\"}}]}\n\n",
@@ -9750,6 +11308,101 @@ mod tests {
 
         let assistant_text = assistant_markdown_text(&runtime, &session_id);
         assert!(assistant_text.contains("real provider answer"));
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
+    fn local_http_provider_request_includes_visible_conversation_history() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider server");
+        let addr = listener.local_addr().expect("local addr");
+        let captured_request = Arc::new(Mutex::new(String::new()));
+        let captured = captured_request.clone();
+        let server = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let text = read_http_request(&mut stream);
+                *captured.lock().expect("capture request") = text;
+                let body = concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"second answer\"}}]}\n\n",
+                    "data: [DONE]\n\n"
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:X}\r\n{}\r\n0\r\n\r\n",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write provider response");
+            }
+        });
+
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+        let session_id = create_test_session(&runtime);
+        configure_test_provider(&runtime, "gpt-scripted");
+
+        let first = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_history_first".to_string(),
+            idempotency_key: "message:history:first".to_string(),
+            kind: "SendMessage".to_string(),
+            session_id: session_id.clone(),
+            content: "first user fact".to_string(),
+            payload_json: r#"{"content":"first assistant memory"}"#.to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(first.accepted, "first rejected: {}", first.message);
+        wait_for_session_event(&runtime, "TurnFinished", &session_id);
+
+        configure_http_test_provider(
+            &runtime,
+            "provider_test",
+            "gpt-real-history",
+            &format!("http://{addr}/v1"),
+        );
+        let second = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_history_second".to_string(),
+            idempotency_key: "message:history:second".to_string(),
+            kind: "SendMessage".to_string(),
+            session_id: session_id.clone(),
+            content: "second user asks".to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(second.accepted, "second rejected: {}", second.message);
+        wait_for_session_event(&runtime, "TurnFinished", &session_id);
+        server.join().expect("provider server");
+
+        let request = captured_request.lock().expect("captured request").clone();
+        let body = request.split("\r\n\r\n").nth(1).expect("request body");
+        let value: Value = serde_json::from_str(body).expect("request JSON");
+        let messages = value
+            .get("messages")
+            .and_then(Value::as_array)
+            .expect("messages array");
+        let projected = messages
+            .iter()
+            .filter(|message| message.get("role").and_then(Value::as_str) != Some("system"))
+            .map(|message| {
+                (
+                    message.get("role").and_then(Value::as_str).unwrap_or(""),
+                    message.get("content").and_then(Value::as_str).unwrap_or(""),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            projected,
+            vec![
+                ("user", "first user fact"),
+                ("assistant", "first assistant memory"),
+                ("user", "second user asks"),
+            ]
+        );
 
         let _ = fs::remove_dir_all(app_files_dir);
     }
@@ -10394,20 +12047,14 @@ mod tests {
         assert!(first.accepted, "seed rejected: {}", first.message);
         wait_for_session_event(&runtime, "TurnFinished", &session_id);
 
-        let timeline = runtime.get_timeline_page(session_id.clone(), 0, 20);
-        let assistant = timeline
-            .items
-            .iter()
-            .find(|item| item.kind == "AssistantMessage")
-            .expect("assistant timeline item")
-            .clone();
+        let assistant_message_id = latest_assistant_message_id(&runtime, &session_id);
 
         let regenerate = runtime.dispatch(RuntimeCommand {
             command_id: "cmd_regenerate".to_string(),
-            idempotency_key: format!("{}:regenerate:test", assistant.payload_ref),
+            idempotency_key: format!("{assistant_message_id}:regenerate:test"),
             kind: "RegenerateMessage".to_string(),
             session_id: session_id.clone(),
-            source_message_id: assistant.payload_ref,
+            source_message_id: assistant_message_id,
             payload_json: r#"{"content":"regenerated answer","reasoning":"regen reasoning"}"#
                 .to_string(),
             ..RuntimeCommand::default()
@@ -10419,32 +12066,120 @@ mod tests {
         );
         wait_for_session_event(&runtime, "TurnFinished", &session_id);
 
-        let timeline = runtime.get_timeline_page(session_id, 0, 20);
+        let timeline = runtime.get_timeline_page(session_id.clone(), 0, 20);
         let assistant_count = timeline
             .items
             .iter()
-            .filter(|item| item.kind == "AssistantMessage")
+            .filter(|item| item.content_type == "assistant_markdown_block")
             .count();
         let user_count = timeline
             .items
             .iter()
             .filter(|item| item.kind == "UserMessage")
             .count();
-        assert_eq!(assistant_count, 2);
-        assert_eq!(user_count, 2);
+        assert_eq!(assistant_count, 1);
+        assert_eq!(user_count, 1);
 
-        let latest_assistant = timeline
-            .items
-            .iter()
-            .rev()
-            .find(|item| item.kind == "AssistantMessage")
-            .expect("latest assistant");
         let message = runtime
-            .get_message_snapshot(latest_assistant.payload_ref.clone())
+            .get_message_snapshot(latest_assistant_message_id(&runtime, &session_id))
             .message
             .expect("latest assistant message");
         assert_eq!(message.content_text, "regenerated answer");
         assert_eq!(message.reasoning_content, "regen reasoning");
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
+    fn regenerated_branch_history_excludes_hidden_old_answer() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider server");
+        let addr = listener.local_addr().expect("local addr");
+        let captured_request = Arc::new(Mutex::new(String::new()));
+        let captured = captured_request.clone();
+        let server = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let text = read_http_request(&mut stream);
+                *captured.lock().expect("capture request") = text;
+                let body = concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"after branch\"}}]}\n\n",
+                    "data: [DONE]\n\n"
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:X}\r\n{}\r\n0\r\n\r\n",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write provider response");
+            }
+        });
+
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+        let session_id = create_test_session(&runtime);
+        configure_test_provider(&runtime, "gpt-scripted");
+
+        let first = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_branch_seed".to_string(),
+            idempotency_key: "message:branch:seed".to_string(),
+            kind: "SendMessage".to_string(),
+            session_id: session_id.clone(),
+            content: "branch prompt".to_string(),
+            payload_json: r#"{"content":"old hidden answer"}"#.to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(first.accepted, "first rejected: {}", first.message);
+        wait_for_session_event(&runtime, "TurnFinished", &session_id);
+
+        let old_assistant_message_id = latest_assistant_message_id(&runtime, &session_id);
+        let regenerate = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_branch_regenerate".to_string(),
+            idempotency_key: "message:branch:regenerate".to_string(),
+            kind: "RegenerateMessage".to_string(),
+            session_id: session_id.clone(),
+            source_message_id: old_assistant_message_id,
+            payload_json: r#"{"content":"new visible answer"}"#.to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(
+            regenerate.accepted,
+            "regenerate rejected: {}",
+            regenerate.message
+        );
+        wait_for_session_event(&runtime, "TurnFinished", &session_id);
+
+        configure_http_test_provider(
+            &runtime,
+            "provider_test",
+            "gpt-branch-real",
+            &format!("http://{addr}/v1"),
+        );
+        let followup = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_branch_followup".to_string(),
+            idempotency_key: "message:branch:followup".to_string(),
+            kind: "SendMessage".to_string(),
+            session_id: session_id.clone(),
+            content: "follow current branch".to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(followup.accepted, "followup rejected: {}", followup.message);
+        wait_for_session_event(&runtime, "TurnFinished", &session_id);
+        server.join().expect("provider server");
+
+        let request = captured_request.lock().expect("captured request").clone();
+        let body = request.split("\r\n\r\n").nth(1).expect("request body");
+        let value: Value = serde_json::from_str(body).expect("request JSON");
+        let message_text = value.get("messages").expect("messages").to_string();
+        assert!(message_text.contains("new visible answer"));
+        assert!(message_text.contains("follow current branch"));
+        assert!(!message_text.contains("old hidden answer"));
 
         let _ = fs::remove_dir_all(app_files_dir);
     }
@@ -10660,6 +12395,137 @@ mod tests {
             .find(|payload| payload.id == assistant_block.payload_ref)
             .expect("assistant markdown payload");
         assert!(payload.raw.contains("hello tools"));
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
+    fn next_provider_request_preserves_prior_tool_protocol_messages() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider server");
+        let addr = listener.local_addr().expect("local addr");
+        let captured_request = Arc::new(Mutex::new(String::new()));
+        let captured = captured_request.clone();
+        let server = thread::spawn(move || {
+            listener
+                .set_nonblocking(true)
+                .expect("set provider listener nonblocking");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let text = read_http_request(&mut stream);
+                        *captured.lock().expect("capture request") = text;
+                        let body = concat!(
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"tool history accepted\"}}]}\n\n",
+                            "data: [DONE]\n\n"
+                        );
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:X}\r\n{}\r\n0\r\n\r\n",
+                            body.len(),
+                            body
+                        );
+                        stream
+                            .write_all(response.as_bytes())
+                            .expect("write provider response");
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            panic!("provider server timed out waiting for request");
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("provider accept failed: {error}"),
+                }
+            }
+        });
+
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+        let session_id = create_test_session(&runtime);
+        configure_test_provider(&runtime, "gpt-tools");
+
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
+            "{\"index\":0,\"id\":\"call_echo_history\",\"function\":{\"name\":\"echo\",\"arguments\":\"{\\\"text\\\":\\\"history tool result\\\"}\"}}",
+            "]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let continuation_sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"tool turn done\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let first = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_tool_history_first".to_string(),
+            idempotency_key: "message:tool-history:first".to_string(),
+            kind: "SendMessage".to_string(),
+            session_id: session_id.clone(),
+            content: "call echo".to_string(),
+            payload_json: serde_json::json!({
+                "sse": sse,
+                "sse_sequence": [continuation_sse]
+            })
+            .to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(first.accepted, "first rejected: {}", first.message);
+        wait_for_session_finished(&runtime, &session_id, "tool history first");
+
+        configure_http_test_provider(
+            &runtime,
+            "provider_test",
+            "gpt-tool-history-real",
+            &format!("http://{addr}/v1"),
+        );
+        let second = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_tool_history_second".to_string(),
+            idempotency_key: "message:tool-history:second".to_string(),
+            kind: "SendMessage".to_string(),
+            session_id: session_id.clone(),
+            content: "continue after tool".to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(second.accepted, "second rejected: {}", second.message);
+        wait_for_session_finished(&runtime, &session_id, "tool history second");
+        server.join().expect("provider server");
+
+        let request = captured_request.lock().expect("captured request").clone();
+        let body = request.split("\r\n\r\n").nth(1).expect("request body");
+        let value: Value = serde_json::from_str(body).expect("request JSON");
+        let messages = value
+            .get("messages")
+            .and_then(Value::as_array)
+            .expect("messages array");
+        let assistant_with_tool_calls = messages.iter().find(|message| {
+            message.get("role").and_then(Value::as_str) == Some("assistant")
+                && message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .is_some()
+        });
+        assert!(
+            assistant_with_tool_calls.is_some(),
+            "missing assistant tool_calls"
+        );
+        assert!(
+            messages.iter().any(|message| {
+                message.get("role").and_then(Value::as_str) == Some("tool")
+                    && message.get("tool_call_id").and_then(Value::as_str)
+                        == Some("call_echo_history")
+                    && message
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .contains("history tool result")
+            }),
+            "missing tool result message"
+        );
 
         let _ = fs::remove_dir_all(app_files_dir);
     }
@@ -11702,13 +13568,21 @@ mod tests {
             "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_delegate_task\",\"function\":{{\"name\":\"delegate_task\",\"arguments\":\"{escaped_delegate_args}\"}}}}]}},\"finish_reason\":\"tool_calls\"}}]}}\n\n\
              data: [DONE]\n\n"
         );
+        let continuation_sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Delegate result: child done verified changedFiles\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
         let send = runtime.dispatch(RuntimeCommand {
             command_id: "cmd_m7_delegate_task".to_string(),
             idempotency_key: "message:m7:delegate-task".to_string(),
             kind: "SendMessage".to_string(),
             session_id: session_id.clone(),
             content: "delegate work".to_string(),
-            payload_json: serde_json::json!({"sse": parent_sse}).to_string(),
+            payload_json: serde_json::json!({
+                "sse": parent_sse,
+                "sse_sequence": [continuation_sse]
+            })
+            .to_string(),
             ..RuntimeCommand::default()
         });
         assert!(send.accepted, "send rejected: {}", send.message);
@@ -11721,19 +13595,10 @@ mod tests {
                 .iter()
                 .any(|item| item.kind == "ToolTrace" && item.trace_title == "Delegate session")
         );
-        let continuation = timeline
-            .items
-            .iter()
-            .rev()
-            .find(|item| item.kind == "AssistantMessage")
-            .expect("assistant continuation");
-        let message = runtime
-            .get_message_snapshot(continuation.payload_ref.clone())
-            .message
-            .expect("message");
-        assert!(message.content_text.contains("child done"));
-        assert!(message.content_text.contains("verified"));
-        assert!(message.content_text.contains("changedFiles"));
+        let message_text = assistant_markdown_text(&runtime, &session_id);
+        assert!(message_text.contains("child done"));
+        assert!(message_text.contains("verified"));
+        assert!(message_text.contains("changedFiles"));
 
         let sessions = runtime.get_session_list_snapshot(10, 0);
         assert_eq!(sessions.selected_session_id, session_id);
@@ -11905,7 +13770,7 @@ mod tests {
     }
 
     #[test]
-    fn milestone7_process_wait_returns_background_output_and_removes_finished_session() {
+    fn milestone7_process_wait_keeps_finished_log_snapshot() {
         let app_files_dir = temp_app_dir();
         fs::create_dir_all(&app_files_dir).expect("create temp app dir");
 
@@ -11962,7 +13827,7 @@ mod tests {
             "process".to_string(),
             serde_json::json!({
                 "action": "wait",
-                "process_session_id": process_session_id,
+                "process_session_id": process_session_id.clone(),
                 "timeout_ms": 30_000
             })
             .to_string(),
@@ -11980,6 +13845,25 @@ mod tests {
                 .expect("process registry")
                 .is_empty()
         );
+        let log_invocation = ToolInvocation::from_model_call(
+            0,
+            "call_process_log".to_string(),
+            "turn_process".to_string(),
+            session_id.clone(),
+            "process".to_string(),
+            serde_json::json!({
+                "action": "log",
+                "process_session_id": process_session_id
+            })
+            .to_string(),
+        )
+        .expect("process log invocation");
+        let log_result = runtime.resolve_process_tool_result(
+            &log_invocation,
+            &log_invocation.arguments_value().unwrap(),
+        );
+        assert!(!log_result.is_error, "process log failed: {}", log_result.summary);
+        assert!(log_result.context_stub.contains("process-ready"));
 
         let _ = fs::remove_dir_all(app_files_dir);
     }
@@ -12182,12 +14066,63 @@ mod tests {
         std::env::temp_dir().join(new_id("hambur_runtime_test"))
     }
 
+    fn read_http_request(stream: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 1024];
+        loop {
+            let read = stream.read(&mut buffer).expect("read provider request");
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if let Some(header_end) = find_header_end(&request) {
+                let headers = String::from_utf8_lossy(&request[..header_end]).to_string();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        if name.eq_ignore_ascii_case("content-length") {
+                            value.trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default();
+                let body_start = header_end + 4;
+                if request.len().saturating_sub(body_start) >= content_length {
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&request).to_string()
+    }
+
+    fn find_header_end(bytes: &[u8]) -> Option<usize> {
+        bytes.windows(4).position(|window| window == b"\r\n\r\n")
+    }
+
     fn create_test_session(runtime: &RuntimeEngine) -> String {
         let ack = runtime.create_session("Chat".to_string());
         assert!(ack.accepted, "create rejected: {}", ack.message);
         let event = runtime.next_event().expect("session created");
         assert_eq!(event.kind.as_str(), "SessionCreated");
         event.snapshot.selected_session_id
+    }
+
+    fn latest_assistant_message_id(runtime: &RuntimeEngine, session_id: &str) -> String {
+        let page = runtime.get_timeline_page(session_id.to_string(), 0, 100);
+        let block = page
+            .items
+            .iter()
+            .rev()
+            .find(|item| item.content_type == "assistant_markdown_block")
+            .expect("assistant markdown block");
+        page.markdown_block_payloads
+            .iter()
+            .find(|payload| payload.id == block.payload_ref)
+            .expect("assistant markdown payload")
+            .message_id
+            .clone()
     }
 
     fn configure_test_provider(runtime: &RuntimeEngine, model_id: &str) {

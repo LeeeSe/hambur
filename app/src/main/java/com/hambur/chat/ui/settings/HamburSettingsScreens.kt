@@ -164,16 +164,20 @@ fun HamburSettingsHomeScreen(
                 }
             }
             item {
+                HamburSection(title = "App") {
+                    SettingsNavigationRow(
+                        icon = Lucide.Settings,
+                        title = "Appearance",
+                        summary = "Theme, font scale, and startup chat behavior",
+                        onClick = onOpenAppearance,
+                    )
+                }
+            }
+            item {
                 HamburSection(
                     title = "Waiting for backend",
                     subtitle = "Kept visible so old UI feature coverage is explicit",
                 ) {
-                    SettingsNavigationRow(
-                        icon = Lucide.Wrench,
-                        title = "Appearance",
-                        summary = "Theme, font scale, and predictive back settings are not in the new backend yet",
-                        onClick = onOpenAppearance,
-                    )
                     SettingsNavigationRow(
                         icon = Lucide.Terminal,
                         title = "Logs",
@@ -1010,12 +1014,23 @@ fun ToolsListScreen(
         item {
             HamburSection(title = "Built-in tools") {
                 listOf(
-                    "web_fetch" to "Fetch and extract web page content",
-                    "view_image" to "Inspect image attachments",
-                    "browser_use" to "Shared browser actions",
-                    "terminal" to "Sandbox terminal tools",
-                    "file" to "Sandbox file tools",
-                    "knowledge" to "Memory and knowledge tools",
+                    "get_current_time" to "Get the current date and time from the user's device.",
+                    "skills_list" to "List available skills with minimal metadata.",
+                    "skill_view" to "Load a skill's main content or linked file.",
+                    "terminal" to "Run a shell command inside the Linux sandbox.",
+                    "process" to "Manage background processes started by terminal.",
+                    "read_file" to "Read a text file with line numbers and pagination.",
+                    "write_file" to "Write content to a sandbox file.",
+                    "patch" to "Targeted find-and-replace edits in files.",
+                    "search_files" to "Search file contents or find files by name.",
+                    "hambur_config" to "Read and update Hambur app configuration.",
+                    "web_search" to "Search the web for information.",
+                    "web_fetch" to "Extract readable text from web page URLs.",
+                    "browser_use" to "Control the shared Android WebView browser.",
+                    "session_search" to "Search past chat sessions stored locally.",
+                    "memory" to "Save durable information to persistent memory.",
+                    "delegate_task" to "Spawn isolated leaf subagents.",
+                    "view_image" to "View a local image file from the sandbox.",
                 ).forEach { (name, description) ->
                     ToolListRow(name, description, onOpenTool)
                 }
@@ -1037,9 +1052,9 @@ fun ToolDetailScreen(
     var toolSettings by rememberSaveable(toolName) {
         mutableStateOf(state.appSettings.firstOrNull { it.key == "tool_settings" }?.value ?: """{"enabled":true}""")
     }
-    var browserSettings by rememberSaveable(toolName) {
-        mutableStateOf(state.appSettings.firstOrNull { it.key == "browser_tool_settings" }?.value ?: """{"enabled":true,"acceptCookies":true,"maxFetchBytes":1000000}""")
-    }
+    val webFetchBackend = state.settingValue("webFetchBackend", "local")
+    val viewImageScaleMode = state.settingValue("viewImageScaleMode", "resize_fit")
+    val browserSettings = state.browserToolSettings()
     SettingsPage(title = "Tool Detail", subtitle = toolName, onBack = onBack) {
         item {
             HamburSection(title = "Description") {
@@ -1047,19 +1062,86 @@ fun ToolDetailScreen(
                 SummaryLine(label = "Backend", value = if (toolName == "browser_use") "AndroidPlatformAdapter browser actions" else "Rust tool registry")
             }
         }
-        item {
-            HamburSection(title = "Tool settings") {
-                OutlinedTextField(value = toolSettings, onValueChange = { toolSettings = it }, modifier = Modifier.fillMaxWidth(), minLines = 5, label = { Text("tool_settings") })
-                Button(onClick = { store.saveAppSetting("tool_settings", toolSettings, false) }) {
-                    Text("Save tool settings")
+        if (toolName == "web_fetch") {
+            item {
+                HamburSection(title = "Configuration") {
+                    ChoiceRow(
+                        title = "Backend",
+                        current = webFetchBackend,
+                        options = listOf("local" to "Local", "tinyfish" to "TinyFish"),
+                        onSelect = { store.saveRawAppSetting("webFetchBackend", it) },
+                    )
+                }
+            }
+        }
+        if (toolName == "view_image") {
+            item {
+                HamburSection(title = "Configuration") {
+                    ChoiceRow(
+                        title = "Image size handling",
+                        current = viewImageScaleMode,
+                        options = listOf("resize_fit" to "Resize fit", "original" to "Original"),
+                        onSelect = { store.saveRawAppSetting("viewImageScaleMode", it) },
+                    )
                 }
             }
         }
         if (toolName == "browser_use") {
             item {
                 HamburSection(title = "Browser settings") {
-                    OutlinedTextField(value = browserSettings, onValueChange = { browserSettings = it }, modifier = Modifier.fillMaxWidth(), minLines = 5, label = { Text("browser_tool_settings") })
-                    SecondaryActionButton(text = "Save browser settings", onClick = { store.saveBrowserToolSettings(browserSettings) })
+                    SettingsSwitchRow(
+                        title = "Accept cookies",
+                        summary = if (browserSettings.acceptCookies) "WebView stores and sends site cookies" else "New browser tabs reject cookies",
+                        checked = browserSettings.acceptCookies,
+                        onCheckedChange = {
+                            store.saveBrowserToolSettings(browserSettings.copy(acceptCookies = it, acceptThirdPartyCookies = it && browserSettings.acceptThirdPartyCookies).toJson())
+                        },
+                    )
+                    SettingsSwitchRow(
+                        title = "Third-party cookies",
+                        summary = if (browserSettings.acceptThirdPartyCookies) "Useful for login redirects and embedded auth" else "Only first-party cookies are allowed",
+                        checked = browserSettings.acceptCookies && browserSettings.acceptThirdPartyCookies,
+                        enabled = browserSettings.acceptCookies,
+                        onCheckedChange = {
+                            store.saveBrowserToolSettings(browserSettings.copy(acceptThirdPartyCookies = it).toJson())
+                        },
+                    )
+                    ChoiceRow(
+                        title = "Fetch download limit",
+                        current = browserSettings.maxFetchBytes.toString(),
+                        options = listOf(
+                            "1000000" to "1.00 MB",
+                            "2000000" to "2.00 MB",
+                            "5000000" to "5.00 MB",
+                            "10000000" to "10.00 MB",
+                        ),
+                        onSelect = {
+                            store.saveBrowserToolSettings(browserSettings.copy(maxFetchBytes = it.toInt()).toJson())
+                        },
+                    )
+                    ChoiceRow(
+                        title = "Idle auto close",
+                        current = browserSettings.autoCloseMinutes.toString(),
+                        options = listOf(
+                            "0" to "Never",
+                            "5" to "5 minutes",
+                            "15" to "15 minutes",
+                            "30" to "30 minutes",
+                            "60" to "60 minutes",
+                            "120" to "120 minutes",
+                        ),
+                        onSelect = {
+                            store.saveBrowserToolSettings(browserSettings.copy(autoCloseMinutes = it.toInt()).toJson())
+                        },
+                    )
+                }
+            }
+        }
+        item {
+            HamburSection(title = "Tool settings") {
+                OutlinedTextField(value = toolSettings, onValueChange = { toolSettings = it }, modifier = Modifier.fillMaxWidth(), minLines = 5, label = { Text("tool_settings") })
+                Button(onClick = { store.saveAppSetting("tool_settings", toolSettings, false) }) {
+                    Text("Save tool settings")
                 }
             }
         }
@@ -1144,6 +1226,69 @@ fun StartupTaskDetailScreen(
 }
 
 @Composable
+fun AppearanceSettingsScreen(
+    state: HamburUiState,
+    store: HamburUiStore,
+    onBack: () -> Unit,
+) {
+    val themeMode = state.settingValue("themeMode", "dark")
+    val fontScale = state.settingValue("fontScale", "default")
+    val startupChatMode = state.settingValue("startupChatMode", "last_chat")
+
+    SettingsPage(title = "Appearance", onBack = onBack) {
+        item {
+            HamburSection(title = "Theme") {
+                ChoiceRow(
+                    title = "Color theme",
+                    current = themeMode,
+                    options = listOf(
+                        "system" to "System",
+                        "light" to "Light",
+                        "dark" to "Dark",
+                    ),
+                    onSelect = { store.saveRawAppSetting("themeMode", it) },
+                )
+            }
+        }
+        item {
+            HamburSection(title = "Text") {
+                ChoiceRow(
+                    title = "Font scale",
+                    current = fontScale,
+                    options = listOf(
+                        "small" to "Small",
+                        "default" to "Default",
+                        "large" to "Large",
+                        "extra_large" to "Extra large",
+                    ),
+                    onSelect = { store.saveRawAppSetting("fontScale", it) },
+                )
+            }
+        }
+        item {
+            HamburSection(title = "Startup") {
+                ChoiceRow(
+                    title = "Chat on app start",
+                    current = startupChatMode,
+                    options = listOf(
+                        "last_chat" to "Last chat",
+                        "new_chat" to "New chat",
+                    ),
+                    onSelect = { store.saveRawAppSetting("startupChatMode", it) },
+                )
+            }
+        }
+        item {
+            HamburSection(title = "Current settings") {
+                SummaryLine(label = "themeMode", value = themeMode)
+                SummaryLine(label = "fontScale", value = fontScale)
+                SummaryLine(label = "startupChatMode", value = startupChatMode)
+            }
+        }
+    }
+}
+
+@Composable
 fun GenericJsonSettingsScreen(
     title: String,
     summary: String,
@@ -1207,7 +1352,7 @@ fun ToolSettingsScreen(
         mutableStateOf(state.appSettings.firstOrNull { it.key == "tool_settings" }?.value ?: """{"enabled":true}""")
     }
     var browserSettings by rememberSaveable {
-        mutableStateOf(state.appSettings.firstOrNull { it.key == "browser_tool_settings" }?.value ?: """{"enabled":true,"autoCloseMinutes":20}""")
+        mutableStateOf(state.appSettings.firstOrNull { it.key == "browser_tool_settings" }?.value ?: DEFAULT_BROWSER_TOOL_SETTINGS_JSON)
     }
     SettingsPage(title = "Tools", onBack = onBack) {
         item {
@@ -1560,9 +1705,6 @@ fun FeatureUnavailableScreen(
     onBack: () -> Unit,
 ) {
     var toggleOne by rememberSaveable(title) { mutableStateOf(false) }
-    var toggleTwo by rememberSaveable(title) { mutableStateOf(false) }
-    var toggleThree by rememberSaveable(title) { mutableStateOf(false) }
-    var toggleFour by rememberSaveable(title) { mutableStateOf(false) }
     var textValue by rememberSaveable(title) { mutableStateOf("") }
     var choiceValue by rememberSaveable(title) { mutableStateOf("") }
     SettingsPage(title = title, subtitle = "Waiting for backend", onBack = onBack) {
@@ -1578,28 +1720,6 @@ fun FeatureUnavailableScreen(
         item {
             HamburSection(title = "UI surface") {
                 when (title) {
-                    "Appearance" -> {
-                        OutlinedTextField(
-                            value = choiceValue,
-                            onValueChange = { choiceValue = it },
-                            modifier = Modifier.fillMaxWidth(),
-                            singleLine = true,
-                            label = { Text("Font scale") },
-                            placeholder = { Text("Small / Default / Large") },
-                        )
-                        OutlinedTextField(
-                            value = textValue,
-                            onValueChange = { textValue = it },
-                            modifier = Modifier.fillMaxWidth(),
-                            singleLine = true,
-                            label = { Text("Startup chat mode") },
-                            placeholder = { Text("Last chat / New chat") },
-                        )
-                        CapabilitySwitch("Follow system theme", toggleOne) { toggleOne = it }
-                        CapabilitySwitch("Dark mode", toggleTwo) { toggleTwo = it }
-                        CapabilitySwitch("Predictive back", toggleThree) { toggleThree = it }
-                        CapabilitySwitch("FPS overlay", toggleFour) { toggleFour = it }
-                    }
                     "Logs" -> {
                         CapabilitySwitch("Record logs", toggleOne) { toggleOne = it }
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1843,6 +1963,102 @@ private fun ToolListRow(
             Text(description, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
         }
     }
+}
+
+@Composable
+private fun ChoiceRow(
+    title: String,
+    current: String,
+    options: List<Pair<String, String>>,
+    onSelect: (String) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(title, fontWeight = FontWeight.Medium)
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            options.forEach { (value, label) ->
+                val selected = current == value
+                if (selected) {
+                    Button(onClick = { onSelect(value) }) {
+                        Text(label)
+                    }
+                } else {
+                    SecondaryActionButton(text = label, onClick = { onSelect(value) })
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsSwitchRow(
+    title: String,
+    summary: String,
+    checked: Boolean,
+    enabled: Boolean = true,
+    onCheckedChange: (Boolean) -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(title, fontWeight = FontWeight.Medium)
+            Text(summary, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+        }
+        Switch(
+            checked = checked,
+            enabled = enabled,
+            onCheckedChange = if (enabled) onCheckedChange else null,
+        )
+    }
+}
+
+private data class UiBrowserToolSettings(
+    val acceptCookies: Boolean = true,
+    val acceptThirdPartyCookies: Boolean = true,
+    val maxFetchBytes: Int = 2_000_000,
+    val autoCloseMinutes: Int = 15,
+) {
+    fun normalized(): UiBrowserToolSettings {
+        return copy(
+            maxFetchBytes = maxFetchBytes.coerceIn(250_000, 10_000_000),
+            autoCloseMinutes = autoCloseMinutes.coerceIn(0, 240),
+            acceptThirdPartyCookies = acceptCookies && acceptThirdPartyCookies,
+        )
+    }
+
+    fun toJson(): String {
+        val normalized = normalized()
+        return """{"acceptCookies":${normalized.acceptCookies},"acceptThirdPartyCookies":${normalized.acceptThirdPartyCookies},"maxFetchBytes":${normalized.maxFetchBytes},"autoCloseMinutes":${normalized.autoCloseMinutes}}"""
+    }
+}
+
+private const val DEFAULT_BROWSER_TOOL_SETTINGS_JSON =
+    """{"acceptCookies":true,"acceptThirdPartyCookies":true,"maxFetchBytes":2000000,"autoCloseMinutes":15}"""
+
+private fun HamburUiState.settingValue(key: String, fallback: String): String {
+    return appSettings.firstOrNull { it.key == key }?.value ?: fallback
+}
+
+private fun HamburUiState.browserToolSettings(): UiBrowserToolSettings {
+    val raw = appSettings.firstOrNull { it.key == "browser_tool_settings" }?.value.orEmpty()
+    return UiBrowserToolSettings(
+        acceptCookies = raw.jsonBool("acceptCookies", true),
+        acceptThirdPartyCookies = raw.jsonBool("acceptThirdPartyCookies", true),
+        maxFetchBytes = raw.jsonInt("maxFetchBytes", 2_000_000),
+        autoCloseMinutes = raw.jsonInt("autoCloseMinutes", 15),
+    ).normalized()
+}
+
+private fun String.jsonBool(key: String, fallback: Boolean): Boolean {
+    val match = Regex(""""$key"\s*:\s*(true|false)""").find(this) ?: return fallback
+    return match.groupValues[1] == "true"
+}
+
+private fun String.jsonInt(key: String, fallback: Int): Int {
+    val match = Regex(""""$key"\s*:\s*(\d+)""").find(this) ?: return fallback
+    return match.groupValues[1].toIntOrNull() ?: fallback
 }
 
 @Composable

@@ -1874,6 +1874,8 @@ impl RuntimeEngine {
                         },
                     )
                     .await?;
+                self.maybe_title_session_from_first_user_message(&command.session_id, &user_content)
+                    .await?;
                 user_message
             };
             let assistant_message = self
@@ -2000,6 +2002,25 @@ impl RuntimeEngine {
         });
 
         accepted_ack(command.command_id, command.idempotency_key)
+    }
+
+    async fn maybe_title_session_from_first_user_message(
+        &self,
+        session_id: &str,
+        user_content: &str,
+    ) -> HamburResult<()> {
+        let summary = self.database.session_summary(session_id).await?;
+        if summary.message_count != 1 || !is_default_session_title(&summary.title) {
+            return Ok(());
+        }
+
+        let title = title_from_first_user_message(user_content);
+        if title.is_empty() {
+            return Ok(());
+        }
+
+        let _ = self.database.rename_session(session_id, &title).await?;
+        Ok(())
     }
 
     fn resolve_turn_content(
@@ -11172,6 +11193,25 @@ impl IfBlank for String {
     }
 }
 
+fn is_default_session_title(title: &str) -> bool {
+    matches!(
+        title.trim(),
+        "" | "New chat" | "新对话" | "Untitled session"
+    )
+}
+
+fn title_from_first_user_message(content: &str) -> String {
+    content
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(32)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 fn accepted_ack(
     command_id: impl Into<String>,
     idempotency_key: impl Into<String>,
@@ -14418,6 +14458,84 @@ mod tests {
         assert_eq!(first_summary.title, "renamed first");
         assert!(first_summary.pinned_at_ms > 0);
         assert!(snapshot.sessions.iter().any(|session| session.id == second));
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
+    fn first_user_message_titles_default_session() {
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+        configure_test_provider(&runtime, "gpt-test");
+
+        let create = runtime.create_session("New chat".to_string());
+        assert!(create.accepted, "create rejected: {}", create.message);
+        let created = runtime.next_event().expect("created event");
+        let session_id = created.snapshot.selected_session_id;
+
+        let ack = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_title_first_message".to_string(),
+            idempotency_key: "message:title:first".to_string(),
+            kind: "SendMessage".to_string(),
+            session_id: session_id.clone(),
+            content: "请帮我解释 Kotlin Flow 的背压问题，以及怎么处理".to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(ack.accepted, "send rejected: {}", ack.message);
+
+        let snapshot = runtime.get_session_list_snapshot(10, 0);
+        let session = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .expect("session summary");
+        assert_eq!(session.title, "请帮我解释 Kotlin Flow 的背压问题，以及怎么处理");
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
+    fn first_user_message_keeps_custom_session_title() {
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
+        })
+        .expect("create runtime");
+        let _ = runtime.next_event().expect("ready event");
+        configure_test_provider(&runtime, "gpt-test");
+
+        let create = runtime.create_session("Research notes".to_string());
+        assert!(create.accepted, "create rejected: {}", create.message);
+        let created = runtime.next_event().expect("created event");
+        let session_id = created.snapshot.selected_session_id;
+
+        let ack = runtime.dispatch(RuntimeCommand {
+            command_id: "cmd_keep_custom_title".to_string(),
+            idempotency_key: "message:title:custom".to_string(),
+            kind: "SendMessage".to_string(),
+            session_id: session_id.clone(),
+            content: "This should not replace the title".to_string(),
+            ..RuntimeCommand::default()
+        });
+        assert!(ack.accepted, "send rejected: {}", ack.message);
+
+        let snapshot = runtime.get_session_list_snapshot(10, 0);
+        let session = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .expect("session summary");
+        assert_eq!(session.title, "Research notes");
 
         let _ = fs::remove_dir_all(app_files_dir);
     }

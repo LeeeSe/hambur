@@ -45,6 +45,22 @@ pub struct TimelineItemSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkdownBlockPayloadRecord {
+    pub id: String,
+    pub session_id: String,
+    pub message_id: String,
+    pub block_id: u64,
+    pub stable_key: String,
+    pub committed: bool,
+    pub payload_json: String,
+    pub raw: String,
+    pub small_summary: String,
+    pub version_sequence: u64,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageRecord {
     pub id: String,
     pub session_id: String,
@@ -92,6 +108,18 @@ pub struct NewTimelineItem {
     pub payload_ref: String,
     pub small_summary: String,
     pub kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewMarkdownBlockPayload {
+    pub id: String,
+    pub message_id: String,
+    pub block_id: u64,
+    pub stable_key: String,
+    pub committed: bool,
+    pub payload_json: String,
+    pub raw: String,
+    pub small_summary: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -454,12 +482,14 @@ pub struct AppSnapshot {
     pub sessions: Vec<SessionSummary>,
     pub selected_session_id: String,
     pub timeline_items: Vec<TimelineItemSnapshot>,
+    pub markdown_block_payloads: Vec<MarkdownBlockPayloadRecord>,
     pub pending_attachments: Vec<AttachmentRecord>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TimelinePageData {
     pub items: Vec<TimelineItemSnapshot>,
+    pub markdown_block_payloads: Vec<MarkdownBlockPayloadRecord>,
     pub next_before_cursor: u64,
     pub has_more: bool,
 }
@@ -1617,10 +1647,11 @@ impl HamburDatabase {
                         payload_ref,
                         small_summary,
                         kind,
+                        visible,
                         created_at_ms,
                         updated_at_ms
                     )
-                 VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8, ?9, ?9)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8, 1, ?9, ?9)
                  ON CONFLICT(session_id, stable_key) DO UPDATE SET
                     content_type = excluded.content_type,
                     display_sequence = excluded.display_sequence,
@@ -1628,6 +1659,7 @@ impl HamburDatabase {
                     payload_ref = excluded.payload_ref,
                     small_summary = excluded.small_summary,
                     kind = excluded.kind,
+                    visible = 1,
                     updated_at_ms = excluded.updated_at_ms",
                 params![
                     id,
@@ -1647,6 +1679,212 @@ impl HamburDatabase {
 
         self.timeline_item_by_stable_key(session_id, &stable_key)
             .await
+    }
+
+    pub async fn upsert_markdown_block_payload(
+        &self,
+        session_id: &str,
+        _turn_id: &str,
+        input: NewMarkdownBlockPayload,
+    ) -> HamburResult<MarkdownBlockPayloadRecord> {
+        self.ensure_session_exists(session_id).await?;
+        if input.message_id.trim().is_empty() {
+            return Err(HamburError::InvalidCommand(
+                "markdown block message_id must not be empty".to_string(),
+            ));
+        }
+        if input.stable_key.trim().is_empty() {
+            return Err(HamburError::InvalidCommand(
+                "markdown block stable_key must not be empty".to_string(),
+            ));
+        }
+
+        let id = if input.id.trim().is_empty() {
+            new_id("mdb")
+        } else {
+            input.id.clone()
+        };
+        let now = now_ms();
+        let stable_key = input.stable_key.clone();
+        self.connection
+            .execute(
+                "INSERT INTO markdown_blocks
+                    (
+                        id,
+                        session_id,
+                        message_id,
+                        block_id,
+                        stable_key,
+                        committed,
+                        payload_json,
+                        raw,
+                        small_summary,
+                        version_sequence,
+                        created_at_ms,
+                        updated_at_ms
+                    )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?10)
+                 ON CONFLICT(session_id, stable_key) DO UPDATE SET
+                    message_id = excluded.message_id,
+                    block_id = excluded.block_id,
+                    committed = excluded.committed,
+                    payload_json = excluded.payload_json,
+                    raw = excluded.raw,
+                    small_summary = excluded.small_summary,
+                    version_sequence = markdown_blocks.version_sequence + 1,
+                    updated_at_ms = excluded.updated_at_ms",
+                params![
+                    id.clone(),
+                    session_id,
+                    input.message_id,
+                    input.block_id as i64,
+                    stable_key.clone(),
+                    if input.committed { 1_i64 } else { 0_i64 },
+                    input.payload_json,
+                    input.raw,
+                    input.small_summary,
+                    now as i64
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+        self.touch_session(session_id, now).await?;
+
+        let record = self.markdown_block_by_stable_key(session_id, &stable_key).await?;
+        self.upsert_timeline_item(
+            session_id,
+            NewTimelineItem {
+                stable_key: record.stable_key.clone(),
+                content_type: if record.committed {
+                    "assistant_markdown_block".to_string()
+                } else {
+                    "assistant_pending_block".to_string()
+                },
+                display_sequence: record.created_at_ms.saturating_add(record.block_id),
+                payload_ref: record.id.clone(),
+                small_summary: record.small_summary.clone(),
+                kind: if record.committed {
+                    "AssistantMarkdownBlock".to_string()
+                } else {
+                    "AssistantPendingBlock".to_string()
+                },
+            },
+        )
+        .await?;
+        if record.committed {
+            self.hide_timeline_item(session_id, &pending_markdown_stable_key(&record.message_id))
+                .await?;
+        }
+        Ok(record)
+    }
+
+    pub async fn remove_pending_markdown_block(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> HamburResult<()> {
+        self.hide_timeline_item(session_id, &pending_markdown_stable_key(message_id))
+            .await
+    }
+
+    async fn hide_timeline_item(&self, session_id: &str, stable_key: &str) -> HamburResult<()> {
+        if stable_key.trim().is_empty() {
+            return Ok(());
+        }
+        let now = now_ms();
+        self.connection
+            .execute(
+                "UPDATE timeline_items
+                 SET visible = 0,
+                     version_sequence = version_sequence + 1,
+                     updated_at_ms = ?3
+                 WHERE session_id = ?1 AND stable_key = ?2",
+                params![session_id, stable_key, now as i64],
+            )
+            .await
+            .map(|_| ())
+            .map_err(database_error)
+    }
+
+    async fn markdown_block_by_stable_key(
+        &self,
+        session_id: &str,
+        stable_key: &str,
+    ) -> HamburResult<MarkdownBlockPayloadRecord> {
+        let mut rows = self
+            .connection
+            .query(
+                "
+                SELECT
+                    id,
+                    session_id,
+                    message_id,
+                    block_id,
+                    stable_key,
+                    committed,
+                    payload_json,
+                    raw,
+                    small_summary,
+                    version_sequence,
+                    created_at_ms,
+                    updated_at_ms
+                FROM markdown_blocks
+                WHERE session_id = ?1 AND stable_key = ?2
+                LIMIT 1
+                ",
+                params![session_id, stable_key],
+            )
+            .await
+            .map_err(database_error)?;
+
+        let Some(row) = rows.next().await.map_err(database_error)? else {
+            return Err(HamburError::Internal(format!(
+                "markdown block not found after upsert: {stable_key}"
+            )));
+        };
+        markdown_block_from_row(&row)
+    }
+
+    async fn markdown_blocks_for_payload_refs(
+        &self,
+        session_id: &str,
+        payload_refs: &[String],
+    ) -> HamburResult<Vec<MarkdownBlockPayloadRecord>> {
+        let mut blocks = Vec::new();
+        for payload_ref in payload_refs {
+            if payload_ref.trim().is_empty() {
+                continue;
+            }
+            let mut rows = self
+                .connection
+                .query(
+                    "
+                    SELECT
+                        id,
+                        session_id,
+                        message_id,
+                        block_id,
+                        stable_key,
+                        committed,
+                        payload_json,
+                        raw,
+                        small_summary,
+                        version_sequence,
+                        created_at_ms,
+                        updated_at_ms
+                    FROM markdown_blocks
+                    WHERE session_id = ?1 AND id = ?2
+                    LIMIT 1
+                    ",
+                    params![session_id, payload_ref],
+                )
+                .await
+                .map_err(database_error)?;
+            if let Some(row) = rows.next().await.map_err(database_error)? {
+                blocks.push(markdown_block_from_row(&row)?);
+            }
+        }
+        Ok(blocks)
     }
 
     pub async fn create_turn(&self, session_id: &str, status: &str) -> HamburResult<TurnRecord> {
@@ -1874,8 +2112,12 @@ impl HamburDatabase {
         limit: u32,
     ) -> HamburResult<TimelinePageData> {
         self.ensure_session_exists(session_id).await?;
-        self.timeline_items_page(session_id, before_cursor, limit)
-            .await
+        let mut page = self.timeline_items_page(session_id, before_cursor, limit).await?;
+        let payload_refs = markdown_payload_refs(&page.items);
+        page.markdown_block_payloads = self
+            .markdown_blocks_for_payload_refs(session_id, &payload_refs)
+            .await?;
+        Ok(page)
     }
 
     pub async fn message_snapshot(&self, message_id: &str) -> HamburResult<Option<MessageRecord>> {
@@ -2802,6 +3044,7 @@ impl HamburDatabase {
                     payload_ref TEXT NOT NULL,
                     small_summary TEXT NOT NULL,
                     kind TEXT NOT NULL,
+                    visible INTEGER NOT NULL DEFAULT 1,
                     created_at_ms INTEGER NOT NULL,
                     updated_at_ms INTEGER NOT NULL,
                     UNIQUE(session_id, stable_key)
@@ -2809,6 +3052,25 @@ impl HamburDatabase {
 
                 CREATE INDEX IF NOT EXISTS idx_timeline_items_session_order
                     ON timeline_items(session_id, display_sequence, id);
+
+                CREATE TABLE IF NOT EXISTS markdown_blocks (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    message_id TEXT NOT NULL,
+                    block_id INTEGER NOT NULL,
+                    stable_key TEXT NOT NULL,
+                    committed INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    raw TEXT NOT NULL,
+                    small_summary TEXT NOT NULL,
+                    version_sequence INTEGER NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL,
+                    UNIQUE(session_id, stable_key)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_markdown_blocks_session_message
+                    ON markdown_blocks(session_id, message_id, block_id);
 
                 CREATE TABLE IF NOT EXISTS turns (
                     id TEXT PRIMARY KEY NOT NULL,
@@ -3078,6 +3340,8 @@ impl HamburDatabase {
             .await?;
         self.add_column_if_missing("messages", "tool_title", "TEXT NOT NULL DEFAULT ''")
             .await?;
+        self.add_column_if_missing("timeline_items", "visible", "INTEGER NOT NULL DEFAULT 1")
+            .await?;
         self.add_column_if_missing("turns", "selected_provider_id", "TEXT NOT NULL DEFAULT ''")
             .await?;
         self.add_column_if_missing(
@@ -3156,6 +3420,13 @@ impl HamburDatabase {
             self.timeline_items_for_session(&selected_session_id)
                 .await?
         };
+        let markdown_block_payloads = if selected_session_id.is_empty() {
+            Vec::new()
+        } else {
+            let payload_refs = markdown_payload_refs(&timeline_items);
+            self.markdown_blocks_for_payload_refs(&selected_session_id, &payload_refs)
+                .await?
+        };
         let pending_attachments = if selected_session_id.is_empty() {
             Vec::new()
         } else {
@@ -3167,6 +3438,7 @@ impl HamburDatabase {
             sessions,
             selected_session_id,
             timeline_items,
+            markdown_block_payloads,
             pending_attachments,
         })
     }
@@ -3196,7 +3468,7 @@ impl HamburDatabase {
                         (
                             SELECT ti.small_summary
                             FROM timeline_items ti
-                            WHERE ti.session_id = s.id
+                            WHERE ti.session_id = s.id AND ti.visible = 1
                             ORDER BY ti.display_sequence DESC, ti.id DESC
                             LIMIT 1
                         ),
@@ -3245,7 +3517,7 @@ impl HamburDatabase {
                 FROM timeline_items ti
                 LEFT JOIN trace_spans ts ON ti.content_type = 'trace' AND ts.id = ti.payload_ref
                 LEFT JOIN tool_calls tc ON tc.id = ts.tool_call_id
-                WHERE ti.session_id = ?1
+                WHERE ti.session_id = ?1 AND ti.visible = 1
                 ORDER BY ti.display_sequence ASC, ti.id ASC
                 ",
                 params![session_id],
@@ -3304,7 +3576,7 @@ impl HamburDatabase {
                     FROM timeline_items ti
                     LEFT JOIN trace_spans ts ON ti.content_type = 'trace' AND ts.id = ti.payload_ref
                     LEFT JOIN tool_calls tc ON tc.id = ts.tool_call_id
-                    WHERE ti.session_id = ?1
+                    WHERE ti.session_id = ?1 AND ti.visible = 1
                     ORDER BY ti.display_sequence DESC, ti.id DESC
                     LIMIT ?2
                     ",
@@ -3334,6 +3606,7 @@ impl HamburDatabase {
                     LEFT JOIN trace_spans ts ON ti.content_type = 'trace' AND ts.id = ti.payload_ref
                     LEFT JOIN tool_calls tc ON tc.id = ts.tool_call_id
                     WHERE ti.session_id = ?1
+                      AND ti.visible = 1
                       AND ti.display_sequence < ?2
                     ORDER BY ti.display_sequence DESC, ti.id DESC
                     LIMIT ?3
@@ -3365,6 +3638,7 @@ impl HamburDatabase {
 
         Ok(TimelinePageData {
             items,
+            markdown_block_payloads: Vec::new(),
             next_before_cursor,
             has_more,
         })
@@ -3519,7 +3793,7 @@ impl HamburDatabase {
                 FROM timeline_items ti
                 LEFT JOIN trace_spans ts ON ti.content_type = 'trace' AND ts.id = ti.payload_ref
                 LEFT JOIN tool_calls tc ON tc.id = ts.tool_call_id
-                WHERE ti.session_id = ?1 AND ti.stable_key = ?2
+                WHERE ti.session_id = ?1 AND ti.stable_key = ?2 AND ti.visible = 1
                 LIMIT 1
                 ",
                 params![session_id, stable_key],
@@ -4735,6 +5009,38 @@ fn timeline_item_from_row(row: &Row) -> HamburResult<TimelineItemSnapshot> {
         tool_call_id: row.get::<String>(11).map_err(database_error)?,
         tool_name: row.get::<String>(12).map_err(database_error)?,
     })
+}
+
+fn markdown_block_from_row(row: &Row) -> HamburResult<MarkdownBlockPayloadRecord> {
+    Ok(MarkdownBlockPayloadRecord {
+        id: row.get::<String>(0).map_err(database_error)?,
+        session_id: row.get::<String>(1).map_err(database_error)?,
+        message_id: row.get::<String>(2).map_err(database_error)?,
+        block_id: unsigned_ms(row.get::<i64>(3).map_err(database_error)?),
+        stable_key: row.get::<String>(4).map_err(database_error)?,
+        committed: row.get::<i64>(5).map_err(database_error)? != 0,
+        payload_json: row.get::<String>(6).map_err(database_error)?,
+        raw: row.get::<String>(7).map_err(database_error)?,
+        small_summary: row.get::<String>(8).map_err(database_error)?,
+        version_sequence: unsigned_ms(row.get::<i64>(9).map_err(database_error)?),
+        created_at_ms: unsigned_ms(row.get::<i64>(10).map_err(database_error)?),
+        updated_at_ms: unsigned_ms(row.get::<i64>(11).map_err(database_error)?),
+    })
+}
+
+fn markdown_payload_refs(items: &[TimelineItemSnapshot]) -> Vec<String> {
+    items
+        .iter()
+        .filter(|item| {
+            item.content_type == "assistant_markdown_block"
+                || item.content_type == "assistant_pending_block"
+        })
+        .map(|item| item.payload_ref.clone())
+        .collect()
+}
+
+pub fn pending_markdown_stable_key(message_id: &str) -> String {
+    format!("{message_id}:pending")
 }
 
 fn message_from_row(row: &Row) -> HamburResult<MessageRecord> {

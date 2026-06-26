@@ -101,6 +101,21 @@ dictionary MarkdownRenderUpdateDTO {
     sequence<u64> invalidated_block_ids;
 };
 
+dictionary MarkdownBlockPayloadDTO {
+    string id;
+    string session_id;
+    string message_id;
+    u64 block_id;
+    string stable_key;
+    boolean committed;
+    MarkdownBlockNodeDTO node;
+    string raw;
+    string small_summary;
+    u64 version_sequence;
+    u64 created_at_ms;
+    u64 updated_at_ms;
+};
+
 dictionary SessionSummaryDTO {
     string id;
     string title;
@@ -151,6 +166,7 @@ dictionary AppSnapshotDTO {
     sequence<SessionSummaryDTO> sessions;
     string selected_session_id;
     sequence<TimelineItemDTO> timeline_items;
+    sequence<MarkdownBlockPayloadDTO> markdown_block_payloads;
     sequence<AttachmentDTO> pending_attachments;
 };
 
@@ -252,6 +268,7 @@ dictionary SessionSnapshotDTO {
     u64 created_at_ms;
     SessionSummaryDTO? session;
     sequence<TimelineItemDTO> timeline_items;
+    sequence<MarkdownBlockPayloadDTO> markdown_block_payloads;
 };
 
 dictionary TimelinePageDTO {
@@ -259,6 +276,7 @@ dictionary TimelinePageDTO {
     u64 created_at_ms;
     string session_id;
     sequence<TimelineItemDTO> items;
+    sequence<MarkdownBlockPayloadDTO> markdown_block_payloads;
     u64 next_before_cursor;
     boolean has_more;
 };
@@ -380,5 +398,6 @@ interface BackendRuntime {
     CommandAck open_session(string session_id);
     CommandAck delete_session(string session_id);
     CommandAck append_markdown_delta(string session_id, string message_id, string chunk, boolean finalize);
+    sequence<MarkdownBlockNodeDTO> render_markdown_document(string message_id, string markdown);
     void shutdown();
 };

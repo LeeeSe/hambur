@@ -545,6 +545,7 @@ dependencies = [
  "hambur-db",
  "hambur-markdown",
  "hambur-runtime",
+ "serde_json",
  "uniffi",
 ]
 

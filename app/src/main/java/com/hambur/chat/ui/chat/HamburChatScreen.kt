@@ -60,11 +60,10 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalClipboard
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -89,12 +88,16 @@ import com.composables.icons.lucide.Trash2
 import com.composables.icons.lucide.Type
 import com.composables.icons.lucide.X
 import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.widget.Toast
 import com.hambur.chat.reducer.HamburUiState
 import com.hambur.chat.reducer.HamburUiStore
 import com.hambur.chat.reducer.UiMessageSnapshot
 import com.hambur.chat.reducer.UiPendingAttachment
 import com.hambur.chat.reducer.UiSessionSummary
 import com.hambur.chat.reducer.UiTimelineItem
+import com.hambur.chat.uniffi.MarkdownBlockNodeDto
 import com.hambur.chat.ui.components.HamburTopBar
 import com.hambur.chat.ui.components.SecondaryActionButton
 import com.hambur.chat.ui.components.StatusPill
@@ -189,7 +192,7 @@ fun HamburChatScreen(
                         editingMessageId = message.id
                         draftMessage = message.contentText
                     },
-                    onSelectText = { selectingText = it.contentText },
+                    onSelectText = { selectingText = it },
                     modifier = Modifier.fillMaxSize(),
                 )
             }
@@ -487,7 +490,7 @@ private fun ChatTimeline(
     store: HamburUiStore,
     onOpenFile: (String) -> Unit,
     onEditMessage: (UiMessageSnapshot) -> Unit,
-    onSelectText: (UiMessageSnapshot) -> Unit,
+    onSelectText: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val listState = rememberLazyListState()
@@ -504,7 +507,6 @@ private fun ChatTimeline(
         state.selectedSessionId,
         state.timelineItems.size,
         state.timelineItems.lastOrNull()?.versionSequence,
-        state.pendingMarkdownByMessageId.values.lastOrNull()?.raw,
         followTail,
     ) {
         if (followTail && visibleCount > 0) {
@@ -535,33 +537,12 @@ private fun ChatTimeline(
             contentType = { _, item -> item.contentType },
         ) { _, item ->
             when {
-                item.contentType == "message" -> {
+                item.contentType == "user_message" -> {
                     val message = state.messagesById[item.payloadRef]
                     MessageTimelineItem(
                         item = item,
                         message = message,
-                        markdownBlocks = state.markdownBlocksByMessageId[item.payloadRef].orEmpty(),
-                        pendingMarkdown = state.pendingMarkdownByMessageId[item.payloadRef],
-                        markdownStyle = markdownStyle,
-                        markdownCache = markdownCache,
-                        onRequestMarkdown = {
-                            if (
-                                message != null &&
-                                message.role == "assistant" &&
-                                state.markdownBlocksByMessageId[item.payloadRef].isNullOrEmpty() &&
-                                state.pendingMarkdownByMessageId[item.payloadRef] == null
-                            ) {
-                                store.renderMarkdownText(
-                                    sessionId = state.selectedSessionId,
-                                    messageId = item.payloadRef,
-                                    markdown = message.contentText,
-                                )
-                            }
-                        },
                         onOpenFile = onOpenFile,
-                        onRegenerate = {
-                            store.regenerateMessage(state.selectedSessionId, item.payloadRef)
-                        },
                         onRetry = {
                             store.retryMessage(state.selectedSessionId, item.payloadRef)
                         },
@@ -570,6 +551,27 @@ private fun ChatTimeline(
                         },
                         onSelectText = onSelectText,
                     )
+                }
+                item.isAssistantMarkdownBlock() -> {
+                    val node = state.markdownBlocksByPayloadRef[item.payloadRef]
+                    if (node != null) {
+                        AssistantMarkdownTimelineItem(
+                            item = item,
+                            node = node,
+                            markdownStyle = markdownStyle,
+                            markdownCache = markdownCache,
+                            onOpenFile = onOpenFile,
+                            onRegenerate = {
+                                store.regenerateMessage(state.selectedSessionId, node.messageId)
+                            },
+                            onRetry = {
+                                store.retryMessage(state.selectedSessionId, node.messageId)
+                            },
+                            onSelectText = onSelectText,
+                        )
+                    } else {
+                        TimelineSummaryItem(item = item)
+                    }
                 }
                 item.contentType == "trace" || item.kind.contains("Trace") -> {
                     ToolTraceItem(item = item)
@@ -662,37 +664,23 @@ private fun SelectTextDialog(
 private fun MessageTimelineItem(
     item: UiTimelineItem,
     message: UiMessageSnapshot?,
-    markdownBlocks: List<com.hambur.chat.uniffi.MarkdownBlockNodeDto>,
-    pendingMarkdown: com.hambur.chat.uniffi.MarkdownBlockNodeDto?,
-    markdownStyle: MarkdownStyle,
-    markdownCache: MarkdownRenderCache,
-    onRequestMarkdown: () -> Unit,
     onOpenFile: (String) -> Unit,
-    onRegenerate: () -> Unit,
     onRetry: () -> Unit,
     onEdit: (UiMessageSnapshot) -> Unit,
-    onSelectText: (UiMessageSnapshot) -> Unit,
+    onSelectText: (String) -> Unit,
 ) {
     val role = message?.role ?: item.kind
     val isUser = role == "user"
-    val bubbleColor = if (isUser) {
-        MaterialTheme.colorScheme.primaryContainer
-    } else {
-        MaterialTheme.colorScheme.surface
-    }
-    val alignment = if (isUser) Alignment.CenterEnd else Alignment.CenterStart
-    val clipboard = LocalClipboard.current
-    val coroutineScope = rememberCoroutineScope()
-
-    LaunchedEffect(message?.id, message?.contentText, markdownBlocks.size, pendingMarkdown) {
-        onRequestMarkdown()
+    val context = LocalContext.current
+    val clipboard = remember(context) {
+        context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
     }
 
-    Box(modifier = Modifier.fillMaxWidth(), contentAlignment = alignment) {
+    Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
         Surface(
-            modifier = Modifier.fillMaxWidth(if (isUser) 0.86f else 1f),
+            modifier = Modifier.fillMaxWidth(0.86f),
             shape = RoundedCornerShape(8.dp),
-            color = bubbleColor,
+            color = MaterialTheme.colorScheme.primaryContainer,
             border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
         ) {
             Column(
@@ -705,7 +693,7 @@ private fun MessageTimelineItem(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text(
-                        text = if (isUser) "You" else "Assistant",
+                        text = if (isUser) "You" else item.kind.ifBlank { "Message" },
                         style = MaterialTheme.typography.labelLarge,
                         fontWeight = FontWeight.SemiBold,
                     )
@@ -717,13 +705,10 @@ private fun MessageTimelineItem(
                     if (message != null) {
                         IconButton(
                             onClick = {
-                                coroutineScope.launch {
-                                    clipboard.setClipEntry(
-                                        ClipEntry(
-                                            ClipData.newPlainText("message", message.contentText),
-                                        ),
-                                    )
-                                }
+                                clipboard.setPrimaryClip(
+                                    ClipData.newPlainText("message", message.contentText),
+                                )
+                                Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
                             },
                             modifier = Modifier.size(32.dp),
                         ) {
@@ -733,7 +718,7 @@ private fun MessageTimelineItem(
                                 modifier = Modifier.size(17.dp),
                             )
                         }
-                        IconButton(onClick = { onSelectText(message) }, modifier = Modifier.size(32.dp)) {
+                        IconButton(onClick = { onSelectText(message.contentText) }, modifier = Modifier.size(32.dp)) {
                             Icon(
                                 imageVector = Lucide.Type,
                                 contentDescription = "Select text",
@@ -741,23 +726,13 @@ private fun MessageTimelineItem(
                             )
                         }
                     }
-                    if (!isUser) {
-                        IconButton(onClick = onRegenerate, modifier = Modifier.size(32.dp)) {
+                    if (message != null) {
+                        IconButton(onClick = { onEdit(message) }, modifier = Modifier.size(32.dp)) {
                             Icon(
-                                imageVector = Lucide.RefreshCw,
-                                contentDescription = "Regenerate",
+                                imageVector = Lucide.Pencil,
+                                contentDescription = "Edit",
                                 modifier = Modifier.size(17.dp),
                             )
-                        }
-                    } else {
-                        if (message != null) {
-                            IconButton(onClick = { onEdit(message) }, modifier = Modifier.size(32.dp)) {
-                                Icon(
-                                    imageVector = Lucide.Pencil,
-                                    contentDescription = "Edit",
-                                    modifier = Modifier.size(17.dp),
-                                )
-                            }
                         }
                         IconButton(onClick = onRetry, modifier = Modifier.size(32.dp)) {
                             Icon(
@@ -792,32 +767,11 @@ private fun MessageTimelineItem(
                         }
                     }
                 }
-                if (!isUser && (markdownBlocks.isNotEmpty() || pendingMarkdown != null)) {
-                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        markdownBlocks.forEach { block ->
-                            MarkdownBlock(
-                                node = block,
-                                style = markdownStyle,
-                                renderCache = markdownCache,
-                                onOpenDestination = onOpenFile,
-                            )
-                        }
-                        if (pendingMarkdown != null) {
-                            MarkdownBlock(
-                                node = pendingMarkdown,
-                                style = markdownStyle,
-                                renderCache = markdownCache,
-                                onOpenDestination = onOpenFile,
-                            )
-                        }
-                    }
-                } else {
-                    Text(
-                        text = message?.contentText?.ifBlank { item.smallSummary }
-                            ?: item.smallSummary.ifBlank { "Loading message..." },
-                        style = MaterialTheme.typography.bodyMedium,
-                    )
-                }
+                Text(
+                    text = message?.contentText?.ifBlank { item.smallSummary }
+                        ?: item.smallSummary.ifBlank { "Loading message..." },
+                    style = MaterialTheme.typography.bodyMedium,
+                )
                 val model = listOfNotNull(
                     message?.providerName?.takeIf { it.isNotBlank() },
                     message?.modelName?.takeIf { it.isNotBlank() },
@@ -831,6 +785,101 @@ private fun MessageTimelineItem(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AssistantMarkdownTimelineItem(
+    item: UiTimelineItem,
+    node: MarkdownBlockNodeDto,
+    markdownStyle: MarkdownStyle,
+    markdownCache: MarkdownRenderCache,
+    onOpenFile: (String) -> Unit,
+    onRegenerate: () -> Unit,
+    onRetry: () -> Unit,
+    onSelectText: (String) -> Unit,
+) {
+    val context = LocalContext.current
+    val clipboard = remember(context) {
+        context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+    }
+    val blockText = node.raw.ifBlank { node.text }.ifBlank { item.smallSummary }
+
+    Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterStart) {
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(8.dp),
+            color = MaterialTheme.colorScheme.surface,
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+        ) {
+            Column(
+                modifier = Modifier.padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = "Assistant",
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    StatusPill(
+                        text = if (item.contentType == "assistant_pending_block") {
+                            "streaming"
+                        } else {
+                            node.nodeKind.ifBlank { item.kind }
+                        },
+                        active = item.contentType == "assistant_pending_block",
+                    )
+                    Spacer(modifier = Modifier.weight(1f))
+                    IconButton(
+                        onClick = {
+                            clipboard.setPrimaryClip(
+                                ClipData.newPlainText("assistant block", blockText),
+                            )
+                            Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
+                        },
+                        modifier = Modifier.size(32.dp),
+                    ) {
+                        Icon(
+                            imageVector = Lucide.Copy,
+                            contentDescription = "Copy",
+                            modifier = Modifier.size(17.dp),
+                        )
+                    }
+                    IconButton(onClick = { onSelectText(blockText) }, modifier = Modifier.size(32.dp)) {
+                        Icon(
+                            imageVector = Lucide.Type,
+                            contentDescription = "Select text",
+                            modifier = Modifier.size(17.dp),
+                        )
+                    }
+                    IconButton(onClick = onRegenerate, modifier = Modifier.size(32.dp)) {
+                        Icon(
+                            imageVector = Lucide.RefreshCw,
+                            contentDescription = "Regenerate",
+                            modifier = Modifier.size(17.dp),
+                        )
+                    }
+                    IconButton(onClick = onRetry, modifier = Modifier.size(32.dp)) {
+                        Icon(
+                            imageVector = Lucide.RefreshCw,
+                            contentDescription = "Retry",
+                            modifier = Modifier.size(17.dp),
+                        )
+                    }
+                }
+                MarkdownBlock(
+                    node = node,
+                    style = markdownStyle,
+                    renderCache = markdownCache,
+                    onOpenDestination = onOpenFile,
+                )
             }
         }
     }
@@ -1210,6 +1259,10 @@ private fun PendingAttachmentChip(
 private fun HamburUiState.selectedSessionTitle(): String {
     return sessions.firstOrNull { it.id == selectedSessionId }?.title?.ifBlank { "Hambur Chat" }
         ?: "Hambur Chat"
+}
+
+private fun UiTimelineItem.isAssistantMarkdownBlock(): Boolean {
+    return contentType == "assistant_markdown_block" || contentType == "assistant_pending_block"
 }
 
 private fun LazyListState.isNearBottom(): Boolean {

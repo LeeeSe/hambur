@@ -11,6 +11,7 @@ use hambur_core::{HamburError, HamburResult};
 
 const HAMBUR_PREFIX: &str = "/var/hambur";
 const AUTOSTART_PREFIX: &str = "/var/minis/autostart";
+const PROBE_CACHE_TTL_MS: u64 = 30_000;
 
 const ROOTFS_RELEASES_BASE_URLS: &[&str] = &[
     "https://mirrors.tuna.tsinghua.edu.cn/alpine/latest-stable/releases/aarch64/",
@@ -85,6 +86,46 @@ pub struct SandboxService {
     native_library_dir: Option<PathBuf>,
     rootfs_dir: PathBuf,
     rootfs_status: Arc<Mutex<RootfsStatus>>,
+    probe_cache: Arc<Mutex<ProbeCache>>,
+    chroot_mount_state: Arc<Mutex<ChrootMountState>>,
+    chroot_exec_lock: Arc<Mutex<()>>,
+    startup_tasks_ran: Arc<Mutex<bool>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProbeCache {
+    root: Option<TimedProbe>,
+    chroot: Option<TimedProbe>,
+    proot: Option<TimedProbe>,
+}
+
+#[derive(Debug, Clone)]
+struct TimedProbe {
+    available: bool,
+    checked_at_ms: u64,
+}
+
+impl TimedProbe {
+    fn is_fresh(&self) -> bool {
+        now_ms().saturating_sub(self.checked_at_ms) < PROBE_CACHE_TTL_MS
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ChrootMountState {
+    static_ready: bool,
+    prepared_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SessionPaths {
+    session_id: String,
+    attachments: PathBuf,
+    uploads: PathBuf,
+    browser: PathBuf,
+    mounts: PathBuf,
+    offloads: PathBuf,
+    workspace: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -155,7 +196,7 @@ const VIRTUAL_ROOTS: &[VirtualRoot] = &[
     },
     VirtualRoot {
         sandbox_prefix: AUTOSTART_PREFIX,
-        host_prefix: "autostart",
+        host_prefix: "var/minis/autostart",
         name: "autostart",
         session_scoped: false,
         writable: false,
@@ -188,6 +229,10 @@ impl SandboxService {
             native_library_dir,
             rootfs_dir,
             rootfs_status: Arc::new(Mutex::new(RootfsStatus::for_target("proot"))),
+            probe_cache: Arc::new(Mutex::new(ProbeCache::default())),
+            chroot_mount_state: Arc::new(Mutex::new(ChrootMountState::default())),
+            chroot_exec_lock: Arc::new(Mutex::new(())),
+            startup_tasks_ran: Arc::new(Mutex::new(false)),
         })
     }
 
@@ -213,7 +258,6 @@ impl SandboxService {
         sandbox_path: &str,
         access: SandboxAccess,
     ) -> HamburResult<SandboxPathResolution> {
-        let session_id = normalize_session_id(session_id)?;
         let normalized = normalize_sandbox_path(sandbox_path)?;
         let (virtual_root, tail) = find_virtual_root(&normalized)?;
         let writable = virtual_root.writable && !is_read_only_attachment_uploads(&normalized);
@@ -224,17 +268,26 @@ impl SandboxService {
         }
 
         let mut host_path = self.root.clone();
+        let guard_root: &Path;
         if virtual_root.session_scoped {
+            let session_id = normalize_session_id(session_id)?;
             host_path.push("sessions");
             host_path.push(&session_id);
+            guard_root = &self.root;
         } else {
-            host_path.push("global");
+            if virtual_root.host_prefix.contains('/') {
+                host_path = self.rootfs_dir.clone();
+                guard_root = &self.rootfs_dir;
+            } else {
+                host_path.push("global");
+                guard_root = &self.root;
+            }
         }
         host_path.push(virtual_root.host_prefix);
         for segment in &tail {
             host_path.push(segment);
         }
-        ensure_inside_root(&self.root, &host_path)?;
+        ensure_inside_root(guard_root, &host_path)?;
         let relative_path = host_path
             .strip_prefix(&self.root)
             .unwrap_or(&host_path)
@@ -251,16 +304,68 @@ impl SandboxService {
     }
 
     pub fn prepare_session(&self, session_id: &str) -> HamburResult<()> {
-        for root in VIRTUAL_ROOTS.iter().filter(|root| root.session_scoped) {
-            let resolved = self.resolve(session_id, root.sandbox_prefix, SandboxAccess::Read)?;
-            fs::create_dir_all(&resolved.host_path).map_err(|error| {
+        let paths = self.session_paths(session_id)?;
+        for dir in [
+            &paths.uploads,
+            &paths.browser,
+            &paths.mounts,
+            &paths.offloads,
+            &paths.workspace,
+        ] {
+            fs::create_dir_all(dir).map_err(|error| {
                 HamburError::Internal(format!(
-                    "create sandbox session root {}: {error}",
-                    resolved.host_path.display()
+                    "create sandbox session dir {}: {error}",
+                    dir.display()
                 ))
             })?;
         }
         Ok(())
+    }
+
+    fn session_paths(&self, session_id: &str) -> HamburResult<SessionPaths> {
+        let session_id = normalize_session_id(session_id)?;
+        let session_dir = self.root.join("sessions").join(&session_id);
+        let attachments = session_dir.join("attachments");
+        let paths = SessionPaths {
+            session_id,
+            uploads: attachments.join("uploads"),
+            browser: session_dir.join("browser"),
+            mounts: session_dir.join("mounts"),
+            offloads: session_dir.join("offloads"),
+            workspace: session_dir.join("workspace"),
+            attachments,
+        };
+        for dir in [
+            &paths.attachments,
+            &paths.uploads,
+            &paths.browser,
+            &paths.mounts,
+            &paths.offloads,
+            &paths.workspace,
+        ] {
+            ensure_inside_root(&self.root, dir)?;
+        }
+        Ok(paths)
+    }
+
+    fn prepared_session_paths(&self, session_id: &str) -> HamburResult<SessionPaths> {
+        let paths = self.session_paths(session_id)?;
+        for dir in [
+            &paths.attachments,
+            &paths.uploads,
+            &paths.browser,
+            &paths.mounts,
+            &paths.offloads,
+            &paths.workspace,
+        ] {
+            if !dir.is_dir() {
+                return Err(HamburError::Internal(format!(
+                    "sandbox session directory is missing: {}. Session directories must be prepared when the session is created.",
+                    dir.display()
+                )));
+            }
+        }
+        Ok(paths)
     }
 
     pub fn is_rootfs_installed(&self) -> bool {
@@ -351,7 +456,7 @@ impl SandboxService {
             })?;
         }
         let global = self.root.join("global");
-        for name in &["memory", "skills", "shared", "autostart"] {
+        for name in &["memory", "skills", "shared"] {
             fs::create_dir_all(global.join(name))
                 .map_err(|e| HamburError::Internal(format!("create global dir {}: {e}", name)))?;
         }
@@ -367,7 +472,9 @@ impl SandboxService {
             let _ = copy_dir_all(&root_home, &backup_dir);
         }
         self.unmount_chroot_mounts();
-        let _ = fs::remove_dir_all(self.root.join("sessions"));
+        self.clear_chroot_mount_state();
+        self.clear_probe_cache();
+        self.clear_startup_tasks_state();
         let _ = fs::remove_dir_all(self.root.join("global"));
         self.recreate_rootfs_dir_for_install()?;
         self.extract_tar_archive(&rootfs_archive.file)?;
@@ -392,13 +499,34 @@ impl SandboxService {
         &self,
         startup_tasks: &[StartupTask],
         tasks_enabled: bool,
+        requested_backend: &str,
     ) -> HamburResult<()> {
         if !self.is_rootfs_installed() {
             self.reset_rootfs(false)?;
         }
         self.ensure_rootfs_skeleton()?;
         self.copy_fallback_proot_asset_if_present();
-        self.run_startup_tasks(startup_tasks, tasks_enabled)?;
+        self.update_rootfs_status(requested_backend);
+        self.prewarm_chroot_if_available();
+        self.run_startup_tasks_once(startup_tasks, tasks_enabled)?;
+        Ok(())
+    }
+
+    pub fn run_startup_tasks_once(&self, tasks: &[StartupTask], enabled: bool) -> HamburResult<()> {
+        let should_run = {
+            let mut ran = self.startup_tasks_ran.lock().map_err(|_| {
+                HamburError::Internal("startup task state lock poisoned".to_string())
+            })?;
+            if *ran {
+                false
+            } else {
+                *ran = true;
+                true
+            }
+        };
+        if should_run {
+            self.run_startup_tasks(tasks, enabled)?;
+        }
         Ok(())
     }
 
@@ -441,6 +569,7 @@ impl SandboxService {
                 }
             }
             if task.enabled {
+                let _ = self.prepare_session("startup_tasks");
                 let cmd = format!("/bin/sh /var/minis/autostart/{}", file_name);
                 let _ = self.execute("startup_tasks", &cmd, "/", 120_000);
             }
@@ -467,54 +596,22 @@ impl SandboxService {
                 reason: "rootfs is not initialized".to_string(),
             };
         }
-        let root_check = std::process::Command::new("su")
-            .arg("-c")
-            .arg("id -u")
-            .output();
-        let root_available = match root_check {
-            Ok(out) => out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "0",
-            Err(_) => false,
-        };
-        let mut chroot_available = false;
-        if root_available {
-            let chroot_check = std::process::Command::new("su")
-                .arg("-c")
-                .arg(format!(
-                    "chroot '{}' /bin/busybox --install -s /bin >/dev/null 2>&1; chroot '{}' /bin/sh -lc 'echo hambur-chroot-ok'",
-                    self.rootfs_dir.to_string_lossy(),
-                    self.rootfs_dir.to_string_lossy()
-                ))
-                .output();
-            if let Ok(out) = chroot_check {
-                chroot_available = out.status.success()
-                    && String::from_utf8_lossy(&out.stdout).contains("hambur-chroot-ok");
-            }
-        }
-        let mut proot_available = false;
-        if let Some(proot_bin) = self.find_proot_executable() {
-            let tmp_dir = self.app_files_dir.join("tmp/proot");
-            let _ = fs::create_dir_all(&tmp_dir);
-            let tmp_dir_str = tmp_dir.to_string_lossy().into_owned();
-            let proot_check = std::process::Command::new(proot_bin)
-                .arg("-0")
-                .arg("-r")
-                .arg(&self.rootfs_dir)
-                .arg("-w")
-                .arg("/")
-                .arg("/bin/sh")
-                .arg("-lc")
-                .arg("echo hambur-proot-ok")
-                .env("PROOT_TMP_DIR", &tmp_dir_str)
-                .env("TMPDIR", &tmp_dir_str)
-                .env("TEMP", &tmp_dir_str)
-                .env("TMP", &tmp_dir_str)
-                .output();
-            if let Ok(out) = proot_check {
-                proot_available = out.status.success()
-                    && String::from_utf8_lossy(&out.stdout).contains("hambur-proot-ok");
-            }
-        }
         let backend = normalize_backend(requested_backend);
+        let proot_available = if backend == "proot" {
+            self.probe_proot_available()
+        } else {
+            false
+        };
+        let chroot_available = if backend == "chroot" {
+            self.probe_chroot_available()
+        } else {
+            false
+        };
+        let fallback_proot_available = if backend == "chroot" && !chroot_available {
+            self.probe_proot_available()
+        } else {
+            proot_available
+        };
         if backend == "chroot" {
             if chroot_available {
                 RootfsStatus {
@@ -523,7 +620,7 @@ impl SandboxService {
                     abi,
                     reason: String::new(),
                 }
-            } else if proot_available {
+            } else if fallback_proot_available {
                 RootfsStatus {
                     available: true,
                     backend: "proot".to_string(),
@@ -557,10 +654,115 @@ impl SandboxService {
         }
     }
 
+    pub fn probe_root_available(&self) -> bool {
+        if let Ok(cache) = self.probe_cache.lock() {
+            if let Some(probe) = cache.root.as_ref().filter(|probe| probe.is_fresh()) {
+                return probe.available;
+            }
+        }
+        let root_check = std::process::Command::new("su")
+            .arg("-c")
+            .arg("id -u")
+            .output();
+        let available = match root_check {
+            Ok(out) => out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "0",
+            Err(_) => false,
+        };
+        if let Ok(mut cache) = self.probe_cache.lock() {
+            cache.root = Some(TimedProbe {
+                available,
+                checked_at_ms: now_ms(),
+            });
+        }
+        available
+    }
+
+    pub fn probe_chroot_available(&self) -> bool {
+        if let Ok(cache) = self.probe_cache.lock() {
+            if let Some(probe) = cache.chroot.as_ref().filter(|probe| probe.is_fresh()) {
+                return probe.available;
+            }
+        }
+        let available = self.probe_root_available()
+            && {
+                let chroot_check = std::process::Command::new("su")
+                .arg("-c")
+                .arg(format!(
+                    "chroot '{}' /bin/busybox --install -s /bin >/dev/null 2>&1; chroot '{}' /bin/sh -lc 'echo hambur-chroot-ok'",
+                    self.rootfs_dir.to_string_lossy(),
+                    self.rootfs_dir.to_string_lossy()
+                ))
+                .output();
+                match chroot_check {
+                    Ok(out) => {
+                        out.status.success()
+                            && String::from_utf8_lossy(&out.stdout).contains("hambur-chroot-ok")
+                    }
+                    Err(_) => false,
+                }
+            };
+        if let Ok(mut cache) = self.probe_cache.lock() {
+            cache.chroot = Some(TimedProbe {
+                available,
+                checked_at_ms: now_ms(),
+            });
+        }
+        available
+    }
+
+    pub fn probe_proot_available(&self) -> bool {
+        if let Ok(cache) = self.probe_cache.lock() {
+            if let Some(probe) = cache.proot.as_ref().filter(|probe| probe.is_fresh()) {
+                return probe.available;
+            }
+        }
+        let available = if let Some(proot_bin) = self.find_proot_executable() {
+            let tmp_dir = self.app_files_dir.join("tmp/proot");
+            let _ = fs::create_dir_all(&tmp_dir);
+            let tmp_dir_str = tmp_dir.to_string_lossy().into_owned();
+            let proot_check = std::process::Command::new(proot_bin)
+                .arg("-0")
+                .arg("-r")
+                .arg(&self.rootfs_dir)
+                .arg("-w")
+                .arg("/")
+                .arg("/bin/sh")
+                .arg("-lc")
+                .arg("echo hambur-proot-ok")
+                .env("PROOT_TMP_DIR", &tmp_dir_str)
+                .env("TMPDIR", &tmp_dir_str)
+                .env("TEMP", &tmp_dir_str)
+                .env("TMP", &tmp_dir_str)
+                .output();
+            match proot_check {
+                Ok(out) => {
+                    out.status.success()
+                        && String::from_utf8_lossy(&out.stdout).contains("hambur-proot-ok")
+                }
+                Err(_) => false,
+            }
+        } else {
+            false
+        };
+        if let Ok(mut cache) = self.probe_cache.lock() {
+            cache.proot = Some(TimedProbe {
+                available,
+                checked_at_ms: now_ms(),
+            });
+        }
+        available
+    }
+
     pub fn update_rootfs_status(&self, requested_backend: &str) {
         let new_status = self.probe_rootfs_status(requested_backend);
         if let Ok(mut status) = self.rootfs_status.lock() {
             *status = new_status;
+        }
+    }
+
+    pub fn prewarm_chroot_if_available(&self) {
+        if self.rootfs_status().backend == "chroot" {
+            let _ = self.prepare_chroot_static_mounts();
         }
     }
 
@@ -863,6 +1065,10 @@ impl SandboxService {
         cwd: &str,
         timeout_ms: u64,
     ) -> HamburResult<SandboxExecResult> {
+        let exec_lock = self.chroot_exec_lock.clone();
+        let _guard = exec_lock
+            .lock()
+            .map_err(|_| HamburError::Internal("chroot execution lock poisoned".to_string()))?;
         let (program, args, _env) = self.build_chroot_command(session_id, command, cwd, true)?;
         self.run_process_blocking(
             program,
@@ -898,51 +1104,12 @@ impl SandboxService {
         std::collections::HashMap<String, String>,
     )> {
         let root = self.rootfs_dir.to_string_lossy().into_owned();
-        let global_memory = self
-            .root
-            .join("global/memory")
-            .to_string_lossy()
-            .into_owned();
-        let global_skills = self
-            .root
-            .join("global/skills")
-            .to_string_lossy()
-            .into_owned();
-        let global_shared = self
-            .root
-            .join("global/shared")
-            .to_string_lossy()
-            .into_owned();
-        let workspace = self
-            .resolve(session_id, "/var/hambur/workspace", SandboxAccess::Read)?
-            .host_path
-            .to_string_lossy()
-            .into_owned();
-        let attachments = self
-            .resolve(session_id, "/var/hambur/attachments", SandboxAccess::Read)?
-            .host_path
-            .to_string_lossy()
-            .into_owned();
-        let browser = self
-            .resolve(session_id, "/var/hambur/browser", SandboxAccess::Read)?
-            .host_path
-            .to_string_lossy()
-            .into_owned();
-        let mounts = self
-            .resolve(session_id, "/var/hambur/mounts", SandboxAccess::Read)?
-            .host_path
-            .to_string_lossy()
-            .into_owned();
-        let offloads = self
-            .resolve(session_id, "/var/hambur/offloads", SandboxAccess::Read)?
-            .host_path
-            .to_string_lossy()
-            .into_owned();
         let marker_line = if emit_ready_marker {
             "printf '__HAMBUR_SANDBOX_READY__\\n'\n"
         } else {
             ""
         };
+        self.prepare_chroot_mounts(session_id)?;
         let inner_script = format!(
             "export HOME=/root\n\
              export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\
@@ -956,32 +1123,10 @@ impl SandboxService {
         let script = format!(
             "set +e\n\
              ROOT={}\n\
-             umount_if_mounted() {{ grep -q \" $1 \" /proc/mounts 2>/dev/null && umount -l \"$1\" 2>/dev/null || true; }}\n\
-             bind_dir() {{ mkdir -p \"$2\" && umount_if_mounted \"$2\" && mount -o bind \"$1\" \"$2\"; }}\n\
-             grep -q \" $ROOT/dev \" /proc/mounts 2>/dev/null || mount -o bind /dev \"$ROOT/dev\"\n\
-             grep -q \" $ROOT/proc \" /proc/mounts 2>/dev/null || mount -t proc proc \"$ROOT/proc\" 2>/dev/null || mount -o bind /proc \"$ROOT/proc\"\n\
-             grep -q \" $ROOT/sys \" /proc/mounts 2>/dev/null || mount -o bind /sys \"$ROOT/sys\" 2>/dev/null || true\n\
-             bind_dir {} \"$ROOT/var/hambur/memory\"\n\
-             bind_dir {} \"$ROOT/var/hambur/skills\"\n\
-             bind_dir {} \"$ROOT/var/hambur/shared\"\n\
-             bind_dir {} \"$ROOT/var/hambur/attachments\"\n\
-             bind_dir {} \"$ROOT/var/hambur/browser\"\n\
-             bind_dir {} \"$ROOT/var/hambur/mounts\"\n\
-             bind_dir {} \"$ROOT/var/hambur/offloads\"\n\
-             bind_dir {} \"$ROOT/var/hambur/workspace\"\n\
-             chroot \"$ROOT\" /bin/busybox --install -s /bin >/dev/null 2>&1 || true\n\
              chroot \"$ROOT\" /bin/sh -lc {}\n\
              STATUS=$?\n\
              exit $STATUS",
             shell_quote(&root),
-            shell_quote(&global_memory),
-            shell_quote(&global_skills),
-            shell_quote(&global_shared),
-            shell_quote(&attachments),
-            shell_quote(&browser),
-            shell_quote(&mounts),
-            shell_quote(&offloads),
-            shell_quote(&workspace),
             shell_quote(&inner_script)
         );
         Ok((
@@ -1002,27 +1147,13 @@ impl SandboxService {
         Vec<String>,
         std::collections::HashMap<String, String>,
     )> {
+        let session_paths = self.prepared_session_paths(session_id)?;
         let proot_bin = self
             .find_proot_executable()
             .ok_or_else(|| HamburError::Internal("proot binary is missing".to_string()))?;
         let global_memory = self.root.join("global/memory");
         let global_skills = self.root.join("global/skills");
         let global_shared = self.root.join("global/shared");
-        let workspace = self
-            .resolve(session_id, "/var/hambur/workspace", SandboxAccess::Read)?
-            .host_path;
-        let attachments = self
-            .resolve(session_id, "/var/hambur/attachments", SandboxAccess::Read)?
-            .host_path;
-        let browser = self
-            .resolve(session_id, "/var/hambur/browser", SandboxAccess::Read)?
-            .host_path;
-        let mounts = self
-            .resolve(session_id, "/var/hambur/mounts", SandboxAccess::Read)?
-            .host_path;
-        let offloads = self
-            .resolve(session_id, "/var/hambur/offloads", SandboxAccess::Read)?
-            .host_path;
         let marker_line = if emit_ready_marker {
             "printf '__HAMBUR_SANDBOX_READY__\\n'\n"
         } else {
@@ -1032,7 +1163,7 @@ impl SandboxService {
             "export HOME=/root\n\
              export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\
              {}\
-             cd {}\n\
+             cd {} || exit 127\n\
              {}",
             marker_line,
             shell_quote(cwd),
@@ -1055,15 +1186,30 @@ impl SandboxService {
             "-b".to_string(),
             format!("{}:/var/hambur/shared", global_shared.to_string_lossy()),
             "-b".to_string(),
-            format!("{}:/var/hambur/attachments", attachments.to_string_lossy()),
+            format!(
+                "{}:/var/hambur/attachments",
+                session_paths.attachments.to_string_lossy()
+            ),
             "-b".to_string(),
-            format!("{}:/var/hambur/browser", browser.to_string_lossy()),
+            format!(
+                "{}:/var/hambur/browser",
+                session_paths.browser.to_string_lossy()
+            ),
             "-b".to_string(),
-            format!("{}:/var/hambur/mounts", mounts.to_string_lossy()),
+            format!(
+                "{}:/var/hambur/mounts",
+                session_paths.mounts.to_string_lossy()
+            ),
             "-b".to_string(),
-            format!("{}:/var/hambur/offloads", offloads.to_string_lossy()),
+            format!(
+                "{}:/var/hambur/offloads",
+                session_paths.offloads.to_string_lossy()
+            ),
             "-b".to_string(),
-            format!("{}:/var/hambur/workspace", workspace.to_string_lossy()),
+            format!(
+                "{}:/var/hambur/workspace",
+                session_paths.workspace.to_string_lossy()
+            ),
             "-w".to_string(),
             cwd.to_string(),
             "/bin/sh".to_string(),
@@ -1086,6 +1232,7 @@ impl SandboxService {
         session_id: &str,
         command: &str,
         cwd: &str,
+        process_session_id: &str,
     ) -> HamburResult<(
         String,
         Vec<String>,
@@ -1094,10 +1241,101 @@ impl SandboxService {
         let status = self.rootfs_status();
         let backend = status.backend.as_str();
         if backend == "chroot" {
-            self.build_chroot_command(session_id, command, cwd, false)
+            self.build_chroot_background_command(session_id, command, cwd, process_session_id)
         } else {
             self.build_proot_command(session_id, command, cwd, false)
         }
+    }
+
+    pub fn chroot_process_pid_file(&self, process_session_id: &str) -> HamburResult<PathBuf> {
+        let process_session_id = normalize_session_id(process_session_id)?;
+        let process_dir = self.root.join("processes");
+        let pid_file = process_dir.join(format!("{process_session_id}.pid"));
+        ensure_inside_root(&self.root, &pid_file)?;
+        Ok(pid_file)
+    }
+
+    fn build_chroot_background_command(
+        &self,
+        session_id: &str,
+        command: &str,
+        cwd: &str,
+        process_session_id: &str,
+    ) -> HamburResult<(
+        String,
+        Vec<String>,
+        std::collections::HashMap<String, String>,
+    )> {
+        let session_paths = self.prepared_session_paths(session_id)?;
+        let pid_file = self.chroot_process_pid_file(process_session_id)?;
+        if let Some(parent) = pid_file.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| HamburError::Internal(format!("create process dir: {e}")))?;
+        }
+        let root = self.rootfs_dir.to_string_lossy().into_owned();
+        let global_memory = self.root.join("global/memory");
+        let global_skills = self.root.join("global/skills");
+        let global_shared = self.root.join("global/shared");
+        for dir in [&global_memory, &global_skills, &global_shared] {
+            fs::create_dir_all(dir).map_err(|e| {
+                HamburError::Internal(format!("create chroot host dir {}: {e}", dir.display()))
+            })?;
+        }
+        let inner_script = format!(
+            "export HOME=/root\n\
+             export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\
+             cd {} || exit 127\n\
+             {}",
+            shell_quote(cwd),
+            command
+        );
+        let script = format!(
+            "set +e\n\
+             ROOT={}\n\
+             PIDFILE={}\n\
+             echo $$ > \"$PIDFILE\"\n\
+             umount_if_mounted() {{ grep -q \" $1 \" /proc/mounts 2>/dev/null && umount -l \"$1\" 2>/dev/null || true; }}\n\
+             bind_dir() {{ mkdir -p \"$2\" && umount_if_mounted \"$2\" && mount -o bind \"$1\" \"$2\"; }}\n\
+             cleanup() {{ STATUS=$?; if [ -n \"${{CHILD:-}}\" ]; then kill -TERM \"$CHILD\" 2>/dev/null || true; wait \"$CHILD\" 2>/dev/null || true; fi; for target in \"$ROOT/var/hambur/workspace\" \"$ROOT/var/hambur/offloads\" \"$ROOT/var/hambur/mounts\" \"$ROOT/var/hambur/browser\" \"$ROOT/var/hambur/attachments\" \"$ROOT/var/hambur/shared\" \"$ROOT/var/hambur/skills\" \"$ROOT/var/hambur/memory\" \"$ROOT/sys\" \"$ROOT/proc\" \"$ROOT/dev\"; do umount_if_mounted \"$target\"; done; rm -f \"$PIDFILE\"; exit $STATUS; }}\n\
+             trap cleanup EXIT INT TERM\n\
+             mount --make-rprivate / 2>/dev/null || true\n\
+             umount_if_mounted \"$ROOT/dev\"\n\
+             umount_if_mounted \"$ROOT/proc\"\n\
+             umount_if_mounted \"$ROOT/sys\"\n\
+             mount -o bind /dev \"$ROOT/dev\"\n\
+             mount -t proc proc \"$ROOT/proc\" 2>/dev/null || mount -o bind /proc \"$ROOT/proc\"\n\
+             mount -o bind /sys \"$ROOT/sys\" 2>/dev/null || true\n\
+             bind_dir {} \"$ROOT/var/hambur/memory\"\n\
+             bind_dir {} \"$ROOT/var/hambur/skills\"\n\
+             bind_dir {} \"$ROOT/var/hambur/shared\"\n\
+             bind_dir {} \"$ROOT/var/hambur/attachments\"\n\
+             bind_dir {} \"$ROOT/var/hambur/browser\"\n\
+             bind_dir {} \"$ROOT/var/hambur/mounts\"\n\
+             bind_dir {} \"$ROOT/var/hambur/offloads\"\n\
+             bind_dir {} \"$ROOT/var/hambur/workspace\"\n\
+             chroot \"$ROOT\" /bin/busybox --install -s /bin >/dev/null 2>&1 || true\n\
+             chroot \"$ROOT\" /bin/sh -lc {} &\n\
+             CHILD=$!\n\
+             wait \"$CHILD\"\n\
+             exit $?",
+            shell_quote(&root),
+            shell_quote(&pid_file.to_string_lossy()),
+            shell_quote(&global_memory.to_string_lossy()),
+            shell_quote(&global_skills.to_string_lossy()),
+            shell_quote(&global_shared.to_string_lossy()),
+            shell_quote(&session_paths.attachments.to_string_lossy()),
+            shell_quote(&session_paths.browser.to_string_lossy()),
+            shell_quote(&session_paths.mounts.to_string_lossy()),
+            shell_quote(&session_paths.offloads.to_string_lossy()),
+            shell_quote(&session_paths.workspace.to_string_lossy()),
+            shell_quote(&inner_script)
+        );
+        let wrapper = format!("unshare -m /system/bin/sh -c {}", shell_quote(&script));
+        Ok((
+            "su".to_string(),
+            vec!["-c".to_string(), wrapper],
+            std::collections::HashMap::new(),
+        ))
     }
 
     fn run_process_blocking(
@@ -1181,6 +1419,136 @@ impl SandboxService {
             .arg("-c")
             .arg(&script)
             .output();
+        self.clear_chroot_mount_state();
+    }
+
+    fn clear_chroot_mount_state(&self) {
+        if let Ok(mut state) = self.chroot_mount_state.lock() {
+            state.static_ready = false;
+            state.prepared_session_id = None;
+        }
+    }
+
+    fn clear_probe_cache(&self) {
+        if let Ok(mut cache) = self.probe_cache.lock() {
+            *cache = ProbeCache::default();
+        }
+    }
+
+    fn clear_startup_tasks_state(&self) {
+        if let Ok(mut ran) = self.startup_tasks_ran.lock() {
+            *ran = false;
+        }
+    }
+
+    fn prepare_chroot_static_mounts(&self) -> HamburResult<()> {
+        if self
+            .chroot_mount_state
+            .lock()
+            .map(|state| state.static_ready)
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        self.ensure_rootfs_skeleton()?;
+        let global_memory = self.root.join("global/memory");
+        let global_skills = self.root.join("global/skills");
+        let global_shared = self.root.join("global/shared");
+        for dir in [&global_memory, &global_skills, &global_shared] {
+            fs::create_dir_all(dir).map_err(|e| {
+                HamburError::Internal(format!("create chroot host dir {}: {e}", dir.display()))
+            })?;
+        }
+
+        let root = self.rootfs_dir.to_string_lossy().into_owned();
+        let script = format!(
+            "set +e\n\
+             ROOT={}\n\
+             umount_if_mounted() {{ grep -q \" $1 \" /proc/mounts 2>/dev/null && umount -l \"$1\" 2>/dev/null || true; }}\n\
+             bind_dir() {{ mkdir -p \"$2\" && umount_if_mounted \"$2\" && mount -o bind \"$1\" \"$2\"; }}\n\
+             umount_if_mounted \"$ROOT/dev\"\n\
+             umount_if_mounted \"$ROOT/proc\"\n\
+             umount_if_mounted \"$ROOT/sys\"\n\
+             mount -o bind /dev \"$ROOT/dev\"\n\
+             mount -t proc proc \"$ROOT/proc\" 2>/dev/null || mount -o bind /proc \"$ROOT/proc\"\n\
+             mount -o bind /sys \"$ROOT/sys\" 2>/dev/null || true\n\
+             bind_dir {} \"$ROOT/var/hambur/memory\"\n\
+             bind_dir {} \"$ROOT/var/hambur/skills\"\n\
+             bind_dir {} \"$ROOT/var/hambur/shared\"\n\
+             chroot \"$ROOT\" /bin/busybox --install -s /bin >/dev/null 2>&1 || true",
+            shell_quote(&root),
+            shell_quote(&global_memory.to_string_lossy()),
+            shell_quote(&global_skills.to_string_lossy()),
+            shell_quote(&global_shared.to_string_lossy())
+        );
+        let out = std::process::Command::new("su")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .map_err(|e| HamburError::Internal(format!("prepare chroot static mounts: {e}")))?;
+        if !out.status.success() {
+            self.clear_chroot_mount_state();
+            return Err(HamburError::Internal(format!(
+                "prepare chroot static mounts failed: {}{}",
+                String::from_utf8_lossy(&out.stderr),
+                String::from_utf8_lossy(&out.stdout)
+            )));
+        }
+        if let Ok(mut state) = self.chroot_mount_state.lock() {
+            state.static_ready = true;
+        }
+        Ok(())
+    }
+
+    fn prepare_chroot_mounts(&self, session_id: &str) -> HamburResult<()> {
+        let paths = self.prepared_session_paths(session_id)?;
+        self.prepare_chroot_static_mounts()?;
+        if self
+            .chroot_mount_state
+            .lock()
+            .map(|state| state.prepared_session_id.as_deref() == Some(&paths.session_id))
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+
+        let root = self.rootfs_dir.to_string_lossy().into_owned();
+        let script = format!(
+            "set +e\n\
+             ROOT={}\n\
+             umount_if_mounted() {{ grep -q \" $1 \" /proc/mounts 2>/dev/null && umount -l \"$1\" 2>/dev/null || true; }}\n\
+             bind_dir() {{ mkdir -p \"$2\" && umount_if_mounted \"$2\" && mount -o bind \"$1\" \"$2\"; }}\n\
+             bind_dir {} \"$ROOT/var/hambur/attachments\"\n\
+             bind_dir {} \"$ROOT/var/hambur/browser\"\n\
+             bind_dir {} \"$ROOT/var/hambur/mounts\"\n\
+             bind_dir {} \"$ROOT/var/hambur/offloads\"\n\
+             bind_dir {} \"$ROOT/var/hambur/workspace\"",
+            shell_quote(&root),
+            shell_quote(&paths.attachments.to_string_lossy()),
+            shell_quote(&paths.browser.to_string_lossy()),
+            shell_quote(&paths.mounts.to_string_lossy()),
+            shell_quote(&paths.offloads.to_string_lossy()),
+            shell_quote(&paths.workspace.to_string_lossy())
+        );
+        let out = std::process::Command::new("su")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .map_err(|e| HamburError::Internal(format!("prepare chroot session mounts: {e}")))?;
+        if !out.status.success() {
+            if let Ok(mut state) = self.chroot_mount_state.lock() {
+                state.prepared_session_id = None;
+            }
+            return Err(HamburError::Internal(format!(
+                "prepare chroot session mounts failed: {}{}",
+                String::from_utf8_lossy(&out.stderr),
+                String::from_utf8_lossy(&out.stdout)
+            )));
+        }
+        if let Ok(mut state) = self.chroot_mount_state.lock() {
+            state.prepared_session_id = Some(paths.session_id);
+        }
+        Ok(())
     }
 }
 
@@ -1552,6 +1920,46 @@ mod tests {
                 .contains("sessions/session_1/workspace")
         );
         assert!(resolved.host_path.starts_with(sandbox.root()));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn prepare_session_creates_uploads_and_workspace_dirs() {
+        let dir = temp_dir();
+        let sandbox = SandboxService::new(&dir).expect("sandbox");
+        sandbox.prepare_session("session_1").expect("prepare");
+
+        let uploads = sandbox
+            .resolve(
+                "session_1",
+                "/var/hambur/attachments/uploads",
+                SandboxAccess::Read,
+            )
+            .expect("uploads");
+        let workspace = sandbox
+            .resolve("session_1", "/var/hambur/workspace", SandboxAccess::Read)
+            .expect("workspace");
+        assert!(uploads.host_path.is_dir());
+        assert!(workspace.host_path.is_dir());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn autostart_resolves_inside_rootfs() {
+        let dir = temp_dir();
+        let sandbox = SandboxService::new(&dir).expect("sandbox");
+        sandbox.ensure_rootfs_skeleton().expect("rootfs skeleton");
+        let resolved = sandbox
+            .resolve(
+                "session_1",
+                "/var/minis/autostart/task.sh",
+                SandboxAccess::Read,
+            )
+            .expect("autostart");
+
+        assert_eq!(resolved.root, "autostart");
+        assert!(resolved.host_path.starts_with(sandbox.rootfs_dir()));
+        assert!(resolved.host_path.ends_with("var/minis/autostart/task.sh"));
         let _ = fs::remove_dir_all(dir);
     }
 

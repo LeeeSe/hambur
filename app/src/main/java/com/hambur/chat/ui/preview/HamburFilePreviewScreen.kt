@@ -61,6 +61,7 @@ import com.hambur.chat.ui.components.HamburTopBar
 import com.hambur.chat.ui.markdown.MarkdownBlock
 import com.hambur.chat.ui.markdown.rememberMarkdownRenderCache
 import com.hambur.chat.ui.markdown.rememberMarkdownStyle
+import com.hambur.chat.uniffi.MarkdownBlockNodeDto
 import java.io.File
 import java.io.FileInputStream
 import kotlin.math.roundToInt
@@ -255,8 +256,6 @@ private fun MarkdownFilePreview(
     }
     val markdownStyle = rememberMarkdownStyle()
     val markdownCache = rememberMarkdownRenderCache()
-    val blocks = state.markdownBlocksByMessageId[messageId].orEmpty()
-    val pending = state.pendingMarkdownByMessageId[messageId]
 
     val content = preview?.getOrNull()?.let {
         if (it.truncated) {
@@ -265,14 +264,17 @@ private fun MarkdownFilePreview(
             it.text
         }
     }.orEmpty()
-
-    LaunchedEffect(messageId, content, blocks.size, pending) {
-        if (content.isNotBlank() && blocks.isEmpty() && pending == null) {
-            store.renderMarkdownText(
-                sessionId = state.selectedSessionId,
-                messageId = messageId,
-                markdown = content,
-            )
+    val blocks by produceState<List<MarkdownBlockNodeDto>>(
+        initialValue = emptyList(),
+        messageId,
+        content,
+    ) {
+        value = if (content.isBlank()) {
+            emptyList()
+        } else {
+            withContext(Dispatchers.IO) {
+                store.renderMarkdownDocument(messageId, content)
+            }
         }
     }
 
@@ -283,7 +285,7 @@ private fun MarkdownFilePreview(
             message = preview?.exceptionOrNull()?.message ?: resolved.file.absolutePath,
             modifier = Modifier.fillMaxSize(),
         )
-        blocks.isEmpty() && pending == null -> LoadingPreview()
+        blocks.isEmpty() -> LoadingPreview()
         else -> LazyColumn(
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
@@ -296,16 +298,6 @@ private fun MarkdownFilePreview(
                     renderCache = markdownCache,
                     onOpenDestination = onOpenFile,
                 )
-            }
-            if (pending != null) {
-                item(key = "pending-${pending.stableKey}") {
-                    MarkdownBlock(
-                        node = pending,
-                        style = markdownStyle,
-                        renderCache = markdownCache,
-                        onOpenDestination = onOpenFile,
-                    )
-                }
             }
         }
     }

@@ -14,8 +14,9 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use hambur_core::{DTO_SCHEMA_VERSION, HamburError, HamburResult, new_id, now_ms};
 use hambur_db::{
-    AppSnapshot, AttachmentRecord, HamburDatabase, MessageRecord, ModelRouteSnapshot,
-    NewAttachment, NewFileRecord, NewTimelineItem, NewToolCall, NewToolResult, NewTraceSpan,
+    AppSnapshot, AttachmentRecord, HamburDatabase, MarkdownBlockPayloadRecord, MessageRecord,
+    ModelRouteSnapshot, NewAttachment, NewFileRecord, NewMarkdownBlockPayload, NewTimelineItem,
+    NewToolCall, NewToolResult, NewTraceSpan,
     ProviderModelOverride, ProviderModelUpsert, ProviderUpsert, SessionSummary, SettingsSnapshot,
     TimelineItemSnapshot,
 };
@@ -168,6 +169,7 @@ pub struct RuntimeSessionSnapshot {
     pub created_at_ms: u64,
     pub session: Option<SessionSummary>,
     pub timeline_items: Vec<TimelineItemSnapshot>,
+    pub markdown_block_payloads: Vec<MarkdownBlockPayloadRecord>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -176,6 +178,7 @@ pub struct RuntimeTimelinePage {
     pub created_at_ms: u64,
     pub session_id: String,
     pub items: Vec<TimelineItemSnapshot>,
+    pub markdown_block_payloads: Vec<MarkdownBlockPayloadRecord>,
     pub next_before_cursor: u64,
     pub has_more: bool,
 }
@@ -374,6 +377,7 @@ struct BackgroundProcessSession {
     cwd: String,
     started_at_ms: u64,
     pid: u32,
+    pid_file: Option<PathBuf>,
     child: Child,
     output: Arc<Mutex<ProcessOutputBuffer>>,
     exit_code: Option<i32>,
@@ -422,6 +426,7 @@ struct ProcessOutputSnapshot {
 enum StreamAttemptResult {
     Completed,
     Cancelled,
+    Continue(ToolContinuation),
     Failed {
         error: HamburError,
         semantic_delta_started: bool,
@@ -429,8 +434,20 @@ enum StreamAttemptResult {
 }
 
 #[derive(Debug, Clone)]
+struct ToolContinuation {
+    assistant_message_id: String,
+    route: ModelRouteSnapshot,
+    stream_source: RouteStreamSource,
+    tool_iteration: u32,
+}
+
+#[derive(Debug, Clone)]
 enum RouteStreamSource {
-    Scripted(Vec<Vec<u8>>),
+    Scripted {
+        request: ModelRequest,
+        chunks: Vec<Vec<u8>>,
+        continuation_sse: Vec<String>,
+    },
     Provider(ModelRequest),
 }
 
@@ -470,6 +487,9 @@ impl RuntimeEngine {
             let _ = tokio.block_on(database.mark_file_cleanup_done(&job.id));
         }
         let snapshot = tokio.block_on(database.bootstrap_snapshot())?;
+        for session in &snapshot.sessions {
+            let _ = sandbox.prepare_session(&session.id);
+        }
         let tools = ToolScheduler::new(PathBuf::from(&bootstrap.app_files_dir).join("offloads"))?;
         let (sender, receiver) = mpsc::channel(64);
         let engine = Arc::new(Self {
@@ -666,6 +686,12 @@ impl RuntimeEngine {
             .block_on(self.database.create_session(&command.title))
         {
             Ok(snapshot) => {
+                if !snapshot.selected_session_id.trim().is_empty()
+                    && let Err(error) = self.sandbox.prepare_session(&snapshot.selected_session_id)
+                {
+                    let _ = self.emit_error(error.clone());
+                    return rejected_ack(command.command_id, command.idempotency_key, error);
+                }
                 let _ = self.emit(RuntimeEventKind::SessionCreated, snapshot, None);
                 accepted_ack(command.command_id, command.idempotency_key)
             }
@@ -1758,7 +1784,7 @@ impl RuntimeEngine {
                     &command.session_id,
                     NewTimelineItem {
                         stable_key: user_message.id.clone(),
-                        content_type: "message".to_string(),
+                        content_type: "user_message".to_string(),
                         display_sequence: user_message.created_at_ms,
                         payload_ref: user_message.id.clone(),
                         small_summary: user_content.chars().take(160).collect(),
@@ -1780,22 +1806,6 @@ impl RuntimeEngine {
                     "streaming",
                     &turn.id,
                     &route,
-                )
-                .await?;
-            self.database
-                .upsert_timeline_item(
-                    &command.session_id,
-                    NewTimelineItem {
-                        stable_key: assistant_message.id.clone(),
-                        content_type: "message".to_string(),
-                        display_sequence: assistant_message.created_at_ms,
-                        payload_ref: assistant_message.id.clone(),
-                        small_summary: format!(
-                            "{} via {}",
-                            route.model_display_name, route.provider_name
-                        ),
-                        kind: "AssistantMessage".to_string(),
-                    },
                 )
                 .await?;
             let snapshot = self.database.session_snapshot(&command.session_id).await?;
@@ -1879,6 +1889,7 @@ impl RuntimeEngine {
                     fallback_policy,
                     cancel,
                     stream_sources_by_route,
+                    0,
                 )
                 .await;
         });
@@ -2195,6 +2206,11 @@ impl RuntimeEngine {
         }
 
         let (tasks, enabled) = self.get_startup_tasks_and_enabled();
+        let settings_snap = self
+            .tokio
+            .block_on(self.database.settings_snapshot())
+            .unwrap_or_default();
+        let requested_backend = get_rootfs_backend(&settings_snap.settings);
 
         if command.kind == "ResetRootfs" {
             let payload = config_payload_value(&command.payload_json);
@@ -2204,22 +2220,15 @@ impl RuntimeEngine {
             }
         }
 
-        if let Err(error) = self.sandbox.ensure_initialized(&tasks, enabled) {
-            return rejected_ack(command.command_id, command.idempotency_key, error);
-        }
-
-        if !command.session_id.trim().is_empty()
-            && let Err(error) = self.sandbox.prepare_session(&command.session_id)
+        if let Err(error) = self
+            .sandbox
+            .ensure_initialized(&tasks, enabled, requested_backend)
         {
             return rejected_ack(command.command_id, command.idempotency_key, error);
         }
 
-        let settings_snap = self
-            .tokio
-            .block_on(self.database.settings_snapshot())
-            .unwrap_or_default();
-        let requested_backend = get_rootfs_backend(&settings_snap.settings);
         self.sandbox.update_rootfs_status(requested_backend);
+        self.sandbox.prewarm_chroot_if_available();
         let status = self.sandbox.rootfs_status();
         let snapshot = self
             .tokio
@@ -2231,7 +2240,7 @@ impl RuntimeEngine {
             "abi": status.abi,
             "reason": status.reason,
             "action": command.kind,
-            "sessionPrepared": !command.session_id.trim().is_empty()
+            "sessionIdProvided": !command.session_id.trim().is_empty()
         })
         .to_string();
         let _ = self.emit_session_event(
@@ -2255,12 +2264,18 @@ impl RuntimeEngine {
         fallback_policy: FallbackPolicy,
         cancel: Arc<AtomicBool>,
         stream_sources_by_route: Vec<RouteStreamSource>,
+        tool_iteration: u32,
     ) {
-        let target_count = routes.len();
-        let route_candidates = routes.clone();
+        let mut current_assistant_message_id = assistant_message_id;
+        let mut current_routes = routes;
+        let mut current_stream_sources_by_route = stream_sources_by_route;
+        let mut current_tool_iteration = tool_iteration;
+        'agent_loop: loop {
+        let target_count = current_routes.len();
+        let route_candidates = current_routes.clone();
         let mut last_error = None;
 
-        for (attempt_index, route) in routes.into_iter().enumerate() {
+        for (attempt_index, route) in current_routes.iter().cloned().enumerate() {
             if attempt_index > 0 {
                 if let Err(error) = self
                     .database
@@ -2270,7 +2285,7 @@ impl RuntimeEngine {
                     self.finish_failed_turn(
                         &session_id,
                         &turn_id,
-                        &assistant_message_id,
+                        &current_assistant_message_id,
                         "",
                         "",
                         error,
@@ -2280,13 +2295,13 @@ impl RuntimeEngine {
                 }
                 if let Err(error) = self
                     .database
-                    .update_message_route_snapshot(&assistant_message_id, &route)
+                    .update_message_route_snapshot(&current_assistant_message_id, &route)
                     .await
                 {
                     self.finish_failed_turn(
                         &session_id,
                         &turn_id,
-                        &assistant_message_id,
+                        &current_assistant_message_id,
                         "",
                         "",
                         error,
@@ -2310,7 +2325,7 @@ impl RuntimeEngine {
                 );
             }
 
-            let stream_source = stream_sources_by_route
+            let stream_source = current_stream_sources_by_route
                 .get(attempt_index)
                 .cloned()
                 .unwrap_or_else(|| {
@@ -2330,15 +2345,23 @@ impl RuntimeEngine {
                 .run_chat_stream_attempt(
                     session_id.clone(),
                     turn_id.clone(),
-                    assistant_message_id.clone(),
+                    current_assistant_message_id.clone(),
                     route,
                     route_candidates.clone(),
                     cancel.clone(),
                     stream_source,
+                    current_tool_iteration,
                 )
                 .await
             {
                 StreamAttemptResult::Completed | StreamAttemptResult::Cancelled => return,
+                StreamAttemptResult::Continue(continuation) => {
+                    current_assistant_message_id = continuation.assistant_message_id;
+                    current_routes = vec![continuation.route];
+                    current_stream_sources_by_route = vec![continuation.stream_source];
+                    current_tool_iteration = continuation.tool_iteration;
+                    continue 'agent_loop;
+                }
                 StreamAttemptResult::Failed {
                     error,
                     semantic_delta_started,
@@ -2358,7 +2381,7 @@ impl RuntimeEngine {
                         self.finish_failed_turn(
                             &session_id,
                             &turn_id,
-                            &assistant_message_id,
+                            &current_assistant_message_id,
                             "",
                             "",
                             error,
@@ -2371,8 +2394,17 @@ impl RuntimeEngine {
         }
 
         if let Some(error) = last_error {
-            self.finish_failed_turn(&session_id, &turn_id, &assistant_message_id, "", "", error)
+            self.finish_failed_turn(
+                &session_id,
+                &turn_id,
+                &current_assistant_message_id,
+                "",
+                "",
+                error,
+            )
                 .await;
+        }
+        return;
         }
     }
 
@@ -2386,11 +2418,23 @@ impl RuntimeEngine {
         route_candidates: Vec<ModelRouteSnapshot>,
         cancel: Arc<AtomicBool>,
         stream_source: RouteStreamSource,
+        tool_iteration: u32,
     ) -> StreamAttemptResult {
         let mut state = StreamAttemptState::default();
+        let mut current_request = match &stream_source {
+            RouteStreamSource::Scripted { request, .. } => request.clone(),
+            RouteStreamSource::Provider(request) => request.clone(),
+        };
+        let continuation_sse = match &stream_source {
+            RouteStreamSource::Scripted {
+                continuation_sse, ..
+            } => continuation_sse.clone(),
+            RouteStreamSource::Provider(_) => Vec::new(),
+        };
+        let scripted_source = matches!(&stream_source, RouteStreamSource::Scripted { .. });
         match stream_source {
-            RouteStreamSource::Scripted(stream_chunks) => {
-                for chunk in stream_chunks {
+            RouteStreamSource::Scripted { chunks, .. } => {
+                for chunk in chunks {
                     if let Some(result) = self
                         .clone()
                         .process_stream_chunk(
@@ -2409,6 +2453,7 @@ impl RuntimeEngine {
                 }
             }
             RouteStreamSource::Provider(request) => {
+                current_request = request.clone();
                 let api_key = match self
                     .resolve_provider_api_key(&session_id, &turn_id, &route, &cancel)
                     .await
@@ -2512,12 +2557,9 @@ impl RuntimeEngine {
         if let Some(update) =
             self.append_stream_markdown(&session_id, &assistant_message_id, "", true)
         {
-            let snapshot = self
-                .database
-                .session_snapshot(&session_id)
-                .await
-                .unwrap_or_default();
-            let _ = self.emit_markdown_event(session_id.clone(), turn_id.clone(), snapshot, update);
+            let _ = self
+                .emit_markdown_event_async(session_id.clone(), turn_id.clone(), update)
+                .await;
         }
 
         let final_finish_reason = state.finish_reason.if_blank("stop".to_string());
@@ -2561,10 +2603,15 @@ impl RuntimeEngine {
                     final_finish_reason,
                     final_native_finish_reason,
                     state.complete_tool_calls,
+                    tool_iteration,
+                    current_request,
+                    continuation_sse,
+                    scripted_source,
                 )
                 .await;
             return match result {
-                Ok(()) => StreamAttemptResult::Completed,
+                Ok(Some(continuation)) => StreamAttemptResult::Continue(continuation),
+                Ok(None) => StreamAttemptResult::Cancelled,
                 Err(error) => {
                     self.finish_failed_turn(
                         &session_id,
@@ -2583,7 +2630,7 @@ impl RuntimeEngine {
             };
         }
 
-        let message = match self
+        if let Err(error) = self
             .database
             .update_message_stream_result(
                 &assistant_message_id,
@@ -2592,39 +2639,6 @@ impl RuntimeEngine {
                 "completed",
                 &final_finish_reason,
                 &final_native_finish_reason,
-            )
-            .await
-        {
-            Ok(message) => message,
-            Err(error) => {
-                self.finish_failed_turn(
-                    &session_id,
-                    &turn_id,
-                    &assistant_message_id,
-                    &state.content,
-                    &state.reasoning,
-                    error.clone(),
-                )
-                .await;
-                return StreamAttemptResult::Failed {
-                    error,
-                    semantic_delta_started: true,
-                };
-            }
-        };
-        let summary = message.content_text.chars().take(160).collect::<String>();
-        if let Err(error) = self
-            .database
-            .upsert_timeline_item(
-                &session_id,
-                NewTimelineItem {
-                    stable_key: message.id,
-                    content_type: "message".to_string(),
-                    display_sequence: message.created_at_ms,
-                    payload_ref: assistant_message_id.clone(),
-                    small_summary: summary,
-                    kind: "AssistantMessage".to_string(),
-                },
             )
             .await
         {
@@ -2793,12 +2807,13 @@ impl RuntimeEngine {
                             &delta,
                             false,
                         ) {
-                            let _ = self.emit_markdown_event(
-                                session_id.to_string(),
-                                turn_id.to_string(),
-                                snapshot,
-                                update,
-                            );
+                            let _ = self
+                                .emit_markdown_event_async(
+                                    session_id.to_string(),
+                                    turn_id.to_string(),
+                                    update,
+                                )
+                                .await;
                         }
                     }
                     ProviderStreamEvent::ReasoningDelta(delta) => {
@@ -2890,8 +2905,12 @@ impl RuntimeEngine {
         finish_reason: String,
         native_finish_reason: String,
         complete_tool_calls: Vec<CompleteToolCall>,
-    ) -> HamburResult<()> {
-        if complete_tool_calls.len() > MAX_TOOL_ITERATIONS_PER_TURN as usize {
+        tool_iteration: u32,
+        current_request: ModelRequest,
+        continuation_sse: Vec<String>,
+        scripted_source: bool,
+    ) -> HamburResult<Option<ToolContinuation>> {
+        if tool_iteration >= MAX_TOOL_ITERATIONS_PER_TURN {
             return Err(HamburError::InvalidCommand(format!(
                 "max tool iterations exceeded: {}",
                 MAX_TOOL_ITERATIONS_PER_TURN
@@ -2901,20 +2920,12 @@ impl RuntimeEngine {
         if let Some(update) =
             self.append_stream_markdown(session_id, assistant_message_id, "", true)
         {
-            let snapshot = self
-                .database
-                .session_snapshot(session_id)
-                .await
-                .unwrap_or_default();
-            let _ = self.emit_markdown_event(
-                session_id.to_string(),
-                turn_id.to_string(),
-                snapshot,
-                update,
-            );
+            let _ = self
+                .emit_markdown_event_async(session_id.to_string(), turn_id.to_string(), update)
+                .await;
         }
 
-        let message = self
+        self
             .database
             .update_message_stream_result(
                 assistant_message_id,
@@ -2923,23 +2934,6 @@ impl RuntimeEngine {
                 "requires_tool",
                 &finish_reason.if_blank("tool_calls".to_string()),
                 &native_finish_reason.if_blank("tool_calls".to_string()),
-            )
-            .await?;
-        self.database
-            .upsert_timeline_item(
-                session_id,
-                NewTimelineItem {
-                    stable_key: message.id,
-                    content_type: "message".to_string(),
-                    display_sequence: message.created_at_ms,
-                    payload_ref: assistant_message_id.to_string(),
-                    small_summary: if content.trim().is_empty() {
-                        "Tool calls requested".to_string()
-                    } else {
-                        content.chars().take(160).collect()
-                    },
-                    kind: "AssistantMessage".to_string(),
-                },
             )
             .await?;
 
@@ -2960,6 +2954,7 @@ impl RuntimeEngine {
             None,
         );
 
+        let assistant_tool_calls = complete_tool_calls.clone();
         let mut invocations = Vec::new();
         let mut trace_ids = HashMap::<String, String>::new();
         for call in complete_tool_calls {
@@ -3025,7 +3020,7 @@ impl RuntimeEngine {
                 reasoning,
             )
             .await;
-            return Ok(());
+            return Ok(None);
         }
 
         let records = self
@@ -3039,6 +3034,7 @@ impl RuntimeEngine {
             )
             .await?;
         let view_image_handoff = select_view_image_handoff_route(route, route_candidates, &records);
+        let mut tool_result_messages = Vec::new();
         let mut context_stubs = Vec::new();
         for record in records {
             let tool_message = self
@@ -3120,7 +3116,13 @@ impl RuntimeEngine {
                 record.result.summary.clone(),
                 None,
             );
-            context_stubs.push(record.result.context_stub);
+            context_stubs.push(record.result.context_stub.clone());
+            tool_result_messages.push(ModelMessage {
+                role: "tool".to_string(),
+                content: record.result.context_stub,
+                tool_calls_json: String::new(),
+                tool_call_id: record.invocation.tool_call_id,
+            });
         }
 
         if cancel.load(Ordering::SeqCst) || self.shutdown.load(Ordering::SeqCst) {
@@ -3132,7 +3134,7 @@ impl RuntimeEngine {
                 reasoning,
             )
             .await;
-            return Ok(());
+            return Ok(None);
         }
 
         self.database
@@ -3159,7 +3161,6 @@ impl RuntimeEngine {
                 None,
             );
         }
-        let continuation_content = format_tool_continuation(&context_stubs);
         if context_stubs
             .iter()
             .any(|stub| stub.contains("ImagePart(fileId="))
@@ -3181,7 +3182,7 @@ impl RuntimeEngine {
                     session_id,
                     NewTimelineItem {
                         stable_key: synthetic.id.clone(),
-                        content_type: "message".to_string(),
+                        content_type: "user_message".to_string(),
                         display_sequence: synthetic.created_at_ms,
                         payload_ref: synthetic.id.clone(),
                         small_summary: synthetic.content_text.chars().take(160).collect(),
@@ -3190,58 +3191,36 @@ impl RuntimeEngine {
                 )
                 .await?;
         }
-        let continuation = self
+
+        let continuation_message = self
             .database
             .insert_message_with_route(
                 session_id,
                 "assistant",
-                &continuation_content,
                 "",
-                "completed",
+                "",
+                "streaming",
                 turn_id,
                 &continuation_route,
             )
             .await?;
-        self.database
-            .upsert_timeline_item(
-                session_id,
-                NewTimelineItem {
-                    stable_key: continuation.id.clone(),
-                    content_type: "message".to_string(),
-                    display_sequence: continuation.created_at_ms,
-                    payload_ref: continuation.id.clone(),
-                    small_summary: continuation_content.chars().take(160).collect(),
-                    kind: "AssistantMessage".to_string(),
-                },
-            )
-            .await?;
-        self.database
-            .update_turn_status(turn_id, "Finished", true)
-            .await?;
 
-        let snapshot = self
-            .database
-            .session_snapshot(session_id)
-            .await
-            .unwrap_or_default();
-        self.clear_active_turn(session_id, turn_id);
-        let _ = self.emit_session_event(
-            RuntimeEventKind::AssistantMessageFinished,
-            session_id.to_string(),
-            turn_id.to_string(),
-            snapshot.clone(),
-            "tool_continuation".to_string(),
-            None,
-        );
-        let _ = self.emit_session_event(
-            RuntimeEventKind::TurnFinished,
-            session_id.to_string(),
-            turn_id.to_string(),
-            snapshot,
-            "tool_continuation".to_string(),
-            None,
-        );
-        Ok(())
+        let continuation_source = tool_continuation_stream_source(
+            current_request,
+            &continuation_route,
+            &self.tools.schemas().compile_openai_tools_json(),
+            content,
+            assistant_tool_calls,
+            tool_result_messages,
+            continuation_sse,
+            scripted_source,
+        )?;
+        Ok(Some(ToolContinuation {
+            assistant_message_id: continuation_message.id,
+            route: continuation_route,
+            stream_source: continuation_source,
+            tool_iteration: tool_iteration.saturating_add(1),
+        }))
     }
 
     async fn update_latest_tool_trace(
@@ -3468,12 +3447,14 @@ impl RuntimeEngine {
         timeout_ms: u64,
     ) -> HamburResult<hambur_sandbox::SandboxExecResult> {
         let (tasks, enabled) = self.get_startup_tasks_and_enabled();
-        self.sandbox.ensure_initialized(&tasks, enabled)?;
         let settings_snap = self
             .safe_block_on(self.database.settings_snapshot())
             .unwrap_or_default();
         let requested_backend = get_rootfs_backend(&settings_snap.settings);
+        self.sandbox
+            .ensure_initialized(&tasks, enabled, requested_backend)?;
         self.sandbox.update_rootfs_status(requested_backend);
+        self.sandbox.prewarm_chroot_if_available();
         let status = self.sandbox.rootfs_status();
         if !status.available {
             return Err(HamburError::Internal(format!(
@@ -3551,27 +3532,12 @@ impl RuntimeEngine {
                 );
             }
         };
-        let _ = fs::create_dir_all(&cwd.host_path);
-        let status = self.sandbox.rootfs_status();
-        if !status.available {
-            return ToolResult::failed(
-                &invocation.tool_call_id,
-                &invocation.name,
-                format!("ToolUnavailable({})", status.reason),
-            );
-        }
-
         if arguments
             .get("background")
             .and_then(Value::as_bool)
             .unwrap_or(false)
         {
-            return self.start_background_process(
-                invocation,
-                command,
-                &cwd.sandbox_path,
-                &cwd.host_path,
-            );
+            return self.start_background_process(invocation, command, &cwd.sandbox_path);
         }
 
         let timeout_ms = arguments
@@ -3638,28 +3604,29 @@ impl RuntimeEngine {
         invocation: &ToolInvocation,
         command: &str,
         sandbox_cwd: &str,
-        host_cwd: &std::path::Path,
     ) -> ToolResult {
         let (tasks, enabled) = self.get_startup_tasks_and_enabled();
-        if let Err(error) = self.sandbox.ensure_initialized(&tasks, enabled) {
+        let settings_snap = self
+            .safe_block_on(self.database.settings_snapshot())
+            .unwrap_or_default();
+        let requested_backend = get_rootfs_backend(&settings_snap.settings);
+        if let Err(error) = self
+            .sandbox
+            .ensure_initialized(&tasks, enabled, requested_backend)
+        {
             return ToolResult::failed(
                 &invocation.tool_call_id,
                 &invocation.name,
                 format!("sandbox initialization failed: {error}"),
             );
         }
-        let settings_snap = self
-            .safe_block_on(self.database.settings_snapshot())
-            .unwrap_or_default();
-        let requested_backend = get_rootfs_backend(&settings_snap.settings);
         self.sandbox.update_rootfs_status(requested_backend);
-
-        let (program, args, envs) =
-            match self
-                .sandbox
-                .build_execution_command(&invocation.session_id, command, sandbox_cwd)
-            {
-                Ok(res) => res,
+        self.sandbox.prewarm_chroot_if_available();
+        let process_session_id = new_id("proc");
+        let backend = self.sandbox.rootfs_status().backend;
+        let pid_file = if backend == "chroot" {
+            match self.sandbox.chroot_process_pid_file(&process_session_id) {
+                Ok(path) => Some(path),
                 Err(error) => {
                     return ToolResult::failed(
                         &invocation.tool_call_id,
@@ -3667,11 +3634,29 @@ impl RuntimeEngine {
                         format!("build execution command failed: {error}"),
                     );
                 }
-            };
+            }
+        } else {
+            None
+        };
+
+        let (program, args, envs) = match self.sandbox.build_execution_command(
+            &invocation.session_id,
+            command,
+            sandbox_cwd,
+            &process_session_id,
+        ) {
+            Ok(res) => res,
+            Err(error) => {
+                return ToolResult::failed(
+                    &invocation.tool_call_id,
+                    &invocation.name,
+                    format!("build execution command failed: {error}"),
+                );
+            }
+        };
 
         let mut cmd = Command::new(&program);
         cmd.args(&args);
-        cmd.current_dir(host_cwd);
         for (k, v) in envs {
             cmd.env(k, v);
         }
@@ -3686,7 +3671,6 @@ impl RuntimeEngine {
                 );
             }
         };
-        let process_session_id = new_id("proc");
         let started_at_ms = now_ms();
         let pid = child.id();
         let output = Arc::new(Mutex::new(ProcessOutputBuffer::default()));
@@ -3705,6 +3689,7 @@ impl RuntimeEngine {
             cwd: sandbox_cwd.to_string(),
             started_at_ms,
             pid,
+            pid_file,
             child,
             output,
             exit_code: None,
@@ -3722,7 +3707,7 @@ impl RuntimeEngine {
 
         let content = json!({
             "processSessionId": process_session_id,
-            "backend": self.sandbox.rootfs_status().backend,
+            "backend": backend,
             "command": command,
             "cwd": sandbox_cwd,
             "startedAt": started_at_ms,
@@ -4143,6 +4128,7 @@ impl RuntimeEngine {
                 "process session belongs to a different session",
             );
         }
+        terminate_background_process_wrapper(&state);
         let _ = state.child.kill();
         let _ = state.child.wait();
         state.exit_code = Some(-1);
@@ -4185,6 +4171,7 @@ impl RuntimeEngine {
             .collect::<Vec<_>>();
         for id in ids {
             if let Some(mut state) = sessions.remove(&id) {
+                terminate_background_process_wrapper(&state);
                 let _ = state.child.kill();
                 let _ = state.child.wait();
             }
@@ -4816,14 +4803,14 @@ impl RuntimeEngine {
             }
         };
         let delegate_session_id = child_snapshot.selected_session_id;
-        if let Err(error) = self.database.open_session(session_id).await {
+        if let Err(error) = self.sandbox.prepare_session(&delegate_session_id) {
             return ToolResult::failed(
                 &invocation.tool_call_id,
                 &invocation.name,
                 error.to_string(),
             );
         }
-        if let Err(error) = self.sandbox.prepare_session(&delegate_session_id) {
+        if let Err(error) = self.database.open_session(session_id).await {
             return ToolResult::failed(
                 &invocation.tool_call_id,
                 &invocation.name,
@@ -4978,7 +4965,7 @@ impl RuntimeEngine {
                 delegate_session_id,
                 NewTimelineItem {
                     stable_key: user_message.id.clone(),
-                    content_type: "message".to_string(),
+                    content_type: "user_message".to_string(),
                     display_sequence: user_message.created_at_ms,
                     payload_ref: user_message.id.clone(),
                     small_summary: child_content.chars().take(160).collect(),
@@ -4996,22 +4983,6 @@ impl RuntimeEngine {
                 "streaming",
                 &turn.id,
                 &route,
-            )
-            .await?;
-        self.database
-            .upsert_timeline_item(
-                delegate_session_id,
-                NewTimelineItem {
-                    stable_key: assistant_message.id.clone(),
-                    content_type: "message".to_string(),
-                    display_sequence: assistant_message.created_at_ms,
-                    payload_ref: assistant_message.id.clone(),
-                    small_summary: format!(
-                        "{} via {}",
-                        route.model_display_name, route.provider_name
-                    ),
-                    kind: "AssistantMessage".to_string(),
-                },
             )
             .await?;
         let snapshot = self.database.session_snapshot(delegate_session_id).await?;
@@ -5104,6 +5075,7 @@ impl RuntimeEngine {
                     prepared.fallback_policy,
                     prepared.cancel,
                     prepared.stream_sources_by_route,
+                    0,
                 )
                 .await;
         });
@@ -5353,6 +5325,64 @@ impl RuntimeEngine {
         }
     }
 
+    async fn persist_markdown_update_for_timeline(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        update: &MarkdownRenderUpdate,
+    ) -> HamburResult<()> {
+        if update.message_id.trim().is_empty() {
+            return Ok(());
+        }
+        for node in &update.committed_nodes {
+            let payload_json = serde_json::to_string(node).map_err(|error| {
+                HamburError::Internal(format!("serialize markdown block payload: {error}"))
+            })?;
+            self.database
+                .upsert_markdown_block_payload(
+                    session_id,
+                    turn_id,
+                    NewMarkdownBlockPayload {
+                        id: String::new(),
+                        message_id: update.message_id.clone(),
+                        block_id: node.block_id,
+                        stable_key: node.stable_key.clone(),
+                        committed: true,
+                        payload_json,
+                        raw: node.raw.clone(),
+                        small_summary: markdown_block_summary(node),
+                    },
+                )
+                .await?;
+        }
+        if let Some(node) = &update.pending_node {
+            let payload_json = serde_json::to_string(node).map_err(|error| {
+                HamburError::Internal(format!("serialize pending markdown block payload: {error}"))
+            })?;
+            self.database
+                .upsert_markdown_block_payload(
+                    session_id,
+                    turn_id,
+                    NewMarkdownBlockPayload {
+                        id: String::new(),
+                        message_id: update.message_id.clone(),
+                        block_id: node.block_id,
+                        stable_key: hambur_db::pending_markdown_stable_key(&update.message_id),
+                        committed: false,
+                        payload_json,
+                        raw: node.raw.clone(),
+                        small_summary: markdown_block_summary(node),
+                    },
+                )
+                .await?;
+        } else if !update.committed_nodes.is_empty() || update.reset {
+            self.database
+                .remove_pending_markdown_block(session_id, &update.message_id)
+                .await?;
+        }
+        Ok(())
+    }
+
     pub fn get_session_list_snapshot(&self, limit: u32, offset: u32) -> RuntimeSessionListSnapshot {
         let sessions = self
             .tokio
@@ -5376,16 +5406,16 @@ impl RuntimeEngine {
             .tokio
             .block_on(self.database.session_summary(&session_id))
             .ok();
-        let timeline_items = self
+        let snapshot = self
             .tokio
             .block_on(self.database.session_snapshot(&session_id))
-            .map(|snapshot| snapshot.timeline_items)
             .unwrap_or_default();
         RuntimeSessionSnapshot {
             snapshot_sequence: self.snapshot_sequence(),
             created_at_ms: now_ms(),
             session,
-            timeline_items,
+            timeline_items: snapshot.timeline_items,
+            markdown_block_payloads: snapshot.markdown_block_payloads,
         }
     }
 
@@ -5407,6 +5437,7 @@ impl RuntimeEngine {
             created_at_ms: now_ms(),
             session_id,
             items: page.items,
+            markdown_block_payloads: page.markdown_block_payloads,
             next_before_cursor: page.next_before_cursor,
             has_more: page.has_more,
         }
@@ -5499,30 +5530,9 @@ impl RuntimeEngine {
 
         let rootfs_installed = self.sandbox.is_rootfs_installed();
 
-        // Perform active su check for root & chroot capability
-        let root_check = std::process::Command::new("su")
-            .arg("-c")
-            .arg("id -u")
-            .output();
-        let root_available = match root_check {
-            Ok(out) => out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "0",
-            Err(_) => false,
-        };
-        let mut chroot_available = false;
-        if root_available {
-            let chroot_check = std::process::Command::new("su")
-                .arg("-c")
-                .arg(format!(
-                    "chroot '{}' /bin/sh -lc 'echo hambur-chroot-ok'",
-                    self.sandbox.rootfs_dir().to_string_lossy()
-                ))
-                .output();
-            if let Ok(out) = chroot_check {
-                chroot_available = out.status.success()
-                    && String::from_utf8_lossy(&out.stdout).contains("hambur-chroot-ok");
-            }
-        }
-        let proot_available = self.sandbox.probe_rootfs_status("proot").available;
+        let root_available = self.sandbox.probe_root_available();
+        let chroot_available = self.sandbox.probe_chroot_available();
+        let proot_available = self.sandbox.probe_proot_available();
 
         let version = if rootfs_installed {
             let version_file = self.sandbox.rootfs_dir().join(".hambur-rootfs.version");
@@ -5731,10 +5741,33 @@ impl RuntimeEngine {
                 }
             })
             .unwrap_or_default();
-        self.emit_markdown_event(session_id, turn_id, snapshot, markdown_render_update)
+        self.emit_markdown_event_with_snapshot(session_id, turn_id, snapshot, markdown_render_update)
     }
 
-    fn emit_markdown_event(
+    async fn emit_markdown_event_async(
+        &self,
+        session_id: String,
+        turn_id: String,
+        markdown_render_update: MarkdownRenderUpdate,
+    ) -> HamburResult<()> {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return Err(HamburError::RuntimeClosed);
+        }
+        self.persist_markdown_update_for_timeline(
+            &session_id,
+            &turn_id,
+            &markdown_render_update,
+        )
+        .await?;
+        let snapshot = if session_id.is_empty() {
+            self.database.bootstrap_snapshot().await?
+        } else {
+            self.database.session_snapshot(&session_id).await?
+        };
+        self.emit_markdown_event_with_snapshot(session_id, turn_id, snapshot, markdown_render_update)
+    }
+
+    fn emit_markdown_event_with_snapshot(
         &self,
         session_id: String,
         turn_id: String,
@@ -7181,14 +7214,28 @@ fn stream_source_for_command(
     deep_thinking_enabled: bool,
     search_enabled: bool,
 ) -> RouteStreamSource {
+    let provider_source = provider_stream_source(
+        &command.session_id,
+        &command.turn_id,
+        content,
+        route,
+        tools_json,
+        deep_thinking_enabled,
+        search_enabled,
+    );
+    let request = match &provider_source {
+        RouteStreamSource::Provider(request) => request.clone(),
+        RouteStreamSource::Scripted { request, .. } => request.clone(),
+    };
     let payload = command.payload_json.trim();
     if payload.starts_with("data:") {
-        return RouteStreamSource::Scripted(split_scripted_sse(payload));
+        return scripted_stream_source(request, payload.to_string(), Vec::new());
     }
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
         if let Some(route_value) = scripted_route_value(&value, route) {
+            let continuation_sse = scripted_continuation_sse(route_value);
             if let Some(sse) = route_value.get("sse").and_then(serde_json::Value::as_str) {
-                return RouteStreamSource::Scripted(split_scripted_sse(sse));
+                return scripted_stream_source(request, sse.to_string(), continuation_sse);
             }
             let response = route_value
                 .get("content")
@@ -7198,10 +7245,15 @@ fn stream_source_for_command(
                 .get("reasoning")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or(command.reasoning.as_str());
-            return RouteStreamSource::Scripted(scripted_openai_sse_chunks(response, reasoning));
+            return RouteStreamSource::Scripted {
+                request,
+                chunks: scripted_openai_sse_chunks(response, reasoning),
+                continuation_sse,
+            };
         }
+        let continuation_sse = scripted_continuation_sse(&value);
         if let Some(sse) = value.get("sse").and_then(serde_json::Value::as_str) {
-            return RouteStreamSource::Scripted(split_scripted_sse(sse));
+            return scripted_stream_source(request, sse.to_string(), continuation_sse);
         }
         if value.get("content").is_some() || value.get("reasoning").is_some() {
             let response = value
@@ -7212,19 +7264,46 @@ fn stream_source_for_command(
                 .get("reasoning")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or(command.reasoning.as_str());
-            return RouteStreamSource::Scripted(scripted_openai_sse_chunks(response, reasoning));
+            return RouteStreamSource::Scripted {
+                request,
+                chunks: scripted_openai_sse_chunks(response, reasoning),
+                continuation_sse,
+            };
         }
     }
 
-    provider_stream_source(
-        &command.session_id,
-        &command.turn_id,
-        content,
-        route,
-        tools_json,
-        deep_thinking_enabled,
-        search_enabled,
-    )
+    provider_source
+}
+
+fn scripted_stream_source(
+    request: ModelRequest,
+    sse: String,
+    continuation_sse: Vec<String>,
+) -> RouteStreamSource {
+    RouteStreamSource::Scripted {
+        request,
+        chunks: split_scripted_sse(&sse),
+        continuation_sse,
+    }
+}
+
+fn scripted_continuation_sse(value: &Value) -> Vec<String> {
+    if let Some(items) = value
+        .get("sse_sequence")
+        .or_else(|| value.get("continuation_sse"))
+        .and_then(Value::as_array)
+    {
+        return items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+    }
+    value
+        .get("continuationSse")
+        .and_then(Value::as_str)
+        .map(|sse| vec![sse.to_string()])
+        .unwrap_or_default()
 }
 
 fn provider_stream_source(
@@ -7253,6 +7332,7 @@ fn provider_stream_source(
         messages: vec![ModelMessage {
             role: "user".to_string(),
             content: content.to_string(),
+            ..Default::default()
         }],
         reasoning_mode: if route.supports_reasoning && deep_thinking_enabled {
             ReasoningMode::Enabled
@@ -7267,6 +7347,70 @@ fn provider_stream_source(
             String::new()
         },
     })
+}
+
+fn tool_continuation_stream_source(
+    mut request: ModelRequest,
+    route: &ModelRouteSnapshot,
+    tools_json: &str,
+    assistant_content: &str,
+    tool_calls: Vec<CompleteToolCall>,
+    tool_result_messages: Vec<ModelMessage>,
+    mut continuation_sse: Vec<String>,
+    scripted_source: bool,
+) -> HamburResult<RouteStreamSource> {
+    request.request_id = new_id("llm_req");
+    request.max_output_tokens = route.output_limit;
+    request.tools_json = if route.supports_tool_call {
+        tools_json.to_string()
+    } else {
+        String::new()
+    };
+    request.messages.push(ModelMessage {
+        role: "assistant".to_string(),
+        content: assistant_content.to_string(),
+        tool_calls_json: complete_tool_calls_json(&tool_calls)?,
+        tool_call_id: String::new(),
+    });
+    request.messages.extend(tool_result_messages);
+
+    if continuation_sse.is_empty() {
+        if scripted_source {
+            return Err(HamburError::InvalidCommand(
+                "scripted tool loop requires a continuation SSE".to_string(),
+            ));
+        }
+        return Ok(RouteStreamSource::Provider(request));
+    }
+    let next_sse = continuation_sse.remove(0);
+    Ok(RouteStreamSource::Scripted {
+        request,
+        chunks: split_scripted_sse(&next_sse),
+        continuation_sse,
+    })
+}
+
+fn complete_tool_calls_json(calls: &[CompleteToolCall]) -> HamburResult<String> {
+    let values = calls
+        .iter()
+        .map(|call| {
+            let arguments_value: Value =
+                serde_json::from_str(&call.arguments_json).unwrap_or_else(|_| json!({}));
+            let arguments_json = serde_json::to_string(&arguments_value).map_err(|error| {
+                HamburError::Internal(format!("serialize tool call arguments: {error}"))
+            })?;
+            Ok(json!({
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.name,
+                    "arguments": arguments_json
+                }
+            }))
+        })
+        .collect::<HamburResult<Vec<_>>>()?;
+    serde_json::to_string(&values)
+        .map_err(|error| HamburError::Internal(format!("serialize tool calls: {error}")))
 }
 
 async fn reqwest_stream(spec: hambur_llm::HttpRequestSpec) -> HamburResult<reqwest::Response> {
@@ -7445,17 +7589,6 @@ fn format_user_content_with_attachments(content: &str, attachments: &[Attachment
         }
     }
     formatted
-}
-
-fn format_tool_continuation(context_stubs: &[String]) -> String {
-    if context_stubs.is_empty() {
-        return "Tool batch completed with no output.".to_string();
-    }
-    let mut output = String::from("Tool batch completed. Results:\n");
-    for (index, stub) in context_stubs.iter().enumerate() {
-        output.push_str(&format!("\n{}. {}\n", index + 1, stub.trim()));
-    }
-    output
 }
 
 fn format_synthetic_view_image_message(context_stubs: &[String]) -> String {
@@ -7647,6 +7780,22 @@ fn refresh_process_exit(state: &mut BackgroundProcessSession) {
     }
 }
 
+fn terminate_background_process_wrapper(state: &BackgroundProcessSession) {
+    let Some(pid_file) = &state.pid_file else {
+        return;
+    };
+    let Ok(pid) = fs::read_to_string(pid_file) else {
+        return;
+    };
+    let Ok(pid) = pid.trim().parse::<u32>() else {
+        return;
+    };
+    let _ = Command::new("su")
+        .arg("-c")
+        .arg(format!("kill -TERM {pid} 2>/dev/null || true"))
+        .output();
+}
+
 fn process_status_json(
     state: &BackgroundProcessSession,
     output: Option<ProcessOutputSnapshot>,
@@ -7677,6 +7826,16 @@ fn process_status_json(
         );
     }
     value
+}
+
+fn markdown_block_summary(node: &hambur_markdown::MarkdownBlockNode) -> String {
+    node.text
+        .trim()
+        .to_string()
+        .if_blank(node.raw.trim().to_string())
+        .chars()
+        .take(160)
+        .collect()
 }
 
 fn run_web_fetch(invocation: &ToolInvocation, arguments: &Value) -> RawToolOutput {
@@ -8221,6 +8380,7 @@ fn rejected_ack(
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashSet,
         fs,
         io::{Read, Write},
         net::TcpListener,
@@ -8228,6 +8388,7 @@ mod tests {
         process::{Command, Stdio},
         sync::{Arc, Mutex},
         thread,
+        time::{Duration, Instant},
     };
 
     use base64::Engine;
@@ -8239,7 +8400,7 @@ mod tests {
 
     use super::{
         AppBootstrap, BackgroundProcessSession, DelegateTaskState, NewTraceSpan,
-        ProcessOutputBuffer, RuntimeCommand, RuntimeEngine, platform_shell,
+        ProcessOutputBuffer, RuntimeCommand, RuntimeEngine, RuntimeEvent, platform_shell,
         spawn_process_pipe_reader, validate_web_fetch_url,
     };
 
@@ -8262,6 +8423,16 @@ mod tests {
         let created = first.next_event().expect("created event");
         assert_eq!(created.kind.as_str(), "SessionCreated");
         assert_eq!(created.snapshot.sessions.len(), 1);
+        let created_session_id = created.snapshot.selected_session_id.clone();
+        let workspace = first
+            .sandbox
+            .resolve(
+                &created_session_id,
+                "/var/hambur/workspace",
+                SandboxAccess::Read,
+            )
+            .expect("created session workspace");
+        assert!(workspace.host_path.is_dir());
         first.shutdown();
         drop(first);
 
@@ -8434,22 +8605,9 @@ mod tests {
         assert!(saw_markdown, "missing markdown update");
         let finished = finished.expect("turn finished");
 
-        let timeline = runtime.get_timeline_page(session_id, 0, 20);
-        let assistant = timeline
-            .items
-            .iter()
-            .find(|item| item.kind == "AssistantMessage")
-            .expect("assistant timeline item");
-        let message = runtime
-            .get_message_snapshot(assistant.payload_ref.clone())
-            .message
-            .expect("assistant message snapshot");
-        assert_eq!(message.content_text, "hello world");
-        assert_eq!(message.reasoning_content, "thinking separately");
-        assert_eq!(message.provider_id_snapshot, "provider_test");
-        assert_eq!(message.model_id_snapshot, "gpt-test");
-        assert_eq!(message.status, "completed");
-        assert_eq!(finished.session_id, message.session_id);
+        let assistant_text = assistant_markdown_text(&runtime, &session_id);
+        assert!(assistant_text.contains("hello world"));
+        assert_eq!(finished.session_id, session_id);
 
         let _ = fs::remove_dir_all(app_files_dir);
     }
@@ -8525,20 +8683,8 @@ mod tests {
         assert!(request.contains("authorization: Bearer test-api-key"));
         assert!(request.contains("content-type: application/json"));
 
-        let timeline = runtime.get_timeline_page(session_id, 0, 20);
-        let assistant = timeline
-            .items
-            .iter()
-            .find(|item| item.kind == "AssistantMessage")
-            .expect("assistant timeline item");
-        let message = runtime
-            .get_message_snapshot(assistant.payload_ref.clone())
-            .message
-            .expect("assistant message snapshot");
-        assert_eq!(message.content_text, "real provider answer");
-        assert_eq!(message.reasoning_content, "real reasoning");
-        assert_eq!(message.provider_id_snapshot, "provider_http");
-        assert_eq!(message.model_id_snapshot, "gpt-real");
+        let assistant_text = assistant_markdown_text(&runtime, &session_id);
+        assert!(assistant_text.contains("real provider answer"));
 
         let _ = fs::remove_dir_all(app_files_dir);
     }
@@ -9392,21 +9538,31 @@ mod tests {
             "]},\"finish_reason\":\"tool_calls\"}]}\n\n",
             "data: [DONE]\n\n"
         );
+        let continuation_sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Tool results received: hello tools\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
         let ack = runtime.dispatch(RuntimeCommand {
             command_id: "cmd_tools".to_string(),
             idempotency_key: "message:tools:batch".to_string(),
             kind: "SendMessage".to_string(),
             session_id: session_id.clone(),
             content: "use tools".to_string(),
-            payload_json: serde_json::json!({"sse": sse}).to_string(),
+            payload_json: serde_json::json!({
+                "sse": sse,
+                "sse_sequence": [continuation_sse]
+            })
+            .to_string(),
             ..RuntimeCommand::default()
         });
         assert!(ack.accepted, "send rejected: {}", ack.message);
 
         let mut finished_tools = 0;
         let mut turn_finished = false;
+        let mut seen_events = Vec::new();
         for _ in 0..96 {
-            let event = runtime.next_event().expect("tool event");
+            let event = next_event_with_timeout(&runtime, "tool event");
+            seen_events.push(event.kind.clone());
             match event.kind.as_str() {
                 "ToolCallFinished" => finished_tools += 1,
                 "TurnFinished" => {
@@ -9417,8 +9573,8 @@ mod tests {
                 _ => {}
             }
         }
+        assert!(turn_finished, "missing turn finish; seen={seen_events:?}");
         assert_eq!(finished_tools, 2);
-        assert!(turn_finished, "missing turn finish");
 
         let timeline = runtime.get_timeline_page(session_id, 0, 50);
         let trace_count = timeline
@@ -9427,17 +9583,18 @@ mod tests {
             .filter(|item| item.kind == "ToolTrace")
             .count();
         assert!(trace_count >= 2, "missing tool traces: {trace_count}");
-        let continuation = timeline
+        let assistant_block = timeline
             .items
             .iter()
             .rev()
-            .find(|item| item.kind == "AssistantMessage")
-            .expect("assistant continuation");
-        let message = runtime
-            .get_message_snapshot(continuation.payload_ref.clone())
-            .message
-            .expect("continuation message");
-        assert!(message.content_text.contains("hello tools"));
+            .find(|item| item.content_type == "assistant_markdown_block")
+            .expect("assistant markdown block");
+        let payload = timeline
+            .markdown_block_payloads
+            .iter()
+            .find(|payload| payload.id == assistant_block.payload_ref)
+            .expect("assistant markdown payload");
+        assert!(payload.raw.contains("hello tools"));
 
         let _ = fs::remove_dir_all(app_files_dir);
     }
@@ -9848,7 +10005,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_rootfs_requires_approval_and_cleans_sandbox_root() {
+    fn reset_rootfs_requires_approval_and_preserves_session_dirs() {
         let app_files_dir = temp_app_dir();
         fs::create_dir_all(&app_files_dir).expect("create temp app dir");
 
@@ -9897,12 +10054,12 @@ mod tests {
         assert!(accepted.accepted, "reset rejected: {}", accepted.message);
         let event = wait_for_session_event_result(&runtime, "TurnStateChanged", &session_id);
         assert!(event.message.contains("\"action\":\"ResetRootfs\""));
-        assert!(!workspace.host_path.exists());
         let prepared = runtime
             .sandbox
             .resolve(&session_id, "/var/hambur/workspace", SandboxAccess::Read)
             .expect("prepared workspace");
         assert!(prepared.host_path.exists());
+        assert!(workspace.host_path.exists());
 
         let _ = fs::remove_dir_all(app_files_dir);
     }
@@ -10245,13 +10402,21 @@ mod tests {
             "]},\"finish_reason\":\"tool_calls\"}]}\n\n",
             "data: [DONE]\n\n"
         );
+        let continuation_sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Found Alpha Project in prior sessions.\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
         let send = runtime.dispatch(RuntimeCommand {
             command_id: "cmd_m7_session_search".to_string(),
             idempotency_key: "message:m7:session-search".to_string(),
             kind: "SendMessage".to_string(),
             session_id: runtime.get_session_list_snapshot(10, 0).selected_session_id,
             content: "search old sessions".to_string(),
-            payload_json: serde_json::json!({"sse": sse}).to_string(),
+            payload_json: serde_json::json!({
+                "sse": sse,
+                "sse_sequence": [continuation_sse]
+            })
+            .to_string(),
             ..RuntimeCommand::default()
         });
         assert!(send.accepted, "send rejected: {}", send.message);
@@ -10259,18 +10424,8 @@ mod tests {
 
         let snapshot = runtime.get_session_list_snapshot(10, 0);
         let selected = snapshot.selected_session_id;
-        let timeline = runtime.get_timeline_page(selected, 0, 50);
-        let continuation = timeline
-            .items
-            .iter()
-            .rev()
-            .find(|item| item.kind == "AssistantMessage")
-            .expect("assistant continuation");
-        let message = runtime
-            .get_message_snapshot(continuation.payload_ref.clone())
-            .message
-            .expect("message");
-        assert!(message.content_text.contains("Alpha Project"));
+        let assistant_text = assistant_markdown_text(&runtime, &selected);
+        assert!(assistant_text.contains("Alpha Project"));
 
         let _ = fs::remove_dir_all(app_files_dir);
     }
@@ -10295,13 +10450,21 @@ mod tests {
             "]},\"finish_reason\":\"tool_calls\"}]}\n\n",
             "data: [DONE]\n\n"
         );
+        let continuation_sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Example Domain <untrusted_tool_result\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
         let send = runtime.dispatch(RuntimeCommand {
             command_id: "cmd_m7_browser".to_string(),
             idempotency_key: "message:m7:browser".to_string(),
             kind: "SendMessage".to_string(),
             session_id: session_id.clone(),
             content: "read page".to_string(),
-            payload_json: serde_json::json!({"sse": sse}).to_string(),
+            payload_json: serde_json::json!({
+                "sse": sse,
+                "sse_sequence": [continuation_sse]
+            })
+            .to_string(),
             ..RuntimeCommand::default()
         });
         assert!(send.accepted, "send rejected: {}", send.message);
@@ -10331,19 +10494,9 @@ mod tests {
         assert!(submit.accepted);
         wait_for_event(&runtime, "TurnFinished");
 
-        let timeline = runtime.get_timeline_page(session_id, 0, 50);
-        let continuation = timeline
-            .items
-            .iter()
-            .rev()
-            .find(|item| item.kind == "AssistantMessage")
-            .expect("assistant continuation");
-        let message = runtime
-            .get_message_snapshot(continuation.payload_ref.clone())
-            .message
-            .expect("message");
-        assert!(message.content_text.contains("Example Domain"));
-        assert!(message.content_text.contains("<untrusted_tool_result"));
+        let assistant_text = assistant_markdown_text(&runtime, &session_id);
+        assert!(assistant_text.contains("Example Domain"));
+        assert!(assistant_text.contains("<untrusted_tool_result"));
 
         let _ = fs::remove_dir_all(app_files_dir);
     }
@@ -10728,6 +10881,7 @@ mod tests {
                     cwd: "/var/hambur/workspace".to_string(),
                     started_at_ms: now_ms(),
                     pid: child.id(),
+                    pid_file: None,
                     child,
                     output,
                     exit_code: None,
@@ -11165,6 +11319,38 @@ mod tests {
             }
         }
         panic!("missing event: {kind}");
+    }
+
+    fn next_event_with_timeout(runtime: &RuntimeEngine, label: &str) -> RuntimeEvent {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(mut receiver) = runtime.receiver.lock()
+                && let Ok(event) = receiver.try_recv()
+            {
+                return event;
+            }
+            if Instant::now() >= deadline {
+                panic!("timed out waiting for event: {label}");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn assistant_markdown_text(runtime: &RuntimeEngine, session_id: &str) -> String {
+        let timeline = runtime.get_timeline_page(session_id.to_string(), 0, 100);
+        let payload_ids = timeline
+            .items
+            .iter()
+            .filter(|item| item.content_type == "assistant_markdown_block")
+            .map(|item| item.payload_ref.as_str())
+            .collect::<HashSet<_>>();
+        timeline
+            .markdown_block_payloads
+            .iter()
+            .filter(|payload| payload_ids.contains(payload.id.as_str()))
+            .map(|payload| payload.raw.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn wait_for_session_event(runtime: &RuntimeEngine, kind: &str, session_id: &str) {

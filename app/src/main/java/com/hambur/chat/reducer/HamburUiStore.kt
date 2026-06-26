@@ -8,6 +8,7 @@ import com.hambur.chat.uniffi.BackendEvent
 import com.hambur.chat.uniffi.CommandAck
 import com.hambur.chat.uniffi.ConfigAuditDto
 import com.hambur.chat.uniffi.DefaultModelGroupDto
+import com.hambur.chat.uniffi.MarkdownBlockPayloadDto
 import com.hambur.chat.uniffi.MarkdownBlockNodeDto
 import com.hambur.chat.uniffi.MessageDto
 import com.hambur.chat.uniffi.MemoryFileDetailDto
@@ -210,11 +211,7 @@ data class HamburUiState(
     val memoryFiles: List<UiMemoryFileSummary> = emptyList(),
     val memoryFileDetails: Map<String, UiMemoryFileDetail> = emptyMap(),
     val sharedBrowser: UiSharedBrowserState = UiSharedBrowserState(),
-    val markdownMessageId: String = "",
-    val markdownBlocks: List<MarkdownBlockNodeDto> = emptyList(),
-    val pendingMarkdownBlock: MarkdownBlockNodeDto? = null,
-    val markdownBlocksByMessageId: Map<String, List<MarkdownBlockNodeDto>> = emptyMap(),
-    val pendingMarkdownByMessageId: Map<String, MarkdownBlockNodeDto> = emptyMap(),
+    val markdownBlocksByPayloadRef: Map<String, MarkdownBlockNodeDto> = emptyMap(),
     val activePreviewPath: String = "",
     val snapshotSequence: ULong = 0UL,
     val lastAppliedSequence: ULong = 0UL,
@@ -790,6 +787,13 @@ class HamburUiStore(
         }
     }
 
+    fun renderMarkdownDocument(messageId: String, markdown: String): List<MarkdownBlockNodeDto> {
+        if (messageId.isBlank() || markdown.isBlank()) return emptyList()
+        return runCatching {
+            runtime.renderMarkdownDocument(messageId, markdown)
+        }.getOrDefault(emptyList())
+    }
+
     fun sendMessage(
         sessionId: String,
         content: String,
@@ -1034,6 +1038,7 @@ class HamburUiStore(
             timelinePage?.snapshotSequence ?: 0UL,
         )
         val timelineItems = timelinePage?.items.orEmpty()
+        val markdownBlockPayloads = timelinePage?.markdownBlockPayloads.orEmpty()
         val settingsSnapshot = runCatching {
             runtime.getSettingsSnapshot()
         }.getOrNull()
@@ -1044,6 +1049,7 @@ class HamburUiStore(
                     snapshot = sessionSnapshot,
                     selectedSessionId = selectedSessionId,
                     timelineItems = timelineItems,
+                    markdownBlockPayloads = markdownBlockPayloads,
                     settingsSnapshot = settingsSnapshot,
                     baselineSequence = baselineSequence,
                 )
@@ -1060,6 +1066,7 @@ class HamburUiStore(
         bufferedEvents.forEach(::applyEvent)
         refreshVisibleMessageSnapshots()
         refreshKnowledgeSnapshots()
+        runRootfsWarmup(selectedSessionId)
     }
 
     private fun runCommand(block: () -> CommandAck) {
@@ -1276,7 +1283,7 @@ class HamburUiStore(
         val current = _state.value
         val messageItems = current.timelineItems
             .asSequence()
-            .filter { it.contentType == "message" && it.payloadRef.isNotBlank() }
+            .filter { it.contentType == "user_message" && it.payloadRef.isNotBlank() }
             .filter { item ->
                 val cached = current.messagesById[item.payloadRef]
                 cached == null || cached.versionSequence < item.versionSequence
@@ -1382,6 +1389,7 @@ private fun HamburUiState.applyBaseline(
     snapshot: SessionListSnapshotDto,
     selectedSessionId: String,
     timelineItems: List<TimelineItemDto>,
+    markdownBlockPayloads: List<MarkdownBlockPayloadDto>,
     settingsSnapshot: SettingsSnapshotDto?,
     baselineSequence: ULong,
 ): HamburUiState {
@@ -1408,11 +1416,7 @@ private fun HamburUiState.applyBaseline(
         defaultModelGroups = settingsSnapshot?.defaultModelGroups?.toUiDefaultModelGroups().orEmpty(),
         appSettings = settingsSnapshot?.settings?.toUiAppSettings().orEmpty(),
         configAudits = settingsSnapshot?.configAudits?.toUiConfigAudits().orEmpty(),
-        markdownMessageId = "",
-        markdownBlocks = emptyList(),
-        pendingMarkdownBlock = null,
-        markdownBlocksByMessageId = emptyMap(),
-        pendingMarkdownByMessageId = emptyMap(),
+        markdownBlocksByPayloadRef = markdownBlockPayloads.toMarkdownBlockMap(),
         activePreviewPath = "",
         pendingAttachments = emptyList(),
         snapshotSequence = baselineSequence,
@@ -1510,48 +1514,21 @@ private fun HamburUiState.reduce(event: BackendEvent): HamburUiState {
 
     val nextSelectedSessionId = snapshot.selectedSessionId
     val sessionChanged = nextSelectedSessionId != selectedSessionId
-    val markdownUpdate = event.markdownRenderUpdate
-    val shouldApplyMarkdown = event.kind == "MarkdownRenderUpdate" &&
-        markdownUpdate.messageId.isNotBlank() &&
-        event.belongsToSelectedSession(nextSelectedSessionId)
-    val currentMessageBlocks = markdownBlocksByMessageId[markdownUpdate.messageId].orEmpty()
-    val baseMarkdownBlocks = if (shouldApplyMarkdown && markdownUpdate.reset) {
-        emptyList()
-    } else {
-        currentMessageBlocks
-    }
-    val nextMarkdownBlocks = if (shouldApplyMarkdown) {
-        val invalidatedIds = markdownUpdate.invalidatedBlockIds.toSet()
-        val committedKeys = markdownUpdate.committedNodes.map { it.stableKey }.toSet()
-        val retained = baseMarkdownBlocks
-            .filterNot { block ->
-                block.blockId in invalidatedIds || block.stableKey in committedKeys
-            }
-            .toMutableList()
-        retained.addAll(markdownUpdate.committedNodes)
-        retained.sortedBy { it.blockId }
-    } else {
-        currentMessageBlocks
-    }
-    val nextMarkdownBlocksByMessageId = if (shouldApplyMarkdown) {
-        markdownBlocksByMessageId + (markdownUpdate.messageId to nextMarkdownBlocks)
-    } else if (sessionChanged) {
-        emptyMap()
-    } else {
-        markdownBlocksByMessageId
-    }
-    val nextPendingMarkdownByMessageId = if (shouldApplyMarkdown) {
-        val pendingNode = markdownUpdate.pendingNode
-        if (pendingNode == null) {
-            pendingMarkdownByMessageId - markdownUpdate.messageId
+    val nextTimelineItems = snapshot.timelineItems.toUiTimelineItems()
+    val visibleMarkdownPayloadRefs = nextTimelineItems
+        .asSequence()
+        .filter { it.isAssistantMarkdownBlock() }
+        .map { it.payloadRef }
+        .filter { it.isNotBlank() }
+        .toSet()
+    val snapshotMarkdownBlocksByPayloadRef = snapshot.markdownBlockPayloads.toMarkdownBlockMap()
+    val nextMarkdownBlocksByPayloadRef = (
+        if (sessionChanged) {
+            snapshotMarkdownBlocksByPayloadRef
         } else {
-            pendingMarkdownByMessageId + (markdownUpdate.messageId to pendingNode)
+            markdownBlocksByPayloadRef + snapshotMarkdownBlocksByPayloadRef
         }
-    } else if (sessionChanged) {
-        emptyMap()
-    } else {
-        pendingMarkdownByMessageId
-    }
+    ).filterKeys { it in visibleMarkdownPayloadRefs }
 
     return copy(
         runtimeStatus = status,
@@ -1567,41 +1544,10 @@ private fun HamburUiState.reduce(event: BackendEvent): HamburUiState {
             )
         },
         selectedSessionId = nextSelectedSessionId,
-        timelineItems = snapshot.timelineItems.map {
-            UiTimelineItem(
-                id = it.id,
-                stableKey = it.stableKey,
-                contentType = it.contentType,
-                versionSequence = it.versionSequence,
-                payloadRef = it.payloadRef,
-                smallSummary = it.smallSummary,
-                kind = it.kind,
-                traceTitle = it.traceTitle,
-                traceContent = it.traceContent,
-                traceStatus = it.traceStatus,
-                toolCallId = it.toolCallId,
-                toolName = it.toolName,
-            )
-        },
+        timelineItems = nextTimelineItems,
         messagesById = if (sessionChanged) emptyMap() else messagesById,
         pendingAttachments = snapshot.pendingAttachments.toUiPendingAttachments(),
-        markdownMessageId = when {
-            shouldApplyMarkdown -> markdownUpdate.messageId
-            sessionChanged -> ""
-            else -> markdownMessageId
-        },
-        markdownBlocks = when {
-            shouldApplyMarkdown -> nextMarkdownBlocks
-            sessionChanged -> emptyList()
-            else -> markdownBlocks
-        },
-        pendingMarkdownBlock = when {
-            shouldApplyMarkdown -> markdownUpdate.pendingNode
-            sessionChanged -> null
-            else -> pendingMarkdownBlock
-        },
-        markdownBlocksByMessageId = nextMarkdownBlocksByMessageId,
-        pendingMarkdownByMessageId = nextPendingMarkdownByMessageId,
+        markdownBlocksByPayloadRef = nextMarkdownBlocksByPayloadRef,
         activePreviewPath = if (sessionChanged) "" else activePreviewPath,
         sharedBrowser = sharedBrowser,
         lastAppliedSequence = event.sequence,
@@ -1664,6 +1610,14 @@ private fun List<TimelineItemDto>.toUiTimelineItems(): List<UiTimelineItem> {
             toolName = it.toolName,
         )
     }
+}
+
+private fun List<MarkdownBlockPayloadDto>.toMarkdownBlockMap(): Map<String, MarkdownBlockNodeDto> {
+    return associate { it.id to it.node }
+}
+
+private fun UiTimelineItem.isAssistantMarkdownBlock(): Boolean {
+    return contentType == "assistant_markdown_block" || contentType == "assistant_pending_block"
 }
 
 private fun MessageDto.toUiMessageSnapshot(): UiMessageSnapshot {

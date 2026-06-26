@@ -15,6 +15,7 @@ hambur-core.workspace = true
 hambur-db.workspace = true
 hambur-markdown.workspace = true
 hambur-runtime.workspace = true
+serde_json.workspace = true
 uniffi.workspace = true
 
 [build-dependencies]

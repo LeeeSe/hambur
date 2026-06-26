@@ -3,8 +3,8 @@ use std::sync::Arc;
 use hambur_core::{new_id, now_ms};
 use hambur_db::{
     AppSettingRecord, AppSnapshot, AttachmentRecord, ConfigAuditRecord, DefaultModelGroupRecord,
-    MessageRecord, ModelGroupMemberRecord, ModelGroupRecord, ProviderModelRecord,
-    PublicProviderRecord, SessionSummary, TimelineItemSnapshot,
+    MarkdownBlockPayloadRecord, MessageRecord, ModelGroupMemberRecord, ModelGroupRecord,
+    ProviderModelRecord, PublicProviderRecord, SessionSummary, TimelineItemSnapshot,
 };
 use hambur_markdown::{
     MarkdownBlockNode, MarkdownInlineNode, MarkdownRenderUpdate, MarkdownTableRow,
@@ -144,6 +144,21 @@ pub struct TimelineItemDTO {
     pub tool_name: String,
 }
 
+pub struct MarkdownBlockPayloadDTO {
+    pub id: String,
+    pub session_id: String,
+    pub message_id: String,
+    pub block_id: u64,
+    pub stable_key: String,
+    pub committed: bool,
+    pub node: MarkdownBlockNodeDTO,
+    pub raw: String,
+    pub small_summary: String,
+    pub version_sequence: u64,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
 pub struct AttachmentDTO {
     pub id: String,
     pub session_id: String,
@@ -168,6 +183,7 @@ pub struct AppSnapshotDTO {
     pub sessions: Vec<SessionSummaryDTO>,
     pub selected_session_id: String,
     pub timeline_items: Vec<TimelineItemDTO>,
+    pub markdown_block_payloads: Vec<MarkdownBlockPayloadDTO>,
     pub pending_attachments: Vec<AttachmentDTO>,
 }
 
@@ -269,6 +285,7 @@ pub struct SessionSnapshotDTO {
     pub created_at_ms: u64,
     pub session: Option<SessionSummaryDTO>,
     pub timeline_items: Vec<TimelineItemDTO>,
+    pub markdown_block_payloads: Vec<MarkdownBlockPayloadDTO>,
 }
 
 pub struct TimelinePageDTO {
@@ -276,6 +293,7 @@ pub struct TimelinePageDTO {
     pub created_at_ms: u64,
     pub session_id: String,
     pub items: Vec<TimelineItemDTO>,
+    pub markdown_block_payloads: Vec<MarkdownBlockPayloadDTO>,
     pub next_before_cursor: u64,
     pub has_more: bool,
 }
@@ -508,6 +526,17 @@ impl BackendRuntime {
             .into()
     }
 
+    pub fn render_markdown_document(
+        &self,
+        message_id: String,
+        markdown: String,
+    ) -> Vec<MarkdownBlockNodeDTO> {
+        hambur_markdown::render_markdown_to_nodes(message_id, &markdown)
+            .into_iter()
+            .map(MarkdownBlockNodeDTO::from)
+            .collect()
+    }
+
     pub fn shutdown(&self) {
         self.engine.shutdown();
     }
@@ -616,6 +645,11 @@ impl From<RuntimeSessionSnapshot> for SessionSnapshotDTO {
                 .into_iter()
                 .map(TimelineItemDTO::from)
                 .collect(),
+            markdown_block_payloads: value
+                .markdown_block_payloads
+                .into_iter()
+                .map(MarkdownBlockPayloadDTO::from)
+                .collect(),
         }
     }
 }
@@ -627,6 +661,11 @@ impl From<RuntimeTimelinePage> for TimelinePageDTO {
             created_at_ms: value.created_at_ms,
             session_id: value.session_id,
             items: value.items.into_iter().map(TimelineItemDTO::from).collect(),
+            markdown_block_payloads: value
+                .markdown_block_payloads
+                .into_iter()
+                .map(MarkdownBlockPayloadDTO::from)
+                .collect(),
             next_before_cursor: value.next_before_cursor,
             has_more: value.has_more,
         }
@@ -794,6 +833,11 @@ impl From<AppSnapshot> for AppSnapshotDTO {
                 .into_iter()
                 .map(TimelineItemDTO::from)
                 .collect(),
+            markdown_block_payloads: value
+                .markdown_block_payloads
+                .into_iter()
+                .map(MarkdownBlockPayloadDTO::from)
+                .collect(),
             pending_attachments: value
                 .pending_attachments
                 .into_iter()
@@ -935,6 +979,36 @@ impl From<TimelineItemSnapshot> for TimelineItemDTO {
             trace_status: value.trace_status,
             tool_call_id: value.tool_call_id,
             tool_name: value.tool_name,
+        }
+    }
+}
+
+impl From<MarkdownBlockPayloadRecord> for MarkdownBlockPayloadDTO {
+    fn from(value: MarkdownBlockPayloadRecord) -> Self {
+        let node = serde_json::from_str::<MarkdownBlockNode>(&value.payload_json)
+            .unwrap_or_else(|_| MarkdownBlockNode {
+                message_id: value.message_id.clone(),
+                block_id: value.block_id,
+                stable_key: value.stable_key.clone(),
+                committed: value.committed,
+                raw: value.raw.clone(),
+                text: value.small_summary.clone(),
+                node_kind: "Paragraph".to_string(),
+                ..Default::default()
+            });
+        Self {
+            id: value.id,
+            session_id: value.session_id,
+            message_id: value.message_id,
+            block_id: value.block_id,
+            stable_key: value.stable_key,
+            committed: value.committed,
+            node: node.into(),
+            raw: value.raw,
+            small_summary: value.small_summary,
+            version_sequence: value.version_sequence,
+            created_at_ms: value.created_at_ms,
+            updated_at_ms: value.updated_at_ms,
         }
     }
 }

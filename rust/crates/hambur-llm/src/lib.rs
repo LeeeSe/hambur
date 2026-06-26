@@ -211,6 +211,10 @@ pub struct ModelRequest {
 pub struct ModelMessage {
     pub role: String,
     pub content: String,
+    #[serde(default)]
+    pub tool_calls_json: String,
+    #[serde(default)]
+    pub tool_call_id: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -306,10 +310,32 @@ impl OpenAiCompatibleAdapter {
             }
         }
         for message in &request.messages {
-            messages.push(json!({
-                "role": message.role,
-                "content": message.content,
-            }));
+            let mut object = serde_json::Map::new();
+            object.insert("role".to_string(), json!(message.role));
+            object.insert("content".to_string(), json!(message.content));
+            if !message.tool_calls_json.trim().is_empty() {
+                let tool_calls: Value =
+                    serde_json::from_str(message.tool_calls_json.trim()).map_err(|error| {
+                        HamburError::InvalidCommand(format!(
+                            "invalid OpenAI assistant tool_calls JSON: {error}"
+                        ))
+                    })?;
+                match tool_calls {
+                    Value::Array(items) if !items.is_empty() => {
+                        object.insert("tool_calls".to_string(), Value::Array(items));
+                    }
+                    Value::Array(_) => {}
+                    _ => {
+                        return Err(HamburError::InvalidCommand(
+                            "OpenAI assistant tool_calls JSON must be an array".to_string(),
+                        ));
+                    }
+                }
+            }
+            if !message.tool_call_id.trim().is_empty() {
+                object.insert("tool_call_id".to_string(), json!(message.tool_call_id));
+            }
+            messages.push(Value::Object(object));
         }
 
         let mut body = json!({
@@ -762,6 +788,7 @@ mod tests {
             messages: vec![ModelMessage {
                 role: "user".to_string(),
                 content: "hello".to_string(),
+                ..Default::default()
             }],
             max_output_tokens: 128,
             ..Default::default()
@@ -799,6 +826,7 @@ mod tests {
             messages: vec![ModelMessage {
                 role: "user".to_string(),
                 content: "use echo".to_string(),
+                ..Default::default()
             }],
             tools_json: serde_json::json!([{
                 "type": "function",

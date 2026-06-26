@@ -11,7 +11,6 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.gestures.awaitLongPressOrCancellation
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.FlingBehavior
 import androidx.compose.foundation.gestures.Orientation
@@ -153,6 +152,7 @@ import com.hambur.chat.ui.markdown.rememberMarkdownStyle
 import com.hambur.chat.ui.theme.HamburTheme
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -1128,10 +1128,31 @@ private fun MessageLongPressMenuBox(
                     requireUnconsumed = false,
                     pass = PointerEventPass.Initial,
                 )
-                val longPress = awaitLongPressOrCancellation(down.id)
-                if (enabled && longPress != null) {
+                if (!enabled) return@awaitEachGesture
+                val longPressTimeout = viewConfiguration.longPressTimeoutMillis
+                var currentPosition = down.position
+                var cancelled = false
+                val slop = viewConfiguration.touchSlop
+                val result = withTimeoutOrNull(longPressTimeout) {
+                    while (true) {
+                        val event = awaitPointerEvent(PointerEventPass.Initial)
+                        val change = event.changes.firstOrNull { it.id == down.id }
+                        if (change == null || !change.pressed) {
+                            cancelled = true
+                            break
+                        }
+                        currentPosition = change.position
+                        val dx = currentPosition.x - down.position.x
+                        val dy = currentPosition.y - down.position.y
+                        if (dx * dx + dy * dy > slop * slop) {
+                            cancelled = true
+                            break
+                        }
+                    }
+                }
+                if (result == null && !cancelled) {
                     longPressHaptic()
-                    pressOffset = longPress.position
+                    pressOffset = currentPosition
                     showMenu = true
                 }
             }

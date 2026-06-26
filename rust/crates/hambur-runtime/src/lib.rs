@@ -616,7 +616,7 @@ impl RuntimeEngine {
         self.dispatch(RuntimeCommand {
             kind: "OpenSession".to_string(),
             session_id: session_id.clone(),
-            idempotency_key: format!("{session_id}:open"),
+            idempotency_key: format!("{session_id}:open:{}", new_id("attempt")),
             ..RuntimeCommand::default()
         })
     }
@@ -9984,62 +9984,400 @@ impl HamburConfigFieldSpec {
 
 fn hambur_config_fields() -> Vec<HamburConfigFieldSpec> {
     const RAW: &[(&str, &str, &str, &str, &str, &str, bool)] = &[
-        ("appearance.theme", "Theme", "App color theme.", "one of: system, light, dark", "readwrite", "normal", true),
-        ("appearance.fontScale", "Font scale", "App text scale.", "one of: small, default, large, extraLarge", "readwrite", "normal", true),
-        ("defaults.primaryModelGroup", "Primary model group", "Default model group used for normal chat.", "string model group id", "readwrite", "sensitive", true),
-        ("defaults.secondaryModelGroup", "Secondary model group", "Default model group used for title generation and memory review.", "string model group id", "readwrite", "sensitive", true),
-        ("defaults.deepThinking", "Deep thinking default", "Default deep-thinking state for new chats.", "bool", "readwrite", "normal", true),
-        ("defaults.startupChatMode", "Startup chat mode", "Which chat to open on app start.", "one of: newChat, lastChat", "readwrite", "normal", true),
-        ("logs.enabled", "Logging enabled", "Hambur logcat logging switch.", "bool", "readwrite", "normal", true),
-        ("permissions.hamburConfig.enabled", "Allow hambur_config", "Native config tool availability. Currently always enabled.", "bool", "readonly", "destructive", false),
-        ("providers", "LLM providers", "Provider summary collection. Supports append/remove.", "json", "readwrite", "sensitive", false),
-        ("providers.<provider_id>.name", "Provider name", "User-visible provider name.", "string max 200 chars", "readwrite", "normal", true),
-        ("providers.<provider_id>.iconName", "Provider icon", "Provider icon key.", "string max 64 chars", "readwrite", "normal", true),
-        ("providers.<provider_id>.apiType", "Provider API type", "Provider API protocol.", "one of: openAI, gemini, anthropic", "readwrite", "sensitive", true),
-        ("providers.<provider_id>.baseUrl", "Provider base URL", "API base URL.", "string max 1000 chars", "readwrite", "sensitive", true),
-        ("providers.<provider_id>.apiKey", "Provider API key", "Provider credential. Write-only and redacted in audit.", "string max 10000 chars", "write-only", "destructive", false),
-        ("providers.<provider_id>.enabled", "Provider enabled", "Whether provider can be used for routing.", "bool", "readwrite", "sensitive", true),
-        ("providers.<provider_id>.selectedModel", "Provider selected model", "Provider default selected model.", "string", "readwrite", "sensitive", true),
-        ("providers.<provider_id>.models", "Provider models", "Model ids available on this provider.", "[string]", "readwrite", "sensitive", true),
-        ("models", "Model entries", "Flattened provider model collection. Supports append/remove.", "json", "readwrite", "sensitive", false),
-        ("models.<entry_id>.displayName", "Model display name", "Custom display name for a provider model.", "string max 200 chars", "readwrite", "normal", true),
-        ("models.<entry_id>.notes", "Model notes", "Custom notes for a provider model.", "string max 1000 chars", "readwrite", "normal", true),
-        ("models.<entry_id>.modelId", "Model id", "API model id.", "string", "readonly", "normal", false),
-        ("models.<entry_id>.providerId", "Provider id", "Owning provider id.", "string", "readonly", "normal", false),
-        ("models.<entry_id>.contextWindow", "Context window", "Catalog context window when known.", "int|null", "readonly", "normal", false),
-        ("models.<entry_id>.maxOutputTokens", "Max output tokens", "Catalog output limit when known.", "int|null", "readonly", "normal", false),
-        ("models.<entry_id>.supportsTools", "Supports tools", "Catalog tool-call support when known.", "bool", "readonly", "normal", false),
-        ("models.<entry_id>.supportsVision", "Supports vision", "Catalog image input support when known.", "bool", "readonly", "normal", false),
-        ("model_groups", "Model groups", "Model routing group collection. Supports append/remove.", "json", "readwrite", "sensitive", false),
-        ("model_groups.<group_id>.name", "Model group name", "User-visible group name.", "string max 200 chars", "readwrite", "normal", true),
-        ("model_groups.<group_id>.routingStrategy", "Routing strategy", "How to choose among group models.", "one of: fallback, loadBalance", "readwrite", "sensitive", true),
-        ("model_groups.<group_id>.fallbackPolicy", "Fallback policy", "When to fall back to another model.", "one of: default, always", "readwrite", "sensitive", true),
-        ("model_groups.<group_id>.models", "Group models", "Group model entries. Supports append/remove.", "[{provider_id, model_id}]", "readwrite", "sensitive", true),
-        ("sandbox.rootfsBackend", "Linux sandbox backend", "Rootfs execution backend.", "one of: chroot, proot", "readwrite", "sensitive", true),
-        ("startup_tasks", "Startup tasks", "App-start shell task collection. Supports append/remove.", "json; append object {name, script, enabled}; remove string task id", "readwrite", "destructive", false),
-        ("startup_tasks.enabled", "Startup tasks enabled", "Master switch for all App-start shell tasks.", "bool", "readwrite", "destructive", true),
-        ("startup_tasks.<task_id>.name", "Startup task name", "User-visible startup task name.", "string max 200 chars", "readwrite", "normal", true),
-        ("startup_tasks.<task_id>.script", "Startup task script", "Shell script content executed from /var/minis/autostart on sandbox initialization.", "string max 200000 chars", "readwrite", "destructive", true),
-        ("startup_tasks.<task_id>.enabled", "Startup task enabled", "Whether this startup task runs when the master switch is enabled.", "bool", "readwrite", "destructive", true),
-        ("startup_tasks.<task_id>.createdAt", "Startup task created at", "Creation timestamp in epoch milliseconds.", "long", "readonly", "normal", false),
-        ("startup_tasks.<task_id>.updatedAt", "Startup task updated at", "Update timestamp in epoch milliseconds.", "long", "readonly", "normal", false),
-        ("startup_tasks.<task_id>.path", "Startup task path", "Sandbox .sh path.", "string", "readonly", "normal", false),
-        ("tools.webFetchBackend", "Web fetch backend", "Backend used by web_fetch.", "one of: local, tinyfish", "readwrite", "normal", true),
-        ("tools.viewImageScaleMode", "View image scale mode", "Image preprocessing mode for view_image.", "one of: resizeFit, original", "readwrite", "normal", true),
+        (
+            "appearance.theme",
+            "Theme",
+            "App color theme.",
+            "one of: system, light, dark",
+            "readwrite",
+            "normal",
+            true,
+        ),
+        (
+            "appearance.fontScale",
+            "Font scale",
+            "App text scale.",
+            "one of: small, default, large, extraLarge",
+            "readwrite",
+            "normal",
+            true,
+        ),
+        (
+            "defaults.primaryModelGroup",
+            "Primary model group",
+            "Default model group used for normal chat.",
+            "string model group id",
+            "readwrite",
+            "sensitive",
+            true,
+        ),
+        (
+            "defaults.secondaryModelGroup",
+            "Secondary model group",
+            "Default model group used for title generation and memory review.",
+            "string model group id",
+            "readwrite",
+            "sensitive",
+            true,
+        ),
+        (
+            "defaults.deepThinking",
+            "Deep thinking default",
+            "Default deep-thinking state for new chats.",
+            "bool",
+            "readwrite",
+            "normal",
+            true,
+        ),
+        (
+            "defaults.startupChatMode",
+            "Startup chat mode",
+            "Which chat to open on app start.",
+            "one of: newChat, lastChat",
+            "readwrite",
+            "normal",
+            true,
+        ),
+        (
+            "logs.enabled",
+            "Logging enabled",
+            "Hambur logcat logging switch.",
+            "bool",
+            "readwrite",
+            "normal",
+            true,
+        ),
+        (
+            "permissions.hamburConfig.enabled",
+            "Allow hambur_config",
+            "Native config tool availability. Currently always enabled.",
+            "bool",
+            "readonly",
+            "destructive",
+            false,
+        ),
+        (
+            "providers",
+            "LLM providers",
+            "Provider summary collection. Supports append/remove.",
+            "json",
+            "readwrite",
+            "sensitive",
+            false,
+        ),
+        (
+            "providers.<provider_id>.name",
+            "Provider name",
+            "User-visible provider name.",
+            "string max 200 chars",
+            "readwrite",
+            "normal",
+            true,
+        ),
+        (
+            "providers.<provider_id>.iconName",
+            "Provider icon",
+            "Provider icon key.",
+            "string max 64 chars",
+            "readwrite",
+            "normal",
+            true,
+        ),
+        (
+            "providers.<provider_id>.apiType",
+            "Provider API type",
+            "Provider API protocol.",
+            "one of: openAI, gemini, anthropic",
+            "readwrite",
+            "sensitive",
+            true,
+        ),
+        (
+            "providers.<provider_id>.baseUrl",
+            "Provider base URL",
+            "API base URL.",
+            "string max 1000 chars",
+            "readwrite",
+            "sensitive",
+            true,
+        ),
+        (
+            "providers.<provider_id>.apiKey",
+            "Provider API key",
+            "Provider credential. Write-only and redacted in audit.",
+            "string max 10000 chars",
+            "write-only",
+            "destructive",
+            false,
+        ),
+        (
+            "providers.<provider_id>.enabled",
+            "Provider enabled",
+            "Whether provider can be used for routing.",
+            "bool",
+            "readwrite",
+            "sensitive",
+            true,
+        ),
+        (
+            "providers.<provider_id>.selectedModel",
+            "Provider selected model",
+            "Provider default selected model.",
+            "string",
+            "readwrite",
+            "sensitive",
+            true,
+        ),
+        (
+            "providers.<provider_id>.models",
+            "Provider models",
+            "Model ids available on this provider.",
+            "[string]",
+            "readwrite",
+            "sensitive",
+            true,
+        ),
+        (
+            "models",
+            "Model entries",
+            "Flattened provider model collection. Supports append/remove.",
+            "json",
+            "readwrite",
+            "sensitive",
+            false,
+        ),
+        (
+            "models.<entry_id>.displayName",
+            "Model display name",
+            "Custom display name for a provider model.",
+            "string max 200 chars",
+            "readwrite",
+            "normal",
+            true,
+        ),
+        (
+            "models.<entry_id>.notes",
+            "Model notes",
+            "Custom notes for a provider model.",
+            "string max 1000 chars",
+            "readwrite",
+            "normal",
+            true,
+        ),
+        (
+            "models.<entry_id>.modelId",
+            "Model id",
+            "API model id.",
+            "string",
+            "readonly",
+            "normal",
+            false,
+        ),
+        (
+            "models.<entry_id>.providerId",
+            "Provider id",
+            "Owning provider id.",
+            "string",
+            "readonly",
+            "normal",
+            false,
+        ),
+        (
+            "models.<entry_id>.contextWindow",
+            "Context window",
+            "Catalog context window when known.",
+            "int|null",
+            "readonly",
+            "normal",
+            false,
+        ),
+        (
+            "models.<entry_id>.maxOutputTokens",
+            "Max output tokens",
+            "Catalog output limit when known.",
+            "int|null",
+            "readonly",
+            "normal",
+            false,
+        ),
+        (
+            "models.<entry_id>.supportsTools",
+            "Supports tools",
+            "Catalog tool-call support when known.",
+            "bool",
+            "readonly",
+            "normal",
+            false,
+        ),
+        (
+            "models.<entry_id>.supportsVision",
+            "Supports vision",
+            "Catalog image input support when known.",
+            "bool",
+            "readonly",
+            "normal",
+            false,
+        ),
+        (
+            "model_groups",
+            "Model groups",
+            "Model routing group collection. Supports append/remove.",
+            "json",
+            "readwrite",
+            "sensitive",
+            false,
+        ),
+        (
+            "model_groups.<group_id>.name",
+            "Model group name",
+            "User-visible group name.",
+            "string max 200 chars",
+            "readwrite",
+            "normal",
+            true,
+        ),
+        (
+            "model_groups.<group_id>.routingStrategy",
+            "Routing strategy",
+            "How to choose among group models.",
+            "one of: fallback, loadBalance",
+            "readwrite",
+            "sensitive",
+            true,
+        ),
+        (
+            "model_groups.<group_id>.fallbackPolicy",
+            "Fallback policy",
+            "When to fall back to another model.",
+            "one of: default, always",
+            "readwrite",
+            "sensitive",
+            true,
+        ),
+        (
+            "model_groups.<group_id>.models",
+            "Group models",
+            "Group model entries. Supports append/remove.",
+            "[{provider_id, model_id}]",
+            "readwrite",
+            "sensitive",
+            true,
+        ),
+        (
+            "sandbox.rootfsBackend",
+            "Linux sandbox backend",
+            "Rootfs execution backend.",
+            "one of: chroot, proot",
+            "readwrite",
+            "sensitive",
+            true,
+        ),
+        (
+            "startup_tasks",
+            "Startup tasks",
+            "App-start shell task collection. Supports append/remove.",
+            "json; append object {name, script, enabled}; remove string task id",
+            "readwrite",
+            "destructive",
+            false,
+        ),
+        (
+            "startup_tasks.enabled",
+            "Startup tasks enabled",
+            "Master switch for all App-start shell tasks.",
+            "bool",
+            "readwrite",
+            "destructive",
+            true,
+        ),
+        (
+            "startup_tasks.<task_id>.name",
+            "Startup task name",
+            "User-visible startup task name.",
+            "string max 200 chars",
+            "readwrite",
+            "normal",
+            true,
+        ),
+        (
+            "startup_tasks.<task_id>.script",
+            "Startup task script",
+            "Shell script content executed from /var/minis/autostart on sandbox initialization.",
+            "string max 200000 chars",
+            "readwrite",
+            "destructive",
+            true,
+        ),
+        (
+            "startup_tasks.<task_id>.enabled",
+            "Startup task enabled",
+            "Whether this startup task runs when the master switch is enabled.",
+            "bool",
+            "readwrite",
+            "destructive",
+            true,
+        ),
+        (
+            "startup_tasks.<task_id>.createdAt",
+            "Startup task created at",
+            "Creation timestamp in epoch milliseconds.",
+            "long",
+            "readonly",
+            "normal",
+            false,
+        ),
+        (
+            "startup_tasks.<task_id>.updatedAt",
+            "Startup task updated at",
+            "Update timestamp in epoch milliseconds.",
+            "long",
+            "readonly",
+            "normal",
+            false,
+        ),
+        (
+            "startup_tasks.<task_id>.path",
+            "Startup task path",
+            "Sandbox .sh path.",
+            "string",
+            "readonly",
+            "normal",
+            false,
+        ),
+        (
+            "tools.webFetchBackend",
+            "Web fetch backend",
+            "Backend used by web_fetch.",
+            "one of: local, tinyfish",
+            "readwrite",
+            "normal",
+            true,
+        ),
+        (
+            "tools.viewImageScaleMode",
+            "View image scale mode",
+            "Image preprocessing mode for view_image.",
+            "one of: resizeFit, original",
+            "readwrite",
+            "normal",
+            true,
+        ),
     ];
     RAW.iter()
-        .map(|(path, display_name, description, schema, access, risk, revertable)| {
-            HamburConfigFieldSpec {
-                path,
-                display_name,
-                description,
-                schema,
-                access,
-                risk,
-                revertable: *revertable,
-                topic: path.split('.').next().unwrap_or(""),
-            }
-        })
+        .map(
+            |(path, display_name, description, schema, access, risk, revertable)| {
+                HamburConfigFieldSpec {
+                    path,
+                    display_name,
+                    description,
+                    schema,
+                    access,
+                    risk,
+                    revertable: *revertable,
+                    topic: path.split('.').next().unwrap_or(""),
+                }
+            },
+        )
         .collect()
 }
 
@@ -10113,14 +10451,22 @@ fn read_hambur_config_path(
     match path {
         "providers" => config_collection_response(
             field,
-            snapshot.providers.iter().map(provider_config_json).collect(),
+            snapshot
+                .providers
+                .iter()
+                .map(provider_config_json)
+                .collect(),
             filter,
             page,
             page_size,
         ),
         "models" => config_collection_response(
             field,
-            snapshot.provider_models.iter().map(model_config_json).collect(),
+            snapshot
+                .provider_models
+                .iter()
+                .map(model_config_json)
+                .collect(),
             filter,
             page,
             page_size,
@@ -10216,14 +10562,18 @@ fn read_hambur_config_value(snapshot: &SettingsSnapshot, path: &str) -> Value {
         "appearance.fontScale" => json!(setting_value(snapshot, "fontScale", "default")),
         "defaults.primaryModelGroup" => json!(default_group(snapshot, "primary")),
         "defaults.secondaryModelGroup" => json!(default_group(snapshot, "secondary")),
-        "defaults.deepThinking" => json!(setting_bool(snapshot, "defaultDeepThinkingEnabled", false)),
+        "defaults.deepThinking" => {
+            json!(setting_bool(snapshot, "defaultDeepThinkingEnabled", false))
+        }
         "defaults.startupChatMode" => json!(setting_value(snapshot, "startupChatMode", "new_chat")),
         "logs.enabled" => json!(setting_bool(snapshot, "loggingEnabled", true)),
         "permissions.hamburConfig.enabled" => json!(true),
         "sandbox.rootfsBackend" => json!(setting_value(snapshot, "rootfsBackend", "chroot")),
         "startup_tasks.enabled" => json!(setting_bool(snapshot, "startupTasksEnabled", true)),
         "tools.webFetchBackend" => json!(setting_value(snapshot, "webFetchBackend", "local")),
-        "tools.viewImageScaleMode" => json!(setting_value(snapshot, "viewImageScaleMode", "resize_fit")),
+        "tools.viewImageScaleMode" => {
+            json!(setting_value(snapshot, "viewImageScaleMode", "resize_fit"))
+        }
         _ => dynamic_hambur_config_value(snapshot, path),
     }
 }
@@ -10251,9 +10601,10 @@ fn dynamic_hambur_config_value(snapshot: &SettingsSnapshot, path: &str) -> Value
             .unwrap_or(Value::Null),
         ["models", entry_id, field] => decode_model_entry_id(entry_id)
             .and_then(|(provider_id, model_id)| {
-                snapshot.provider_models.iter().find(|model| {
-                    model.provider_id == provider_id && model.model_id == model_id
-                })
+                snapshot
+                    .provider_models
+                    .iter()
+                    .find(|model| model.provider_id == provider_id && model.model_id == model_id)
             })
             .map(|model| match *field {
                 "displayName" => json!(model.display_name),
@@ -10319,12 +10670,21 @@ fn app_setting_for_hambur_config_path(path: &str, value_json: &str) -> Option<(S
         "appearance.theme" => ("themeMode", normalize_theme_value(&string_value)),
         "appearance.fontScale" => ("fontScale", normalize_font_scale_value(&string_value)),
         "defaults.deepThinking" => ("defaultDeepThinkingEnabled", string_value),
-        "defaults.startupChatMode" => ("startupChatMode", normalize_startup_chat_value(&string_value)),
+        "defaults.startupChatMode" => (
+            "startupChatMode",
+            normalize_startup_chat_value(&string_value),
+        ),
         "logs.enabled" => ("loggingEnabled", string_value),
         "sandbox.rootfsBackend" => ("rootfsBackend", string_value),
         "startup_tasks.enabled" => ("startupTasksEnabled", string_value),
-        "tools.webFetchBackend" => ("webFetchBackend", normalize_web_fetch_backend_value(&string_value)),
-        "tools.viewImageScaleMode" => ("viewImageScaleMode", normalize_view_image_scale_value(&string_value)),
+        "tools.webFetchBackend" => (
+            "webFetchBackend",
+            normalize_web_fetch_backend_value(&string_value),
+        ),
+        "tools.viewImageScaleMode" => (
+            "viewImageScaleMode",
+            normalize_view_image_scale_value(&string_value),
+        ),
         _ => return None,
     };
     Some((mapped.0.to_string(), mapped.1))
@@ -10607,7 +10967,12 @@ fn config_u32(value: &Value, key: &str, fallback: u32) -> u32 {
         .unwrap_or(fallback)
 }
 
-fn argument_seconds_or_ms(value: &Value, seconds_key: &str, millis_key: &str, fallback_ms: u64) -> u64 {
+fn argument_seconds_or_ms(
+    value: &Value,
+    seconds_key: &str,
+    millis_key: &str,
+    fallback_ms: u64,
+) -> u64 {
     if let Some(seconds) = value.get(seconds_key).and_then(Value::as_u64) {
         return seconds.saturating_mul(1_000);
     }
@@ -11151,6 +11516,68 @@ mod tests {
         assert_eq!(snapshot.sessions.len(), 1);
         assert_eq!(snapshot.sessions[0].title, "Once");
         assert_eq!(snapshot.snapshot_sequence, created.sequence);
+
+        let _ = fs::remove_dir_all(app_files_dir);
+    }
+
+    #[test]
+    fn open_session_can_switch_back_to_previously_opened_session() {
+        let app_files_dir = temp_app_dir();
+        fs::create_dir_all(&app_files_dir).expect("create temp app dir");
+
+        let runtime = RuntimeEngine::create(AppBootstrap {
+            app_files_dir: app_files_dir.to_string_lossy().to_string(),
+            native_library_dir: String::new(),
+        })
+        .expect("create runtime");
+        let ready = runtime.next_event().expect("ready event");
+        assert_eq!(ready.kind.as_str(), "RuntimeReady");
+
+        let first_session_id = create_test_session(&runtime);
+        let second_session_id = create_test_session(&runtime);
+        assert_ne!(first_session_id, second_session_id);
+
+        let first_open = runtime.open_session(first_session_id.clone());
+        assert!(
+            first_open.accepted,
+            "first open rejected: {}",
+            first_open.message
+        );
+        assert!(!first_open.duplicate);
+        let first_opened = next_event_with_timeout(&runtime, "first session opened");
+        assert_eq!(first_opened.kind.as_str(), "SessionOpened");
+        assert_eq!(first_opened.snapshot.selected_session_id, first_session_id);
+
+        let second_open = runtime.open_session(second_session_id.clone());
+        assert!(
+            second_open.accepted,
+            "second open rejected: {}",
+            second_open.message
+        );
+        assert!(!second_open.duplicate);
+        let second_opened = next_event_with_timeout(&runtime, "second session opened");
+        assert_eq!(second_opened.kind.as_str(), "SessionOpened");
+        assert_eq!(
+            second_opened.snapshot.selected_session_id,
+            second_session_id
+        );
+
+        let reopen_first = runtime.open_session(first_session_id.clone());
+        assert!(
+            reopen_first.accepted,
+            "reopen first rejected: {}",
+            reopen_first.message
+        );
+        assert!(!reopen_first.duplicate);
+        let first_reopened = next_event_with_timeout(&runtime, "first session reopened");
+        assert_eq!(first_reopened.kind.as_str(), "SessionOpened");
+        assert_eq!(
+            first_reopened.snapshot.selected_session_id,
+            first_session_id
+        );
+
+        let snapshot = runtime.get_session_list_snapshot(10, 0);
+        assert_eq!(snapshot.selected_session_id, first_session_id);
 
         let _ = fs::remove_dir_all(app_files_dir);
     }
@@ -13862,7 +14289,11 @@ mod tests {
             &log_invocation,
             &log_invocation.arguments_value().unwrap(),
         );
-        assert!(!log_result.is_error, "process log failed: {}", log_result.summary);
+        assert!(
+            !log_result.is_error,
+            "process log failed: {}",
+            log_result.summary
+        );
         assert!(log_result.context_stub.contains("process-ready"));
 
         let _ = fs::remove_dir_all(app_files_dir);

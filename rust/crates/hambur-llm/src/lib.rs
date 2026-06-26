@@ -314,8 +314,8 @@ impl OpenAiCompatibleAdapter {
             object.insert("role".to_string(), json!(message.role));
             object.insert("content".to_string(), json!(message.content));
             if !message.tool_calls_json.trim().is_empty() {
-                let tool_calls: Value =
-                    serde_json::from_str(message.tool_calls_json.trim()).map_err(|error| {
+                let tool_calls: Value = serde_json::from_str(message.tool_calls_json.trim())
+                    .map_err(|error| {
                         HamburError::InvalidCommand(format!(
                             "invalid OpenAI assistant tool_calls JSON: {error}"
                         ))

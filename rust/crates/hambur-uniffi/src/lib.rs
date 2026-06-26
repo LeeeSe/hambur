@@ -987,16 +987,18 @@ impl From<TimelineItemSnapshot> for TimelineItemDTO {
 
 impl From<MarkdownBlockPayloadRecord> for MarkdownBlockPayloadDTO {
     fn from(value: MarkdownBlockPayloadRecord) -> Self {
-        let node = serde_json::from_str::<MarkdownBlockNode>(&value.payload_json)
-            .unwrap_or_else(|_| MarkdownBlockNode {
-                message_id: value.message_id.clone(),
-                block_id: value.block_id,
-                stable_key: value.stable_key.clone(),
-                committed: value.committed,
-                raw: value.raw.clone(),
-                text: value.small_summary.clone(),
-                node_kind: "Paragraph".to_string(),
-                ..Default::default()
+        let node =
+            serde_json::from_str::<MarkdownBlockNode>(&value.payload_json).unwrap_or_else(|_| {
+                MarkdownBlockNode {
+                    message_id: value.message_id.clone(),
+                    block_id: value.block_id,
+                    stable_key: value.stable_key.clone(),
+                    committed: value.committed,
+                    raw: value.raw.clone(),
+                    text: value.small_summary.clone(),
+                    node_kind: "Paragraph".to_string(),
+                    ..Default::default()
+                }
             });
         Self {
             id: value.id,

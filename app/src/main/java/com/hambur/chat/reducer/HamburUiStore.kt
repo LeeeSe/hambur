@@ -270,7 +270,7 @@ class HamburUiStore(
             runtime.dispatch(
                 backendCommand(
                     kind = "OpenSession",
-                    idempotencyKey = "$sessionId:open",
+                    idempotencyKey = "$sessionId:open:${nextCommandOrdinal()}",
                     sessionId = sessionId,
                 ),
             )
@@ -1093,7 +1093,7 @@ class HamburUiStore(
                     runtime.dispatch(
                         backendCommand(
                             kind = "OpenSession",
-                            idempotencyKey = "$emptySessionId:open:startup",
+                            idempotencyKey = "$emptySessionId:open:startup:${nextCommandOrdinal()}",
                             sessionId = emptySessionId,
                         ),
                     ),
@@ -1279,7 +1279,7 @@ class HamburUiStore(
             val ack = runtime.dispatch(
                 backendCommand(
                     kind = "OpenSession",
-                    idempotencyKey = "$sessionId:open:send",
+                    idempotencyKey = "$sessionId:open:send:${nextCommandOrdinal()}",
                     sessionId = sessionId,
                 ),
             )

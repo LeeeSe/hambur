@@ -9,6 +9,9 @@ import androidx.compose.foundation.Image as ComposeImage
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.awaitLongPressOrCancellation
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.FlingBehavior
 import androidx.compose.foundation.gestures.Orientation
@@ -83,6 +86,7 @@ import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
@@ -932,7 +936,9 @@ private fun ChatTimeline(
                                 onOpenFile = onOpenFile,
                                 onSelectText = onSelectText,
                                 onRetryMessage = {
-                                    store.retryMessage(state.selectedSessionId, timelineItem.payloadRef)
+                                    message?.let {
+                                        store.retryMessage(state.selectedSessionId, it.id)
+                                    }
                                 },
                                 onEditMessage = { message?.let(onEditMessage) },
                             )
@@ -1117,15 +1123,18 @@ private fun MessageLongPressMenuBox(
 
     Box(
         modifier = Modifier.pointerInput(enabled) {
-            detectTapGestures(
-                onLongPress = { offset ->
-                    if (enabled) {
-                        longPressHaptic()
-                        pressOffset = offset
-                        showMenu = true
-                    }
-                },
-            )
+            awaitEachGesture {
+                val down = awaitFirstDown(
+                    requireUnconsumed = false,
+                    pass = PointerEventPass.Initial,
+                )
+                val longPress = awaitLongPressOrCancellation(down.id)
+                if (enabled && longPress != null) {
+                    longPressHaptic()
+                    pressOffset = longPress.position
+                    showMenu = true
+                }
+            }
         },
     ) {
         content()

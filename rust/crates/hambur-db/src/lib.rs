@@ -446,6 +446,13 @@ pub struct AppSettingRecord {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelCatalogCacheRecord {
+    pub key: String,
+    pub catalog_json: String,
+    pub synced_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConfigAuditRecord {
     pub id: String,
     pub command_id: String,
@@ -517,7 +524,6 @@ pub struct TimelinePageData {
     pub has_more: bool,
 }
 
-
 mod connection;
 mod database;
 mod mutations;
@@ -527,7 +533,7 @@ mod utils;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use connection::{Connection, IntoSqlValue, Row, Rows, database_error, SqlParams};
+pub(crate) use connection::{Connection, IntoSqlValue, Row, Rows, SqlParams, database_error};
 pub use utils::*;
 
 pub struct HamburDatabase {

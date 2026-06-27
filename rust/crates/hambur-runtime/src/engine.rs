@@ -1,7 +1,7 @@
 use crate::*;
 
 impl RuntimeEngine {
-pub fn create(bootstrap: AppBootstrap) -> HamburResult<Arc<Self>> {
+    pub fn create(bootstrap: AppBootstrap) -> HamburResult<Arc<Self>> {
         if bootstrap.app_files_dir.trim().is_empty() {
             return Err(HamburError::InvalidCommand(
                 "app_files_dir must not be empty".to_string(),
@@ -63,9 +63,9 @@ pub fn create(bootstrap: AppBootstrap) -> HamburResult<Arc<Self>> {
         }
         engine.emit(RuntimeEventKind::RuntimeReady, snapshot, None)?;
         engine.schedule_startup_memory_review_check();
+        engine.schedule_model_catalog_sync();
         Ok(engine)
     }
-
 
     pub(crate) fn safe_block_on<F: std::future::Future>(&self, future: F) -> F::Output {
         if let Ok(_handle) = tokio::runtime::Handle::try_current() {
@@ -181,7 +181,9 @@ pub fn create(bootstrap: AppBootstrap) -> HamburResult<Arc<Self>> {
                     .message_snapshot(&source_message_id)
                     .await?
                     .ok_or_else(|| {
-                        HamburError::InvalidCommand(format!("message not found: {source_message_id}"))
+                        HamburError::InvalidCommand(format!(
+                            "message not found: {source_message_id}"
+                        ))
                     })?;
                 let is_user = source_message.role == "user";
                 let source_user = self
@@ -207,6 +209,7 @@ pub fn create(bootstrap: AppBootstrap) -> HamburResult<Arc<Self>> {
         _current_attachments: &[AttachmentRecord],
         route: &ModelRouteSnapshot,
         append_current_user: bool,
+        current_user_model_content: &str,
     ) -> HamburResult<Vec<ModelMessage>> {
         let transcript = self
             .database
@@ -229,7 +232,10 @@ pub fn create(bootstrap: AppBootstrap) -> HamburResult<Arc<Self>> {
         if append_current_user {
             messages.push(ModelMessage {
                 role: "user".to_string(),
-                content: current_user_message.content_text.clone(),
+                content: current_user_model_content
+                    .trim()
+                    .to_string()
+                    .if_blank(current_user_message.content_text.clone()),
                 ..Default::default()
             });
         }
@@ -1062,7 +1068,26 @@ pub fn create(bootstrap: AppBootstrap) -> HamburResult<Arc<Self>> {
             }
         });
     }
-    pub(crate) fn maybe_spawn_memory_review_for_session(self: Arc<Self>, session_id: String, reason: &str) {
+
+    pub(crate) fn schedule_model_catalog_sync(self: &Arc<Self>) {
+        let Some(engine) = self.self_ref.lock().ok().and_then(|value| value.upgrade()) else {
+            return;
+        };
+        let handle = self.tokio.handle().clone();
+        handle.spawn(async move {
+            sleep(Duration::from_secs(15)).await;
+            if engine.shutdown.load(Ordering::SeqCst) {
+                return;
+            }
+            let _ = engine.models_dev_catalog_json(false).await;
+        });
+    }
+
+    pub(crate) fn maybe_spawn_memory_review_for_session(
+        self: Arc<Self>,
+        session_id: String,
+        reason: &str,
+    ) {
         if session_id.trim().is_empty() || self.shutdown.load(Ordering::SeqCst) {
             return;
         }
@@ -1087,7 +1112,11 @@ pub fn create(bootstrap: AppBootstrap) -> HamburResult<Arc<Self>> {
             }
         });
     }
-    pub(crate) async fn review_memory_session_if_needed(self: Arc<Self>, session_id: String, reason: String) {
+    pub(crate) async fn review_memory_session_if_needed(
+        self: Arc<Self>,
+        session_id: String,
+        reason: String,
+    ) {
         if self.active_turn_for_session(&session_id).is_some() {
             return;
         }
@@ -1701,8 +1730,7 @@ pub fn create(bootstrap: AppBootstrap) -> HamburResult<Arc<Self>> {
             })),
             "topic_help" => {
                 let topic = normalize_hambur_config_topic(
-                    &config_string(arguments, "topic")
-                        .if_blank(config_string(arguments, "path")),
+                    &config_string(arguments, "topic").if_blank(config_string(arguments, "path")),
                 );
                 if topic.is_empty() {
                     return Ok(config_error("validation_failed", "topic is required."));
@@ -1826,7 +1854,10 @@ pub fn create(bootstrap: AppBootstrap) -> HamburResult<Arc<Self>> {
                 let entries = snapshot
                     .config_audits
                     .iter()
-                    .filter(|entry| scope.is_empty() || normalize_hambur_config_topic(&entry.target_kind) == scope)
+                    .filter(|entry| {
+                        scope.is_empty()
+                            || normalize_hambur_config_topic(&entry.target_kind) == scope
+                    })
                     .take(limit)
                     .map(config_audit_json)
                     .collect::<Vec<_>>();
@@ -1844,7 +1875,11 @@ pub fn create(bootstrap: AppBootstrap) -> HamburResult<Arc<Self>> {
                     return Ok(config_error("validation_failed", "audit_id is required."));
                 }
                 let snapshot = self.database.settings_snapshot().await?;
-                let Some(entry) = snapshot.config_audits.iter().find(|entry| entry.id == audit_id) else {
+                let Some(entry) = snapshot
+                    .config_audits
+                    .iter()
+                    .find(|entry| entry.id == audit_id)
+                else {
                     return Ok(config_error(
                         "unknown_path",
                         &format!("No audit entry '{audit_id}'."),
@@ -1923,11 +1958,19 @@ pub fn create(bootstrap: AppBootstrap) -> HamburResult<Arc<Self>> {
             .database
             .insert_config_audit(
                 &new_id("config_tool"),
-                if actor.trim().is_empty() { "agent" } else { actor },
+                if actor.trim().is_empty() {
+                    "agent"
+                } else {
+                    actor
+                },
                 "HamburConfigTool",
                 field.topic,
                 &path,
-                if caption.trim().is_empty() { &summary } else { caption },
+                if caption.trim().is_empty() {
+                    &summary
+                } else {
+                    caption
+                },
                 false,
                 "",
             )
@@ -2061,8 +2104,7 @@ pub fn create(bootstrap: AppBootstrap) -> HamburResult<Arc<Self>> {
         };
         let Some(state) = sessions.get_mut(process_session_id) else {
             drop(sessions);
-            if let Some(completed) =
-                self.completed_process_snapshot(invocation, process_session_id)
+            if let Some(completed) = self.completed_process_snapshot(invocation, process_session_id)
             {
                 return completed;
             }
@@ -2147,11 +2189,8 @@ pub fn create(bootstrap: AppBootstrap) -> HamburResult<Arc<Self>> {
                     if let Some(completed) =
                         completed_process_session_from_state(state, process_session_id)
                     {
-                        if let Ok(mut completed_sessions) =
-                            self.completed_process_sessions.lock()
-                        {
-                            completed_sessions
-                                .insert(process_session_id.to_string(), completed);
+                        if let Ok(mut completed_sessions) = self.completed_process_sessions.lock() {
+                            completed_sessions.insert(process_session_id.to_string(), completed);
                         }
                     }
                     sessions.remove(process_session_id);
@@ -3300,12 +3339,12 @@ pub fn create(bootstrap: AppBootstrap) -> HamburResult<Arc<Self>> {
             .trim();
         let detail = if detail.is_empty() {
             match self.database.settings_snapshot().await {
-                Ok(snapshot) => match setting_value(&snapshot, "viewImageScaleMode", "resize_fit")
-                    .as_str()
-                {
-                    "original" => "original",
-                    _ => "high",
-                },
+                Ok(snapshot) => {
+                    match setting_value(&snapshot, "viewImageScaleMode", "resize_fit").as_str() {
+                        "original" => "original",
+                        _ => "high",
+                    }
+                }
                 Err(_) => "high",
             }
         } else {
@@ -3805,7 +3844,7 @@ pub fn create(bootstrap: AppBootstrap) -> HamburResult<Arc<Self>> {
             .try_send(event)
             .map_err(|error| HamburError::Internal(format!("event queue: {error}")))
     }
-pub(crate) fn skills_root(&self) -> PathBuf {
+    pub(crate) fn skills_root(&self) -> PathBuf {
         PathBuf::from(&self.bootstrap.app_files_dir)
             .join("sandbox")
             .join("global")

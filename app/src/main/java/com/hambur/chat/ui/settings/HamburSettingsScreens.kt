@@ -76,6 +76,7 @@ import com.hambur.chat.ui.theme.HamburThemeDefaults
 import com.hambur.chat.ui.theme.HamburThemeSettingKeys
 import java.text.DateFormat
 import java.util.Date
+import org.json.JSONObject
 
 @Composable
 fun HamburSettingsHomeScreen(
@@ -328,6 +329,8 @@ fun ModelDetailScreen(
     val model = state.providerModels.firstOrNull {
         it.providerId == providerId && it.modelId == modelId
     }
+    val provider = state.providers.firstOrNull { it.id == providerId }
+    val metadata = remember(model?.metadataJson) { model?.metadataJson.orEmpty().toModelMetadataSummary() }
     var displayName by rememberSaveable(modelId) { mutableStateOf(model?.displayName ?: modelId) }
     var supportsTool by rememberSaveable(modelId) { mutableStateOf(model?.supportsToolCall ?: true) }
     var supportsReasoning by rememberSaveable(modelId) { mutableStateOf(model?.supportsReasoning ?: true) }
@@ -335,16 +338,62 @@ fun ModelDetailScreen(
     var contextLimit by rememberSaveable(modelId) { mutableStateOf((model?.contextLimit ?: 32000u).toString()) }
     var outputLimit by rememberSaveable(modelId) { mutableStateOf((model?.outputLimit ?: 4096u).toString()) }
 
-    SettingsPage(title = "Model Detail", subtitle = modelId, onBack = onBack) {
+    SettingsPage(title = displayName.ifBlank { modelId }, subtitle = provider?.name ?: providerId, onBack = onBack) {
         item {
-            HamburSection(title = "Capabilities") {
-                SummaryLine(label = "Provider", value = providerId)
-                OutlinedTextField(value = displayName, onValueChange = { displayName = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Display name") })
-                CapabilitySwitch("Tool calls", supportsTool) { supportsTool = it }
-                CapabilitySwitch("Reasoning", supportsReasoning) { supportsReasoning = it }
-                CapabilitySwitch("Image input", supportsImage) { supportsImage = it }
-                OutlinedTextField(value = contextLimit, onValueChange = { contextLimit = it.filter(Char::isDigit) }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Context limit") })
-                OutlinedTextField(value = outputLimit, onValueChange = { outputLimit = it.filter(Char::isDigit) }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Output limit") })
+            HamburSection(title = "模型") {
+                SummaryLine(label = "模型 ID", value = modelId)
+                SummaryLine(label = "提供商", value = provider?.name ?: providerId)
+                SummaryLine(label = "同步时间", value = model?.syncedAtMs?.toDateTimeText().orEmpty().ifBlank { "暂无" })
+                OutlinedTextField(
+                    value = displayName,
+                    onValueChange = { displayName = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    label = { Text("显示名称") },
+                )
+            }
+        }
+        item {
+            HamburSection(title = "基本信息") {
+                SummaryLine(label = "模型家族", value = metadata.family.ifBlank { "暂无" })
+                SummaryLine(label = "知识截止", value = metadata.knowledgeCutoff.ifBlank { "暂无" })
+                SummaryLine(label = "发布时间", value = metadata.releaseDate.ifBlank { "暂无" })
+                SummaryLine(label = "最近更新", value = metadata.lastUpdated.ifBlank { "暂无" })
+                SummaryLine(label = "状态", value = metadata.status.ifBlank { "暂无" })
+            }
+        }
+        item {
+            HamburSection(title = "模型能力") {
+                SummaryLine(label = "输入模态", value = metadata.inputModalities.joinToString(" / ").ifBlank { if (supportsImage) "text / image" else "text" })
+                SummaryLine(label = "输出模态", value = metadata.outputModalities.joinToString(" / ").ifBlank { "text" })
+                CapabilityIndicator("支持附件", metadata.supportsAttachments || supportsImage)
+                CapabilitySwitch("支持推理", supportsReasoning) { supportsReasoning = it }
+                CapabilitySwitch("支持工具调用", supportsTool) { supportsTool = it }
+                CapabilitySwitch("图片输入", supportsImage) { supportsImage = it }
+                CapabilityIndicator("结构化输出", model?.supportsStructuredOutput ?: false)
+                CapabilityIndicator("可调温度", model?.supportsTemperature ?: true)
+                CapabilityIndicator("开放权重", metadata.openWeights)
+                SummaryLine(label = "推理内容字段", value = model?.reasoningField.orEmpty().ifBlank { metadata.interleavedField.ifBlank { "暂无" } })
+                SummaryLine(label = "推理选项", value = metadata.reasoningOptions.joinToString("、").ifBlank { "暂无" })
+            }
+        }
+        item {
+            HamburSection(title = "限制与价格") {
+                OutlinedTextField(value = contextLimit, onValueChange = { contextLimit = it.filter(Char::isDigit) }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("上下文长度") })
+                OutlinedTextField(value = outputLimit, onValueChange = { outputLimit = it.filter(Char::isDigit) }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("最大输出") })
+                SummaryLine(label = "输入价格", value = metadata.inputCostPerMillion.toCostText())
+                SummaryLine(label = "输出价格", value = metadata.outputCostPerMillion.toCostText())
+                SummaryLine(label = "缓存读取价格", value = metadata.cacheReadCostPerMillion.toCostText())
+            }
+        }
+        item {
+            HamburSection(title = "参考资料") {
+                SummaryLine(label = "权重链接", value = metadata.weightLinks.joinToString { it.label.ifBlank { it.url } }.ifBlank { "暂无" })
+                SummaryLine(label = "基准测试", value = if (metadata.benchmarks.isEmpty()) "暂无" else "${metadata.benchmarks.size} 项")
+            }
+        }
+        item {
+            HamburSection(title = "覆盖设置") {
                 Button(
                     enabled = providerId.isNotBlank() && modelId.isNotBlank(),
                     onClick = {
@@ -360,7 +409,7 @@ fun ModelDetailScreen(
                         )
                     },
                 ) {
-                    Text("Save override")
+                    Text("保存覆盖")
                 }
             }
         }
@@ -2099,6 +2148,114 @@ private fun CapabilitySwitch(
         Switch(checked = checked, onCheckedChange = onCheckedChange)
         Text(label, modifier = Modifier.padding(start = 8.dp))
     }
+}
+
+@Composable
+private fun CapabilityIndicator(
+    label: String,
+    checked: Boolean,
+) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Checkbox(checked = checked, onCheckedChange = null)
+        Text(label, modifier = Modifier.padding(start = 8.dp))
+    }
+}
+
+private data class ModelMetadataSummary(
+    val family: String = "",
+    val knowledgeCutoff: String = "",
+    val releaseDate: String = "",
+    val lastUpdated: String = "",
+    val status: String = "",
+    val supportsAttachments: Boolean = false,
+    val openWeights: Boolean = false,
+    val inputModalities: List<String> = emptyList(),
+    val outputModalities: List<String> = emptyList(),
+    val inputCostPerMillion: Double? = null,
+    val outputCostPerMillion: Double? = null,
+    val cacheReadCostPerMillion: Double? = null,
+    val reasoningOptions: List<String> = emptyList(),
+    val interleavedField: String = "",
+    val weightLinks: List<ModelLinkSummary> = emptyList(),
+    val benchmarks: List<String> = emptyList(),
+)
+
+private data class ModelLinkSummary(
+    val label: String = "",
+    val url: String = "",
+)
+
+private fun String.toModelMetadataSummary(): ModelMetadataSummary {
+    if (isBlank()) return ModelMetadataSummary()
+    return runCatching {
+        val root = JSONObject(this)
+        val modalities = root.optJSONObject("modalities")
+        val cost = root.optJSONObject("cost")
+        val interleaved = root.optJSONObject("interleaved")
+        ModelMetadataSummary(
+            family = root.optString("family"),
+            knowledgeCutoff = root.optString("knowledge"),
+            releaseDate = root.optString("release_date"),
+            lastUpdated = root.optString("last_updated"),
+            status = root.optString("status"),
+            supportsAttachments = root.optBoolean("attachment", false),
+            openWeights = root.optBoolean("open_weights", false),
+            inputModalities = modalities?.optStringArray("input").orEmpty(),
+            outputModalities = modalities?.optStringArray("output").orEmpty(),
+            inputCostPerMillion = cost?.optNullableDouble("input"),
+            outputCostPerMillion = cost?.optNullableDouble("output"),
+            cacheReadCostPerMillion = cost?.optNullableDouble("cache_read"),
+            reasoningOptions = root.optJSONArray("reasoning_options").toStringList(),
+            interleavedField = interleaved?.optString("field").orEmpty().ifBlank {
+                root.optString("interleaved")
+            },
+            weightLinks = root.optJSONArray("weights").toModelLinks(),
+            benchmarks = root.optJSONArray("benchmarks").toBenchmarkLabels(),
+        )
+    }.getOrDefault(ModelMetadataSummary())
+}
+
+private fun org.json.JSONObject.optStringArray(key: String): List<String> {
+    return optJSONArray(key).toStringList()
+}
+
+private fun org.json.JSONObject.optNullableDouble(key: String): Double? {
+    return if (has(key) && !isNull(key)) optDouble(key) else null
+}
+
+private fun org.json.JSONArray?.toStringList(): List<String> {
+    if (this == null) return emptyList()
+    return (0 until length()).mapNotNull { index ->
+        val value = opt(index)
+        when (value) {
+            is String -> value
+            is JSONObject -> value.optString("type").ifBlank { value.optString("name") }
+            else -> null
+        }
+    }.filter { it.isNotBlank() }
+}
+
+private fun org.json.JSONArray?.toModelLinks(): List<ModelLinkSummary> {
+    if (this == null) return emptyList()
+    return (0 until length()).mapNotNull { index ->
+        val value = optJSONObject(index) ?: return@mapNotNull null
+        ModelLinkSummary(
+            label = value.optString("label"),
+            url = value.optString("url"),
+        )
+    }.filter { it.label.isNotBlank() || it.url.isNotBlank() }
+}
+
+private fun org.json.JSONArray?.toBenchmarkLabels(): List<String> {
+    if (this == null) return emptyList()
+    return (0 until length()).mapNotNull { index ->
+        val value = optJSONObject(index) ?: return@mapNotNull null
+        value.optString("name").ifBlank { value.optString("metric") }
+    }.filter { it.isNotBlank() }
+}
+
+private fun Double?.toCostText(): String {
+    return this?.let { "$$it / 1M tokens" } ?: "暂无"
 }
 
 private fun Long.toReadableSize(): String {

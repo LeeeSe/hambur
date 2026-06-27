@@ -191,6 +191,37 @@ fn capability_matches(capabilities: &ModelCapabilities, requirements: &RouteRequ
     true
 }
 
+fn model_modalities_include_image(item: &Value) -> bool {
+    let Some(modalities) = item
+        .get("input_modalities")
+        .or_else(|| item.get("inputModalities"))
+        .or_else(|| item.get("modalities"))
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    modalities
+        .iter()
+        .filter_map(Value::as_str)
+        .any(|value| value.eq_ignore_ascii_case("image") || value.eq_ignore_ascii_case("vision"))
+}
+
+fn model_id_implies_image_input(model_id: &str) -> bool {
+    let normalized = model_id.to_ascii_lowercase();
+    normalized.contains("vision")
+        || normalized.contains("gpt-4o")
+        || normalized.contains("gpt-4.1")
+        || normalized.contains("gpt-5")
+        || normalized.contains("o3")
+        || normalized.contains("o4")
+        || normalized.contains("gemini")
+        || normalized.contains("claude-3")
+        || normalized.contains("claude-4")
+        || normalized.contains("qwen-vl")
+        || normalized.contains("qwen2.5-vl")
+        || normalized.contains("llava")
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModelRequest {
     pub request_id: String,
@@ -424,8 +455,11 @@ impl OpenAiCompatibleAdapter {
                 .unwrap_or(false);
             capabilities.supports_image_input = item
                 .get("supports_image_input")
+                .or_else(|| item.get("supportsImageInput"))
+                .or_else(|| item.get("supports_vision"))
+                .or_else(|| item.get("supportsVision"))
                 .and_then(Value::as_bool)
-                .unwrap_or(false);
+                .unwrap_or_else(|| model_modalities_include_image(item) || model_id_implies_image_input(model_id));
             capabilities.supports_structured_output = item
                 .get("supports_structured_output")
                 .and_then(Value::as_bool)
@@ -866,6 +900,18 @@ mod tests {
         assert_eq!(models[0].model_id, "gpt-a");
         assert!(models[0].capabilities.supports_reasoning);
         assert!(!models[0].metadata_json.contains("price"));
+    }
+
+    #[test]
+    fn model_refresh_infers_image_input_for_common_vision_models() {
+        let models = OpenAiCompatibleAdapter::parse_models_response(
+            "provider",
+            r#"{"data":[{"id":"gpt-4o"},{"id":"custom-model","input_modalities":["text","image"]}]}"#,
+        )
+        .expect("models");
+
+        assert!(models[0].capabilities.supports_image_input);
+        assert!(models[1].capabilities.supports_image_input);
     }
 
     #[test]

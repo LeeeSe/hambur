@@ -108,9 +108,13 @@ data class UiProviderModelSettings(
     val supportsToolCall: Boolean,
     val supportsReasoning: Boolean,
     val supportsImageInput: Boolean,
+    val supportsStructuredOutput: Boolean,
     val supportsTemperature: Boolean,
     val contextLimit: UInt,
     val outputLimit: UInt,
+    val reasoningField: String,
+    val metadataJson: String,
+    val syncedAtMs: ULong,
 )
 
 data class UiModelGroupSettings(
@@ -391,54 +395,14 @@ class HamburUiStore(
     ) {
         if (providerId.isBlank()) return
         runCommand {
-            val effectiveSecretRef = if (secretRef.startsWith("android-secret://")) {
-                secretRef
-            } else {
-                "android-secret://providers/${providerId.ifBlank { "prv_" + java.util.UUID.randomUUID().toString().replace("-", "") }}"
-            }
-            val resolvedApiKey = if (apiKey.isNotBlank()) apiKey else platformAdapter.getSecret(effectiveSecretRef).orEmpty()
-            
-            var payload = ""
-            if (baseUrl.isNotBlank()) {
-                val modelsUrl = if (baseUrl.endsWith("/models") || baseUrl.endsWith("/models/")) {
-                    baseUrl
-                } else if (baseUrl.endsWith("/")) {
-                    "${baseUrl}models"
-                } else {
-                    "$baseUrl/models"
-                }
-                
-                try {
-                    val connection = (java.net.URL(modelsUrl).openConnection() as java.net.HttpURLConnection).apply {
-                        connectTimeout = 10000
-                        readTimeout = 10000
-                        requestMethod = "GET"
-                        if (resolvedApiKey.isNotBlank()) {
-                            setRequestProperty("Authorization", "Bearer $resolvedApiKey")
-                        }
-                        setRequestProperty("Accept", "application/json")
-                    }
-                    val status = connection.responseCode
-                    val stream = if (status >= 400) connection.errorStream else connection.inputStream
-                    val text = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
-                    if (status in 200..299 && text.trim().startsWith("{")) {
-                        payload = text
-                    } else {
-                        Log.w("HamburBackend", "Models fetch returned status $status: $text")
-                    }
-                    connection.disconnect()
-                } catch (e: Exception) {
-                    Log.e("HamburBackend", "Failed to fetch models from provider: ${e.message}", e)
-                }
-            }
-
             runtime.dispatch(
                 backendCommand(
                     kind = "RefreshProviderModels",
                     idempotencyKey = "provider:$providerId:models:${nextCommandOrdinal()}",
                     providerId = providerId,
                     modelId = modelId.ifBlank { "hambur-openai-compatible-text" },
-                    payloadJson = payload,
+                    chunk = baseUrl,
+                    payloadJson = providerRefreshPayload(secretRef),
                 ),
             )
         }
@@ -805,9 +769,11 @@ class HamburUiStore(
         content: String,
         deepThinkingEnabled: Boolean = false,
         searchEnabled: Boolean = false,
+        onAccepted: () -> Unit = {},
+        onRejected: (String) -> Unit = {},
     ) {
         val attachmentIds = _state.value.pendingAttachments.map { it.id }
-        if (content.isBlank() && attachmentIds.isEmpty()) return
+        if (content.isBlank()) return
 
         scope.launch {
             val targetSessionId = sessionId.ifBlank { ensureSessionForNewMessage() }
@@ -825,6 +791,11 @@ class HamburUiStore(
                 ),
             )
             applyRejectedAck(ack)
+            if (ack.accepted) {
+                onAccepted()
+            } else {
+                onRejected(ack.message.ifBlank { ack.rejectionCode })
+            }
         }
     }
 
@@ -887,13 +858,14 @@ class HamburUiStore(
         bytesBase64: String = "",
     ) {
         if (sessionId.isBlank()) return
+        val kind = if (mimeType.startsWith("image/")) "image" else "file"
         val escapedName = displayName.jsonEscaped()
         val escapedMime = mimeType.jsonEscaped()
         val escapedUri = originalUri.jsonEscaped()
         val escapedPath = sourcePath.jsonEscaped()
         val escapedBytes = bytesBase64.jsonEscaped()
         val payload = """
-            {"displayName":"$escapedName","mimeType":"$escapedMime","byteSize":$byteSize,"originalUri":"$escapedUri","sourcePath":"$escapedPath","bytesBase64":"$escapedBytes","originType":"content_uri"}
+            {"displayName":"$escapedName","mimeType":"$escapedMime","byteSize":$byteSize,"originalUri":"$escapedUri","sourcePath":"$escapedPath","bytesBase64":"$escapedBytes","originType":"content_uri","kind":"$kind"}
         """.trimIndent()
         runCommand {
             runtime.dispatch(
@@ -1268,7 +1240,6 @@ class HamburUiStore(
 
         _state.update {
             it.copy(
-                runtimeStatus = "Error",
                 footer = ack.message.ifBlank { ack.rejectionCode },
             )
         }
@@ -1760,9 +1731,13 @@ private fun List<ProviderModelDto>.toUiProviderModels(): List<UiProviderModelSet
             supportsToolCall = it.supportsToolCall,
             supportsReasoning = it.supportsReasoning,
             supportsImageInput = it.supportsImageInput,
+            supportsStructuredOutput = it.supportsStructuredOutput,
             supportsTemperature = it.supportsTemperature,
             contextLimit = it.contextLimit,
             outputLimit = it.outputLimit,
+            reasoningField = it.reasoningField,
+            metadataJson = it.metadataJson,
+            syncedAtMs = it.syncedAtMs,
         )
     }
 }
@@ -1932,6 +1907,12 @@ private fun sendPayloadJson(
         it.jsonEscaped()
     }
     return """{"attachmentIds":$attachments,"deepThinkingEnabled":$deepThinkingEnabled,"searchEnabled":$searchEnabled}"""
+}
+
+private fun providerRefreshPayload(secretRef: String): String {
+    return JSONObject().apply {
+        if (secretRef.isNotBlank()) put("secretRef", secretRef)
+    }.toString()
 }
 
 private fun maxSequence(first: ULong, second: ULong): ULong {

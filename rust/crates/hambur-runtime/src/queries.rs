@@ -368,7 +368,10 @@ impl RuntimeEngine {
         });
         Ok(files)
     }
-    pub(crate) fn get_memory_file_detail_internal(&self, name: &str) -> HamburResult<RuntimeMemoryFileDetail> {
+    pub(crate) fn get_memory_file_detail_internal(
+        &self,
+        name: &str,
+    ) -> HamburResult<RuntimeMemoryFileDetail> {
         let root = self.memory_root();
         fs::create_dir_all(&root)
             .map_err(|error| HamburError::Internal(format!("create memory root: {error}")))?;

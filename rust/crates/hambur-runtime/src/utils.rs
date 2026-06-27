@@ -54,7 +54,11 @@ pub(crate) fn relative_path(root: &Path, path: &Path) -> HamburResult<String> {
         .replace('\\', "/"))
 }
 
-pub(crate) fn collect_named_files(root: &Path, name: &str, output: &mut Vec<PathBuf>) -> HamburResult<()> {
+pub(crate) fn collect_named_files(
+    root: &Path,
+    name: &str,
+    output: &mut Vec<PathBuf>,
+) -> HamburResult<()> {
     if !root.exists() {
         return Ok(());
     }
@@ -562,7 +566,10 @@ pub(crate) fn collect_all_files(root: &Path, output: &mut Vec<PathBuf>) -> Hambu
     Ok(())
 }
 
-pub(crate) fn path_for_search_result(resolved: &hambur_sandbox::SandboxPathResolution, file: &Path) -> String {
+pub(crate) fn path_for_search_result(
+    resolved: &hambur_sandbox::SandboxPathResolution,
+    file: &Path,
+) -> String {
     if resolved.host_path.is_file() {
         return resolved.sandbox_path.clone();
     }
@@ -731,7 +738,8 @@ pub(crate) const BUNDLED_SKILLS: &[BundledSkillFile] = &[BundledSkillFile {
 
 pub(crate) struct BundledSkillFile {
     pub(crate) relative_path: &'static str,
-    pub(crate) content: &'static str,}
+    pub(crate) content: &'static str,
+}
 
 pub(crate) fn normalize_command(mut command: RuntimeCommand) -> RuntimeCommand {
     if command.command_id.trim().is_empty() {
@@ -1116,7 +1124,9 @@ pub(crate) fn assistant_message_is_context_eligible(
     !message.content_text.trim().is_empty() || !tool_calls.is_empty()
 }
 
-pub(crate) fn tool_calls_json_from_records(calls: &[hambur_db::ToolCallRecord]) -> HamburResult<String> {
+pub(crate) fn tool_calls_json_from_records(
+    calls: &[hambur_db::ToolCallRecord],
+) -> HamburResult<String> {
     let values = calls
         .iter()
         .map(|call| {
@@ -1426,7 +1436,9 @@ pub(crate) async fn reqwest_json(spec: hambur_llm::HttpRequestSpec) -> HamburRes
         .map_err(|error| HamburError::ProviderUnavailable(format!("NetworkError: {error}")))
 }
 
-pub(crate) fn parse_openai_non_stream_message(body: &str) -> HamburResult<MemoryReviewAssistantMessage> {
+pub(crate) fn parse_openai_non_stream_message(
+    body: &str,
+) -> HamburResult<MemoryReviewAssistantMessage> {
     let value: Value = serde_json::from_str(body)
         .map_err(|error| HamburError::SseParse(format!("parse chat completion JSON: {error}")))?;
     if let Some(error) = value.get("error") {
@@ -1509,7 +1521,9 @@ pub(crate) fn compile_named_tools_json(tools_json: &str, names: &[&str]) -> Hamb
     Ok(Value::Array(filtered).to_string())
 }
 
-pub(crate) async fn reqwest_stream(spec: hambur_llm::HttpRequestSpec) -> HamburResult<reqwest::Response> {
+pub(crate) async fn reqwest_stream(
+    spec: hambur_llm::HttpRequestSpec,
+) -> HamburResult<reqwest::Response> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .build()
@@ -1564,7 +1578,8 @@ pub(crate) struct AttachmentImportPayload {
     pub(crate) kind: String,
     pub(crate) width: u32,
     pub(crate) height: u32,
-    pub(crate) sha256: String,}
+    pub(crate) sha256: String,
+}
 
 impl AttachmentImportPayload {
     pub(crate) fn parse(payload_json: &str) -> HamburResult<Self> {
@@ -1584,7 +1599,11 @@ impl AttachmentImportPayload {
                 .to_string()
         };
         let mime_type = get_string(&["mimeType", "mime_type"]);
-        let kind = get_string(&["kind"]);
+        let kind = get_string(&["kind"]).if_blank(if mime_type.starts_with("image/") {
+            "image".to_string()
+        } else {
+            "file".to_string()
+        });
         Ok(Self {
             display_name: get_string(&["displayName", "display_name", "name"]),
             mime_type: if mime_type.trim().is_empty() {
@@ -1622,7 +1641,8 @@ impl AttachmentImportPayload {
 pub(crate) struct SendOptions {
     pub(crate) attachment_ids: Vec<String>,
     pub(crate) deep_thinking_enabled: bool,
-    pub(crate) search_enabled: bool,}
+    pub(crate) search_enabled: bool,
+}
 
 impl SendOptions {
     pub(crate) fn parse(payload_json: &str) -> Self {
@@ -1659,26 +1679,28 @@ impl SendOptions {
     }
 }
 
-pub(crate) fn format_user_content_with_attachments(content: &str, attachments: &[AttachmentRecord]) -> String {
+pub(crate) fn format_user_content_with_attachments(
+    content: &str,
+    attachments: &[AttachmentRecord],
+) -> String {
     if attachments.is_empty() {
         return content.to_string();
     }
     let mut formatted = content.trim().to_string();
-    formatted.push_str("\n\nAttachments:");
+    if !formatted.is_empty() {
+        formatted.push_str("\n\n");
+    }
+    formatted.push_str("Attachments:");
     for attachment in attachments {
         if attachment.kind == "image" {
             formatted.push_str(&format!(
-                "\n- ImagePart(fileId={}, sandboxPath={}, mimeType={}, detail=auto)",
-                attachment.file_id, attachment.sandbox_path, attachment.mime_type
+                "\n- 用户附加了一张图片：{}，大小：{} bytes。路径：{}。需要查看时请调用 view_image。",
+                attachment.display_name, attachment.byte_size, attachment.sandbox_path
             ));
         } else {
             formatted.push_str(&format!(
-                "\n- FileReferencePart(fileId={}, sandboxPath={}, name={}, size={}, mimeType={})",
-                attachment.file_id,
-                attachment.sandbox_path,
-                attachment.display_name,
-                attachment.byte_size,
-                attachment.mime_type
+                "\n- 用户附加了文件：{}，大小：{} bytes。路径：{}。需要查看时请使用文件工具读取。",
+                attachment.display_name, attachment.byte_size, attachment.sandbox_path
             ));
         }
     }
@@ -1971,7 +1993,11 @@ pub(crate) fn markdown_block_summary(node: &hambur_markdown::MarkdownBlockNode) 
 
 pub(crate) const TINYFISH_API_KEY: &str = "sk-tinyfish-nOfH8Vi9QMLd88_lfB0MKZbWg_O23YN-";
 
-pub(crate) fn run_web_fetch(invocation: &ToolInvocation, arguments: &Value, backend: &str) -> RawToolOutput {
+pub(crate) fn run_web_fetch(
+    invocation: &ToolInvocation,
+    arguments: &Value,
+    backend: &str,
+) -> RawToolOutput {
     let urls = arguments
         .get("urls")
         .and_then(Value::as_array)
@@ -2305,6 +2331,36 @@ pub(crate) fn default_models_response(model_id: &str) -> String {
     )
 }
 
+pub(crate) async fn reqwest_text_url(url: &str, timeout_secs: u64) -> HamburResult<String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .build()
+        .map_err(|error| {
+            HamburError::ProviderUnavailable(format!("NetworkError: build HTTP client: {error}"))
+        })?;
+    let response = client
+        .get(url)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header(reqwest::header::USER_AGENT, "Hambur/0.1")
+        .send()
+        .await
+        .map_err(|error| {
+            if error.is_timeout() {
+                HamburError::ProviderUnavailable(format!("NetworkTimeout: {error}"))
+            } else {
+                HamburError::ProviderUnavailable(format!("NetworkError: {error}"))
+            }
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(map_provider_http_status(status));
+    }
+    response
+        .text()
+        .await
+        .map_err(|error| HamburError::ProviderUnavailable(format!("NetworkError: {error}")))
+}
+
 pub(crate) fn config_payload_value(payload_json: &str) -> Value {
     serde_json::from_str::<Value>(payload_json)
         .unwrap_or_else(|_| Value::Object(Default::default()))
@@ -2336,7 +2392,8 @@ pub(crate) struct HamburConfigFieldSpec {
     pub(crate) access: &'static str,
     pub(crate) risk: &'static str,
     pub(crate) revertable: bool,
-    pub(crate) topic: &'static str,}
+    pub(crate) topic: &'static str,
+}
 
 impl HamburConfigFieldSpec {
     pub(crate) fn to_json(self) -> Value {
@@ -3033,7 +3090,10 @@ pub(crate) fn default_group(snapshot: &SettingsSnapshot, key: &str) -> String {
         .unwrap_or_default()
 }
 
-pub(crate) fn app_setting_for_hambur_config_path(path: &str, value_json: &str) -> Option<(String, String)> {
+pub(crate) fn app_setting_for_hambur_config_path(
+    path: &str,
+    value_json: &str,
+) -> Option<(String, String)> {
     let value = parse_config_literal(value_json);
     let string_value = config_literal_string(&value);
     let mapped = match path {

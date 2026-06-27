@@ -1158,7 +1158,11 @@ impl HamburDatabase {
             .await
     }
 
-    pub(crate) async fn hide_timeline_item(&self, session_id: &str, stable_key: &str) -> HamburResult<()> {
+    pub(crate) async fn hide_timeline_item(
+        &self,
+        session_id: &str,
+        stable_key: &str,
+    ) -> HamburResult<()> {
         if stable_key.trim().is_empty() {
             return Ok(());
         }
@@ -1977,6 +1981,31 @@ impl HamburDatabase {
         })
     }
 
+    pub async fn upsert_model_catalog_cache(
+        &self,
+        key: &str,
+        catalog_json: &str,
+        synced_at_ms: u64,
+    ) -> HamburResult<ModelCatalogCacheRecord> {
+        let key = normalize_setting_id(key, "model-catalog");
+        self.connection
+            .execute(
+                "INSERT INTO model_catalog_cache (key, catalog_json, synced_at_ms)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(key) DO UPDATE SET
+                    catalog_json = excluded.catalog_json,
+                    synced_at_ms = excluded.synced_at_ms",
+                params![key.clone(), catalog_json, synced_at_ms as i64],
+            )
+            .await
+            .map_err(database_error)?;
+        Ok(ModelCatalogCacheRecord {
+            key,
+            catalog_json: catalog_json.to_string(),
+            synced_at_ms,
+        })
+    }
+
     pub async fn delete_model_group(&self, group_id: &str) -> HamburResult<()> {
         let group_id = normalize_setting_id(group_id, "grp");
         self.connection
@@ -2341,6 +2370,12 @@ impl HamburDatabase {
                     key TEXT PRIMARY KEY NOT NULL,
                     value TEXT NOT NULL,
                     updated_at_ms INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS model_catalog_cache (
+                    key TEXT PRIMARY KEY NOT NULL,
+                    catalog_json TEXT NOT NULL,
+                    synced_at_ms INTEGER NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS config_audit (

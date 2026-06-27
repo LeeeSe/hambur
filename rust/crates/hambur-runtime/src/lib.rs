@@ -38,6 +38,10 @@ use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, sleep, timeout};
 
+const MODEL_CATALOG_CACHE_KEY: &str = "models_dev_api";
+const MODEL_CATALOG_CACHE_MAX_AGE_MS: u64 = 24 * 60 * 60 * 1000;
+const MODELS_DEV_API_URL: &str = "https://models.dev/api.json";
+
 #[derive(Debug, Clone)]
 pub struct AppBootstrap {
     pub app_files_dir: String,
@@ -496,7 +500,6 @@ struct StreamAttemptState {
     tool_accumulator: ToolCallAccumulator,
     complete_tool_calls: Vec<CompleteToolCall>,
 }
-
 
 mod commands;
 mod engine;

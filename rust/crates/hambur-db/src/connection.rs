@@ -13,7 +13,11 @@ impl Connection {
         })
     }
 
-    pub(crate) fn execute(&self, sql: &str, params: SqlParams) -> Ready<Result<usize, rusqlite::Error>> {
+    pub(crate) fn execute(
+        &self,
+        sql: &str,
+        params: SqlParams,
+    ) -> Ready<Result<usize, rusqlite::Error>> {
         let result = self
             .inner
             .lock()
@@ -31,7 +35,11 @@ impl Connection {
         ready(result)
     }
 
-    pub(crate) fn query(&self, sql: &str, params: SqlParams) -> Ready<Result<Rows, rusqlite::Error>> {
+    pub(crate) fn query(
+        &self,
+        sql: &str,
+        params: SqlParams,
+    ) -> Ready<Result<Rows, rusqlite::Error>> {
         let result = self
             .inner
             .lock()

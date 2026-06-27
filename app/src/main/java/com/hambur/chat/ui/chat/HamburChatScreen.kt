@@ -3,8 +3,10 @@ package com.hambur.chat.ui.chat
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image as ComposeImage
@@ -77,6 +79,7 @@ import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.zIndex
 import androidx.compose.ui.geometry.Offset
@@ -177,6 +180,7 @@ fun HamburChatScreen(
     onPickFile: (((String, String, ULong, String, String) -> Unit) -> Unit) = {},
 ) {
     val scope = rememberCoroutineScope()
+    val context = LocalContext.current
     var searchQuery by rememberSaveable { mutableStateOf("") }
     var draftTitle by rememberSaveable { mutableStateOf("") }
     var draftMessage by rememberSaveable { mutableStateOf("") }
@@ -186,17 +190,24 @@ fun HamburChatScreen(
     var thinkingEnabled by rememberSaveable { mutableStateOf(false) }
     var searchEnabled by rememberSaveable { mutableStateOf(false) }
     var attachmentPanelOpen by rememberSaveable { mutableStateOf(false) }
-    var bottomInputHeightPx by remember { mutableStateOf(0) }
+    var baseInputHeightPx by remember { mutableStateOf(0) }
     val density = LocalDensity.current
     val configuration = LocalConfiguration.current
+    val chatTokens = HamburTheme.tokens.chat
+    val attachmentPanelHeight = 220.dp
+    val attachmentPanelSlotHeight by animateDpAsState(
+        targetValue = if (attachmentPanelOpen) attachmentPanelHeight + chatTokens.inputOuterGap else 0.dp,
+        animationSpec = tween(durationMillis = 250, easing = FastOutSlowInEasing),
+        label = "attachmentPanelSlotHeight",
+    )
     val drawerBackgroundColor = MaterialTheme.colorScheme.background
     val drawerWidth = configuration.screenWidthDp.dp * 0.82f
     val maxDrawerOffset = with(density) { drawerWidth.toPx() }
     var drawerOffset by remember { mutableFloatStateOf(0f) }
     val drawerAnimation = remember { Animatable(0f) }
     val messageListBottomPadding = with(density) {
-        bottomInputHeightPx.toDp()
-    } + HamburTheme.tokens.chat.timelineBottomGap
+        baseInputHeightPx.toDp()
+    } + attachmentPanelSlotHeight + chatTokens.timelineBottomGap
     val consumeDrawerDelta: (Float) -> Float = { delta ->
         val previousOffset = drawerOffset
         drawerOffset = (drawerOffset + delta).coerceIn(0f, maxDrawerOffset)
@@ -385,6 +396,8 @@ fun HamburChatScreen(
                             generating = state.activeTurnIds.containsKey(state.selectedSessionId),
                             thinkingEnabled = thinkingEnabled,
                             attachmentPanelOpen = attachmentPanelOpen,
+                            attachmentPanelSlotHeight = attachmentPanelSlotHeight,
+                            attachmentPanelHeight = attachmentPanelHeight,
                             pendingAttachments = state.pendingAttachments,
                             editing = editingMessageId.isNotBlank(),
                             onToggleThinking = { thinkingEnabled = !thinkingEnabled },
@@ -399,8 +412,9 @@ fun HamburChatScreen(
                                     sourcePath = sourcePath,
                                 )
                             },
+                            onPickImage = onPickImage,
+                            onPickFile = onPickFile,
                             onRemoveAttachment = { store.removePendingAttachment(state.selectedSessionId, it) },
-                            onClearAttachments = { store.clearPendingAttachments(state.selectedSessionId) },
                             onStop = { store.cancelActiveTurn(state.selectedSessionId) },
                             onCancelEdit = {
                                 editingMessageId = ""
@@ -410,22 +424,41 @@ fun HamburChatScreen(
                                 if (editingMessageId.isNotBlank()) {
                                     store.editMessage(state.selectedSessionId, editingMessageId, draftMessage)
                                     editingMessageId = ""
+                                    draftMessage = ""
+                                    attachmentPanelOpen = false
                                 } else {
                                     store.sendMessage(
                                         sessionId = state.selectedSessionId,
                                         content = draftMessage,
                                         deepThinkingEnabled = thinkingEnabled,
                                         searchEnabled = searchEnabled,
+                                        onAccepted = {
+                                            scope.launch {
+                                                draftMessage = ""
+                                                attachmentPanelOpen = false
+                                            }
+                                        },
+                                        onRejected = { message ->
+                                            scope.launch {
+                                                Toast.makeText(
+                                                    context,
+                                                    message.ifBlank { "发送失败，请检查模型能力" },
+                                                    Toast.LENGTH_SHORT,
+                                                ).show()
+                                            }
+                                        },
                                     )
                                 }
-                                draftMessage = ""
-                                attachmentPanelOpen = false
                             },
                             modifier = Modifier
                                 .align(Alignment.BottomCenter)
                                 .onSizeChanged { size ->
-                                    if (bottomInputHeightPx != size.height) {
-                                        bottomInputHeightPx = size.height
+                                    val attachmentSlotHeightPx = with(density) {
+                                        attachmentPanelSlotHeight.roundToPx()
+                                    }
+                                    val inputHeight = (size.height - attachmentSlotHeightPx).coerceAtLeast(0)
+                                    if (baseInputHeightPx != inputHeight) {
+                                        baseInputHeightPx = inputHeight
                                     }
                                 },
                         )
@@ -1566,13 +1599,16 @@ private fun ChatInputPanel(
     generating: Boolean,
     thinkingEnabled: Boolean,
     attachmentPanelOpen: Boolean,
+    attachmentPanelSlotHeight: Dp,
+    attachmentPanelHeight: Dp,
     pendingAttachments: List<UiPendingAttachment>,
     editing: Boolean,
     onToggleThinking: () -> Unit,
     onToggleAttachmentPanel: () -> Unit,
     onImportAttachment: (String, String, ULong, String, String) -> Unit,
+    onPickImage: (((String, String, ULong, String, String) -> Unit) -> Unit),
+    onPickFile: (((String, String, ULong, String, String) -> Unit) -> Unit),
     onRemoveAttachment: (String) -> Unit,
-    onClearAttachments: () -> Unit,
     onStop: () -> Unit,
     onCancelEdit: () -> Unit,
     onSend: () -> Unit,
@@ -1595,25 +1631,7 @@ private fun ChatInputPanel(
                 top = tokens.inputOuterTopPadding,
                 bottom = tokens.inputOuterBottomPadding,
             ),
-        verticalArrangement = Arrangement.spacedBy(tokens.inputOuterGap),
     ) {
-        if (pendingAttachments.isNotEmpty()) {
-            LazyRow(
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                items(pendingAttachments, key = { it.id }) { attachment ->
-                    PendingAttachmentChip(
-                        attachment = attachment,
-                        onRemove = { onRemoveAttachment(attachment.id) },
-                    )
-                }
-                item {
-                    TextButton(onClick = onClearAttachments) {
-                        Text("Clear")
-                    }
-                }
-            }
-        }
         if (editing) {
             Surface(
                 modifier = Modifier.fillMaxWidth(),
@@ -1635,6 +1653,7 @@ private fun ChatInputPanel(
                     }
                 }
             }
+            Spacer(modifier = Modifier.height(tokens.inputOuterGap))
         }
         Surface(
             modifier = Modifier
@@ -1654,6 +1673,20 @@ private fun ChatInputPanel(
                 ),
                 verticalArrangement = Arrangement.spacedBy(tokens.inputContentGap),
             ) {
+                if (pendingAttachments.isNotEmpty()) {
+                    LazyRow(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        items(pendingAttachments, key = { it.id }) { attachment ->
+                            PendingAttachmentChip(
+                                attachment = attachment,
+                                onRemove = { onRemoveAttachment(attachment.id) },
+                            )
+                        }
+                    }
+                }
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -1767,13 +1800,25 @@ private fun ChatInputPanel(
                 }
             }
         }
-        AnimatedVisibility(visible = attachmentPanelOpen) {
-            AttachmentPickerPanel(
-                enabled = enabled && !generating,
-                pendingAttachments = pendingAttachments,
-                onImportAttachment = onImportAttachment,
-                onRemoveAttachment = onRemoveAttachment,
-            )
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(attachmentPanelSlotHeight)
+                .clipToBounds(),
+        ) {
+            if (attachmentPanelSlotHeight > 0.dp) {
+                AttachmentPickerPanel(
+                    enabled = enabled && !generating,
+                    pendingAttachments = pendingAttachments,
+                    onImportAttachment = onImportAttachment,
+                    onPickImage = onPickImage,
+                    onPickFile = onPickFile,
+                    onRemoveAttachment = onRemoveAttachment,
+                    modifier = Modifier
+                        .padding(top = tokens.inputOuterGap)
+                        .height(attachmentPanelHeight),
+                )
+            }
         }
     }
 }
@@ -1783,6 +1828,8 @@ private fun AttachmentPickerPanel(
     enabled: Boolean,
     pendingAttachments: List<UiPendingAttachment>,
     onImportAttachment: (String, String, ULong, String, String) -> Unit,
+    onPickImage: (((String, String, ULong, String, String) -> Unit) -> Unit),
+    onPickFile: (((String, String, ULong, String, String) -> Unit) -> Unit),
     onRemoveAttachment: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -1840,14 +1887,6 @@ private fun AttachmentPickerPanel(
         }
     }
 
-    val selectImageLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent(),
-    ) { uri: Uri? ->
-        if (uri != null) {
-            importUri(uri, "image_${System.currentTimeMillis()}.jpg", "image/*")
-        }
-    }
-
     val takePictureLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.TakePicturePreview(),
     ) { bitmap: android.graphics.Bitmap? ->
@@ -1863,14 +1902,6 @@ private fun AttachmentPickerPanel(
             } else {
                 Toast.makeText(context, "照片保存失败", Toast.LENGTH_SHORT).show()
             }
-        }
-    }
-
-    val selectFileLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent(),
-    ) { uri: Uri? ->
-        if (uri != null) {
-            importUri(uri, uri.lastPathSegment ?: "file", "application/octet-stream")
         }
     }
 
@@ -1994,14 +2025,18 @@ private fun AttachmentPickerPanel(
 
                                 "gallery" -> {
                                     if (hasImageReadPermission(context)) {
-                                        selectImageLauncher.launch("image/*")
+                                        onPickImage { displayName, mimeType, byteSize, uri, sourcePath ->
+                                            onImportAttachment(displayName, mimeType, byteSize, uri, sourcePath)
+                                        }
                                     } else {
                                         galleryPermissionLauncher.launch(galleryPermissions)
                                     }
                                 }
 
                                 "file" -> {
-                                    selectFileLauncher.launch("*/*")
+                                    onPickFile { displayName, mimeType, byteSize, uri, sourcePath ->
+                                        onImportAttachment(displayName, mimeType, byteSize, uri, sourcePath)
+                                    }
                                 }
                             }
                         },
@@ -2235,44 +2270,124 @@ private fun PendingAttachmentChip(
     attachment: UiPendingAttachment,
     onRemove: () -> Unit,
 ) {
-    Surface(
-        shape = RoundedCornerShape(8.dp),
-        color = MaterialTheme.colorScheme.surface,
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
-    ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
+    val isDark = MaterialTheme.colorScheme.background.luminance() <= 0.5f
+    val mediaBorderColor = if (isDark) {
+        Color.White.copy(alpha = 0.12f)
+    } else {
+        Color.Black.copy(alpha = 0.08f)
+    }
+    val tileBackground = if (isDark) Color(0xFF2C2C2E) else Color(0xFFEDEDF2)
+    val iconBackground = if (isDark) Color(0xFF1E1E20) else Color(0xFFF8F8FA)
+    val imageSource = attachment.originalUri
+        .ifBlank { attachment.sandboxPath }
+        .ifBlank { attachment.displayName }
+
+    if (attachment.mimeType.startsWith("image/")) {
+        Box(
+            modifier = Modifier
+                .size(72.dp)
+                .clip(RoundedCornerShape(14.dp))
+                .border(0.5.dp, mediaBorderColor, RoundedCornerShape(14.dp))
+                .background(tileBackground),
         ) {
-            Icon(
-                imageVector = if (attachment.mimeType.startsWith("image/")) {
-                    Lucide.Image
-                } else {
-                    Lucide.FileText
-                },
-                contentDescription = null,
-                modifier = Modifier.size(18.dp),
-            )
-            Column(modifier = Modifier.widthIn(max = 180.dp)) {
+            if (imageSource.startsWith("content://") || imageSource.startsWith("file://") || imageSource.startsWith("/")) {
+                AsyncImage(
+                    model = imageSource,
+                    contentDescription = null,
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Crop,
+                )
+            } else {
+                Icon(
+                    imageVector = Lucide.Image,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .size(24.dp),
+                )
+            }
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(4.dp)
+                    .size(18.dp)
+                    .clip(CircleShape)
+                    .border(1.5.dp, Color.White, CircleShape)
+                    .background(MaterialTheme.colorScheme.error)
+                    .clickable(onClick = onRemove),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = Lucide.X,
+                    contentDescription = "Remove",
+                    tint = Color.White,
+                    modifier = Modifier.size(12.dp),
+                )
+            }
+        }
+    } else {
+        Row(
+            modifier = Modifier
+                .width(200.dp)
+                .height(72.dp)
+                .clip(RoundedCornerShape(12.dp))
+                .background(tileBackground)
+                .border(0.5.dp, mediaBorderColor, RoundedCornerShape(12.dp))
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(40.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(iconBackground),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = Lucide.Folder,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(24.dp),
+                )
+            }
+            Spacer(modifier = Modifier.width(10.dp))
+            Column(modifier = Modifier.weight(1f)) {
                 Text(
                     text = attachment.displayName,
                     style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
+                Spacer(modifier = Modifier.height(2.dp))
                 Text(
-                    text = attachment.mimeType,
+                    text = attachment.byteSize.toAttachmentSizeText(),
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
             }
-            IconButton(onClick = onRemove, modifier = Modifier.size(28.dp)) {
-                Icon(imageVector = Lucide.X, contentDescription = "Remove", modifier = Modifier.size(16.dp))
-            }
+            Spacer(modifier = Modifier.width(6.dp))
+            Icon(
+                imageVector = Lucide.X,
+                contentDescription = "Remove",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier
+                    .size(16.dp)
+                    .clickable(onClick = onRemove),
+            )
         }
+    }
+}
+
+private fun ULong.toAttachmentSizeText(): String {
+    val bytes = toDouble()
+    return when {
+        bytes >= 1024.0 * 1024.0 -> String.format("%.1f MB", bytes / 1024.0 / 1024.0)
+        bytes >= 1024.0 -> String.format("%.1f KB", bytes / 1024.0)
+        else -> "$this bytes"
     }
 }
 

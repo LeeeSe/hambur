@@ -1037,7 +1037,10 @@ impl HamburDatabase {
 
         Ok(rows.next().await.map_err(database_error)?.is_some())
     }
-    pub(crate) async fn session_summary_by_id(&self, session_id: &str) -> HamburResult<SessionSummary> {
+    pub(crate) async fn session_summary_by_id(
+        &self,
+        session_id: &str,
+    ) -> HamburResult<SessionSummary> {
         let mut rows = self
             .connection
             .query(
@@ -1139,7 +1142,10 @@ impl HamburDatabase {
 
         timeline_item_from_row(&row)
     }
-    pub(crate) async fn message_by_id(&self, message_id: &str) -> HamburResult<Option<MessageRecord>> {
+    pub(crate) async fn message_by_id(
+        &self,
+        message_id: &str,
+    ) -> HamburResult<Option<MessageRecord>> {
         let mut rows = self
             .connection
             .query(
@@ -1427,7 +1433,10 @@ impl HamburDatabase {
         }
         Ok(calls)
     }
-    pub(crate) async fn tool_result_by_id(&self, result_id: &str) -> HamburResult<ToolResultRecord> {
+    pub(crate) async fn tool_result_by_id(
+        &self,
+        result_id: &str,
+    ) -> HamburResult<ToolResultRecord> {
         let mut rows = self
             .connection
             .query(
@@ -1581,7 +1590,10 @@ impl HamburDatabase {
         Ok(attachments)
     }
 
-    pub(crate) async fn file_cleanup_job_by_id(&self, job_id: &str) -> HamburResult<FileCleanupJobRecord> {
+    pub(crate) async fn file_cleanup_job_by_id(
+        &self,
+        job_id: &str,
+    ) -> HamburResult<FileCleanupJobRecord> {
         let mut rows = self
             .connection
             .query(
@@ -1805,6 +1817,34 @@ impl HamburDatabase {
         }
         Ok(settings)
     }
+
+    pub async fn model_catalog_cache(
+        &self,
+        key: &str,
+    ) -> HamburResult<Option<ModelCatalogCacheRecord>> {
+        let mut rows = self
+            .connection
+            .query(
+                "
+                SELECT key, catalog_json, synced_at_ms
+                FROM model_catalog_cache
+                WHERE key = ?1
+                LIMIT 1
+                ",
+                params![key],
+            )
+            .await
+            .map_err(database_error)?;
+        let Some(row) = rows.next().await.map_err(database_error)? else {
+            return Ok(None);
+        };
+        Ok(Some(ModelCatalogCacheRecord {
+            key: row.get::<String>(0).map_err(database_error)?,
+            catalog_json: row.get::<String>(1).map_err(database_error)?,
+            synced_at_ms: unsigned_ms(row.get::<i64>(2).map_err(database_error)?),
+        }))
+    }
+
     pub(crate) async fn config_audits(&self, limit: u32) -> HamburResult<Vec<ConfigAuditRecord>> {
         let limit = clamp_limit(limit, 1, 100);
         let mut rows = self

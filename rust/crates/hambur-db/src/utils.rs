@@ -205,7 +205,11 @@ pub(crate) fn normalize_app_setting_value(key: &str, value: &str) -> HamburResul
     }
 }
 
-pub(crate) fn normalize_enum_setting(key: &str, value: &str, allowed: &[&str]) -> HamburResult<String> {
+pub(crate) fn normalize_enum_setting(
+    key: &str,
+    value: &str,
+    allowed: &[&str],
+) -> HamburResult<String> {
     if allowed.contains(&value) {
         Ok(value.to_string())
     } else {

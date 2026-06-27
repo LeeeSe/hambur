@@ -1,6 +1,8 @@
 package com.hambur.chat.ui.chat
 
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Animatable
 import androidx.compose.foundation.BorderStroke
@@ -76,6 +78,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
@@ -105,10 +108,14 @@ import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupPositionProvider
 import androidx.compose.ui.window.PopupProperties
+import coil3.compose.AsyncImage
 import com.composables.icons.lucide.Brain
+import com.composables.icons.lucide.Camera
+import com.composables.icons.lucide.Check
 import com.composables.icons.lucide.ChartNoAxesGantt
 import com.composables.icons.lucide.CircleArrowUp
 import com.composables.icons.lucide.CirclePause
@@ -116,6 +123,7 @@ import com.composables.icons.lucide.CirclePlus
 import com.composables.icons.lucide.CircleX
 import com.composables.icons.lucide.Copy
 import com.composables.icons.lucide.FileText
+import com.composables.icons.lucide.Folder
 import com.composables.icons.lucide.Globe
 import com.composables.icons.lucide.Image
 import com.composables.icons.lucide.Lucide
@@ -132,6 +140,7 @@ import com.composables.icons.lucide.X
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.net.Uri
 import android.view.HapticFeedbackConstants
 import android.widget.Toast
 import com.hambur.chat.R
@@ -142,7 +151,6 @@ import com.hambur.chat.reducer.UiPendingAttachment
 import com.hambur.chat.reducer.UiSessionSummary
 import com.hambur.chat.reducer.UiTimelineItem
 import com.hambur.chat.uniffi.MarkdownBlockNodeDto
-import com.hambur.chat.ui.components.SecondaryActionButton
 import com.hambur.chat.ui.components.SummaryLine
 import com.hambur.chat.ui.markdown.MarkdownBlock
 import com.hambur.chat.ui.markdown.MarkdownRenderCache
@@ -153,6 +161,9 @@ import com.hambur.chat.ui.theme.HamburTheme
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import java.io.File
+import java.io.FileOutputStream
+import java.util.UUID
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -378,29 +389,15 @@ fun HamburChatScreen(
                             editing = editingMessageId.isNotBlank(),
                             onToggleThinking = { thinkingEnabled = !thinkingEnabled },
                             onToggleAttachmentPanel = { attachmentPanelOpen = !attachmentPanelOpen },
-                            onAddImage = {
-                                onPickImage { displayName, mimeType, byteSize, uri, sourcePath ->
-                                    store.importAttachmentMetadata(
-                                        sessionId = state.selectedSessionId,
-                                        displayName = displayName,
-                                        mimeType = mimeType.ifBlank { "image/*" },
-                                        byteSize = byteSize,
-                                        originalUri = uri,
-                                        sourcePath = sourcePath,
-                                    )
-                                }
-                            },
-                            onAddFile = {
-                                onPickFile { displayName, mimeType, byteSize, uri, sourcePath ->
-                                    store.importAttachmentMetadata(
-                                        sessionId = state.selectedSessionId,
-                                        displayName = displayName,
-                                        mimeType = mimeType.ifBlank { "application/octet-stream" },
-                                        byteSize = byteSize,
-                                        originalUri = uri,
-                                        sourcePath = sourcePath,
-                                    )
-                                }
+                            onImportAttachment = { displayName, mimeType, byteSize, uri, sourcePath ->
+                                store.importAttachmentMetadata(
+                                    sessionId = state.selectedSessionId,
+                                    displayName = displayName,
+                                    mimeType = mimeType,
+                                    byteSize = byteSize,
+                                    originalUri = uri,
+                                    sourcePath = sourcePath,
+                                )
                             },
                             onRemoveAttachment = { store.removePendingAttachment(state.selectedSessionId, it) },
                             onClearAttachments = { store.clearPendingAttachments(state.selectedSessionId) },
@@ -1573,8 +1570,7 @@ private fun ChatInputPanel(
     editing: Boolean,
     onToggleThinking: () -> Unit,
     onToggleAttachmentPanel: () -> Unit,
-    onAddImage: () -> Unit,
-    onAddFile: () -> Unit,
+    onImportAttachment: (String, String, ULong, String, String) -> Unit,
     onRemoveAttachment: (String) -> Unit,
     onClearAttachments: () -> Unit,
     onStop: () -> Unit,
@@ -1641,7 +1637,9 @@ private fun ChatInputPanel(
             }
         }
         Surface(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .zIndex(1f),
             shape = panelShape,
             color = MaterialTheme.colorScheme.surface,
             border = BorderStroke(tokens.inputBorderWidth, panelBorder),
@@ -1770,28 +1768,401 @@ private fun ChatInputPanel(
             }
         }
         AnimatedVisibility(visible = attachmentPanelOpen) {
-            Surface(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(8.dp),
-                color = MaterialTheme.colorScheme.surfaceVariant,
+            AttachmentPickerPanel(
+                enabled = enabled && !generating,
+                pendingAttachments = pendingAttachments,
+                onImportAttachment = onImportAttachment,
+                onRemoveAttachment = onRemoveAttachment,
+            )
+        }
+    }
+}
+
+@Composable
+private fun AttachmentPickerPanel(
+    enabled: Boolean,
+    pendingAttachments: List<UiPendingAttachment>,
+    onImportAttachment: (String, String, ULong, String, String) -> Unit,
+    onRemoveAttachment: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val context = LocalContext.current
+    val isDark = MaterialTheme.colorScheme.background.luminance() <= 0.5f
+    val panelBgColor = MaterialTheme.colorScheme.background
+    val labelColor = if (isDark) Color.White else Color.Black
+    val textPrimary = MaterialTheme.colorScheme.onBackground
+    val searchBoxBackground = if (isDark) Color(0xFF1E1E20) else Color(0xFFE5E5EA)
+    val imgBorderColor = if (isDark) Color.White.copy(alpha = 0.12f) else Color.Black.copy(alpha = 0.08f)
+    val galleryPermissions = imageReadPermissions()
+    var recentImages by remember { mutableStateOf<List<Uri>>(emptyList()) }
+
+    fun checkAndLoadImages() {
+        recentImages = if (hasImageReadPermission(context)) {
+            fetchRecentImages(context)
+        } else {
+            emptyList()
+        }
+    }
+
+    fun importUri(uri: Uri, fallbackName: String, fallbackMime: String) {
+        val displayName = getDisplayNameForUri(context, uri).ifBlank { fallbackName }
+        onImportAttachment(
+            displayName,
+            context.contentResolver.getType(uri).orEmpty().ifBlank { fallbackMime },
+            getSizeForUri(context, uri).coerceAtLeast(0L).toULong(),
+            uri.toString(),
+            copyUriToAttachmentCache(context, uri, displayName),
+        )
+    }
+
+    LaunchedEffect(Unit) {
+        checkAndLoadImages()
+    }
+
+    val cameraPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+    ) { isGranted ->
+        Toast.makeText(
+            context,
+            if (isGranted) "相机权限已获取" else "相机权限已被拒绝",
+            Toast.LENGTH_SHORT,
+        ).show()
+    }
+
+    val galleryPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions(),
+    ) { grants ->
+        if (grants.values.any { it }) {
+            Toast.makeText(context, "相册权限已获取", Toast.LENGTH_SHORT).show()
+            checkAndLoadImages()
+        } else {
+            Toast.makeText(context, "相册权限已被拒绝", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    val selectImageLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent(),
+    ) { uri: Uri? ->
+        if (uri != null) {
+            importUri(uri, "image_${System.currentTimeMillis()}.jpg", "image/*")
+        }
+    }
+
+    val takePictureLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.TakePicturePreview(),
+    ) { bitmap: android.graphics.Bitmap? ->
+        if (bitmap != null) {
+            val savedUri = saveCameraPreviewToCache(context, bitmap)
+            if (savedUri != null) {
+                importUri(
+                    savedUri,
+                    savedUri.lastPathSegment ?: "camera_${System.currentTimeMillis()}.jpg",
+                    "image/jpeg",
+                )
+                Toast.makeText(context, "已拍摄照片", Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(context, "照片保存失败", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    val selectFileLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent(),
+    ) { uri: Uri? ->
+        if (uri != null) {
+            importUri(uri, uri.lastPathSegment ?: "file", "application/octet-stream")
+        }
+    }
+
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(220.dp)
+            .background(panelBgColor)
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = {},
+            )
+            .padding(vertical = 16.dp, horizontal = 12.dp),
+    ) {
+        if (recentImages.isNotEmpty()) {
+            val recentImageListState = rememberLazyListState()
+            LazyRow(
+                state = recentImageListState,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 20.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                Row(
-                    modifier = Modifier.padding(12.dp),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    verticalAlignment = Alignment.CenterVertically,
+                items(recentImages, key = { it.toString() }) { uri ->
+                    val selectedAttachment = pendingAttachments.find { it.originalUri == uri.toString() }
+                    val isSelected = selectedAttachment != null
+                    Box(
+                        modifier = Modifier
+                            .size(75.dp)
+                            .clip(RoundedCornerShape(14.dp))
+                            .border(0.5.dp, imgBorderColor, RoundedCornerShape(14.dp))
+                            .background(searchBoxBackground)
+                            .clickable(enabled = enabled) {
+                                if (selectedAttachment != null) {
+                                    onRemoveAttachment(selectedAttachment.id)
+                                } else {
+                                    importUri(
+                                        uri,
+                                        "image_${System.currentTimeMillis()}.jpg",
+                                        "image/*",
+                                    )
+                                }
+                            },
+                    ) {
+                        AsyncImage(
+                            model = uri,
+                            contentDescription = null,
+                            modifier = Modifier.fillMaxSize(),
+                            contentScale = ContentScale.Crop,
+                        )
+
+                        if (isSelected) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .background(Color.Black.copy(alpha = 0.4f)),
+                            )
+                        }
+
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.TopEnd)
+                                .padding(6.dp)
+                                .size(18.dp)
+                                .clip(CircleShape)
+                                .border(1.5.dp, Color.White, CircleShape)
+                                .background(
+                                    if (isSelected) {
+                                        MaterialTheme.colorScheme.tertiary
+                                    } else {
+                                        Color.Black.copy(alpha = 0.4f)
+                                    },
+                                ),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            if (isSelected) {
+                                Icon(
+                                    imageVector = Lucide.Check,
+                                    contentDescription = null,
+                                    tint = Color.White,
+                                    modifier = Modifier.size(12.dp),
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            val buttons = listOf(
+                Triple("拍照", Lucide.Camera, "camera"),
+                Triple("相册", Lucide.Image, "gallery"),
+                Triple("文件", Lucide.Folder, "file"),
+            )
+
+            buttons.forEach { (label, icon, type) ->
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(72.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(searchBoxBackground.copy(alpha = 0.5f))
+                        .clickable(enabled = enabled) {
+                            when (type) {
+                                "camera" -> {
+                                    if (androidx.core.content.ContextCompat.checkSelfPermission(
+                                            context,
+                                            android.Manifest.permission.CAMERA,
+                                        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                                    ) {
+                                        takePictureLauncher.launch(null)
+                                    } else {
+                                        cameraPermissionLauncher.launch(android.Manifest.permission.CAMERA)
+                                    }
+                                }
+
+                                "gallery" -> {
+                                    if (hasImageReadPermission(context)) {
+                                        selectImageLauncher.launch("image/*")
+                                    } else {
+                                        galleryPermissionLauncher.launch(galleryPermissions)
+                                    }
+                                }
+
+                                "file" -> {
+                                    selectFileLauncher.launch("*/*")
+                                }
+                            }
+                        },
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center,
                 ) {
-                    SecondaryActionButton(text = "Image", enabled = enabled && !generating, onClick = onAddImage)
-                    SecondaryActionButton(text = "File", enabled = enabled && !generating, onClick = onAddFile)
+                    Icon(
+                        imageVector = icon,
+                        contentDescription = label,
+                        tint = textPrimary,
+                        modifier = Modifier.size(22.dp),
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = "Picker metadata is imported; backend file byte ingestion is still pending.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.weight(1f),
+                        text = label,
+                        color = labelColor,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium,
                     )
                 }
             }
         }
     }
+}
+
+private fun imageReadPermissions(): Array<String> {
+    return when {
+        android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.UPSIDE_DOWN_CAKE -> arrayOf(
+            android.Manifest.permission.READ_MEDIA_IMAGES,
+            android.Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED,
+        )
+
+        android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU -> arrayOf(
+            android.Manifest.permission.READ_MEDIA_IMAGES,
+        )
+
+        else -> arrayOf(android.Manifest.permission.READ_EXTERNAL_STORAGE)
+    }
+}
+
+private fun hasImageReadPermission(context: Context): Boolean {
+    return imageReadPermissions().any { permission ->
+        androidx.core.content.ContextCompat.checkSelfPermission(
+            context,
+            permission,
+        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+    }
+}
+
+private fun fetchRecentImages(context: Context): List<Uri> {
+    val images = mutableListOf<Uri>()
+    if (!hasImageReadPermission(context)) return emptyList()
+
+    val projection = arrayOf(
+        android.provider.MediaStore.Images.Media._ID,
+        android.provider.MediaStore.Images.Media.DATE_ADDED,
+    )
+    val sortOrder = "${android.provider.MediaStore.Images.Media.DATE_ADDED} DESC"
+
+    runCatching {
+        val cursor = context.contentResolver.query(
+            android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+            projection,
+            null,
+            null,
+            sortOrder,
+        )
+        cursor?.use {
+            val idColumn = it.getColumnIndexOrThrow(android.provider.MediaStore.Images.Media._ID)
+            var count = 0
+            while (it.moveToNext() && count < 5) {
+                val id = it.getLong(idColumn)
+                images += android.content.ContentUris.withAppendedId(
+                    android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                    id,
+                )
+                count++
+            }
+        }
+    }
+    return images
+}
+
+private fun getDisplayNameForUri(context: Context, uri: Uri): String {
+    if (uri.scheme == "file") return uri.lastPathSegment.orEmpty()
+    return runCatching {
+        val cursor = context.contentResolver.query(
+            uri,
+            arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),
+            null,
+            null,
+            null,
+        )
+        cursor?.use {
+            if (it.moveToFirst()) {
+                val index = it.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                if (index >= 0) it.getString(index).orEmpty() else ""
+            } else {
+                ""
+            }
+        }.orEmpty()
+    }.getOrDefault("")
+}
+
+private fun getSizeForUri(context: Context, uri: Uri): Long {
+    if (uri.scheme == "file") {
+        return runCatching { File(uri.path.orEmpty()).length() }.getOrDefault(0L)
+    }
+    return runCatching {
+        val cursor = context.contentResolver.query(
+            uri,
+            arrayOf(android.provider.OpenableColumns.SIZE),
+            null,
+            null,
+            null,
+        )
+        cursor?.use {
+            if (it.moveToFirst()) {
+                val index = it.getColumnIndex(android.provider.OpenableColumns.SIZE)
+                if (index >= 0) it.getLong(index) else 0L
+            } else {
+                0L
+            }
+        } ?: 0L
+    }.getOrDefault(0L)
+}
+
+private fun saveCameraPreviewToCache(
+    context: Context,
+    bitmap: android.graphics.Bitmap,
+): Uri? {
+    return runCatching {
+        val directory = File(context.cacheDir, "attachments").apply {
+            if (!exists()) mkdirs()
+        }
+        val file = File(directory, "camera_${System.currentTimeMillis()}.jpg")
+        FileOutputStream(file).use { output ->
+            bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 90, output)
+        }
+        Uri.fromFile(file)
+    }.getOrNull()
+}
+
+private fun copyUriToAttachmentCache(context: Context, uri: Uri, displayName: String): String {
+    if (uri.scheme == "file") return uri.path.orEmpty()
+    return runCatching {
+        val dir = File(context.cacheDir, "hambur_attachments").also { it.mkdirs() }
+        val safeName = displayName
+            .ifBlank { uri.lastPathSegment ?: "attachment" }
+            .map { ch ->
+                if (ch.isLetterOrDigit() || ch == '.' || ch == '-' || ch == '_') ch else '_'
+            }
+            .joinToString("")
+            .ifBlank { "attachment" }
+            .take(96)
+        val file = File(dir, "${UUID.randomUUID()}-$safeName")
+        context.contentResolver.openInputStream(uri)?.use { input ->
+            file.outputStream().use { output -> input.copyTo(output) }
+        } ?: return@runCatching ""
+        file.absolutePath
+    }.getOrDefault("")
 }
 
 @Composable

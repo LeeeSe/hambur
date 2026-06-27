@@ -88,6 +88,7 @@ data class UiPendingAttachment(
     val mimeType: String,
     val byteSize: ULong,
     val sandboxPath: String,
+    val originalUri: String,
 )
 
 data class UiProviderSettings(
@@ -1731,6 +1732,7 @@ private fun List<AttachmentDto>.toUiPendingAttachments(): List<UiPendingAttachme
             mimeType = it.mimeType,
             byteSize = it.byteSize,
             sandboxPath = it.sandboxPath,
+            originalUri = it.originalUri,
         )
     }
 }

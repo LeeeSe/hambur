@@ -469,6 +469,17 @@ pub(crate) fn normalize_attachment_status(status: &str) -> HamburResult<String> 
     }
 }
 
+pub(crate) fn normalize_session_purpose(purpose: &str) -> HamburResult<String> {
+    let purpose = purpose.trim();
+    match purpose {
+        "chat" | "delegate" | "memory_review" => Ok(purpose.to_string()),
+        "" => Ok("chat".to_string()),
+        _ => Err(HamburError::InvalidCommand(format!(
+            "invalid session purpose: {purpose}"
+        ))),
+    }
+}
+
 pub(crate) fn sql_bool(value: i64) -> bool {
     value != 0
 }
@@ -477,12 +488,13 @@ pub(crate) fn session_summary_from_row(row: &Row) -> HamburResult<SessionSummary
     Ok(SessionSummary {
         id: row.get::<String>(0).map_err(database_error)?,
         title: row.get::<String>(1).map_err(database_error)?,
-        created_at_ms: unsigned_ms(row.get::<i64>(2).map_err(database_error)?),
-        updated_at_ms: unsigned_ms(row.get::<i64>(3).map_err(database_error)?),
-        pinned_at_ms: unsigned_ms(row.get::<i64>(4).map_err(database_error)?),
-        memory_reviewed: sql_bool(row.get::<i64>(5).map_err(database_error)?),
-        message_count: unsigned_count(row.get::<i64>(6).map_err(database_error)?),
-        latest_preview: row.get::<String>(7).map_err(database_error)?,
+        purpose: row.get::<String>(2).map_err(database_error)?,
+        created_at_ms: unsigned_ms(row.get::<i64>(3).map_err(database_error)?),
+        updated_at_ms: unsigned_ms(row.get::<i64>(4).map_err(database_error)?),
+        pinned_at_ms: unsigned_ms(row.get::<i64>(5).map_err(database_error)?),
+        memory_reviewed: sql_bool(row.get::<i64>(6).map_err(database_error)?),
+        message_count: unsigned_count(row.get::<i64>(7).map_err(database_error)?),
+        latest_preview: row.get::<String>(8).map_err(database_error)?,
     })
 }
 

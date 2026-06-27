@@ -121,6 +121,7 @@ pub struct MarkdownRenderUpdateDTO {
 pub struct SessionSummaryDTO {
     pub id: String,
     pub title: String,
+    pub purpose: String,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub pinned_at_ms: u64,
@@ -971,6 +972,7 @@ impl From<SessionSummary> for SessionSummaryDTO {
         Self {
             id: value.id,
             title: value.title,
+            purpose: value.purpose,
             created_at_ms: value.created_at_ms,
             updated_at_ms: value.updated_at_ms,
             pinned_at_ms: value.pinned_at_ms,

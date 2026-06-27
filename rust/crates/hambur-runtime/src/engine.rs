@@ -805,6 +805,12 @@ impl RuntimeEngine {
             .await
             .unwrap_or_default();
 
+        self.maybe_complete_delegate_session_from_assistant(
+            &session_id,
+            &assistant_message_id,
+            "Delegate completed without submit_delegate_result.",
+        )
+        .await;
         self.clear_active_turn(&session_id, &turn_id);
         let _ = self.emit_session_event(
             RuntimeEventKind::AssistantMessageFinished,
@@ -823,6 +829,59 @@ impl RuntimeEngine {
             None,
         );
         StreamAttemptResult::Completed
+    }
+
+    pub(crate) async fn maybe_complete_delegate_session_from_assistant(
+        &self,
+        session_id: &str,
+        assistant_message_id: &str,
+        fallback_summary: &str,
+    ) {
+        let Some(state) = self
+            .delegate_tasks
+            .lock()
+            .ok()
+            .and_then(|mut tasks| tasks.remove(session_id))
+        else {
+            return;
+        };
+
+        let content_text = self
+            .database
+            .message_snapshot(assistant_message_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|message| message.content_text.trim().to_string())
+            .unwrap_or_default();
+        let summary = content_text
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .map(|line| line.trim().chars().take(240).collect::<String>())
+            .unwrap_or_else(|| fallback_summary.to_string());
+        let content = json!({
+            "summary": summary,
+            "findings": if content_text.is_empty() {
+                json!([])
+            } else {
+                json!([content_text])
+            },
+            "changedFiles": [],
+            "artifactPaths": [],
+            "artifactMappings": [],
+            "risks": [],
+            "nextSteps": [],
+            "autoSubmitted": true
+        });
+        let _ = self
+            .database
+            .update_trace_span_status(&state.trace_id, "completed", &summary, true)
+            .await;
+        let _ = state.sender.send(DelegateCompletionPayload {
+            is_error: false,
+            content,
+            summary,
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1129,7 +1188,7 @@ impl RuntimeEngine {
             .lock()
             .map(|sessions| sessions.contains(&session_id))
             .unwrap_or(false)
-            || review.title.starts_with("Delegate:")
+            || review.purpose == "delegate"
         {
             let _ = self
                 .database
@@ -3015,15 +3074,18 @@ impl RuntimeEngine {
             .unwrap_or_default()
             .to_string();
 
-        let child_snapshot = match self
+        let delegate_session_id = match self
             .database
-            .create_session(&format!(
+            .create_internal_session(
+                &format!(
                 "Delegate: {}",
                 task.chars().take(72).collect::<String>()
-            ))
+                ),
+                "delegate",
+            )
             .await
         {
-            Ok(snapshot) => snapshot,
+            Ok(session_id) => session_id,
             Err(error) => {
                 return ToolResult::failed(
                     &invocation.tool_call_id,
@@ -3032,15 +3094,7 @@ impl RuntimeEngine {
                 );
             }
         };
-        let delegate_session_id = child_snapshot.selected_session_id;
         if let Err(error) = self.sandbox.prepare_session(&delegate_session_id) {
-            return ToolResult::failed(
-                &invocation.tool_call_id,
-                &invocation.name,
-                error.to_string(),
-            );
-        }
-        if let Err(error) = self.database.open_session(session_id).await {
             return ToolResult::failed(
                 &invocation.tool_call_id,
                 &invocation.name,
@@ -3455,6 +3509,8 @@ impl RuntimeEngine {
             .database
             .fail_turn(turn_id, "Cancelled", "Cancelled", "turn cancelled")
             .await;
+        self.maybe_fail_delegate_session(session_id, "delegate task was cancelled")
+            .await;
         self.clear_active_turn(session_id, turn_id);
         let snapshot = self
             .database
@@ -3494,6 +3550,8 @@ impl RuntimeEngine {
             .database
             .fail_turn(turn_id, "Failed", error.code().as_str(), &error.to_string())
             .await;
+        self.maybe_fail_delegate_session(session_id, &error.to_string())
+            .await;
         self.clear_active_turn(session_id, turn_id);
         let snapshot = self
             .database
@@ -3508,6 +3566,43 @@ impl RuntimeEngine {
             error.to_string(),
             Some(&error),
         );
+    }
+    pub(crate) async fn maybe_fail_delegate_session(&self, session_id: &str, message: &str) {
+        let Some(state) = self
+            .delegate_tasks
+            .lock()
+            .ok()
+            .and_then(|mut tasks| tasks.remove(session_id))
+        else {
+            return;
+        };
+        let summary = {
+            let trimmed = message.trim();
+            if trimmed.is_empty() {
+                "delegate task failed".to_string()
+            } else {
+                trimmed.to_string()
+            }
+        };
+        let content = json!({
+            "summary": summary,
+            "findings": [],
+            "changedFiles": [],
+            "artifactPaths": [],
+            "artifactMappings": [],
+            "risks": [summary],
+            "nextSteps": [],
+            "autoSubmitted": true
+        });
+        let _ = self
+            .database
+            .update_trace_span_status(&state.trace_id, "failed", &summary, true)
+            .await;
+        let _ = state.sender.send(DelegateCompletionPayload {
+            is_error: true,
+            content,
+            summary,
+        });
     }
     pub(crate) fn append_stream_markdown(
         &self,

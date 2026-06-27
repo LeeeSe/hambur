@@ -8,7 +8,7 @@ impl HamburDatabase {
     }
 
     pub async fn open_session(&self, session_id: &str) -> HamburResult<AppSnapshot> {
-        if !self.session_exists(session_id).await? {
+        if !self.chat_session_exists(session_id).await? {
             return Err(HamburError::InvalidCommand(format!(
                 "session not found: {session_id}"
             )));
@@ -230,6 +230,7 @@ impl HamburDatabase {
                 SELECT
                     s.id,
                     s.title,
+                    s.purpose,
                     s.created_at_ms,
                     s.updated_at_ms,
                     s.pinned_at_ms,
@@ -248,6 +249,7 @@ impl HamburDatabase {
                 FROM sessions s
                 WHERE s.deleted_at_ms IS NULL
                   AND s.memory_reviewed = 0
+                  AND s.purpose = 'chat'
                 ORDER BY s.updated_at_ms ASC, s.created_at_ms ASC, s.id ASC
                 LIMIT ?1
                 ",
@@ -271,6 +273,7 @@ impl HamburDatabase {
         Ok(SessionReviewRecord {
             id: summary.id.clone(),
             title: summary.title,
+            purpose: summary.purpose,
             created_at_ms: summary.created_at_ms,
             updated_at_ms: summary.updated_at_ms,
             memory_reviewed: summary.memory_reviewed,
@@ -523,6 +526,7 @@ impl HamburDatabase {
                 SELECT
                     s.id,
                     s.title,
+                    s.purpose,
                     s.created_at_ms,
                     s.updated_at_ms,
                     s.pinned_at_ms,
@@ -540,6 +544,7 @@ impl HamburDatabase {
                     ) AS latest_preview
                 FROM sessions s
                 WHERE s.deleted_at_ms IS NULL
+                  AND s.purpose = 'chat'
                   AND s.title LIKE ?1 ESCAPE '\\'
                 ORDER BY s.pinned_at_ms DESC, s.created_at_ms DESC, s.id DESC
                 LIMIT ?2
@@ -790,6 +795,7 @@ impl HamburDatabase {
             Some(session_id) if sessions.iter().any(|session| session.id == session_id) => {
                 session_id.to_string()
             }
+            Some(session_id) if self.session_exists(session_id).await? => session_id.to_string(),
             _ if active_session_id.as_ref().is_some_and(|session_id| {
                 sessions.iter().any(|session| session.id == *session_id)
             }) =>
@@ -845,6 +851,7 @@ impl HamburDatabase {
                 SELECT
                     s.id,
                     s.title,
+                    s.purpose,
                     s.created_at_ms,
                     s.updated_at_ms,
                     s.pinned_at_ms,
@@ -862,6 +869,7 @@ impl HamburDatabase {
                     ) AS latest_preview
                 FROM sessions s
                 WHERE s.deleted_at_ms IS NULL
+                  AND s.purpose = 'chat'
                 ORDER BY s.pinned_at_ms DESC, s.created_at_ms DESC, s.id DESC
                 LIMIT ?1 OFFSET ?2
                 ",
@@ -1042,6 +1050,18 @@ impl HamburDatabase {
 
         Ok(rows.next().await.map_err(database_error)?.is_some())
     }
+    pub(crate) async fn chat_session_exists(&self, session_id: &str) -> HamburResult<bool> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT id FROM sessions WHERE id = ?1 AND purpose = 'chat' AND deleted_at_ms IS NULL LIMIT 1",
+                params![session_id],
+            )
+            .await
+            .map_err(database_error)?;
+
+        Ok(rows.next().await.map_err(database_error)?.is_some())
+    }
     pub(crate) async fn session_summary_by_id(
         &self,
         session_id: &str,
@@ -1053,6 +1073,7 @@ impl HamburDatabase {
                 SELECT
                     s.id,
                     s.title,
+                    s.purpose,
                     s.created_at_ms,
                     s.updated_at_ms,
                     s.pinned_at_ms,

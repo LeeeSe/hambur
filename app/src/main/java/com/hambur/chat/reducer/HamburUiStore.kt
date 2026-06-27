@@ -43,6 +43,7 @@ import org.json.JSONObject
 data class UiSessionSummary(
     val id: String,
     val title: String,
+    val purpose: String,
     val createdAtMs: ULong,
     val updatedAtMs: ULong,
     val pinnedAtMs: ULong,
@@ -1466,6 +1467,7 @@ private fun HamburUiState.applyBaseline(
             UiSessionSummary(
                 id = it.id,
                 title = it.title,
+                purpose = it.purpose,
                 createdAtMs = it.createdAtMs,
                 updatedAtMs = it.updatedAtMs,
                 pinnedAtMs = it.pinnedAtMs,
@@ -1511,15 +1513,26 @@ private fun HamburUiState.reduce(event: BackendEvent): HamburUiState {
     }
 
     val nextAppliedEventIds = rememberEventId(event.eventId)
+    val targetsVisibleSession = event.targetsVisibleSession(selectedSessionId)
     if (isStaleTurnEvent(event)) {
         return copy(
             latestEventKind = event.kind,
-            lastAppliedSequence = event.sequence,
+            lastAppliedSequence = if (targetsVisibleSession) event.sequence else lastAppliedSequence,
             appliedEventIds = nextAppliedEventIds,
         )
     }
 
     val snapshot = event.snapshot
+    if (!targetsVisibleSession) {
+        return copy(
+            latestEventKind = event.kind,
+            sessions = event.toUiSessionSummaries(),
+            lastAppliedSequence = lastAppliedSequence,
+            appliedEventIds = nextAppliedEventIds,
+            activeTurnIds = updateActiveTurnIds(event),
+        )
+    }
+
     val status = when (event.kind) {
         "RuntimeReady",
         "SessionCreated",
@@ -1579,7 +1592,11 @@ private fun HamburUiState.reduce(event: BackendEvent): HamburUiState {
         else -> footer
     }
 
-    val nextSelectedSessionId = snapshot.selectedSessionId
+    val nextSelectedSessionId = if (event.switchesVisibleSession()) {
+        snapshot.selectedSessionId
+    } else {
+        selectedSessionId.ifBlank { snapshot.selectedSessionId }
+    }
     val sessionChanged = nextSelectedSessionId != selectedSessionId
     val nextTimelineItems = snapshot.timelineItems.toUiTimelineItems()
     val visibleMarkdownPayloadRefs = nextTimelineItems
@@ -1601,17 +1618,7 @@ private fun HamburUiState.reduce(event: BackendEvent): HamburUiState {
         runtimeStatus = status,
         latestEventKind = event.kind,
         footer = footer,
-        sessions = snapshot.sessions.map {
-            UiSessionSummary(
-                id = it.id,
-                title = it.title,
-                createdAtMs = it.createdAtMs,
-                updatedAtMs = it.updatedAtMs,
-                pinnedAtMs = it.pinnedAtMs,
-                messageCount = it.messageCount,
-                latestPreview = it.latestPreview,
-            )
-        },
+        sessions = event.toUiSessionSummaries(),
         selectedSessionId = nextSelectedSessionId,
         timelineItems = nextTimelineItems,
         messagesById = if (sessionChanged) emptyMap() else messagesById,
@@ -1625,8 +1632,39 @@ private fun HamburUiState.reduce(event: BackendEvent): HamburUiState {
     )
 }
 
-private fun BackendEvent.belongsToSelectedSession(selectedSessionId: String): Boolean {
-    return sessionId.isBlank() || selectedSessionId.isBlank() || sessionId == selectedSessionId
+private fun BackendEvent.switchesVisibleSession(): Boolean {
+    return when (kind) {
+        "RuntimeReady",
+        "SessionCreated",
+        "SessionOpened",
+        "SessionDeleted" -> true
+        else -> false
+    }
+}
+
+private fun BackendEvent.targetsVisibleSession(selectedSessionId: String): Boolean {
+    if (switchesVisibleSession()) return true
+    if (selectedSessionId.isBlank()) return false
+    return if (sessionId.isBlank()) {
+        snapshot.selectedSessionId == selectedSessionId
+    } else {
+        sessionId == selectedSessionId
+    }
+}
+
+private fun BackendEvent.toUiSessionSummaries(): List<UiSessionSummary> {
+    return snapshot.sessions.map {
+        UiSessionSummary(
+            id = it.id,
+            title = it.title,
+            purpose = it.purpose,
+            createdAtMs = it.createdAtMs,
+            updatedAtMs = it.updatedAtMs,
+            pinnedAtMs = it.pinnedAtMs,
+            messageCount = it.messageCount,
+            latestPreview = it.latestPreview,
+        )
+    }
 }
 
 private fun HamburUiState.isStaleTurnEvent(event: BackendEvent): Boolean {

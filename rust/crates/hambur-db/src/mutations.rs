@@ -2,21 +2,34 @@ use crate::*;
 
 impl HamburDatabase {
     pub async fn create_session(&self, title: &str) -> HamburResult<AppSnapshot> {
+        let id = self.insert_session(title, "chat").await?;
+        self.set_active_session(Some(&id)).await?;
+        self.snapshot_for_selected(Some(&id)).await
+    }
+
+    pub async fn create_internal_session(
+        &self,
+        title: &str,
+        purpose: &str,
+    ) -> HamburResult<String> {
+        self.insert_session(title, purpose).await
+    }
+
+    async fn insert_session(&self, title: &str, purpose: &str) -> HamburResult<String> {
         let id = new_id("ses");
         let now = now_ms();
         let title = normalize_title(title);
+        let purpose = normalize_session_purpose(purpose)?;
 
         self.connection
             .execute(
-                "INSERT INTO sessions (id, title, created_at_ms, updated_at_ms)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![id.clone(), title, now as i64, now as i64],
+                "INSERT INTO sessions (id, title, purpose, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id.clone(), title, purpose, now as i64, now as i64],
             )
             .await
             .map_err(database_error)?;
-
-        self.set_active_session(Some(&id)).await?;
-        self.snapshot_for_selected(Some(&id)).await
+        Ok(id)
     }
 
     pub async fn rename_session(&self, session_id: &str, title: &str) -> HamburResult<AppSnapshot> {
@@ -2089,6 +2102,7 @@ impl HamburDatabase {
                 CREATE TABLE IF NOT EXISTS sessions (
                     id TEXT PRIMARY KEY NOT NULL,
                     title TEXT NOT NULL,
+                    purpose TEXT NOT NULL DEFAULT 'chat',
                     created_at_ms INTEGER NOT NULL,
                     updated_at_ms INTEGER NOT NULL,
                     pinned_at_ms INTEGER NOT NULL DEFAULT 0,
@@ -2468,6 +2482,28 @@ impl HamburDatabase {
             .await?;
         self.add_column_if_missing("sessions", "memory_reviewed", "INTEGER NOT NULL DEFAULT 0")
             .await?;
+        self.add_column_if_missing("sessions", "purpose", "TEXT NOT NULL DEFAULT 'chat'")
+            .await?;
+        self.connection
+            .execute(
+                "UPDATE sessions
+                 SET purpose = 'delegate'
+                 WHERE purpose = 'chat' AND title LIKE 'Delegate:%'",
+                params![],
+            )
+            .await
+            .map_err(database_error)?;
+        self.connection
+            .execute(
+                "DELETE FROM app_state
+                 WHERE key = 'active_session_id'
+                   AND value IN (
+                     SELECT id FROM sessions WHERE purpose != 'chat'
+                   )",
+                params![],
+            )
+            .await
+            .map_err(database_error)?;
         self.add_column_if_missing("tool_calls", "call_index", "INTEGER NOT NULL DEFAULT 0")
             .await?;
 

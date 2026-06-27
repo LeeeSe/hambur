@@ -20,6 +20,7 @@ const DEFAULT_SESSION_TITLE: &str = "Untitled session";
 pub struct SessionSummary {
     pub id: String,
     pub title: String,
+    pub purpose: String,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub pinned_at_ms: u64,
@@ -97,6 +98,7 @@ pub struct ChatTranscriptEntry {
 pub struct SessionReviewRecord {
     pub id: String,
     pub title: String,
+    pub purpose: String,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub memory_reviewed: bool,

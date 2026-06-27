@@ -563,11 +563,12 @@ private fun ChatDrawerContent(
     val selectedBackground = colorScheme.primaryContainer
     val mutedText = colorScheme.onSurfaceVariant
     val groupedSessions = remember(sessions, searchQuery) {
+        val chatSessions = sessions.filter { it.purpose == "chat" }
         groupDrawerSessions(
             sessions = if (searchQuery.isBlank()) {
-                sessions
+                chatSessions
             } else {
-                sessions.filter {
+                chatSessions.filter {
                     it.title.contains(searchQuery, ignoreCase = true) ||
                         it.latestPreview.contains(searchQuery, ignoreCase = true)
                 }

@@ -1858,6 +1858,7 @@ impl RuntimeEngine {
             tool_result_messages.push(ModelMessage {
                 role: "tool".to_string(),
                 content: record.result.context_stub,
+                reasoning_content: String::new(),
                 tool_calls_json: String::new(),
                 tool_call_id: record.invocation.tool_call_id,
             });
@@ -1948,6 +1949,7 @@ impl RuntimeEngine {
             &continuation_route,
             &self.tools.schemas().compile_openai_tools_json(),
             content,
+            reasoning,
             assistant_tool_calls,
             tool_result_messages,
             continuation_sse,

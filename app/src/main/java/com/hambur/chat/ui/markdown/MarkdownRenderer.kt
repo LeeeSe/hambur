@@ -18,6 +18,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -45,6 +46,7 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import com.hambur.chat.perf.ChatJankTracer
 import com.hambur.chat.uniffi.MarkdownBlockNodeDto
 import com.hambur.chat.uniffi.MarkdownInlineNodeDto
 import kotlin.math.max
@@ -190,6 +192,13 @@ fun MarkdownBlock(
     onOpenDestination: (String) -> Unit = {},
 ) {
     val markdownStyle = style ?: rememberMarkdownStyle()
+    SideEffect {
+        ChatJankTracer.markSessionSwitchOnce(
+            phase = "markdown_block_seen",
+            key = "markdown_seen:${node.messageId}:${node.blockId}",
+            extra = "kind=${node.nodeKind} message=${traceShortId(node.messageId)} block=${node.blockId} raw=${node.raw.length} text=${node.text.length}",
+        )
+    }
     when (node.nodeKind) {
         "Heading" -> MarkdownInlineText(
             node = node,
@@ -286,12 +295,18 @@ private fun MarkdownInlineText(
         markdownStyle.visualFingerprint(),
         renderCache,
     ) {
-        renderCache?.annotatedStringFor(node, markdownStyle) ?: buildAnnotatedString {
-            appendInlineNodes(
-                inlines = node.inlines,
-                linkColor = markdownStyle.linkColor,
-                inlineCodeBackground = markdownStyle.inlineCodeBackground,
-            )
+        ChatJankTracer.timeSessionSwitch(
+            phase = "markdown_annotated_build",
+            warnAtMs = 2.0,
+            extra = "kind=${node.nodeKind} message=${traceShortId(node.messageId)} block=${node.blockId} inlineNodes=${node.inlines.size} raw=${node.raw.length}",
+        ) {
+            renderCache?.annotatedStringFor(node, markdownStyle) ?: buildAnnotatedString {
+                appendInlineNodes(
+                    inlines = node.inlines,
+                    linkColor = markdownStyle.linkColor,
+                    inlineCodeBackground = markdownStyle.inlineCodeBackground,
+                )
+            }
         }
     }
     var layoutResult by remember(annotated) { mutableStateOf<TextLayoutResult?>(null) }
@@ -488,10 +503,16 @@ private fun MarkdownTable(
 ) {
     val hasHeader = node.tableHeader.isNotEmpty()
     val rows = remember(node.tableHeader, node.tableRows) {
-        buildList<List<String>> {
-            if (hasHeader) add(node.tableHeader)
-            addAll(node.tableRows.map { it.cells })
-        }.normalizedTableRows()
+        ChatJankTracer.timeSessionSwitch(
+            phase = "markdown_table_rows_build",
+            warnAtMs = 2.0,
+            extra = "message=${traceShortId(node.messageId)} block=${node.blockId} header=${node.tableHeader.size} rows=${node.tableRows.size}",
+        ) {
+            buildList<List<String>> {
+                if (hasHeader) add(node.tableHeader)
+                addAll(node.tableRows.map { it.cells })
+            }.normalizedTableRows()
+        }
     }
     val scrollState = rememberScrollState()
 
@@ -619,18 +640,17 @@ private fun MarkdownTableLayout(
             }
         },
     ) { measurables, constraints ->
+        val measureStartNs = ChatJankTracer.nowNs()
         val minColumnWidth = markdownStyle.tableMinColumnWidth.roundToPx()
         val maxColumnWidth = markdownStyle.tableMaxColumnWidth.roundToPx()
             .coerceAtLeast(minColumnWidth)
-        val columnWidths = IntArray(columnCount) { minColumnWidth }
-
-        measurables.forEachIndexed { index, measurable ->
-            val columnIndex = index % columnCount
-            val preferredWidth = measurable
-                .maxIntrinsicWidth(Constraints.Infinity)
-                .coerceIn(minColumnWidth, maxColumnWidth)
-            columnWidths[columnIndex] = max(columnWidths[columnIndex], preferredWidth)
-        }
+        val horizontalPaddingPx = markdownStyle.tableCellHorizontalPadding.roundToPx() * 2
+        val columnWidths = rows.estimatedTableColumnWidths(
+            columnCount = columnCount,
+            minColumnWidth = minColumnWidth,
+            maxColumnWidth = maxColumnWidth,
+            horizontalPaddingPx = horizontalPaddingPx,
+        )
 
         val placeables = measurables.mapIndexed { index, measurable ->
             val columnIndex = index % columnCount
@@ -663,6 +683,12 @@ private fun MarkdownTableLayout(
         }
         gridMetrics.columnWidths = columnWidths
         gridMetrics.rowHeights = rowHeights
+        ChatJankTracer.markDuration(
+            phase = "markdown_table_measure",
+            startNs = measureStartNs,
+            warnAtMs = 3.0,
+            extra = "rows=$rowCount columns=$columnCount cells=${measurables.size} width=$tableWidth height=$tableHeight",
+        )
 
         layout(layoutWidth, layoutHeight) {
             var y = 0
@@ -679,6 +705,79 @@ private fun MarkdownTableLayout(
     }
 }
 
+private fun List<List<String>>.estimatedTableColumnWidths(
+    columnCount: Int,
+    minColumnWidth: Int,
+    maxColumnWidth: Int,
+    horizontalPaddingPx: Int,
+): IntArray {
+    val narrowCharWidth = ((maxColumnWidth - horizontalPaddingPx) / 28)
+        .coerceAtLeast(6)
+    val wideCharWidth = (narrowCharWidth * 1.65f).toInt()
+        .coerceAtLeast(narrowCharWidth + 2)
+    val whitespaceCharWidth = (narrowCharWidth / 2).coerceAtLeast(3)
+    val widths = IntArray(columnCount) { minColumnWidth }
+
+    forEach { row ->
+        row.forEachIndexed { columnIndex, cell ->
+            if (columnIndex >= columnCount) return@forEachIndexed
+            widths[columnIndex] = max(
+                widths[columnIndex],
+                cell.estimatedTableCellWidth(
+                    minColumnWidth = minColumnWidth,
+                    maxColumnWidth = maxColumnWidth,
+                    horizontalPaddingPx = horizontalPaddingPx,
+                    narrowCharWidth = narrowCharWidth,
+                    wideCharWidth = wideCharWidth,
+                    whitespaceCharWidth = whitespaceCharWidth,
+                ),
+            )
+        }
+    }
+
+    return widths
+}
+
+private fun String.estimatedTableCellWidth(
+    minColumnWidth: Int,
+    maxColumnWidth: Int,
+    horizontalPaddingPx: Int,
+    narrowCharWidth: Int,
+    wideCharWidth: Int,
+    whitespaceCharWidth: Int,
+): Int {
+    if (isBlank()) return minColumnWidth
+    var lineWidth = horizontalPaddingPx
+    var widestLineWidth = minColumnWidth
+    for (char in this) {
+        if (char == '\n') {
+            widestLineWidth = max(widestLineWidth, lineWidth)
+            if (widestLineWidth >= maxColumnWidth) return maxColumnWidth
+            lineWidth = horizontalPaddingPx
+            continue
+        }
+        lineWidth += when {
+            char.isWhitespace() -> whitespaceCharWidth
+            char.isWideTableChar() -> wideCharWidth
+            else -> narrowCharWidth
+        }
+        if (lineWidth >= maxColumnWidth) return maxColumnWidth
+    }
+    return max(widestLineWidth, lineWidth).coerceIn(minColumnWidth, maxColumnWidth)
+}
+
+private fun Char.isWideTableChar(): Boolean {
+    val code = code
+    return code in 0x1100..0x115F ||
+        code in 0x2E80..0xA4CF ||
+        code in 0xAC00..0xD7A3 ||
+        code in 0xF900..0xFAFF ||
+        code in 0xFE10..0xFE19 ||
+        code in 0xFE30..0xFE6F ||
+        code in 0xFF00..0xFF60 ||
+        code in 0xFFE0..0xFFE6
+}
+
 private class MarkdownTableGridMetrics {
     var columnWidths: IntArray = IntArray(0)
     var rowHeights: IntArray = IntArray(0)
@@ -690,6 +789,11 @@ private fun List<String>.textAlignAt(index: Int): TextAlign {
         "right" -> TextAlign.End
         else -> TextAlign.Start
     }
+}
+
+private fun traceShortId(id: String): String {
+    if (id.isBlank()) return "-"
+    return if (id.length <= 10) id else id.take(4) + ".." + id.takeLast(6)
 }
 
 @Composable

@@ -602,6 +602,24 @@ impl RuntimeEngine {
                         };
                     }
                 };
+                let thinking_trace = openai_request_thinking_trace(
+                    &request,
+                    &route,
+                    &spec.body_json,
+                );
+                let snapshot = self
+                    .database
+                    .session_snapshot(&session_id)
+                    .await
+                    .unwrap_or_default();
+                let _ = self.emit_session_event(
+                    RuntimeEventKind::TurnStateChanged,
+                    session_id.clone(),
+                    turn_id.clone(),
+                    snapshot,
+                    thinking_trace,
+                    None,
+                );
                 let mut response = match reqwest_stream(spec).await {
                     Ok(response) => response,
                     Err(error) => {
@@ -780,6 +798,26 @@ impl RuntimeEngine {
                 semantic_delta_started: true,
             };
         }
+        let snapshot = self
+            .database
+            .session_snapshot(&session_id)
+            .await
+            .unwrap_or_default();
+        let _ = self.emit_session_event(
+            RuntimeEventKind::TurnStateChanged,
+            session_id.clone(),
+            turn_id.clone(),
+            snapshot,
+            format!(
+                "ThinkingToggle db final_write message={} status=completed contentLen={} reasoningLen={} finishReason={} nativeFinishReason={}",
+                assistant_message_id,
+                state.content.chars().count(),
+                state.reasoning.chars().count(),
+                final_finish_reason,
+                final_native_finish_reason,
+            ),
+            None,
+        );
         if let Err(error) = self
             .database
             .update_turn_status(&turn_id, "Finished", true)
@@ -932,6 +970,24 @@ impl RuntimeEngine {
         };
 
         for payload in payloads {
+            if let Some(trace) =
+                provider_payload_thinking_trace(&payload.data, state.thinking_raw_trace_count + 1)
+            {
+                state.thinking_raw_trace_count += 1;
+                let snapshot = self
+                    .database
+                    .session_snapshot(session_id)
+                    .await
+                    .unwrap_or_default();
+                let _ = self.emit_session_event(
+                    RuntimeEventKind::TurnStateChanged,
+                    session_id.to_string(),
+                    turn_id.to_string(),
+                    snapshot,
+                    trace,
+                    None,
+                );
+            }
             let events = match OpenAiCompatibleAdapter::parse_stream_payload(&payload) {
                 Ok(events) => events,
                 Err(error) => {
@@ -971,11 +1027,26 @@ impl RuntimeEngine {
                     ProviderStreamEvent::ContentDelta(delta) => {
                         state.semantic_delta_started = true;
                         state.content.push_str(&delta);
+                        state.thinking_parsed_trace_count += 1;
                         let snapshot = self
                             .database
                             .session_snapshot(session_id)
                             .await
                             .unwrap_or_default();
+                        let _ = self.emit_session_event(
+                            RuntimeEventKind::TurnStateChanged,
+                            session_id.to_string(),
+                            turn_id.to_string(),
+                            snapshot.clone(),
+                            format!(
+                                "ThinkingToggle parsed content_delta parsedIndex={} deltaLen={} totalContentLen={} totalReasoningLen={}",
+                                state.thinking_parsed_trace_count,
+                                delta.chars().count(),
+                                state.content.chars().count(),
+                                state.reasoning.chars().count(),
+                            ),
+                            None,
+                        );
                         let _ = self.emit_session_event(
                             RuntimeEventKind::AssistantContentDelta,
                             session_id.to_string(),
@@ -1002,11 +1073,26 @@ impl RuntimeEngine {
                     ProviderStreamEvent::ReasoningDelta(delta) => {
                         state.semantic_delta_started = true;
                         state.reasoning.push_str(&delta);
+                        state.thinking_parsed_trace_count += 1;
                         let snapshot = self
                             .database
                             .session_snapshot(session_id)
                             .await
                             .unwrap_or_default();
+                        let _ = self.emit_session_event(
+                            RuntimeEventKind::TurnStateChanged,
+                            session_id.to_string(),
+                            turn_id.to_string(),
+                            snapshot.clone(),
+                            format!(
+                                "ThinkingToggle parsed reasoning_delta parsedIndex={} deltaLen={} totalReasoningLen={} totalContentLen={}",
+                                state.thinking_parsed_trace_count,
+                                delta.chars().count(),
+                                state.reasoning.chars().count(),
+                                state.content.chars().count(),
+                            ),
+                            None,
+                        );
                         let _ = self.emit_session_event(
                             RuntimeEventKind::AssistantReasoningDelta,
                             session_id.to_string(),
@@ -1303,6 +1389,7 @@ impl RuntimeEngine {
             messages.push(ModelMessage {
                 role: "assistant".to_string(),
                 content: assistant.content,
+                reasoning_content: String::new(),
                 tool_calls_json: complete_tool_calls_json(&assistant.tool_calls)?,
                 tool_call_id: String::new(),
             });
@@ -1319,6 +1406,7 @@ impl RuntimeEngine {
                 messages.push(ModelMessage {
                     role: "tool".to_string(),
                     content: result.context_stub,
+                    reasoning_content: String::new(),
                     tool_calls_json: String::new(),
                     tool_call_id: result.tool_call_id,
                 });
@@ -4423,4 +4511,88 @@ impl RuntimeEngine {
         };
         Ok(result)
     }
+}
+
+fn openai_request_thinking_trace(
+    request: &ModelRequest,
+    route: &ModelRouteSnapshot,
+    body_json: &str,
+) -> String {
+    let body = serde_json::from_str::<serde_json::Value>(body_json)
+        .unwrap_or(serde_json::Value::Null);
+    let thinking = body
+        .get("thinking")
+        .map(serde_json::Value::to_string)
+        .unwrap_or_else(|| "null".to_string());
+    let reasoning_effort = body
+        .get("reasoning_effort")
+        .map(serde_json::Value::to_string)
+        .unwrap_or_else(|| "null".to_string());
+    format!(
+        "ThinkingToggle rust request session={} model={} supports_reasoning={} reasoning_mode={:?} thinking={} reasoning_effort={}",
+        request.session_id,
+        route.model_id,
+        route.supports_reasoning,
+        request.reasoning_mode,
+        thinking,
+        reasoning_effort,
+    )
+}
+
+fn provider_payload_thinking_trace(data: &str, raw_index: u32) -> Option<String> {
+    if data.trim().is_empty() || data.trim() == "[DONE]" {
+        return None;
+    }
+    let value = serde_json::from_str::<serde_json::Value>(data).ok()?;
+    let choice = value.get("choices")?.as_array()?.first()?;
+    let delta = choice.get("delta").unwrap_or(&serde_json::Value::Null);
+    let delta_keys = delta
+        .as_object()
+        .map(|object| {
+            let mut keys = object.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            keys.join("|")
+        })
+        .unwrap_or_default();
+    let reasoning_content_len = json_string_len(delta.get("reasoning_content"));
+    let reasoning_len = json_string_len(delta.get("reasoning"));
+    let reasoning_content_camel_len = json_string_len(delta.get("reasoningContent"));
+    let content_len = json_string_len(delta.get("content"));
+    let finish_reason = choice
+        .get("finish_reason")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let sample = delta
+        .get("reasoning_content")
+        .or_else(|| delta.get("reasoning"))
+        .or_else(|| delta.get("reasoningContent"))
+        .or_else(|| delta.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .map(short_log_sample)
+        .unwrap_or_default();
+    Some(format!(
+        "ThinkingToggle sse raw rawIndex={} deltaKeys={} reasoning_content_len={} reasoning_len={} reasoningContent_len={} content_len={} finishReason={} sample={}",
+        raw_index,
+        delta_keys,
+        reasoning_content_len,
+        reasoning_len,
+        reasoning_content_camel_len,
+        content_len,
+        finish_reason,
+        sample,
+    ))
+}
+
+fn json_string_len(value: Option<&serde_json::Value>) -> usize {
+    value
+        .and_then(serde_json::Value::as_str)
+        .map(|text| text.chars().count())
+        .unwrap_or(0)
+}
+
+fn short_log_sample(text: &str) -> String {
+    text.chars()
+        .take(24)
+        .collect::<String>()
+        .replace('\n', "\\n")
 }

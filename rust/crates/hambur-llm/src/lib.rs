@@ -243,6 +243,8 @@ pub struct ModelMessage {
     pub role: String,
     pub content: String,
     #[serde(default)]
+    pub reasoning_content: String,
+    #[serde(default)]
     pub tool_calls_json: String,
     #[serde(default)]
     pub tool_call_id: String,
@@ -344,6 +346,12 @@ impl OpenAiCompatibleAdapter {
             let mut object = serde_json::Map::new();
             object.insert("role".to_string(), json!(message.role));
             object.insert("content".to_string(), json!(message.content));
+            if !message.reasoning_content.trim().is_empty() {
+                object.insert(
+                    "reasoning_content".to_string(),
+                    json!(message.reasoning_content),
+                );
+            }
             if !message.tool_calls_json.trim().is_empty() {
                 let tool_calls: Value = serde_json::from_str(message.tool_calls_json.trim())
                     .map_err(|error| {
@@ -400,11 +408,27 @@ impl OpenAiCompatibleAdapter {
         {
             body["temperature"] = json!(temperature);
         }
-        if request.reasoning_mode == ReasoningMode::Enabled
-            && target.model.capabilities.supports_reasoning
-        {
-            body["reasoning"] = json!({"enabled": true});
+        if target.model.capabilities.supports_reasoning {
+            body["thinking"] = json!({
+                "type": if request.reasoning_mode == ReasoningMode::Enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            });
+            if request.reasoning_mode == ReasoningMode::Enabled {
+                body["reasoning_effort"] = json!("high");
+            }
         }
+        eprintln!(
+            "ThinkingToggle build_openai_request session={} model={} supports_reasoning={} reasoning_mode={:?} thinking={} reasoning_effort={}",
+            request.session_id,
+            target.model.model_id,
+            target.model.capabilities.supports_reasoning,
+            request.reasoning_mode,
+            body.get("thinking").map(Value::to_string).unwrap_or_else(|| "null".to_string()),
+            body.get("reasoning_effort").map(Value::to_string).unwrap_or_else(|| "null".to_string()),
+        );
 
         Ok(HttpRequestSpec {
             method: "POST".to_string(),

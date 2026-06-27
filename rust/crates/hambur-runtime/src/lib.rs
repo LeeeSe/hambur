@@ -493,6 +493,8 @@ struct StreamAttemptState {
     decoder: SseDecoder,
     content: String,
     reasoning: String,
+    thinking_raw_trace_count: u32,
+    thinking_parsed_trace_count: u32,
     semantic_delta_started: bool,
     finish_reason: String,
     native_finish_reason: String,

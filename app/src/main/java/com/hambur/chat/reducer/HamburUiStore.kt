@@ -1,6 +1,7 @@
 package com.hambur.chat.reducer
 
 import android.util.Log
+import com.hambur.chat.perf.ChatJankTracer
 import com.hambur.chat.uniffi.AppBootstrapConfig
 import com.hambur.chat.uniffi.AttachmentDto
 import com.hambur.chat.uniffi.BackendCommand
@@ -26,6 +27,7 @@ import com.hambur.chat.uniffi.TimelineItemDto
 import com.hambur.chat.uniffi.createRuntime
 import com.hambur.chat.platform.AndroidPlatformAdapter
 import com.hambur.chat.platform.PlatformResult
+import java.io.File
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -210,6 +212,7 @@ data class HamburUiState(
     val selectedSessionId: String = "",
     val timelineItems: List<UiTimelineItem> = emptyList(),
     val messagesById: Map<String, UiMessageSnapshot> = emptyMap(),
+    val reasoningByMessageId: Map<String, String> = emptyMap(),
     val pendingAttachments: List<UiPendingAttachment> = emptyList(),
     val providers: List<UiProviderSettings> = emptyList(),
     val providerModels: List<UiProviderModelSettings> = emptyList(),
@@ -230,6 +233,28 @@ data class HamburUiState(
     val appliedEventIds: Set<String> = emptySet(),
     val activeTurnIds: Map<String, String> = emptyMap(),
     val rootfsStatus: RootfsStatusDto? = null,
+    val thinkingEnabledBySession: Map<String, Boolean> = emptyMap(),
+    val defaultThinkingEnabled: Boolean = false,
+    val isDraftNewSession: Boolean = false,
+)
+
+data class UiSessionScrollPosition(
+    val firstVisibleItemIndex: Int = 0,
+    val firstVisibleItemScrollOffset: Int = 0,
+)
+
+private data class UiSessionCacheEntry(
+    val timelineItems: List<UiTimelineItem>,
+    val markdownBlocksByPayloadRef: Map<String, MarkdownBlockNodeDto>,
+    val messagesById: Map<String, UiMessageSnapshot>,
+    val reasoningByMessageId: Map<String, String>,
+    val pendingAttachments: List<UiPendingAttachment>,
+    val snapshotSequence: ULong,
+)
+
+private data class PersistedSessionUiState(
+    val thinkingEnabledBySession: Map<String, Boolean> = emptyMap(),
+    val scrollPositions: Map<String, UiSessionScrollPosition> = emptyMap(),
 )
 
 class HamburUiStore(
@@ -238,6 +263,7 @@ class HamburUiStore(
     private val platformAdapter: AndroidPlatformAdapter,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val sessionUiStateFile = File(appFilesDir, "session-ui-state.json")
     init {
         Log.i(
             "RootfsDebug",
@@ -255,33 +281,61 @@ class HamburUiStore(
     private val startupBuffer = mutableListOf<BackendEvent>()
     private val markdownCoalesceLock = Any()
     private val pendingMarkdownEvents = mutableListOf<BackendEvent>()
+    private val sessionCacheLock = Any()
+    private val sessionCache = linkedMapOf<String, UiSessionCacheEntry>()
+    private val sessionScrollPositions = mutableMapOf<String, UiSessionScrollPosition>()
+    private val persistedSessionUiState = loadPersistedSessionUiState(sessionUiStateFile)
     private val commandCounter = AtomicLong()
     private var markdownFlushScheduled = false
     private var baselineApplied = false
     private var defaultProviderConfigured = false
+    private var sessionUiStatePersistScheduled = false
 
     val state: StateFlow<HamburUiState> = _state.asStateFlow()
 
     init {
+        sessionScrollPositions.putAll(persistedSessionUiState.scrollPositions)
+        _state.update {
+            it.copy(thinkingEnabledBySession = persistedSessionUiState.thinkingEnabledBySession)
+        }
         scope.launch { collectBackendEvents() }
         scope.launch { applyInitialSnapshotBaseline() }
     }
 
     fun createSession(title: String) {
-        runCommand {
-            runtime.dispatch(
-                backendCommand(
-                    kind = "CreateSession",
-                    idempotencyKey = "session:create:${nextCommandOrdinal()}",
-                    title = title,
-                ),
+        startNewSessionDraft()
+    }
+
+    fun startNewSessionDraft() {
+        val current = _state.value
+        if (current.isNewSessionBlank()) return
+        rememberSessionCache(current)
+        _state.update {
+            it.copy(
+                latestEventKind = "DraftSessionStarted",
+                footer = "Draft new session",
+                selectedSessionId = "",
+                timelineItems = emptyList(),
+                messagesById = emptyMap(),
+                reasoningByMessageId = emptyMap(),
+                pendingAttachments = emptyList(),
+                markdownBlocksByPayloadRef = emptyMap(),
+                activePreviewPath = "",
+                isDraftNewSession = true,
             )
         }
     }
 
     fun openSession(sessionId: String) {
         if (sessionId.isBlank()) return
-        runCommand {
+        val target = _state.value.sessions.firstOrNull { it.id == sessionId }
+        ChatJankTracer.markSessionSwitch(
+            phase = "store_openSession_enqueue",
+            targetSessionId = sessionId,
+            extra = "targetMessages=${target?.messageCount ?: 0u}",
+        )
+        applyCachedSession(sessionId)
+        runCommand(commandKind = "OpenSession", targetSessionId = sessionId) {
             runtime.dispatch(
                 backendCommand(
                     kind = "OpenSession",
@@ -289,6 +343,40 @@ class HamburUiStore(
                     sessionId = sessionId,
                 ),
             )
+        }
+    }
+
+    fun setSessionThinkingEnabled(sessionId: String, enabled: Boolean) {
+        val targetSessionId = sessionId
+            .ifBlank { _state.value.selectedSessionId }
+            .ifBlank { NEW_SESSION_THINKING_KEY }
+        _state.update {
+            it.copy(
+                thinkingEnabledBySession = it.thinkingEnabledBySession + (targetSessionId to enabled),
+            )
+        }
+        persistSessionUiState()
+    }
+
+    fun updateSessionScrollPosition(
+        sessionId: String,
+        firstVisibleItemIndex: Int,
+        firstVisibleItemScrollOffset: Int,
+    ) {
+        if (sessionId.isBlank()) return
+        synchronized(sessionCacheLock) {
+            sessionScrollPositions[sessionId] = UiSessionScrollPosition(
+                firstVisibleItemIndex = firstVisibleItemIndex.coerceAtLeast(0),
+                firstVisibleItemScrollOffset = firstVisibleItemScrollOffset.coerceAtLeast(0),
+            )
+        }
+        persistSessionUiState()
+    }
+
+    fun sessionScrollPosition(sessionId: String): UiSessionScrollPosition {
+        if (sessionId.isBlank()) return UiSessionScrollPosition()
+        return synchronized(sessionCacheLock) {
+            sessionScrollPositions[sessionId] ?: UiSessionScrollPosition()
         }
     }
 
@@ -792,8 +880,13 @@ class HamburUiStore(
         scope.launch {
             val targetSessionId = sessionId.ifBlank { ensureSessionForNewMessage() }
             if (targetSessionId.isBlank()) return@launch
+            setSessionThinkingEnabled(targetSessionId, deepThinkingEnabled)
             ensureDefaultTextProvider()
             val payload = sendPayloadJson(attachmentIds, deepThinkingEnabled, searchEnabled)
+            Log.i(
+                "ThinkingToggle",
+                "dispatch SendMessage target=$targetSessionId deepThinking=$deepThinkingEnabled payload=$payload",
+            )
             val ack = runtime.dispatch(
                 backendCommand(
                     kind = "SendMessage",
@@ -817,12 +910,18 @@ class HamburUiStore(
         if (sessionId.isBlank() || sourceMessageId.isBlank()) return
         scope.launch {
             ensureDefaultTextProvider()
+            val payload = sendPayloadJson(
+                attachmentIds = emptyList(),
+                deepThinkingEnabled = _state.value.thinkingEnabledForSession(sessionId),
+                searchEnabled = false,
+            )
             val ack = runtime.dispatch(
                 backendCommand(
                     kind = "RegenerateMessage",
                     idempotencyKey = "message:$sourceMessageId:regenerate:${nextCommandOrdinal()}",
                     sessionId = sessionId,
                     sourceMessageId = sourceMessageId,
+                    payloadJson = payload,
                 ),
             )
             applyRejectedAck(ack)
@@ -833,12 +932,18 @@ class HamburUiStore(
         if (sessionId.isBlank() || sourceMessageId.isBlank()) return
         scope.launch {
             ensureDefaultTextProvider()
+            val payload = sendPayloadJson(
+                attachmentIds = emptyList(),
+                deepThinkingEnabled = _state.value.thinkingEnabledForSession(sessionId),
+                searchEnabled = false,
+            )
             val ack = runtime.dispatch(
                 backendCommand(
                     kind = "RetryTurn",
                     idempotencyKey = "message:$sourceMessageId:retry:${nextCommandOrdinal()}",
                     sessionId = sessionId,
                     sourceMessageId = sourceMessageId,
+                    payloadJson = payload,
                 ),
             )
             applyRejectedAck(ack)
@@ -849,6 +954,11 @@ class HamburUiStore(
         if (sessionId.isBlank() || sourceMessageId.isBlank() || content.isBlank()) return
         scope.launch {
             ensureDefaultTextProvider()
+            val payload = sendPayloadJson(
+                attachmentIds = emptyList(),
+                deepThinkingEnabled = _state.value.thinkingEnabledForSession(sessionId),
+                searchEnabled = false,
+            )
             val ack = runtime.dispatch(
                 backendCommand(
                     kind = "EditMessage",
@@ -856,6 +966,7 @@ class HamburUiStore(
                     sessionId = sessionId,
                     sourceMessageId = sourceMessageId,
                     content = content,
+                    payloadJson = payload,
                 ),
             )
             applyRejectedAck(ack)
@@ -1059,6 +1170,7 @@ class HamburUiStore(
         }
 
         bufferedEvents.forEach(::applyEvent)
+        rememberSessionCache(_state.value, selectedSessionId)
         refreshVisibleMessageSnapshots()
         refreshKnowledgeSnapshots()
         runRootfsWarmup(selectedSessionId)
@@ -1074,40 +1186,33 @@ class HamburUiStore(
         if (settingsSnapshot.settingValue("startupChatMode", "last_chat") != "new_chat") {
             return defaultSessionId
         }
-
-        val emptySessionId = sessionSnapshot.sessions.firstOrNull { it.messageCount == 0u }?.id
-        if (!emptySessionId.isNullOrBlank()) {
-            if (emptySessionId != sessionSnapshot.selectedSessionId) {
-                applyRejectedAck(
-                    runtime.dispatch(
-                        backendCommand(
-                            kind = "OpenSession",
-                            idempotencyKey = "$emptySessionId:open:startup:${nextCommandOrdinal()}",
-                            sessionId = emptySessionId,
-                        ),
-                    ),
-                )
-            }
-            return emptySessionId
-        }
-
-        applyRejectedAck(
-            runtime.dispatch(
-                backendCommand(
-                    kind = "CreateSession",
-                    idempotencyKey = "session:create:startup:${nextCommandOrdinal()}",
-                    title = "New chat",
-                ),
-            ),
-        )
-        return runCatching {
-            runtime.getSessionListSnapshot(limit = 1u, offset = 0u).selectedSessionId
-        }.getOrDefault(defaultSessionId)
+        return ""
     }
 
-    private fun runCommand(block: () -> CommandAck) {
+    private fun runCommand(
+        commandKind: String = "Command",
+        targetSessionId: String = "",
+        block: () -> CommandAck,
+    ) {
+        val enqueueNs = ChatJankTracer.nowNs()
         scope.launch {
+            ChatJankTracer.markDuration(
+                phase = "command_queue_delay",
+                startNs = enqueueNs,
+                targetSessionId = targetSessionId,
+                warnAtMs = 4.0,
+                extra = "kind=$commandKind",
+            )
+            val dispatchStartNs = ChatJankTracer.nowNs()
             val ack = runCatching(block).getOrElse { error ->
+                ChatJankTracer.markDuration(
+                    phase = "command_dispatch_failed",
+                    startNs = dispatchStartNs,
+                    targetSessionId = targetSessionId,
+                    warnAtMs = 1.0,
+                    always = true,
+                    extra = "kind=$commandKind error=${error.message.orEmpty()}",
+                )
                 _state.update {
                     it.copy(
                         runtimeStatus = "Error",
@@ -1117,24 +1222,63 @@ class HamburUiStore(
                 return@launch
             }
 
+            ChatJankTracer.markDuration(
+                phase = "command_dispatch",
+                startNs = dispatchStartNs,
+                targetSessionId = targetSessionId,
+                warnAtMs = 4.0,
+                always = commandKind == "OpenSession",
+                extra = "kind=$commandKind accepted=${ack.accepted} rejection=${ack.rejectionCode}",
+            )
             applyRejectedAck(ack)
         }
     }
 
     private fun applyEvent(event: BackendEvent) {
+        val eventStartNs = ChatJankTracer.nowNs()
+        val targetSessionId = event.traceTargetSessionId()
+        val eventStats = event.traceStats()
+        if (event.message.startsWith("ThinkingToggle ")) {
+            Log.i("ThinkingToggle", event.message)
+        }
+        if (event.kind == "AssistantReasoningDelta") {
+            Log.i(
+                "ThinkingToggle",
+                "ui event AssistantReasoningDelta session=${event.sessionId} turn=${event.turnId} deltaLen=${event.message.length}",
+            )
+        }
         if (event.kind == "PlatformRequest") {
             handlePlatformRequest(event)
         }
         if (event.kind == "MarkdownRenderUpdate") {
+            ChatJankTracer.markSessionSwitch(
+                phase = "markdown_event_enqueue",
+                targetSessionId = targetSessionId,
+                extra = eventStats,
+            )
             enqueueMarkdownEvent(event)
             return
         }
         val markdownEvents = drainMarkdownEvents()
+        ChatJankTracer.markSessionSwitch(
+            phase = "event_apply_start",
+            targetSessionId = targetSessionId,
+            extra = "$eventStats drainedMarkdown=${markdownEvents.size}",
+        )
         _state.update { state ->
-            markdownEvents.fold(state) { nextState, markdownEvent ->
-                nextState.reduce(markdownEvent)
-            }.reduce(event)
+            ChatJankTracer.timeSessionSwitch(
+                phase = "state_reduce",
+                targetSessionId = targetSessionId,
+                warnAtMs = 4.0,
+                always = event.kind == "SessionOpened",
+                extra = "$eventStats drainedMarkdown=${markdownEvents.size}",
+            ) {
+                markdownEvents.fold(state) { nextState, markdownEvent ->
+                    nextState.reduce(markdownEvent)
+                }.reduce(event)
+            }
         }
+        rememberSessionCache(_state.value)
         if (event.kind == "SettingsChanged" || event.kind == "ModelsUpdated") {
             refreshSettingsSnapshot()
         }
@@ -1144,11 +1288,20 @@ class HamburUiStore(
             "MessageUpserted",
             "AssistantMessageStarted",
             "AssistantContentDelta",
+            "AssistantReasoningDelta",
             "AssistantMessageFinished",
             "TurnFinished",
             "TurnFailed",
             "TurnCancelled" -> refreshVisibleMessageSnapshots()
         }
+        ChatJankTracer.markDuration(
+            phase = "event_apply",
+            startNs = eventStartNs,
+            targetSessionId = targetSessionId,
+            warnAtMs = 6.0,
+            always = event.kind == "SessionOpened",
+            extra = "$eventStats drainedMarkdown=${markdownEvents.size}",
+        )
     }
 
     private fun handlePlatformRequest(event: BackendEvent) {
@@ -1238,6 +1391,7 @@ class HamburUiStore(
                 nextState.reduce(event)
             }
         }
+        rememberSessionCache(_state.value)
     }
 
     private fun drainMarkdownEvents(): List<BackendEvent> {
@@ -1259,11 +1413,84 @@ class HamburUiStore(
         }
     }
 
+    private fun applyCachedSession(sessionId: String) {
+        val cached = synchronized(sessionCacheLock) {
+            sessionCache[sessionId]
+        } ?: return
+
+        _state.update { state ->
+            if (state.selectedSessionId == sessionId) {
+                state
+            } else {
+                val sessionExists = state.sessions.any { it.id == sessionId }
+                state.copy(
+                    latestEventKind = "CachedSessionOpened",
+                    footer = "Cached session opened",
+                    selectedSessionId = sessionId,
+                    timelineItems = cached.timelineItems,
+                    messagesById = cached.messagesById,
+                    reasoningByMessageId = cached.reasoningByMessageId,
+                    pendingAttachments = cached.pendingAttachments,
+                    markdownBlocksByPayloadRef = cached.markdownBlocksByPayloadRef,
+                    activePreviewPath = "",
+                    snapshotSequence = if (sessionExists) state.snapshotSequence else cached.snapshotSequence,
+                )
+            }
+        }
+    }
+
+    private fun rememberSessionCache(state: HamburUiState, sessionId: String = state.selectedSessionId) {
+        if (sessionId.isBlank()) return
+        val entry = UiSessionCacheEntry(
+            timelineItems = state.timelineItems,
+            markdownBlocksByPayloadRef = state.markdownBlocksByPayloadRef,
+            messagesById = state.messagesById,
+            reasoningByMessageId = state.reasoningByMessageId,
+            pendingAttachments = state.pendingAttachments,
+            snapshotSequence = state.snapshotSequence,
+        )
+        synchronized(sessionCacheLock) {
+            sessionCache[sessionId] = entry
+            val keys = sessionCache.keys.toList()
+            if (keys.size > SESSION_CACHE_LIMIT) {
+                keys.take(keys.size - SESSION_CACHE_LIMIT).forEach { sessionCache.remove(it) }
+            }
+        }
+    }
+
+    private fun persistSessionUiState() {
+        val shouldSchedule = synchronized(sessionCacheLock) {
+            if (sessionUiStatePersistScheduled) {
+                false
+            } else {
+                sessionUiStatePersistScheduled = true
+                true
+            }
+        }
+        if (!shouldSchedule) return
+
+        scope.launch {
+            delay(250)
+            val snapshot = synchronized(sessionCacheLock) {
+                sessionUiStatePersistScheduled = false
+                PersistedSessionUiState(
+                    thinkingEnabledBySession = _state.value.thinkingEnabledBySession,
+                    scrollPositions = sessionScrollPositions.toMap(),
+                )
+            }
+            runCatching {
+                sessionUiStateFile.parentFile?.mkdirs()
+                sessionUiStateFile.writeText(snapshot.toJsonString())
+            }.onFailure { error ->
+                Log.w("HamburUiStore", "Failed to persist session UI state: ${error.message}")
+            }
+        }
+    }
+
     private fun ensureSessionForNewMessage(): String {
         val currentState = _state.value
-        currentState.selectedSessionId.ifBlank {
-            currentState.sessions.firstOrNull { it.messageCount == 0u }?.id.orEmpty()
-        }.takeIf { it.isNotBlank() }?.let { sessionId ->
+        if (!currentState.isDraftNewSession && currentState.selectedSessionId.isNotBlank()) {
+            val sessionId = currentState.selectedSessionId
             val ack = runtime.dispatch(
                 backendCommand(
                     kind = "OpenSession",
@@ -1285,9 +1512,20 @@ class HamburUiStore(
         applyRejectedAck(ack)
         if (!ack.accepted) return ""
 
-        return runCatching {
+        val sessionId = runCatching {
             runtime.getSessionListSnapshot(limit = 1u, offset = 0u).selectedSessionId
         }.getOrDefault("")
+        if (sessionId.isNotBlank()) {
+            val draftThinking = _state.value.thinkingEnabledForSession("")
+            _state.update {
+                it.copy(
+                    isDraftNewSession = false,
+                    thinkingEnabledBySession = it.thinkingEnabledBySession + (sessionId to draftThinking),
+                )
+            }
+            persistSessionUiState()
+        }
+        return sessionId
     }
 
     private fun refreshSettingsSnapshot() {
@@ -1347,14 +1585,25 @@ class HamburUiStore(
 
     private fun refreshVisibleMessageSnapshots() {
         val current = _state.value
-        val messageItems = current.timelineItems
+        val userMessageIds = current.timelineItems
             .asSequence()
             .filter { it.contentType == "user_message" && it.payloadRef.isNotBlank() }
-            .filter { item ->
-                val cached = current.messagesById[item.payloadRef]
-                cached == null || cached.versionSequence < item.versionSequence
+            .map { it.payloadRef to it.versionSequence }
+        val assistantMessageIds = current.timelineItems
+            .asSequence()
+            .filter { it.isAssistantMarkdownBlock() && it.payloadRef.isNotBlank() }
+            .mapNotNull { item ->
+                val messageId = current.markdownBlocksByPayloadRef[item.payloadRef]?.messageId
+                    ?.takeIf { it.isNotBlank() }
+                    ?: return@mapNotNull null
+                messageId to item.versionSequence
             }
-            .map { it.payloadRef }
+        val messageItems = (userMessageIds + assistantMessageIds)
+            .filter { (messageId, versionSequence) ->
+                val cached = current.messagesById[messageId]
+                cached == null || cached.versionSequence < versionSequence
+            }
+            .map { it.first }
             .distinct()
             .toList()
         if (messageItems.isEmpty()) return
@@ -1366,9 +1615,20 @@ class HamburUiStore(
                 }.getOrNull()
             }
             if (loaded.isEmpty()) return@launch
+            loaded.forEach { message ->
+                Log.i(
+                    "ThinkingToggle",
+                    "ui snapshot message=${message.id} role=${message.role} contentLen=${message.contentText.length} reasoningLen=${message.reasoningContent.length}",
+                )
+            }
             _state.update { state ->
+                val loadedReasoning = loaded
+                    .asSequence()
+                    .filter { it.role == "assistant" && it.reasoningContent.isNotBlank() }
+                    .associate { it.id to it.reasoningContent }
                 state.copy(
                     messagesById = state.messagesById + loaded.associateBy { it.id },
+                    reasoningByMessageId = state.reasoningByMessageId + loadedReasoning,
                 )
             }
         }
@@ -1478,6 +1738,7 @@ private fun HamburUiState.applyBaseline(
         selectedSessionId = selectedSessionId,
         timelineItems = timelineItems.toUiTimelineItems(),
         messagesById = emptyMap(),
+        reasoningByMessageId = emptyMap(),
         providers = settingsSnapshot?.providers?.toUiProviders().orEmpty(),
         providerModels = settingsSnapshot?.providerModels?.toUiProviderModels().orEmpty(),
         modelGroups = settingsSnapshot?.modelGroups?.toUiModelGroups().orEmpty(),
@@ -1492,6 +1753,9 @@ private fun HamburUiState.applyBaseline(
         lastAppliedSequence = baselineSequence,
         appliedEventIds = emptySet(),
         activeTurnIds = emptyMap(),
+        defaultThinkingEnabled = settingsSnapshot.settingBool("defaultDeepThinkingEnabled", false),
+        isDraftNewSession = selectedSessionId.isBlank() &&
+            settingsSnapshot.settingValue("startupChatMode", "last_chat") == "new_chat",
     )
 }
 
@@ -1504,6 +1768,7 @@ private fun HamburUiState.applySettingsSnapshot(snapshot: SettingsSnapshotDto): 
         defaultModelGroups = snapshot.defaultModelGroups.toUiDefaultModelGroups(),
         appSettings = snapshot.settings.toUiAppSettings(),
         configAudits = snapshot.configAudits.toUiConfigAudits(),
+        defaultThinkingEnabled = snapshot.settingBool("defaultDeepThinkingEnabled", defaultThinkingEnabled),
     )
 }
 
@@ -1613,6 +1878,16 @@ private fun HamburUiState.reduce(event: BackendEvent): HamburUiState {
             markdownBlocksByPayloadRef + snapshotMarkdownBlocksByPayloadRef
         }
     ).filterKeys { it in visibleMarkdownPayloadRefs }
+    val snapshotReasoningByMessageId = messagesById
+        .values
+        .asSequence()
+        .filter { it.role == "assistant" && it.reasoningContent.isNotBlank() }
+        .associate { it.id to it.reasoningContent }
+    val nextReasoningByMessageId = if (sessionChanged) {
+        snapshotReasoningByMessageId
+    } else {
+        reasoningByMessageId + snapshotReasoningByMessageId
+    }
 
     return copy(
         runtimeStatus = status,
@@ -1622,6 +1897,7 @@ private fun HamburUiState.reduce(event: BackendEvent): HamburUiState {
         selectedSessionId = nextSelectedSessionId,
         timelineItems = nextTimelineItems,
         messagesById = if (sessionChanged) emptyMap() else messagesById,
+        reasoningByMessageId = nextReasoningByMessageId,
         pendingAttachments = snapshot.pendingAttachments.toUiPendingAttachments(),
         markdownBlocksByPayloadRef = nextMarkdownBlocksByPayloadRef,
         activePreviewPath = if (sessionChanged) "" else activePreviewPath,
@@ -1629,6 +1905,7 @@ private fun HamburUiState.reduce(event: BackendEvent): HamburUiState {
         lastAppliedSequence = event.sequence,
         appliedEventIds = nextAppliedEventIds,
         activeTurnIds = updateActiveTurnIds(event),
+        isDraftNewSession = false,
     )
 }
 
@@ -1640,6 +1917,21 @@ private fun BackendEvent.switchesVisibleSession(): Boolean {
         "SessionDeleted" -> true
         else -> false
     }
+}
+
+private fun BackendEvent.traceTargetSessionId(): String {
+    return when {
+        snapshot.selectedSessionId.isNotBlank() -> snapshot.selectedSessionId
+        sessionId.isNotBlank() -> sessionId
+        else -> ""
+    }
+}
+
+private fun BackendEvent.traceStats(): String {
+    return "kind=$kind sequence=$sequence eventSession=${traceShortId(sessionId)} " +
+        "selected=${traceShortId(snapshot.selectedSessionId)} " +
+        "sessions=${snapshot.sessions.size} timelineItems=${snapshot.timelineItems.size} " +
+        "markdownPayloads=${snapshot.markdownBlockPayloads.size}"
 }
 
 private fun BackendEvent.targetsVisibleSession(selectedSessionId: String): Boolean {
@@ -1690,6 +1982,19 @@ private fun HamburUiState.updateActiveTurnIds(event: BackendEvent): Map<String, 
     }
 }
 
+fun HamburUiState.thinkingEnabledForSession(sessionId: String = selectedSessionId): Boolean {
+    if (sessionId.isBlank()) {
+        return thinkingEnabledBySession[NEW_SESSION_THINKING_KEY] ?: defaultThinkingEnabled
+    }
+    return thinkingEnabledBySession[sessionId] ?: defaultThinkingEnabled
+}
+
+fun HamburUiState.isNewSessionBlank(): Boolean {
+    if (isDraftNewSession || selectedSessionId.isBlank()) return true
+    val selected = sessions.firstOrNull { it.id == selectedSessionId } ?: return false
+    return selected.messageCount == 0u && timelineItems.isEmpty()
+}
+
 private fun HamburUiState.rememberEventId(eventId: String): Set<String> {
     if (eventId.isBlank()) return appliedEventIds
     val next = appliedEventIds + eventId
@@ -1726,6 +2031,11 @@ private fun List<MarkdownBlockPayloadDto>.toMarkdownBlockMap(): Map<String, Mark
 
 private fun UiTimelineItem.isAssistantMarkdownBlock(): Boolean {
     return contentType == "assistant_markdown_block" || contentType == "assistant_pending_block"
+}
+
+private fun traceShortId(id: String): String {
+    if (id.isBlank()) return "-"
+    return if (id.length <= 10) id else id.take(4) + ".." + id.takeLast(6)
 }
 
 private fun MessageDto.toUiMessageSnapshot(): UiMessageSnapshot {
@@ -1961,6 +2271,55 @@ private fun sendPayloadJson(
     return """{"attachmentIds":$attachments,"deepThinkingEnabled":$deepThinkingEnabled,"searchEnabled":$searchEnabled}"""
 }
 
+private fun loadPersistedSessionUiState(file: File): PersistedSessionUiState {
+    return runCatching {
+        val root = JSONObject(file.takeIf { it.exists() }?.readText().orEmpty())
+        val thinking = mutableMapOf<String, Boolean>()
+        root.optJSONObject("thinkingEnabledBySession")?.let { objectValue ->
+            objectValue.keys().forEach { key ->
+                thinking[key] = objectValue.optBoolean(key, false)
+            }
+        }
+        val scroll = mutableMapOf<String, UiSessionScrollPosition>()
+        root.optJSONObject("scrollPositions")?.let { objectValue ->
+            objectValue.keys().forEach { key ->
+                val position = objectValue.optJSONObject(key) ?: return@forEach
+                scroll[key] = UiSessionScrollPosition(
+                    firstVisibleItemIndex = position.optInt("firstVisibleItemIndex", 0).coerceAtLeast(0),
+                    firstVisibleItemScrollOffset = position.optInt("firstVisibleItemScrollOffset", 0).coerceAtLeast(0),
+                )
+            }
+        }
+        PersistedSessionUiState(
+            thinkingEnabledBySession = thinking,
+            scrollPositions = scroll,
+        )
+    }.getOrDefault(PersistedSessionUiState())
+}
+
+private fun PersistedSessionUiState.toJsonString(): String {
+    val thinking = JSONObject().apply {
+        thinkingEnabledBySession.forEach { (sessionId, enabled) ->
+            put(sessionId, enabled)
+        }
+    }
+    val scroll = JSONObject().apply {
+        scrollPositions.forEach { (sessionId, position) ->
+            put(
+                sessionId,
+                JSONObject().apply {
+                    put("firstVisibleItemIndex", position.firstVisibleItemIndex)
+                    put("firstVisibleItemScrollOffset", position.firstVisibleItemScrollOffset)
+                },
+            )
+        }
+    }
+    return JSONObject().apply {
+        put("thinkingEnabledBySession", thinking)
+        put("scrollPositions", scroll)
+    }.toString()
+}
+
 private fun providerRefreshPayload(secretRef: String): String {
     return JSONObject().apply {
         if (secretRef.isNotBlank()) put("secretRef", secretRef)
@@ -1978,3 +2337,10 @@ private fun SettingsSnapshotDto?.settingValue(key: String, fallback: String): St
         ?.value
         ?: fallback
 }
+
+private fun SettingsSnapshotDto?.settingBool(key: String, fallback: Boolean): Boolean {
+    return settingValue(key, if (fallback) "true" else "false") == "true"
+}
+
+private const val SESSION_CACHE_LIMIT = 8
+private const val NEW_SESSION_THINKING_KEY = "__new_session__"

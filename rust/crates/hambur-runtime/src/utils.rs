@@ -1088,6 +1088,7 @@ pub(crate) fn append_transcript_entry_to_context(
             messages.push(ModelMessage {
                 role: "assistant".to_string(),
                 content: message.content_text,
+                reasoning_content: message.reasoning_content,
                 tool_calls_json,
                 tool_call_id: String::new(),
             });
@@ -1102,6 +1103,7 @@ pub(crate) fn append_transcript_entry_to_context(
             messages.push(ModelMessage {
                 role: "tool".to_string(),
                 content: message.content_text,
+                reasoning_content: String::new(),
                 tool_calls_json: String::new(),
                 tool_call_id: message.tool_call_id,
             });
@@ -1330,6 +1332,7 @@ pub(crate) fn tool_continuation_stream_source(
     route: &ModelRouteSnapshot,
     tools_json: &str,
     assistant_content: &str,
+    assistant_reasoning: &str,
     tool_calls: Vec<CompleteToolCall>,
     tool_result_messages: Vec<ModelMessage>,
     mut continuation_sse: Vec<String>,
@@ -1345,6 +1348,7 @@ pub(crate) fn tool_continuation_stream_source(
     request.messages.push(ModelMessage {
         role: "assistant".to_string(),
         content: assistant_content.to_string(),
+        reasoning_content: assistant_reasoning.to_string(),
         tool_calls_json: complete_tool_calls_json(&tool_calls)?,
         tool_call_id: String::new(),
     });
@@ -1398,9 +1402,6 @@ pub(crate) fn openai_non_stream_request(
     let mut body: Value = serde_json::from_str(&spec.body_json)
         .map_err(|error| HamburError::InvalidCommand(format!("invalid request body: {error}")))?;
     body["stream"] = json!(false);
-    if request.reasoning_mode == ReasoningMode::Disabled {
-        body["thinking"] = json!({"type": "disabled"});
-    }
     spec.body_json = body.to_string();
     Ok(spec)
 }

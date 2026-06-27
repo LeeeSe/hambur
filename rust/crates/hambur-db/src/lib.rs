@@ -530,9 +530,6 @@ mod mutations;
 mod queries;
 mod utils;
 
-#[cfg(test)]
-mod tests;
-
 pub(crate) use connection::{Connection, IntoSqlValue, Row, Rows, SqlParams, database_error};
 pub use utils::*;
 

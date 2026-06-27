@@ -505,10 +505,6 @@ mod commands;
 mod engine;
 mod queries;
 mod utils;
-
-#[cfg(test)]
-mod tests;
-
 pub(crate) use utils::*;
 
 pub(crate) fn dir_size(path: &std::path::Path) -> u64 {

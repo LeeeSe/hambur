@@ -945,6 +945,24 @@ impl RuntimeEngine {
                 return rejected_ack(command.command_id, command.idempotency_key, error);
             }
         };
+        let attachment_path = match self.sandbox.resolve(
+            &command.session_id,
+            &reserved.sandbox_path,
+            SandboxAccess::Read,
+        ) {
+            Ok(resolved) => resolved.host_path,
+            Err(error) => {
+                let _ = self.emit_error(error.clone());
+                return rejected_ack(command.command_id, command.idempotency_key, error);
+            }
+        };
+        if let Some(parent) = attachment_path.parent()
+            && let Err(error) = fs::create_dir_all(parent)
+        {
+            let error = HamburError::Internal(format!("create attachment parent: {error}"));
+            let _ = self.emit_error(error.clone());
+            return rejected_ack(command.command_id, command.idempotency_key, error);
+        }
 
         if !metadata.bytes_base64.trim().is_empty() {
             let bytes = match BASE64_STANDARD.decode(metadata.bytes_base64.as_bytes()) {
@@ -956,29 +974,30 @@ impl RuntimeEngine {
                     return rejected_ack(command.command_id, command.idempotency_key, error);
                 }
             };
-            if let Err(error) = fs::write(&reserved.host_path, bytes) {
+            if let Err(error) = fs::write(&attachment_path, bytes) {
                 let error = HamburError::Internal(format!("write attachment bytes: {error}"));
                 let _ = self.emit_error(error.clone());
                 return rejected_ack(command.command_id, command.idempotency_key, error);
             }
         } else if !metadata.source_path.trim().is_empty() {
-            if let Err(error) = fs::copy(&metadata.source_path, &reserved.host_path)
+            if let Err(error) = fs::copy(&metadata.source_path, &attachment_path)
                 .map(|_| ())
                 .map_err(|error| HamburError::Internal(format!("copy attachment source: {error}")))
             {
                 let _ = self.emit_error(error.clone());
                 return rejected_ack(command.command_id, command.idempotency_key, error);
             }
-        } else if !reserved.host_path.exists()
-            && let Err(error) = fs::write(&reserved.host_path, [])
+        } else if !attachment_path.exists()
+            && let Err(error) = fs::write(&attachment_path, [])
         {
             let error = HamburError::Internal(format!("create attachment placeholder: {error}"));
             let _ = self.emit_error(error.clone());
             return rejected_ack(command.command_id, command.idempotency_key, error);
         }
 
-        let byte_size = if reserved.host_path.exists() {
-            fs::metadata(&reserved.host_path)
+        let _ = fs::copy(&attachment_path, &reserved.host_path);
+        let byte_size = if attachment_path.exists() {
+            fs::metadata(&attachment_path)
                 .map(|metadata| metadata.len())
                 .unwrap_or(metadata.byte_size)
         } else {

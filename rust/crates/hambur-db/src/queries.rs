@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::*;
 
 impl HamburDatabase {
@@ -924,9 +926,11 @@ impl HamburDatabase {
                 trace_status: row.get::<String>(10).map_err(database_error)?,
                 tool_call_id: row.get::<String>(11).map_err(database_error)?,
                 tool_name: row.get::<String>(12).map_err(database_error)?,
+                attachments: Vec::new(),
             });
         }
 
+        self.hydrate_timeline_attachments(&mut items).await?;
         Ok(items)
     }
     pub(crate) async fn timeline_items_page(
@@ -1017,6 +1021,7 @@ impl HamburDatabase {
         } else {
             0
         };
+        self.hydrate_timeline_attachments(&mut items).await?;
 
         Ok(TimelinePageData {
             items,
@@ -1140,7 +1145,10 @@ impl HamburDatabase {
             )));
         };
 
-        timeline_item_from_row(&row)
+        let mut item = timeline_item_from_row(&row)?;
+        self.hydrate_timeline_attachments(std::slice::from_mut(&mut item))
+            .await?;
+        Ok(item)
     }
     pub(crate) async fn message_by_id(
         &self,
@@ -1588,6 +1596,79 @@ impl HamburDatabase {
             attachments.push(attachment_from_row(&row)?);
         }
         Ok(attachments)
+    }
+
+    async fn hydrate_timeline_attachments(
+        &self,
+        items: &mut [TimelineItemSnapshot],
+    ) -> HamburResult<()> {
+        let message_ids = items
+            .iter()
+            .filter(|item| {
+                item.content_type == "user_message" && !item.payload_ref.trim().is_empty()
+            })
+            .map(|item| item.payload_ref.clone())
+            .collect::<Vec<_>>();
+        if message_ids.is_empty() {
+            return Ok(());
+        }
+
+        let placeholders = std::iter::repeat("?")
+            .take(message_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "
+            SELECT
+                id,
+                session_id,
+                message_id,
+                kind,
+                display_name,
+                mime_type,
+                byte_size,
+                origin_type,
+                original_uri,
+                file_id,
+                sandbox_path,
+                width,
+                height,
+                sha256,
+                status,
+                created_at_ms,
+                updated_at_ms
+            FROM attachments
+            WHERE status = 'attached'
+              AND message_id IN ({placeholders})
+            ORDER BY created_at_ms ASC, id ASC
+            "
+        );
+        let params = message_ids
+            .iter()
+            .map(IntoSqlValue::into_sql_value)
+            .collect::<Vec<_>>();
+        let mut rows = self
+            .connection
+            .query(&sql, params)
+            .await
+            .map_err(database_error)?;
+
+        let mut attachments_by_message_id: HashMap<String, Vec<AttachmentRecord>> = HashMap::new();
+        while let Some(row) = rows.next().await.map_err(database_error)? {
+            let attachment = attachment_from_row(&row)?;
+            attachments_by_message_id
+                .entry(attachment.message_id.clone())
+                .or_default()
+                .push(attachment);
+        }
+
+        for item in items {
+            item.attachments = attachments_by_message_id
+                .get(&item.payload_ref)
+                .cloned()
+                .unwrap_or_default();
+        }
+        Ok(())
     }
 
     pub(crate) async fn file_cleanup_job_by_id(

@@ -223,6 +223,18 @@ impl SandboxService {
         fs::create_dir_all(&root)
             .map_err(|error| HamburError::Internal(format!("create sandbox root: {error}")))?;
         let rootfs_dir = app_files_dir.join("alpine-rootfs");
+        eprintln!(
+            "RootfsDebug sandbox_new app_files_dir={} native_library_dir={} root={} rootfs_dir={} root_exists={} rootfs_exists={}",
+            app_files_dir.display(),
+            native_library_dir
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+            root.display(),
+            rootfs_dir.display(),
+            root.exists(),
+            rootfs_dir.exists()
+        );
         Ok(Self {
             root,
             app_files_dir,
@@ -371,10 +383,32 @@ impl SandboxService {
     pub fn is_rootfs_installed(&self) -> bool {
         let shell = self.rootfs_dir.join("bin/sh");
         let busybox = self.rootfs_dir.join("bin/busybox");
-        fs::symlink_metadata(&shell).is_ok()
-            && fs::symlink_metadata(&busybox)
-                .map(|metadata| metadata.file_type().is_file())
-                .unwrap_or(false)
+        let shell_meta = fs::symlink_metadata(&shell);
+        let busybox_meta = fs::symlink_metadata(&busybox);
+        let shell_exists = shell_meta.is_ok();
+        let busybox_is_file = busybox_meta
+            .as_ref()
+            .map(|metadata| metadata.file_type().is_file())
+            .unwrap_or(false);
+        let installed = shell_exists && busybox_is_file;
+        eprintln!(
+            "RootfsDebug is_rootfs_installed installed={} rootfs_dir={} shell={} shell_ok={} shell_err={} busybox={} busybox_file={} busybox_err={}",
+            installed,
+            self.rootfs_dir.display(),
+            shell.display(),
+            shell_exists,
+            shell_meta
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default(),
+            busybox.display(),
+            busybox_is_file,
+            busybox_meta
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default()
+        );
+        installed
     }
 
     fn recreate_rootfs_dir_for_install(&self) -> HamburResult<()> {
@@ -579,7 +613,17 @@ impl SandboxService {
 
     pub fn probe_rootfs_status(&self, requested_backend: &str) -> RootfsStatus {
         let abi = android_abi();
+        eprintln!(
+            "RootfsDebug probe_rootfs_status_start requested_backend={} abi={} rootfs_dir={}",
+            requested_backend,
+            abi,
+            self.rootfs_dir.display()
+        );
         if abi != "arm64-v8a" {
+            eprintln!(
+                "RootfsDebug probe_rootfs_status_result available=false backend={} reason=UnsupportedAbi",
+                normalize_backend(requested_backend)
+            );
             return RootfsStatus {
                 available: false,
                 backend: normalize_backend(requested_backend),
@@ -589,6 +633,10 @@ impl SandboxService {
         }
         let rootfs_installed = self.is_rootfs_installed();
         if !rootfs_installed {
+            eprintln!(
+                "RootfsDebug probe_rootfs_status_result available=false backend={} reason=rootfs_not_initialized",
+                normalize_backend(requested_backend)
+            );
             return RootfsStatus {
                 available: false,
                 backend: normalize_backend(requested_backend),
@@ -612,6 +660,10 @@ impl SandboxService {
         } else {
             proot_available
         };
+        eprintln!(
+            "RootfsDebug probe_rootfs_status_probes backend={} chroot_available={} proot_available={} fallback_proot_available={}",
+            backend, chroot_available, proot_available, fallback_proot_available
+        );
         if backend == "chroot" {
             if chroot_available {
                 RootfsStatus {
@@ -657,6 +709,10 @@ impl SandboxService {
     pub fn probe_root_available(&self) -> bool {
         if let Ok(cache) = self.probe_cache.lock() {
             if let Some(probe) = cache.root.as_ref().filter(|probe| probe.is_fresh()) {
+                eprintln!(
+                    "RootfsDebug probe_root_available cached=true available={}",
+                    probe.available
+                );
                 return probe.available;
             }
         }
@@ -666,8 +722,9 @@ impl SandboxService {
             .output();
         let available = match root_check {
             Ok(out) => out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "0",
-            Err(_) => false,
-        };
+                Err(_) => false,
+            };
+        eprintln!("RootfsDebug probe_root_available available={available}");
         if let Ok(mut cache) = self.probe_cache.lock() {
             cache.root = Some(TimedProbe {
                 available,
@@ -680,6 +737,10 @@ impl SandboxService {
     pub fn probe_chroot_available(&self) -> bool {
         if let Ok(cache) = self.probe_cache.lock() {
             if let Some(probe) = cache.chroot.as_ref().filter(|probe| probe.is_fresh()) {
+                eprintln!(
+                    "RootfsDebug probe_chroot_available cached=true available={}",
+                    probe.available
+                );
                 return probe.available;
             }
         }
@@ -695,12 +756,22 @@ impl SandboxService {
                 .output();
                 match chroot_check {
                     Ok(out) => {
+                        eprintln!(
+                            "RootfsDebug probe_chroot_available status={} stdout={} stderr={}",
+                            out.status,
+                            String::from_utf8_lossy(&out.stdout).trim(),
+                            String::from_utf8_lossy(&out.stderr).trim()
+                        );
                         out.status.success()
                             && String::from_utf8_lossy(&out.stdout).contains("hambur-chroot-ok")
                     }
-                    Err(_) => false,
+                    Err(error) => {
+                        eprintln!("RootfsDebug probe_chroot_available spawn_error={error}");
+                        false
+                    }
                 }
             };
+        eprintln!("RootfsDebug probe_chroot_available available={available}");
         if let Ok(mut cache) = self.probe_cache.lock() {
             cache.chroot = Some(TimedProbe {
                 available,
@@ -713,6 +784,10 @@ impl SandboxService {
     pub fn probe_proot_available(&self) -> bool {
         if let Ok(cache) = self.probe_cache.lock() {
             if let Some(probe) = cache.proot.as_ref().filter(|probe| probe.is_fresh()) {
+                eprintln!(
+                    "RootfsDebug probe_proot_available cached=true available={}",
+                    probe.available
+                );
                 return probe.available;
             }
         }
@@ -720,7 +795,7 @@ impl SandboxService {
             let tmp_dir = self.app_files_dir.join("tmp/proot");
             let _ = fs::create_dir_all(&tmp_dir);
             let tmp_dir_str = tmp_dir.to_string_lossy().into_owned();
-            let proot_check = std::process::Command::new(proot_bin)
+            let proot_check = std::process::Command::new(&proot_bin)
                 .arg("-0")
                 .arg("-r")
                 .arg(&self.rootfs_dir)
@@ -736,14 +811,29 @@ impl SandboxService {
                 .output();
             match proot_check {
                 Ok(out) => {
+                    eprintln!(
+                        "RootfsDebug probe_proot_available bin={} status={} stdout={} stderr={}",
+                        proot_bin.display(),
+                        out.status,
+                        String::from_utf8_lossy(&out.stdout).trim(),
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    );
                     out.status.success()
                         && String::from_utf8_lossy(&out.stdout).contains("hambur-proot-ok")
                 }
-                Err(_) => false,
+                Err(error) => {
+                    eprintln!(
+                        "RootfsDebug probe_proot_available bin={} spawn_error={error}",
+                        proot_bin.display()
+                    );
+                    false
+                }
             }
         } else {
+            eprintln!("RootfsDebug probe_proot_available missing_proot_binary=true");
             false
         };
+        eprintln!("RootfsDebug probe_proot_available available={available}");
         if let Ok(mut cache) = self.probe_cache.lock() {
             cache.proot = Some(TimedProbe {
                 available,
@@ -1892,4 +1982,3 @@ fn create_dummy_rootfs_tar_gz(path: &Path) -> std::io::Result<()> {
     tar.finish()?;
     Ok(())
 }
-

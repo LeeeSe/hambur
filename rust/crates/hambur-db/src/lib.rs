@@ -43,6 +43,7 @@ pub struct TimelineItemSnapshot {
     pub trace_status: String,
     pub tool_call_id: String,
     pub tool_name: String,
+    pub attachments: Vec<AttachmentRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

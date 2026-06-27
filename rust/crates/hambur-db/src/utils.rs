@@ -613,6 +613,7 @@ pub(crate) fn timeline_item_from_row(row: &Row) -> HamburResult<TimelineItemSnap
         trace_status: row.get::<String>(10).map_err(database_error)?,
         tool_call_id: row.get::<String>(11).map_err(database_error)?,
         tool_name: row.get::<String>(12).map_err(database_error)?,
+        attachments: Vec::new(),
     })
 }
 

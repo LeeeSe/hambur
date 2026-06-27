@@ -203,6 +203,11 @@ impl RuntimeEngine {
             .block_on(self.database.settings_snapshot())
             .unwrap_or_default();
         let requested_backend = get_rootfs_backend(&settings_snap.settings);
+        eprintln!(
+            "RootfsDebug get_rootfs_status_start app_files_dir={} requested_backend={}",
+            self.app_files_dir(),
+            requested_backend
+        );
 
         // Dynamically probe status
         let probed = self.sandbox.probe_rootfs_status(requested_backend);
@@ -223,7 +228,20 @@ impl RuntimeEngine {
             String::new()
         };
 
-        let size_bytes = dir_size(self.sandbox.rootfs_dir());
+        let size_bytes = rootfs_storage_size(self.sandbox.rootfs_dir());
+        eprintln!(
+            "RootfsDebug get_rootfs_status_result installed={} backend={} probed_available={} probed_reason={} root_available={} chroot_available={} proot_available={} version={} size={} rootfs_path={}",
+            rootfs_installed,
+            probed.backend,
+            probed.available,
+            probed.reason,
+            root_available,
+            chroot_available,
+            proot_available,
+            version,
+            size_bytes,
+            self.sandbox.rootfs_dir().display()
+        );
 
         RuntimeRootfsStatus {
             rootfs_installed,
@@ -489,5 +507,51 @@ impl RuntimeEngine {
             "total": total,
             "summary": format!("{} matches", total)
         }))
+    }
+}
+
+fn rootfs_storage_size(root: &std::path::Path) -> u64 {
+    rootfs_storage_size_inner(root, root)
+}
+
+fn rootfs_storage_size_inner(root: &std::path::Path, path: &std::path::Path) -> u64 {
+    if should_skip_rootfs_size_path(root, path) {
+        return 0;
+    }
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(_) => return 0,
+    };
+    if metadata.is_file() {
+        return metadata.len();
+    }
+    if !metadata.is_dir() {
+        return 0;
+    }
+    let mut size = 0;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            size += rootfs_storage_size_inner(root, &entry.path());
+        }
+    }
+    size
+}
+
+fn should_skip_rootfs_size_path(root: &std::path::Path, path: &std::path::Path) -> bool {
+    let relative = match path.strip_prefix(root) {
+        Ok(relative) => relative,
+        Err(_) => return true,
+    };
+    let mut components = relative.components();
+    match components.next() {
+        None => false,
+        Some(std::path::Component::Normal(name)) if name == "proc" || name == "sys" || name == "dev" => true,
+        Some(std::path::Component::Normal(name)) if name == "var" => {
+            matches!(
+                components.next(),
+                Some(std::path::Component::Normal(next)) if next == "hambur"
+            )
+        }
+        _ => false,
     }
 }

@@ -36,8 +36,10 @@ impl FileStore {
         let session_id = safe_segment(session_id, "session_id")?;
         let file_id = new_id("file");
         let name = safe_file_name(display_name);
-        let relative_path = format!("sessions/{session_id}/attachments/{file_id}-{name}");
-        self.resolve_reserved(&file_id, &relative_path)
+        let file_name = format!("{file_id}-{name}");
+        let relative_path = format!("sessions/{session_id}/attachments/uploads/{file_name}");
+        let sandbox_path = format!("/var/hambur/attachments/uploads/{file_name}");
+        self.resolve_reserved(&file_id, &relative_path, sandbox_path)
     }
 
     pub fn reserve_cache_image(
@@ -49,7 +51,7 @@ impl FileStore {
         let file_id = new_id("file");
         let extension = safe_extension(extension);
         let relative_path = format!("cache/{session_id}/{file_id}.{extension}");
-        self.resolve_reserved(&file_id, &relative_path)
+        self.resolve_reserved(&file_id, &relative_path, format!("/var/hambur/{relative_path}"))
     }
 
     pub fn host_path_for_relative(&self, relative_path: &str) -> HamburResult<PathBuf> {
@@ -73,7 +75,12 @@ impl FileStore {
         Ok(())
     }
 
-    fn resolve_reserved(&self, file_id: &str, relative_path: &str) -> HamburResult<StoredFilePath> {
+    fn resolve_reserved(
+        &self,
+        file_id: &str,
+        relative_path: &str,
+        sandbox_path: String,
+    ) -> HamburResult<StoredFilePath> {
         let host_path = self.host_path_for_relative(relative_path)?;
         if let Some(parent) = host_path.parent() {
             fs::create_dir_all(parent).map_err(|error| {
@@ -84,7 +91,7 @@ impl FileStore {
             file_id: file_id.to_string(),
             relative_path: relative_path.to_string(),
             host_path,
-            sandbox_path: format!("/var/hambur/{relative_path}"),
+            sandbox_path,
         })
     }
 }

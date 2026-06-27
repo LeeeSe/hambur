@@ -63,6 +63,7 @@ data class UiTimelineItem(
     val traceStatus: String = "",
     val toolCallId: String = "",
     val toolName: String = "",
+    val attachments: List<UiPendingAttachment> = emptyList(),
 )
 
 data class UiMessageSnapshot(
@@ -236,6 +237,12 @@ class HamburUiStore(
     private val platformAdapter: AndroidPlatformAdapter,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    init {
+        Log.i(
+            "RootfsDebug",
+            "HamburUiStore init appFilesDir=$appFilesDir nativeLibraryDir=$nativeLibraryDir",
+        )
+    }
     private val runtime = createRuntime(
         AppBootstrapConfig(
             appFilesDir = appFilesDir,
@@ -679,10 +686,16 @@ class HamburUiStore(
     fun refreshRootfsStatus() {
         scope.launch {
             try {
+                Log.i("RootfsDebug", "refreshRootfsStatus start")
                 val status = runtime.getRootfsStatus()
+                Log.i(
+                    "RootfsDebug",
+                    "refreshRootfsStatus result installed=${status.rootfsInstalled} backend=${status.backend} root=${status.rootAvailable} chroot=${status.chrootAvailable} proot=${status.prootAvailable} version=${status.version} size=${status.rootfsSizeBytes} path=${status.rootfsPath}",
+                )
                 _state.update { it.copy(rootfsStatus = status) }
             } catch (e: Exception) {
                 Log.e("HamburUiStore", "Failed to refresh rootfs status: ${e.message}", e)
+                Log.e("RootfsDebug", "refreshRootfsStatus failed: ${e.message}", e)
             }
         }
     }
@@ -1664,6 +1677,7 @@ private fun List<TimelineItemDto>.toUiTimelineItems(): List<UiTimelineItem> {
             traceStatus = it.traceStatus,
             toolCallId = it.toolCallId,
             toolName = it.toolName,
+            attachments = it.attachments.toUiPendingAttachments(),
         )
     }
 }

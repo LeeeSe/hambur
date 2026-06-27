@@ -1083,6 +1083,7 @@ private fun MessageTimelineItem(
     val context = LocalContext.current
     val messageText = message?.contentText?.ifBlank { item.smallSummary }
         ?: item.smallSummary.ifBlank { "Loading message..." }
+    val attachments = message?.attachments ?: item.attachments
 
     Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
         MessageLongPressMenuBox(
@@ -1116,9 +1117,9 @@ private fun MessageTimelineItem(
                             )
                         }
                     }
-                    if (!message?.attachments.isNullOrEmpty()) {
+                    if (attachments.isNotEmpty()) {
                         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                            message.attachments.forEach { attachment ->
+                            attachments.forEach { attachment ->
                                 MessageAttachmentRow(
                                     attachment = attachment,
                                     onOpen = { onOpenFile(attachment.sandboxPath) },

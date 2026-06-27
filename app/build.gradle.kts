@@ -77,8 +77,8 @@ android {
 
     buildTypes {
         getByName("release") {
-            isMinifyEnabled = true
-            isShrinkResources = true
+            isMinifyEnabled = false
+            isShrinkResources = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -120,10 +120,6 @@ tasks.register<Exec>("generateUniFfiKotlinBindings") {
     inputs.file(uniffiConfig)
     outputs.dir(generatedUniffiDir)
     workingDir = rustDir.asFile
-    doFirst {
-        delete(generatedUniffiDir)
-        generatedUniffiDir.get().asFile.mkdirs()
-    }
     commandLine(
         uniffiBindgenBin.get().absolutePath,
         "generate",

@@ -143,6 +143,7 @@ pub struct TimelineItemDTO {
     pub trace_status: String,
     pub tool_call_id: String,
     pub tool_name: String,
+    pub attachments: Vec<AttachmentDTO>,
 }
 
 pub struct MarkdownBlockPayloadDTO {
@@ -401,20 +402,35 @@ pub struct BackendRuntime {
 }
 
 pub fn create_runtime(config: AppBootstrapConfig) -> Arc<BackendRuntime> {
+    eprintln!(
+        "RootfsDebug create_runtime_start app_files_dir={} native_library_dir={}",
+        config.app_files_dir, config.native_library_dir
+    );
     let bootstrap = AppBootstrap {
         app_files_dir: config.app_files_dir,
         native_library_dir: config.native_library_dir,
     };
 
     match RuntimeEngine::create(bootstrap) {
-        Ok(engine) => Arc::new(BackendRuntime { engine }),
+        Ok(engine) => {
+            eprintln!(
+                "RootfsDebug create_runtime_ok app_files_dir={}",
+                engine.app_files_dir()
+            );
+            Arc::new(BackendRuntime { engine })
+        }
         Err(error) => {
+            eprintln!("RootfsDebug create_runtime_error error={error}");
             let fallback = RuntimeEngine::create(AppBootstrap {
                 app_files_dir: ".".to_string(),
                 native_library_dir: String::new(),
             })
             .expect("fallback runtime must be constructible");
             let _ = fallback.app_files_dir();
+            eprintln!(
+                "RootfsDebug create_runtime_fallback app_files_dir={}",
+                fallback.app_files_dir()
+            );
             let _ = error;
             Arc::new(BackendRuntime { engine: fallback })
         }
@@ -981,6 +997,11 @@ impl From<TimelineItemSnapshot> for TimelineItemDTO {
             trace_status: value.trace_status,
             tool_call_id: value.tool_call_id,
             tool_name: value.tool_name,
+            attachments: value
+                .attachments
+                .into_iter()
+                .map(AttachmentDTO::from)
+                .collect(),
         }
     }
 }

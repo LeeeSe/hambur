@@ -43,7 +43,6 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -74,8 +73,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.snapshotFlow
-import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -161,7 +158,6 @@ import com.hambur.chat.ui.markdown.MarkdownStyle
 import com.hambur.chat.ui.markdown.rememberMarkdownRenderCache
 import com.hambur.chat.ui.markdown.rememberMarkdownStyle
 import com.hambur.chat.ui.theme.HamburTheme
-import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
@@ -895,7 +891,6 @@ private fun ChatTimeline(
     modifier: Modifier = Modifier,
 ) {
     val listState = rememberLazyListState()
-    var followTail by remember(state.selectedSessionId) { mutableStateOf(true) }
     val displayItems = remember(
         state.timelineItems,
         state.markdownBlocksByPayloadRef,
@@ -908,25 +903,6 @@ private fun ChatTimeline(
             .lastOrNull { group -> group.nodes.any { it.raw.isNotBlank() || it.text.isNotBlank() } }
             ?.messageId
             .orEmpty()
-    }
-    val visibleCount = displayItems.size + 1
-
-    LaunchedEffect(listState, state.selectedSessionId) {
-        snapshotFlow { listState.isNearBottom() }
-            .distinctUntilChanged()
-            .collect { nearBottom -> followTail = nearBottom }
-    }
-
-    LaunchedEffect(
-        state.selectedSessionId,
-        displayItems.size,
-        displayItems.lastOrNull()?.versionSequence,
-        followTail,
-    ) {
-        if (followTail && visibleCount > 0) {
-            withFrameNanos { }
-            listState.scrollToItem(visibleCount - 1)
-        }
     }
 
     if (state.selectedSessionId.isBlank() || state.timelineItems.isEmpty()) {
@@ -2472,11 +2448,4 @@ private fun List<UiTimelineItem>.toChatDisplayItems(
 
 private fun UiTimelineItem.isAssistantMarkdownBlock(): Boolean {
     return contentType == "assistant_markdown_block" || contentType == "assistant_pending_block"
-}
-
-private fun LazyListState.isNearBottom(): Boolean {
-    val total = layoutInfo.totalItemsCount
-    if (total == 0) return true
-    val last = layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: return true
-    return last >= total - 2
 }

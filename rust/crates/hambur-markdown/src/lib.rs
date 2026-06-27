@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use mdstream::{Block, BlockId, MdStream, Update};
 use pulldown_cmark::{
-    CodeBlockKind, Event, HeadingLevel, Options as PulldownOptions, Parser, Tag, TagEnd,
+    Alignment as PulldownAlignment, CodeBlockKind, Event, HeadingLevel, Options as PulldownOptions,
+    Parser, Tag, TagEnd,
 };
 use serde::{Deserialize, Serialize};
 
@@ -38,6 +39,8 @@ pub struct MarkdownBlockNode {
     pub items_json: String,
     pub table_header: Vec<String>,
     pub table_rows: Vec<MarkdownTableRow>,
+    #[serde(default)]
+    pub table_alignments: Vec<String>,
     pub path: String,
     pub file_kind: String,
 }
@@ -381,9 +384,13 @@ fn fill_table_node(node: &mut MarkdownBlockNode, events: &[Event<'_>]) {
     let mut current_row = Vec::<String>::new();
     let mut header = Vec::<String>::new();
     let mut rows = Vec::<MarkdownTableRow>::new();
+    let mut alignments = Vec::<String>::new();
 
     for event in events {
         match event {
+            Event::Start(Tag::Table(table_alignments)) => {
+                alignments = table_alignments.iter().map(table_alignment).collect();
+            }
             Event::Start(Tag::TableHead) => {
                 in_head = true;
             }
@@ -425,6 +432,17 @@ fn fill_table_node(node: &mut MarkdownBlockNode, events: &[Event<'_>]) {
     node.node_kind = "Table".to_string();
     node.table_header = header;
     node.table_rows = rows;
+    node.table_alignments = alignments;
+}
+
+fn table_alignment(alignment: &PulldownAlignment) -> String {
+    match alignment {
+        PulldownAlignment::None => "default",
+        PulldownAlignment::Left => "left",
+        PulldownAlignment::Center => "center",
+        PulldownAlignment::Right => "right",
+    }
+    .to_string()
 }
 
 fn paragraph_child(message_id: &str, inlines: &[MarkdownInlineNode]) -> MarkdownBlockNode {
@@ -635,5 +653,41 @@ fn append_plain_text(inlines: &[MarkdownInlineNode], out: &mut String) {
             "Image" if !inline.alt.is_empty() => out.push_str(&inline.alt),
             _ => append_plain_text(&inline.children, out),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renders_table_alignment_metadata() {
+        let markdown = "\
+| Name | Count | Status | Notes |
+| :--- | ---: | :---: | --- |
+| Alpha | 12 | ok | wrapped value |
+";
+
+        let table = render_markdown_to_nodes("message", markdown)
+            .into_iter()
+            .find(|node| node.node_kind == "Table")
+            .expect("table node");
+
+        assert_eq!(table.table_header, vec!["Name", "Count", "Status", "Notes"]);
+        assert_eq!(
+            table.table_alignments,
+            vec!["left", "right", "center", "default"]
+        );
+        assert_eq!(
+            table.table_rows,
+            vec![MarkdownTableRow {
+                cells: vec![
+                    "Alpha".to_string(),
+                    "12".to_string(),
+                    "ok".to_string(),
+                    "wrapped value".to_string(),
+                ],
+            }]
+        );
     }
 }

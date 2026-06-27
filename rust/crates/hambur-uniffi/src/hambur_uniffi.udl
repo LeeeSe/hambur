@@ -89,6 +89,7 @@ dictionary MarkdownBlockNodeDTO {
     string items_json;
     sequence<string> table_header;
     sequence<MarkdownTableRowDTO> table_rows;
+    sequence<string> table_alignments;
     string path;
     string file_kind;
 };

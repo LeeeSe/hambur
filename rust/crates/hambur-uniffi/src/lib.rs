@@ -106,6 +106,7 @@ pub struct MarkdownBlockNodeDTO {
     pub items_json: String,
     pub table_header: Vec<String>,
     pub table_rows: Vec<MarkdownTableRowDTO>,
+    pub table_alignments: Vec<String>,
     pub path: String,
     pub file_kind: String,
 }
@@ -815,6 +816,7 @@ impl From<MarkdownBlockNode> for MarkdownBlockNodeDTO {
                 .into_iter()
                 .map(MarkdownTableRowDTO::from)
                 .collect(),
+            table_alignments: value.table_alignments,
             path: value.path,
             file_kind: value.file_kind,
         }

@@ -1,11 +1,11 @@
 package com.hambur.chat.ui.markdown
 
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -24,8 +24,13 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextLayoutResult
@@ -34,12 +39,15 @@ import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.hambur.chat.uniffi.MarkdownBlockNodeDto
 import com.hambur.chat.uniffi.MarkdownInlineNodeDto
+import kotlin.math.max
 
 private const val DestinationAnnotation = "hambur_destination"
 
@@ -126,9 +134,16 @@ data class MarkdownStyle(
     val quoteRailColor: Color,
     val outlineColor: Color,
     val onSurfaceVariantColor: Color,
+    val tableHeaderBackgroundColor: Color,
+    val tableBodyBackgroundColor: Color,
+    val tableHeaderTextStyle: TextStyle,
+    val tableBodyTextStyle: TextStyle,
+    val tableMinColumnWidth: Dp,
+    val tableMaxColumnWidth: Dp,
+    val tableCellHorizontalPadding: Dp,
+    val tableCellVerticalPadding: Dp,
     val cornerRadius: Dp,
     val blockPadding: Dp,
-    val tableCellWidth: Dp,
 )
 
 @Composable
@@ -152,9 +167,16 @@ fun rememberMarkdownStyle(styleVersion: Int = 1): MarkdownStyle {
             quoteRailColor = colors.primary,
             outlineColor = colors.outlineVariant,
             onSurfaceVariantColor = colors.onSurfaceVariant,
+            tableHeaderBackgroundColor = colors.surfaceVariant.copy(alpha = 0.72f),
+            tableBodyBackgroundColor = colors.surface,
+            tableHeaderTextStyle = typography.labelLarge.copy(fontWeight = FontWeight.SemiBold),
+            tableBodyTextStyle = typography.bodyMedium,
+            tableMinColumnWidth = 92.dp,
+            tableMaxColumnWidth = 224.dp,
+            tableCellHorizontalPadding = 12.dp,
+            tableCellVerticalPadding = 8.dp,
             cornerRadius = 8.dp,
             blockPadding = 12.dp,
-            tableCellWidth = 132.dp,
         )
     }
 }
@@ -464,40 +486,209 @@ private fun MarkdownTable(
     markdownStyle: MarkdownStyle,
     modifier: Modifier = Modifier,
 ) {
+    val hasHeader = node.tableHeader.isNotEmpty()
     val rows = remember(node.tableHeader, node.tableRows) {
-        buildList {
-            if (node.tableHeader.isNotEmpty()) add(node.tableHeader)
+        buildList<List<String>> {
+            if (hasHeader) add(node.tableHeader)
             addAll(node.tableRows.map { it.cells })
-        }
+        }.normalizedTableRows()
     }
     val scrollState = rememberScrollState()
 
-    Column(
+    if (rows.isEmpty()) return
+
+    Box(
         modifier = modifier
             .fillMaxWidth()
             .horizontalScroll(scrollState),
     ) {
-        rows.forEachIndexed { index, cells ->
-            Row {
-                cells.forEach { cell ->
+        MarkdownTableLayout(
+            rows = rows,
+            hasHeader = hasHeader,
+            alignments = node.tableAlignments,
+            markdownStyle = markdownStyle,
+        )
+    }
+}
+
+private fun List<List<String>>.normalizedTableRows(): List<List<String>> {
+    val columnCount = maxOfOrNull { it.size } ?: return emptyList()
+    if (columnCount == 0) return emptyList()
+    return map { row ->
+        if (row.size == columnCount) {
+            row
+        } else {
+            row + List(columnCount - row.size) { "" }
+        }
+    }
+}
+
+@Composable
+private fun MarkdownTableLayout(
+    rows: List<List<String>>,
+    hasHeader: Boolean,
+    alignments: List<String>,
+    markdownStyle: MarkdownStyle,
+) {
+    val rowCount = rows.size
+    val columnCount = rows.firstOrNull()?.size ?: return
+    val gridMetrics = remember(rowCount, columnCount) { MarkdownTableGridMetrics() }
+    val tableShape = RoundedCornerShape(markdownStyle.cornerRadius)
+    val cellPadding = Modifier.padding(
+        horizontal = markdownStyle.tableCellHorizontalPadding,
+        vertical = markdownStyle.tableCellVerticalPadding,
+    )
+
+    Layout(
+        modifier = Modifier
+            .clip(tableShape)
+            .drawWithContent {
+                drawRect(markdownStyle.tableBodyBackgroundColor)
+                if (hasHeader && gridMetrics.rowHeights.isNotEmpty()) {
+                    drawRect(
+                        color = markdownStyle.tableHeaderBackgroundColor,
+                        size = Size(
+                            width = size.width,
+                            height = gridMetrics.rowHeights[0].toFloat().coerceAtMost(size.height),
+                        ),
+                    )
+                }
+                drawContent()
+
+                val strokeWidth = 1.dp.toPx()
+                val halfStroke = strokeWidth / 2f
+                val gridWidth = gridMetrics.columnWidths.sum().toFloat()
+                    .coerceAtMost(size.width)
+                val gridHeight = gridMetrics.rowHeights.sum().toFloat()
+                    .coerceAtMost(size.height)
+                if (gridWidth <= 0f || gridHeight <= 0f) {
+                    return@drawWithContent
+                }
+
+                var x = halfStroke
+                drawLine(
+                    color = markdownStyle.outlineColor,
+                    start = Offset(x, 0f),
+                    end = Offset(x, gridHeight),
+                    strokeWidth = strokeWidth,
+                )
+                gridMetrics.columnWidths.forEach { columnWidth ->
+                    x += columnWidth
+                    val lineX = x.coerceAtMost(gridWidth - halfStroke)
+                    drawLine(
+                        color = markdownStyle.outlineColor,
+                        start = Offset(lineX, 0f),
+                        end = Offset(lineX, gridHeight),
+                        strokeWidth = strokeWidth,
+                    )
+                }
+
+                var y = halfStroke
+                drawLine(
+                    color = markdownStyle.outlineColor,
+                    start = Offset(0f, y),
+                    end = Offset(gridWidth, y),
+                    strokeWidth = strokeWidth,
+                )
+                gridMetrics.rowHeights.forEach { rowHeight ->
+                    y += rowHeight
+                    val lineY = y.coerceAtMost(gridHeight - halfStroke)
+                    drawLine(
+                        color = markdownStyle.outlineColor,
+                        start = Offset(0f, lineY),
+                        end = Offset(gridWidth, lineY),
+                        strokeWidth = strokeWidth,
+                    )
+                }
+            },
+        content = {
+            rows.forEachIndexed { rowIndex, cells ->
+                val textStyle = if (hasHeader && rowIndex == 0) {
+                    markdownStyle.tableHeaderTextStyle
+                } else {
+                    markdownStyle.tableBodyTextStyle
+                }
+                cells.forEachIndexed { columnIndex, cell ->
                     Text(
                         text = cell,
-                        style = if (index == 0) {
-                            markdownStyle.labelTextStyle.copy(fontWeight = FontWeight.SemiBold)
-                        } else {
-                            markdownStyle.smallTextStyle
-                        },
-                        modifier = Modifier
-                            .width(markdownStyle.tableCellWidth)
-                            .border(
-                                width = 1.dp,
-                                color = markdownStyle.outlineColor,
-                            )
-                            .padding(horizontal = 8.dp, vertical = 6.dp),
+                        style = textStyle,
+                        textAlign = alignments.textAlignAt(columnIndex),
+                        modifier = cellPadding,
                     )
                 }
             }
+        },
+    ) { measurables, constraints ->
+        val minColumnWidth = markdownStyle.tableMinColumnWidth.roundToPx()
+        val maxColumnWidth = markdownStyle.tableMaxColumnWidth.roundToPx()
+            .coerceAtLeast(minColumnWidth)
+        val columnWidths = IntArray(columnCount) { minColumnWidth }
+
+        measurables.forEachIndexed { index, measurable ->
+            val columnIndex = index % columnCount
+            val preferredWidth = measurable
+                .maxIntrinsicWidth(Constraints.Infinity)
+                .coerceIn(minColumnWidth, maxColumnWidth)
+            columnWidths[columnIndex] = max(columnWidths[columnIndex], preferredWidth)
         }
+
+        val placeables = measurables.mapIndexed { index, measurable ->
+            val columnIndex = index % columnCount
+            measurable.measure(
+                Constraints(
+                    minWidth = columnWidths[columnIndex],
+                    maxWidth = columnWidths[columnIndex],
+                    minHeight = 0,
+                    maxHeight = constraints.maxHeight,
+                ),
+            )
+        }
+        val rowHeights = IntArray(rowCount)
+        placeables.forEachIndexed { index, placeable ->
+            val rowIndex = index / columnCount
+            rowHeights[rowIndex] = max(rowHeights[rowIndex], placeable.height)
+        }
+
+        val tableWidth = columnWidths.sum()
+        val tableHeight = rowHeights.sum()
+        val layoutWidth = if (constraints.hasBoundedWidth) {
+            tableWidth.coerceIn(constraints.minWidth, constraints.maxWidth)
+        } else {
+            max(tableWidth, constraints.minWidth)
+        }
+        val layoutHeight = if (constraints.hasBoundedHeight) {
+            tableHeight.coerceIn(constraints.minHeight, constraints.maxHeight)
+        } else {
+            max(tableHeight, constraints.minHeight)
+        }
+        gridMetrics.columnWidths = columnWidths
+        gridMetrics.rowHeights = rowHeights
+
+        layout(layoutWidth, layoutHeight) {
+            var y = 0
+            repeat(rowCount) { rowIndex ->
+                var x = 0
+                repeat(columnCount) { columnIndex ->
+                    val placeable = placeables[rowIndex * columnCount + columnIndex]
+                    placeable.placeRelative(x, y)
+                    x += columnWidths[columnIndex]
+                }
+                y += rowHeights[rowIndex]
+            }
+        }
+    }
+}
+
+private class MarkdownTableGridMetrics {
+    var columnWidths: IntArray = IntArray(0)
+    var rowHeights: IntArray = IntArray(0)
+}
+
+private fun List<String>.textAlignAt(index: Int): TextAlign {
+    return when (getOrNull(index)) {
+        "center" -> TextAlign.Center
+        "right" -> TextAlign.End
+        else -> TextAlign.Start
     }
 }
 

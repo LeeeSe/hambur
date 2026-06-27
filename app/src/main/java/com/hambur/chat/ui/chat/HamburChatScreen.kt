@@ -675,7 +675,7 @@ private fun groupDrawerSessions(
     val earlier = mutableListOf<UiSessionSummary>()
 
     sessions.forEach { session ->
-        val timestamp = session.updatedAtMs.takeIf { it > 0UL } ?: session.createdAtMs
+        val timestamp = session.createdAtMs
         val ageMs = if (timestamp > nowMs) 0UL else nowMs - timestamp
         when {
             ageMs < dayMs -> today += session

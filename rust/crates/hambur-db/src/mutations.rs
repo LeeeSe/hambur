@@ -2068,7 +2068,7 @@ impl HamburDatabase {
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_sessions_active_updated
-                    ON sessions(deleted_at_ms, pinned_at_ms DESC, updated_at_ms DESC, created_at_ms DESC);
+                    ON sessions(deleted_at_ms, pinned_at_ms DESC, created_at_ms DESC);
 
                 CREATE TABLE IF NOT EXISTS app_state (
                     key TEXT PRIMARY KEY NOT NULL,

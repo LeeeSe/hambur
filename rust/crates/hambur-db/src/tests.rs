@@ -65,6 +65,10 @@ use std::{fs, path::PathBuf};
 
             let opened_first = database.open_session(&first_id).await.expect("open first");
             assert_eq!(opened_first.selected_session_id, first_id);
+            assert_eq!(
+                opened_first.sessions.first().map(|session| session.id.as_str()),
+                Some(second.selected_session_id.as_str())
+            );
             drop(database);
 
             let restarted = HamburDatabase::open(&path).await.expect("reopen database");
@@ -73,6 +77,10 @@ use std::{fs, path::PathBuf};
                 .await
                 .expect("bootstrap snapshot");
             assert_eq!(snapshot.selected_session_id, first_id);
+            assert_eq!(
+                snapshot.sessions.first().map(|session| session.id.as_str()),
+                Some(second.selected_session_id.as_str())
+            );
         });
 
         let _ = fs::remove_file(path);

@@ -12,14 +12,6 @@ impl HamburDatabase {
             )));
         }
 
-        let now = now_ms();
-        self.connection
-            .execute(
-                "UPDATE sessions SET updated_at_ms = ?1 WHERE id = ?2 AND deleted_at_ms IS NULL",
-                params![now as i64, session_id],
-            )
-            .await
-            .map_err(database_error)?;
         self.set_active_session(Some(session_id)).await?;
         self.snapshot_for_selected(Some(session_id)).await
     }
@@ -547,7 +539,7 @@ impl HamburDatabase {
                 FROM sessions s
                 WHERE s.deleted_at_ms IS NULL
                   AND s.title LIKE ?1 ESCAPE '\\'
-                ORDER BY s.pinned_at_ms DESC, s.updated_at_ms DESC, s.created_at_ms DESC, s.id DESC
+                ORDER BY s.pinned_at_ms DESC, s.created_at_ms DESC, s.id DESC
                 LIMIT ?2
                 ",
                 params![pattern, limit as i64],
@@ -868,7 +860,7 @@ impl HamburDatabase {
                     ) AS latest_preview
                 FROM sessions s
                 WHERE s.deleted_at_ms IS NULL
-                ORDER BY s.pinned_at_ms DESC, s.updated_at_ms DESC, s.created_at_ms DESC, s.id DESC
+                ORDER BY s.pinned_at_ms DESC, s.created_at_ms DESC, s.id DESC
                 LIMIT ?1 OFFSET ?2
                 ",
                 params![limit as i64, offset as i64],

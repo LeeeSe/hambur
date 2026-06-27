@@ -5,7 +5,13 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -117,6 +123,7 @@ import androidx.compose.ui.window.PopupPositionProvider
 import androidx.compose.ui.window.PopupProperties
 import coil3.compose.AsyncImage
 import com.composables.icons.lucide.Brain
+import com.composables.icons.lucide.ChevronRight
 import com.composables.icons.lucide.Camera
 import com.composables.icons.lucide.Check
 import com.composables.icons.lucide.ChartNoAxesGantt
@@ -140,6 +147,7 @@ import com.composables.icons.lucide.Trash2
 import com.composables.icons.lucide.Type
 import com.composables.icons.lucide.User
 import com.composables.icons.lucide.X
+import androidx.compose.ui.draw.drawBehind
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -255,6 +263,14 @@ fun HamburChatScreen(
     } else {
         0f
     }
+    val newSessionBlank = state.isNewSessionBlank()
+    fun handleNewChatClick() {
+        if (newSessionBlank) {
+            Toast.makeText(context, "已经在新聊天", Toast.LENGTH_SHORT).show()
+            return
+        }
+        store.createSession("New chat")
+    }
     val mainScale = 1f - (0.08f * drawerProgress)
     val mainContentAlpha = 1f - (0.55f * drawerProgress)
     val mainCornerRadius = if (drawerOffset > 0f) 30.dp else 0.dp
@@ -294,7 +310,7 @@ fun HamburChatScreen(
                 searchQuery = searchQuery,
                 onSearchQueryChange = { searchQuery = it },
                 onNewSession = {
-                    store.startNewSessionDraft()
+                    handleNewChatClick()
                     draftTitle = ""
                     scope.launch { animateDrawerTo(0f) }
                 },
@@ -380,8 +396,8 @@ fun HamburChatScreen(
                         onOpenDrawer = {
                             scope.launch { animateDrawerTo(maxDrawerOffset) }
                         },
-                        canCreateNewChat = !state.isNewSessionBlank(),
-                        onNewChat = { store.startNewSessionDraft() },
+                        canCreateNewChat = !newSessionBlank,
+                        onNewChat = ::handleNewChatClick,
                         onOpenBrowser = onOpenBrowser,
                     )
 
@@ -406,7 +422,7 @@ fun HamburChatScreen(
                         ChatInputPanel(
                             message = draftMessage,
                             onMessageChange = { draftMessage = it },
-                            enabled = state.selectedSessionId.isNotBlank() || state.runtimeStatus == "Ready",
+                            enabled = state.selectedSessionId.isNotBlank(),
                             generating = state.activeTurnIds.containsKey(state.selectedSessionId),
                             thinkingEnabled = thinkingEnabled,
                             attachmentPanelOpen = attachmentPanelOpen,
@@ -559,7 +575,6 @@ private fun ChatHeader(
             }
             ChatIconButton(
                 onClick = onNewChat,
-                enabled = canCreateNewChat,
                 size = tokens.headerIconButtonSize,
             ) {
                 Icon(
@@ -597,7 +612,7 @@ private fun ChatDrawerContent(
     val selectedBackground = colorScheme.primaryContainer
     val mutedText = colorScheme.onSurfaceVariant
     val groupedSessions = remember(sessions, searchQuery) {
-        val chatSessions = sessions.filter { it.purpose == "chat" }
+        val chatSessions = sessions.filter { it.purpose == "chat" && it.messageCount > 0u }
         groupDrawerSessions(
             sessions = if (searchQuery.isBlank()) {
                 chatSessions
@@ -1046,12 +1061,15 @@ private fun ChatTimeline(
                     }
                 }
                 is ChatDisplayItem.AssistantMarkdownBlock -> {
+                    val message = state.messagesById[item.messageId]
+                    val isGenerating = message != null && state.activeTurnIds[sessionId] == message.turnId
                     AssistantMarkdownBlockTimelineItem(
                         item = item,
                         sessionId = sessionId,
                         reasoningText = state.reasoningByMessageId[item.messageId].orEmpty(),
                         showReasoning = previousItem !is ChatDisplayItem.AssistantMarkdownBlock ||
                             previousItem.messageId != item.messageId,
+                        isGenerating = isGenerating,
                         markdownStyle = markdownStyle,
                         markdownCache = markdownCache,
                         onOpenFile = onOpenFile,
@@ -1185,18 +1203,13 @@ private fun MessageTimelineItem(
                     modifier = Modifier.padding(horizontal = 18.dp, vertical = 13.dp),
                 ) {
                     if (!message?.reasoningContent.isNullOrBlank()) {
-                        Surface(
-                            modifier = Modifier.fillMaxWidth(),
-                            shape = RoundedCornerShape(8.dp),
-                            color = MaterialTheme.colorScheme.surfaceVariant,
-                        ) {
-                            Text(
-                                text = message.reasoningContent,
-                                modifier = Modifier.padding(10.dp),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
+                        ThinkingBlock(
+                            text = message.reasoningContent,
+                            isGenerating = false,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(bottom = 8.dp),
+                        )
                     }
                     if (attachments.isNotEmpty()) {
                         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -1333,11 +1346,121 @@ private fun MessageLongPressMenuBox(
 }
 
 @Composable
+private fun ThinkingBlock(
+    text: String,
+    isGenerating: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    var isExpanded by rememberSaveable { mutableStateOf(isGenerating) }
+
+    LaunchedEffect(isGenerating) {
+        if (isGenerating) {
+            isExpanded = true
+        }
+    }
+
+    val infiniteTransition = rememberInfiniteTransition(label = "brain_pulse")
+    val alpha by infiniteTransition.animateFloat(
+        initialValue = 0.4f,
+        targetValue = 1.0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1000, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "brain_alpha"
+    )
+
+    val rotationAngle by animateFloatAsState(
+        targetValue = if (isExpanded) 90f else 0f,
+        animationSpec = tween(durationMillis = 200, easing = FastOutSlowInEasing),
+        label = "chevron_rotation"
+    )
+
+    val outlineColor = MaterialTheme.colorScheme.outlineVariant
+
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(8.dp))
+                .clickable { isExpanded = !isExpanded }
+                .padding(vertical = 6.dp, horizontal = 4.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                imageVector = Lucide.Brain,
+                contentDescription = null,
+                tint = if (isGenerating) {
+                    MaterialTheme.colorScheme.primary.copy(alpha = alpha)
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+                },
+                modifier = Modifier.size(16.dp)
+            )
+
+            Spacer(modifier = Modifier.width(8.dp))
+
+            Text(
+                text = if (isGenerating) "正在思考..." else "已思考",
+                style = MaterialTheme.typography.labelLarge.copy(
+                    fontWeight = FontWeight.Medium,
+                    fontSize = 13.sp
+                ),
+                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f),
+                modifier = Modifier.weight(1f)
+            )
+
+            Icon(
+                imageVector = Lucide.ChevronRight,
+                contentDescription = if (isExpanded) "收起" else "展开",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
+                modifier = Modifier
+                    .size(16.dp)
+                    .graphicsLayer(rotationZ = rotationAngle)
+            )
+        }
+
+        if (isExpanded && text.isNotBlank()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 12.dp, top = 4.dp, bottom = 8.dp)
+                    .drawBehind {
+                        val strokeWidth = 2.dp.toPx()
+                        drawLine(
+                            color = outlineColor.copy(alpha = 0.6f),
+                            start = Offset(0f, 0f),
+                            end = Offset(0f, size.height),
+                            strokeWidth = strokeWidth
+                        )
+                    }
+                    .padding(start = 14.dp)
+            ) {
+                Text(
+                    text = text,
+                    style = MaterialTheme.typography.bodyMedium.copy(
+                        fontSize = 13.sp,
+                        lineHeight = 18.sp
+                    ),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.65f),
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        }
+    }
+}
+
+@Composable
 private fun AssistantMarkdownBlockTimelineItem(
     item: ChatDisplayItem.AssistantMarkdownBlock,
     sessionId: String,
     reasoningText: String,
     showReasoning: Boolean,
+    isGenerating: Boolean,
     markdownStyle: MarkdownStyle,
     markdownCache: MarkdownRenderCache,
     onOpenFile: (String) -> Unit,
@@ -1366,21 +1489,14 @@ private fun AssistantMarkdownBlockTimelineItem(
         onRegenerate = onRegenerate,
     ) {
         Column(modifier = modifier.fillMaxWidth()) {
-            if (showReasoning && reasoningText.isNotBlank()) {
-                Surface(
+            if (showReasoning && (reasoningText.isNotBlank() || isGenerating)) {
+                ThinkingBlock(
+                    text = reasoningText,
+                    isGenerating = isGenerating,
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(bottom = 8.dp),
-                    shape = RoundedCornerShape(8.dp),
-                    color = MaterialTheme.colorScheme.surfaceVariant,
-                ) {
-                    Text(
-                        text = reasoningText,
-                        modifier = Modifier.padding(10.dp),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
+                )
             }
             MarkdownBlock(
                 node = node,

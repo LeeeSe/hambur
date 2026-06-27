@@ -235,7 +235,6 @@ data class HamburUiState(
     val rootfsStatus: RootfsStatusDto? = null,
     val thinkingEnabledBySession: Map<String, Boolean> = emptyMap(),
     val defaultThinkingEnabled: Boolean = false,
-    val isDraftNewSession: Boolean = false,
 )
 
 data class UiSessionScrollPosition(
@@ -290,6 +289,7 @@ class HamburUiStore(
     private var baselineApplied = false
     private var defaultProviderConfigured = false
     private var sessionUiStatePersistScheduled = false
+    private var creatingSession = false
 
     val state: StateFlow<HamburUiState> = _state.asStateFlow()
 
@@ -303,26 +303,30 @@ class HamburUiStore(
     }
 
     fun createSession(title: String) {
-        startNewSessionDraft()
-    }
-
-    fun startNewSessionDraft() {
         val current = _state.value
         if (current.isNewSessionBlank()) return
+        synchronized(sessionCacheLock) {
+            if (creatingSession) return
+            creatingSession = true
+        }
         rememberSessionCache(current)
-        _state.update {
-            it.copy(
-                latestEventKind = "DraftSessionStarted",
-                footer = "Draft new session",
-                selectedSessionId = "",
-                timelineItems = emptyList(),
-                messagesById = emptyMap(),
-                reasoningByMessageId = emptyMap(),
-                pendingAttachments = emptyList(),
-                markdownBlocksByPayloadRef = emptyMap(),
-                activePreviewPath = "",
-                isDraftNewSession = true,
-            )
+        val newSessionThinking = current.thinkingEnabledForSession()
+        runCommand(commandKind = "CreateSession") {
+            val (ack, sessionId) = createRealSession(title)
+            if (!ack.accepted) {
+                synchronized(sessionCacheLock) {
+                    creatingSession = false
+                }
+            }
+            if (ack.accepted && sessionId.isNotBlank()) {
+                _state.update {
+                    it.copy(
+                        thinkingEnabledBySession = it.thinkingEnabledBySession + (sessionId to newSessionThinking),
+                    )
+                }
+                persistSessionUiState()
+            }
+            ack
         }
     }
 
@@ -1126,7 +1130,7 @@ class HamburUiStore(
             runtime.getSettingsSnapshot()
         }.getOrNull()
 
-        val selectedSessionId = selectStartupSessionId(sessionSnapshot, settingsSnapshot).also {
+        val selectedSessionId = resolveStartupSessionId(sessionSnapshot, settingsSnapshot).also {
             sessionSnapshot = runCatching {
                 runtime.getSessionListSnapshot(limit = 100u, offset = 0u)
             }.getOrDefault(sessionSnapshot)
@@ -1176,17 +1180,39 @@ class HamburUiStore(
         runRootfsWarmup(selectedSessionId)
     }
 
-    private fun selectStartupSessionId(
+    private fun resolveStartupSessionId(
         sessionSnapshot: SessionListSnapshotDto,
         settingsSnapshot: SettingsSnapshotDto?,
     ): String {
         val defaultSessionId = sessionSnapshot.selectedSessionId.ifBlank {
             sessionSnapshot.sessions.firstOrNull()?.id.orEmpty()
         }
-        if (settingsSnapshot.settingValue("startupChatMode", "last_chat") != "new_chat") {
-            return defaultSessionId
+        if (settingsSnapshot.settingValue("startupChatMode", "last_chat") == "new_chat") {
+            return createRealSession(title = "New chat")
+                .also { (ack, _) -> applyRejectedAck(ack) }
+                .second
+                .ifBlank { defaultSessionId }
         }
-        return ""
+        return defaultSessionId.ifBlank {
+            createRealSession(title = "New chat")
+                .also { (ack, _) -> applyRejectedAck(ack) }
+                .second
+        }
+    }
+
+    private fun createRealSession(title: String): Pair<CommandAck, String> {
+        val ack = runtime.dispatch(
+            backendCommand(
+                kind = "CreateSession",
+                idempotencyKey = "session:create:${nextCommandOrdinal()}",
+                title = title.ifBlank { "New chat" },
+            ),
+        )
+        if (!ack.accepted) return ack to ""
+        val sessionId = runCatching {
+            runtime.getSessionListSnapshot(limit = 1u, offset = 0u).selectedSessionId
+        }.getOrDefault("")
+        return ack to sessionId
     }
 
     private fun runCommand(
@@ -1240,6 +1266,11 @@ class HamburUiStore(
         val eventStats = event.traceStats()
         if (event.message.startsWith("ThinkingToggle ")) {
             Log.i("ThinkingToggle", event.message)
+        }
+        if (event.kind == "SessionCreated" || event.kind == "RuntimeError" || event.kind == "RuntimeClosed") {
+            synchronized(sessionCacheLock) {
+                creatingSession = false
+            }
         }
         if (event.kind == "AssistantReasoningDelta") {
             Log.i(
@@ -1489,7 +1520,7 @@ class HamburUiStore(
 
     private fun ensureSessionForNewMessage(): String {
         val currentState = _state.value
-        if (!currentState.isDraftNewSession && currentState.selectedSessionId.isNotBlank()) {
+        if (currentState.selectedSessionId.isNotBlank()) {
             val sessionId = currentState.selectedSessionId
             val ack = runtime.dispatch(
                 backendCommand(
@@ -1502,24 +1533,13 @@ class HamburUiStore(
             return if (ack.accepted) sessionId else ""
         }
 
-        val ack = runtime.dispatch(
-            backendCommand(
-                kind = "CreateSession",
-                idempotencyKey = "session:create:send:${nextCommandOrdinal()}",
-                title = "New chat",
-            ),
-        )
+        val (ack, sessionId) = createRealSession("New chat")
         applyRejectedAck(ack)
         if (!ack.accepted) return ""
-
-        val sessionId = runCatching {
-            runtime.getSessionListSnapshot(limit = 1u, offset = 0u).selectedSessionId
-        }.getOrDefault("")
         if (sessionId.isNotBlank()) {
             val draftThinking = _state.value.thinkingEnabledForSession("")
             _state.update {
                 it.copy(
-                    isDraftNewSession = false,
                     thinkingEnabledBySession = it.thinkingEnabledBySession + (sessionId to draftThinking),
                 )
             }
@@ -1754,8 +1774,6 @@ private fun HamburUiState.applyBaseline(
         appliedEventIds = emptySet(),
         activeTurnIds = emptyMap(),
         defaultThinkingEnabled = settingsSnapshot.settingBool("defaultDeepThinkingEnabled", false),
-        isDraftNewSession = selectedSessionId.isBlank() &&
-            settingsSnapshot.settingValue("startupChatMode", "last_chat") == "new_chat",
     )
 }
 
@@ -1905,7 +1923,6 @@ private fun HamburUiState.reduce(event: BackendEvent): HamburUiState {
         lastAppliedSequence = event.sequence,
         appliedEventIds = nextAppliedEventIds,
         activeTurnIds = updateActiveTurnIds(event),
-        isDraftNewSession = false,
     )
 }
 
@@ -1990,7 +2007,7 @@ fun HamburUiState.thinkingEnabledForSession(sessionId: String = selectedSessionI
 }
 
 fun HamburUiState.isNewSessionBlank(): Boolean {
-    if (isDraftNewSession || selectedSessionId.isBlank()) return true
+    if (selectedSessionId.isBlank()) return true
     val selected = sessions.firstOrNull { it.id == selectedSessionId } ?: return false
     return selected.messageCount == 0u && timelineItems.isEmpty()
 }

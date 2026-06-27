@@ -1063,6 +1063,7 @@ private fun ChatTimeline(
                 is ChatDisplayItem.AssistantMarkdownBlock -> {
                     val message = state.messagesById[item.messageId]
                     val isGenerating = message != null && state.activeTurnIds[sessionId] == message.turnId
+                    val thinkingEnabled = state.thinkingEnabledForSession()
                     AssistantMarkdownBlockTimelineItem(
                         item = item,
                         sessionId = sessionId,
@@ -1070,6 +1071,7 @@ private fun ChatTimeline(
                         showReasoning = previousItem !is ChatDisplayItem.AssistantMarkdownBlock ||
                             previousItem.messageId != item.messageId,
                         isGenerating = isGenerating,
+                        thinkingEnabled = thinkingEnabled,
                         markdownStyle = markdownStyle,
                         markdownCache = markdownCache,
                         onOpenFile = onOpenFile,
@@ -1461,6 +1463,7 @@ private fun AssistantMarkdownBlockTimelineItem(
     reasoningText: String,
     showReasoning: Boolean,
     isGenerating: Boolean,
+    thinkingEnabled: Boolean,
     markdownStyle: MarkdownStyle,
     markdownCache: MarkdownRenderCache,
     onOpenFile: (String) -> Unit,
@@ -1489,10 +1492,13 @@ private fun AssistantMarkdownBlockTimelineItem(
         onRegenerate = onRegenerate,
     ) {
         Column(modifier = modifier.fillMaxWidth()) {
-            if (showReasoning && (reasoningText.isNotBlank() || isGenerating)) {
+            val shouldShowThinking = showReasoning && (
+                reasoningText.isNotBlank() || (isGenerating && thinkingEnabled)
+            )
+            if (shouldShowThinking) {
                 ThinkingBlock(
                     text = reasoningText,
-                    isGenerating = isGenerating,
+                    isGenerating = isGenerating && thinkingEnabled,
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(bottom = 8.dp),

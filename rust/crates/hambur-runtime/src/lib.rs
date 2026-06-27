@@ -26,7 +26,7 @@ use hambur_llm::{
     ProviderStreamEvent, ProviderTarget, ReasoningMode, RoutePlan, RouteRequirements,
     RoutingStrategy, SseDecoder, ToolCallAccumulator, scripted_openai_sse_chunks, should_fallback,
 };
-use hambur_markdown::{MarkdownPipeline, MarkdownRenderUpdate};
+use hambur_markdown::{MarkdownBlockNode, MarkdownPipeline, MarkdownRenderUpdate};
 use hambur_sandbox::{SandboxAccess, SandboxService};
 use hambur_tools::{
     MAX_TOOL_ITERATIONS_PER_TURN, RawToolOutput, ToolCallBatch, ToolExecutionRecord,

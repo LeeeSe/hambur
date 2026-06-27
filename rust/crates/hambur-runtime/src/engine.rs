@@ -1074,6 +1074,17 @@ impl RuntimeEngine {
                         state.semantic_delta_started = true;
                         state.reasoning.push_str(&delta);
                         state.thinking_parsed_trace_count += 1;
+                        let _ = self
+                            .database
+                            .update_message_stream_result(
+                                assistant_message_id,
+                                &state.content,
+                                &state.reasoning,
+                                "streaming",
+                                "",
+                                "",
+                            )
+                            .await;
                         let snapshot = self
                             .database
                             .session_snapshot(session_id)
@@ -3357,6 +3368,12 @@ impl RuntimeEngine {
                 &route,
             )
             .await?;
+        self.insert_initial_pending_markdown_block(
+            delegate_session_id,
+            &turn.id,
+            &assistant_message.id,
+        )
+        .await?;
         let snapshot = self.database.session_snapshot(delegate_session_id).await?;
         let cancel = Arc::new(AtomicBool::new(false));
         if let Ok(mut active_turns) = self.active_turns.lock() {
@@ -3721,6 +3738,54 @@ impl RuntimeEngine {
         } else {
             Some(update)
         }
+    }
+    pub(crate) async fn insert_initial_pending_markdown_block(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        message_id: &str,
+    ) -> HamburResult<()> {
+        let stable_key = hambur_db::pending_markdown_stable_key(message_id);
+        let node = MarkdownBlockNode {
+            message_id: message_id.to_string(),
+            block_id: 0,
+            stable_key: stable_key.clone(),
+            source_kind: "assistant".to_string(),
+            node_kind: "root".to_string(),
+            committed: false,
+            level: 0,
+            inlines: Vec::new(),
+            language: String::new(),
+            text: String::new(),
+            raw: String::new(),
+            children_json: String::new(),
+            items_json: String::new(),
+            table_header: Vec::new(),
+            table_rows: Vec::new(),
+            table_alignments: Vec::new(),
+            path: String::new(),
+            file_kind: String::new(),
+        };
+        let payload_json = serde_json::to_string(&node).map_err(|error| {
+            HamburError::Internal(format!("serialize initial pending markdown block payload: {error}"))
+        })?;
+        self.database
+            .upsert_markdown_block_payload(
+                session_id,
+                turn_id,
+                NewMarkdownBlockPayload {
+                    id: String::new(),
+                    message_id: message_id.to_string(),
+                    block_id: 0,
+                    stable_key,
+                    committed: false,
+                    payload_json,
+                    raw: String::new(),
+                    small_summary: String::new(),
+                },
+            )
+            .await?;
+        Ok(())
     }
     pub(crate) async fn persist_markdown_update_for_timeline(
         &self,

@@ -1621,7 +1621,8 @@ class HamburUiStore(
         val messageItems = (userMessageIds + assistantMessageIds)
             .filter { (messageId, versionSequence) ->
                 val cached = current.messagesById[messageId]
-                cached == null || cached.versionSequence < versionSequence
+                val isStreaming = cached?.status == "streaming"
+                cached == null || cached.versionSequence < versionSequence || isStreaming
             }
             .map { it.first }
             .distinct()

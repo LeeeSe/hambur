@@ -1317,6 +1317,14 @@ impl RuntimeEngine {
                     &route,
                 )
                 .await?;
+            let engine = self.self_ref.lock().ok().and_then(|value| value.upgrade()).ok_or_else(|| {
+                HamburError::Internal("runtime self reference unavailable".to_string())
+            })?;
+            engine.insert_initial_pending_markdown_block(
+                &command.session_id,
+                &turn.id,
+                &assistant_message.id,
+            ).await?;
             let chat_context = self
                 .build_chat_context_messages(
                     &command.session_id,
@@ -1943,6 +1951,14 @@ impl RuntimeEngine {
                 &continuation_route,
             )
             .await?;
+        let engine = self.self_ref.lock().ok().and_then(|value| value.upgrade()).ok_or_else(|| {
+            HamburError::Internal("runtime self reference unavailable".to_string())
+        })?;
+        engine.insert_initial_pending_markdown_block(
+            session_id,
+            turn_id,
+            &continuation_message.id,
+        ).await?;
 
         let continuation_source = tool_continuation_stream_source(
             current_request,

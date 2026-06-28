@@ -1940,7 +1940,7 @@ private fun ChatInputPanel(
                     BasicTextField(
                         value = message,
                         onValueChange = onMessageChange,
-                        enabled = enabled && !generating,
+                        enabled = enabled,
                         textStyle = MaterialTheme.typography.bodyLarge.copy(
                             color = primaryText,
                         ),
@@ -1956,7 +1956,7 @@ private fun ChatInputPanel(
                 ) {
                     ChatIconButton(
                         onClick = onToggleThinking,
-                        enabled = enabled && !generating,
+                        enabled = enabled,
                         size = tokens.inputIconButtonSize,
                         modifier = Modifier.offset(
                             x = tokens.inputLeftIconOffsetX,
@@ -1973,7 +1973,7 @@ private fun ChatInputPanel(
                     Spacer(modifier = Modifier.weight(1f))
                     ChatIconButton(
                         onClick = onToggleAttachmentPanel,
-                        enabled = enabled && !generating,
+                        enabled = enabled,
                         size = tokens.inputIconButtonSize,
                         modifier = Modifier.offset(
                             x = tokens.inputIconOffsetX,
@@ -2038,7 +2038,7 @@ private fun ChatInputPanel(
         ) {
             if (attachmentPanelSlotHeight > 0.dp) {
                 AttachmentPickerPanel(
-                    enabled = enabled && !generating,
+                    enabled = enabled,
                     pendingAttachments = pendingAttachments,
                     onImportAttachment = onImportAttachment,
                     onPickImage = onPickImage,

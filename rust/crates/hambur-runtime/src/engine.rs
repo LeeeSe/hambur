@@ -2133,6 +2133,15 @@ impl RuntimeEngine {
                 "",
             )
             .await?;
+        let snapshot = self.database.bootstrap_snapshot().await?;
+        let _ = self.emit_session_event(
+            RuntimeEventKind::SettingsChanged,
+            String::new(),
+            String::new(),
+            snapshot,
+            format!("Setting updated: {}", path),
+            None,
+        );
         Ok(json!({
             "ok": true,
             "path": path,

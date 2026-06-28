@@ -181,6 +181,8 @@ import com.hambur.chat.ui.theme.HamburTheme
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
 import java.util.UUID
@@ -2088,6 +2090,7 @@ private fun AttachmentPickerPanel(
     onRemoveAttachment: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val scope = rememberCoroutineScope()
     val context = LocalContext.current
     val isDark = MaterialTheme.colorScheme.background.luminance() <= 0.5f
     val panelBgColor = MaterialTheme.colorScheme.background
@@ -2099,22 +2102,34 @@ private fun AttachmentPickerPanel(
     var recentImages by remember { mutableStateOf<List<Uri>>(emptyList()) }
 
     fun checkAndLoadImages() {
-        recentImages = if (hasImageReadPermission(context)) {
-            fetchRecentImages(context)
-        } else {
-            emptyList()
+        scope.launch(Dispatchers.IO) {
+            val images = if (hasImageReadPermission(context)) {
+                fetchRecentImages(context)
+            } else {
+                emptyList()
+            }
+            withContext(Dispatchers.Main) {
+                recentImages = images
+            }
         }
     }
 
     fun importUri(uri: Uri, fallbackName: String, fallbackMime: String) {
-        val displayName = getDisplayNameForUri(context, uri).ifBlank { fallbackName }
-        onImportAttachment(
-            displayName,
-            context.contentResolver.getType(uri).orEmpty().ifBlank { fallbackMime },
-            getSizeForUri(context, uri).coerceAtLeast(0L).toULong(),
-            uri.toString(),
-            copyUriToAttachmentCache(context, uri, displayName),
-        )
+        scope.launch(Dispatchers.IO) {
+            val displayName = getDisplayNameForUri(context, uri).ifBlank { fallbackName }
+            val mimeType = context.contentResolver.getType(uri).orEmpty().ifBlank { fallbackMime }
+            val size = getSizeForUri(context, uri).coerceAtLeast(0L).toULong()
+            val cachedPath = copyUriToAttachmentCache(context, uri, displayName)
+            withContext(Dispatchers.Main) {
+                onImportAttachment(
+                    displayName,
+                    mimeType,
+                    size,
+                    uri.toString(),
+                    cachedPath,
+                )
+            }
+        }
     }
 
     LaunchedEffect(Unit) {
@@ -2251,11 +2266,13 @@ private fun AttachmentPickerPanel(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            val buttons = listOf(
-                Triple("拍照", Lucide.Camera, "camera"),
-                Triple("相册", Lucide.Image, "gallery"),
-                Triple("文件", Lucide.Folder, "file"),
-            )
+            val buttons = remember {
+                listOf(
+                    Triple("拍照", Lucide.Camera, "camera"),
+                    Triple("相册", Lucide.Image, "gallery"),
+                    Triple("文件", Lucide.Folder, "file"),
+                )
+            }
 
             buttons.forEach { (label, icon, type) ->
                 Column(

@@ -42,6 +42,11 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.windowInsetsBottomHeight
+import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -376,9 +381,7 @@ fun HamburChatScreen(
                         scope.launch { animateDrawerTo(0f) }
                     },
                 )
-                .statusBarsPadding()
-                .navigationBarsPadding()
-                .imePadding(),
+                .statusBarsPadding(),
         ) {
             Box(
                 modifier = Modifier
@@ -1851,20 +1854,32 @@ private fun ChatInputPanel(
     val secondaryText = MaterialTheme.colorScheme.onSurfaceVariant
     val canSend = enabled && !generating && (message.isNotBlank() || pendingAttachments.isNotEmpty())
 
+    val navInsets = WindowInsets.navigationBars
+    val imeInsets = WindowInsets.ime
+    val bgColor = MaterialTheme.colorScheme.background
+
     Column(
         modifier = modifier
             .fillMaxWidth()
-            .background(MaterialTheme.colorScheme.background)
-            .padding(
-                start = tokens.inputOuterStartPadding,
-                end = tokens.inputOuterEndPadding,
-                top = tokens.inputOuterTopPadding,
-                bottom = tokens.inputOuterBottomPadding,
-            ),
+            .padding(top = tokens.inputOuterTopPadding)
+            .drawBehind {
+                val insetsHeightPx = navInsets.union(imeInsets).getBottom(this)
+                val attachmentSlotHeightPx = attachmentPanelSlotHeight.toPx()
+                val extraHeightPx = (tokens.inputOuterBottomPadding * 4).toPx()
+                val totalHeightPx = insetsHeightPx + attachmentSlotHeightPx + extraHeightPx
+
+                drawRect(
+                    color = bgColor,
+                    topLeft = Offset(0f, size.height - totalHeightPx),
+                    size = androidx.compose.ui.geometry.Size(size.width, totalHeightPx)
+                )
+            },
     ) {
         if (editing) {
             Surface(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = tokens.inputOuterStartPadding),
                 shape = RoundedCornerShape(8.dp),
                 color = MaterialTheme.colorScheme.surfaceVariant,
             ) {
@@ -1888,6 +1903,7 @@ private fun ChatInputPanel(
         Surface(
             modifier = Modifier
                 .fillMaxWidth()
+                .padding(horizontal = tokens.inputOuterStartPadding)
                 .zIndex(1f),
             shape = panelShape,
             color = MaterialTheme.colorScheme.surface,
@@ -2050,6 +2066,15 @@ private fun ChatInputPanel(
                 )
             }
         }
+        Spacer(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(tokens.inputOuterBottomPadding)
+        )
+        Spacer(
+            modifier = Modifier
+                .windowInsetsBottomHeight(WindowInsets.navigationBars.union(WindowInsets.ime))
+        )
     }
 }
 

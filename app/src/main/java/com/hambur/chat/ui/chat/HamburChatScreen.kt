@@ -13,6 +13,7 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image as ComposeImage
@@ -79,6 +80,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -178,6 +180,8 @@ import com.hambur.chat.ui.markdown.MarkdownStyle
 import com.hambur.chat.ui.markdown.rememberMarkdownRenderCache
 import com.hambur.chat.ui.markdown.rememberMarkdownStyle
 import com.hambur.chat.ui.theme.HamburTheme
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
@@ -186,6 +190,8 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
 import java.util.UUID
+
+private const val SESSION_OPEN_DELAY_MS = 50L
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -208,11 +214,29 @@ fun HamburChatScreen(
     var unavailableAction by rememberSaveable { mutableStateOf("") }
     var searchEnabled by rememberSaveable { mutableStateOf(false) }
     var attachmentPanelOpen by rememberSaveable { mutableStateOf(false) }
+    var pendingOpenSessionId by remember { mutableStateOf("") }
+    var delayedOpenSessionJob by remember { mutableStateOf<Job?>(null) }
     var baseInputHeightPx by remember { mutableStateOf(0) }
     val density = LocalDensity.current
     val configuration = LocalConfiguration.current
     val chatTokens = HamburTheme.tokens.chat
-    val thinkingEnabled = state.thinkingEnabledForSession()
+    val isSessionOpenPending = pendingOpenSessionId.isNotBlank() &&
+            pendingOpenSessionId != state.selectedSessionId
+    val visibleState = if (isSessionOpenPending) {
+        state.copy(
+            latestEventKind = "SessionOpenPending",
+            selectedSessionId = pendingOpenSessionId,
+            timelineItems = emptyList(),
+            messagesById = emptyMap(),
+            reasoningByMessageId = emptyMap(),
+            pendingAttachments = emptyList(),
+            messageBlocksByPayloadRef = emptyMap(),
+            activePreviewPath = "",
+        )
+    } else {
+        state
+    }
+    val thinkingEnabled = visibleState.thinkingEnabledForSession()
     val attachmentPanelHeight = 220.dp
     val attachmentPanelSlotHeight by animateDpAsState(
         targetValue = if (attachmentPanelOpen) attachmentPanelHeight + chatTokens.inputOuterGap else 0.dp,
@@ -234,7 +258,10 @@ fun HamburChatScreen(
     }
     val animateDrawerTo: suspend (Float) -> Unit = { targetOffset ->
         drawerAnimation.snapTo(drawerOffset)
-        drawerAnimation.animateTo(targetOffset) {
+        drawerAnimation.animateTo(
+            targetValue = targetOffset,
+            animationSpec = spring(dampingRatio = 0.9f, stiffness = 1500f)
+        ) {
             drawerOffset = value
         }
         drawerOffset = targetOffset
@@ -278,6 +305,7 @@ fun HamburChatScreen(
         }
         store.createSession("New chat")
     }
+
     val mainScale = 1f - (0.08f * drawerProgress)
     val mainContentAlpha = 1f - (0.55f * drawerProgress)
     val mainCornerRadius = if (drawerOffset > 0f) 30.dp else 0.dp
@@ -287,6 +315,13 @@ fun HamburChatScreen(
 
     LaunchedEffect(maxDrawerOffset) {
         drawerOffset = drawerOffset.coerceIn(0f, maxDrawerOffset)
+    }
+
+    LaunchedEffect(state.selectedSessionId, pendingOpenSessionId) {
+        if (pendingOpenSessionId.isNotBlank() && state.selectedSessionId == pendingOpenSessionId) {
+            pendingOpenSessionId = ""
+            delayedOpenSessionJob = null
+        }
     }
 
     BackHandler(enabled = drawerOffset > 0f) {
@@ -329,10 +364,15 @@ fun HamburChatScreen(
                         targetSessionId = it,
                         targetMessageCount = target?.messageCount?.toString().orEmpty(),
                         drawerProgress = drawerProgress,
-                        extra = "timelineItems=${state.timelineItems.size} markdownBlocks=${state.markdownBlocksByPayloadRef.size}",
+                        extra = "timelineItems=${state.timelineItems.size} markdownBlocks=${state.messageBlocksByPayloadRef.size}",
                     )
-                    store.openSession(it)
-                    scope.launch { animateDrawerTo(0f) }
+                    delayedOpenSessionJob?.cancel()
+                    pendingOpenSessionId = it
+                    delayedOpenSessionJob = scope.launch {
+                        launch { animateDrawerTo(0f) }
+                        delay(SESSION_OPEN_DELAY_MS)
+                        store.openSession(it)
+                    }
                 },
                 onDeleteSession = store::deleteSession,
                 onRenameSession = { sessionId ->
@@ -397,7 +437,7 @@ fun HamburChatScreen(
                         },
                 ) {
                     ChatHeader(
-                        title = state.selectedSessionTitle(),
+                        title = visibleState.selectedSessionTitle(),
                         onOpenDrawer = {
                             scope.launch { animateDrawerTo(maxDrawerOffset) }
                         },
@@ -412,7 +452,7 @@ fun HamburChatScreen(
                             .fillMaxWidth(),
                     ) {
                         ChatTimeline(
-                            state = state,
+                            state = visibleState,
                             store = store,
                             onOpenFile = onOpenFile,
                             onEditMessage = { message ->
@@ -421,34 +461,35 @@ fun HamburChatScreen(
                             },
                             onSelectText = { selectingText = it },
                             bottomPadding = messageListBottomPadding,
+                            blank = isSessionOpenPending,
                             modifier = Modifier.fillMaxSize(),
                         )
 
                         ChatInputPanel(
                             message = draftMessage,
                             onMessageChange = { draftMessage = it },
-                            enabled = state.selectedSessionId.isNotBlank(),
-                            generating = state.activeTurnIds.containsKey(state.selectedSessionId),
+                            enabled = visibleState.selectedSessionId.isNotBlank() && !isSessionOpenPending,
+                            generating = visibleState.activeTurnIds.containsKey(visibleState.selectedSessionId),
                             thinkingEnabled = thinkingEnabled,
                             attachmentPanelOpen = attachmentPanelOpen,
                             attachmentPanelSlotHeight = attachmentPanelSlotHeight,
                             attachmentPanelHeight = attachmentPanelHeight,
-                            pendingAttachments = state.pendingAttachments,
+                            pendingAttachments = visibleState.pendingAttachments,
                             editing = editingMessageId.isNotBlank(),
                             onToggleThinking = {
                                 Log.i(
                                     "ThinkingToggle",
-                                    "brain click session=${state.selectedSessionId.ifBlank { "<draft>" }} from=$thinkingEnabled to=${!thinkingEnabled}",
+                                    "brain click session=${visibleState.selectedSessionId.ifBlank { "<draft>" }} from=$thinkingEnabled to=${!thinkingEnabled}",
                                 )
                                 store.setSessionThinkingEnabled(
-                                    state.selectedSessionId,
+                                    visibleState.selectedSessionId,
                                     !thinkingEnabled,
                                 )
                             },
                             onToggleAttachmentPanel = { attachmentPanelOpen = !attachmentPanelOpen },
                             onImportAttachment = { displayName, mimeType, byteSize, uri, sourcePath ->
                                 store.importAttachmentMetadata(
-                                    sessionId = state.selectedSessionId,
+                                    sessionId = visibleState.selectedSessionId,
                                     displayName = displayName,
                                     mimeType = mimeType,
                                     byteSize = byteSize,
@@ -458,25 +499,25 @@ fun HamburChatScreen(
                             },
                             onPickImage = onPickImage,
                             onPickFile = onPickFile,
-                            onRemoveAttachment = { store.removePendingAttachment(state.selectedSessionId, it) },
-                            onStop = { store.cancelActiveTurn(state.selectedSessionId) },
+                            onRemoveAttachment = { store.removePendingAttachment(visibleState.selectedSessionId, it) },
+                            onStop = { store.cancelActiveTurn(visibleState.selectedSessionId) },
                             onCancelEdit = {
                                 editingMessageId = ""
                                 draftMessage = ""
                             },
                             onSend = {
                                 if (editingMessageId.isNotBlank()) {
-                                    store.editMessage(state.selectedSessionId, editingMessageId, draftMessage)
+                                    store.editMessage(visibleState.selectedSessionId, editingMessageId, draftMessage)
                                     editingMessageId = ""
                                     draftMessage = ""
                                     attachmentPanelOpen = false
                                 } else {
                                     Log.i(
                                         "ThinkingToggle",
-                                        "send click session=${state.selectedSessionId.ifBlank { "<draft>" }} thinking=$thinkingEnabled textLen=${draftMessage.length}",
+                                        "send click session=${visibleState.selectedSessionId.ifBlank { "<draft>" }} thinking=$thinkingEnabled textLen=${draftMessage.length}",
                                     )
                                     store.sendMessage(
-                                        sessionId = state.selectedSessionId,
+                                        sessionId = visibleState.selectedSessionId,
                                         content = draftMessage,
                                         deepThinkingEnabled = thinkingEnabled,
                                         searchEnabled = searchEnabled,
@@ -530,6 +571,7 @@ fun HamburChatScreen(
         )
     }
 }
+
 @Composable
 private fun ChatHeader(
     title: String,
@@ -624,7 +666,7 @@ private fun ChatDrawerContent(
             } else {
                 chatSessions.filter {
                     it.title.contains(searchQuery, ignoreCase = true) ||
-                        it.latestPreview.contains(searchQuery, ignoreCase = true)
+                            it.latestPreview.contains(searchQuery, ignoreCase = true)
                 }
             },
             nowMs = System.currentTimeMillis().coerceAtLeast(0).toULong(),
@@ -946,45 +988,44 @@ private fun ChatTimeline(
     onEditMessage: (UiMessageSnapshot) -> Unit,
     onSelectText: (String) -> Unit,
     bottomPadding: Dp,
+    blank: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
+    if (blank) {
+        Box(modifier = modifier)
+        return
+    }
+
     val sessionId = state.selectedSessionId
     val initialScroll = remember(sessionId) {
         store.sessionScrollPosition(sessionId)
     }
-    val listState = rememberLazyListState(
-        initialFirstVisibleItemIndex = initialScroll.firstVisibleItemIndex,
-        initialFirstVisibleItemScrollOffset = initialScroll.firstVisibleItemScrollOffset,
-    )
+    val listState = key(sessionId) {
+        rememberLazyListState(
+            initialFirstVisibleItemIndex = initialScroll.firstVisibleItemIndex,
+            initialFirstVisibleItemScrollOffset = initialScroll.firstVisibleItemScrollOffset,
+        )
+    }
     SideEffect {
         ChatJankTracer.markSessionSwitch(
             phase = "chat_timeline_recompose",
             targetSessionId = sessionId,
-            extra = "timelineItems=${state.timelineItems.size} markdownBlocks=${state.markdownBlocksByPayloadRef.size}",
+            extra = "timelineItems=${state.timelineItems.size} markdownBlocks=${state.messageBlocksByPayloadRef.size}",
         )
     }
     val displayItems = remember(
         state.timelineItems,
-        state.markdownBlocksByPayloadRef,
+        state.messageBlocksByPayloadRef,
     ) {
         ChatJankTracer.timeSessionSwitch(
             phase = "display_items_build",
             targetSessionId = state.selectedSessionId,
             warnAtMs = 3.0,
             always = true,
-            extra = "timelineItems=${state.timelineItems.size} markdownBlocks=${state.markdownBlocksByPayloadRef.size}",
+            extra = "timelineItems=${state.timelineItems.size} markdownBlocks=${state.messageBlocksByPayloadRef.size}",
         ) {
-            state.timelineItems.toChatDisplayItems(state.markdownBlocksByPayloadRef)
+            state.timelineItems.toChatDisplayItems(state.messageBlocksByPayloadRef)
         }
-    }
-    LaunchedEffect(sessionId, displayItems.size) {
-        if (sessionId.isBlank() || displayItems.isEmpty()) return@LaunchedEffect
-        val saved = store.sessionScrollPosition(sessionId)
-        val maxIndex = displayItems.lastIndex + 1
-        listState.scrollToItem(
-            saved.firstVisibleItemIndex.coerceIn(0, maxIndex),
-            saved.firstVisibleItemScrollOffset,
-        )
     }
     LaunchedEffect(sessionId, listState) {
         if (sessionId.isBlank()) return@LaunchedEffect
@@ -1051,12 +1092,14 @@ private fun ChatTimeline(
                                 modifier = Modifier.padding(top = topPadding),
                             )
                         }
+
                         timelineItem.contentType == "trace" || timelineItem.kind.contains("Trace") -> {
                             ToolTraceItem(
                                 item = timelineItem,
                                 modifier = Modifier.padding(top = topPadding),
                             )
                         }
+
                         else -> {
                             TimelineSummaryItem(
                                 item = timelineItem,
@@ -1065,16 +1108,21 @@ private fun ChatTimeline(
                         }
                     }
                 }
+
+                is ChatDisplayItem.AssistantReasoningBlock -> {
+                    ThinkingBlock(
+                        text = item.reasoningText,
+                        isGenerating = state.activeTurnIds.containsKey(sessionId),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = topPadding),
+                    )
+                }
+
                 is ChatDisplayItem.AssistantMarkdownBlock -> {
-                    val message = state.messagesById[item.messageId]
-                    val isGenerating = message != null && state.activeTurnIds[sessionId] == message.turnId
                     AssistantMarkdownBlockTimelineItem(
                         item = item,
                         sessionId = sessionId,
-                        reasoningText = state.reasoningByMessageId[item.messageId].orEmpty(),
-                        showReasoning = previousItem !is ChatDisplayItem.AssistantMarkdownBlock ||
-                            previousItem.messageId != item.messageId,
-                        isGenerating = isGenerating,
                         markdownStyle = markdownStyle,
                         markdownCache = markdownCache,
                         onOpenFile = onOpenFile,
@@ -1085,6 +1133,7 @@ private fun ChatTimeline(
                         modifier = Modifier.padding(top = topPadding),
                     )
                 }
+
                 is ChatDisplayItem.AssistantActions -> {
                     AssistantMarkdownActionsItem(
                         item = item,
@@ -1463,9 +1512,6 @@ private fun ThinkingBlock(
 private fun AssistantMarkdownBlockTimelineItem(
     item: ChatDisplayItem.AssistantMarkdownBlock,
     sessionId: String,
-    reasoningText: String,
-    showReasoning: Boolean,
-    isGenerating: Boolean,
     markdownStyle: MarkdownStyle,
     markdownCache: MarkdownRenderCache,
     onOpenFile: (String) -> Unit,
@@ -1494,16 +1540,6 @@ private fun AssistantMarkdownBlockTimelineItem(
         onRegenerate = onRegenerate,
     ) {
         Column(modifier = modifier.fillMaxWidth()) {
-            val shouldShowThinking = showReasoning && reasoningText.isNotBlank()
-            if (shouldShowThinking) {
-                ThinkingBlock(
-                    text = reasoningText,
-                    isGenerating = isGenerating,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(bottom = 8.dp),
-                )
-            }
             MarkdownBlock(
                 node = node,
                 modifier = Modifier.fillMaxWidth(),
@@ -2695,6 +2731,17 @@ private sealed interface ChatDisplayItem {
         override val versionSequence: ULong = item.versionSequence
     }
 
+    data class AssistantReasoningBlock(
+        val messageId: String,
+        val item: UiTimelineItem,
+        val node: MarkdownBlockNodeDto,
+        val reasoningText: String,
+    ) : ChatDisplayItem {
+        override val stableKey: String = "assistant-reasoning:$messageId:${item.stableKey}"
+        override val contentType: String = "assistant_reasoning_block_item"
+        override val versionSequence: ULong = item.versionSequence
+    }
+
     data class AssistantActions(
         val messageId: String,
         val firstStableKey: String,
@@ -2708,7 +2755,7 @@ private sealed interface ChatDisplayItem {
 }
 
 private fun List<UiTimelineItem>.toChatDisplayItems(
-    markdownBlocksByPayloadRef: Map<String, MarkdownBlockNodeDto>,
+    messageBlocksByPayloadRef: Map<String, MarkdownBlockNodeDto>,
 ): List<ChatDisplayItem> {
     val displayItems = mutableListOf<ChatDisplayItem>()
     val groupItems = mutableListOf<UiTimelineItem>()
@@ -2747,8 +2794,27 @@ private fun List<UiTimelineItem>.toChatDisplayItems(
     }
 
     for (item in this) {
+        if (item.isAssistantReasoningBlock()) {
+            flushGroup()
+            val node = messageBlocksByPayloadRef[item.payloadRef]
+            if (node == null) {
+                displayItems += ChatDisplayItem.Timeline(item)
+                continue
+            }
+            val reasoningText = node.raw.ifBlank { node.text }.ifBlank { item.smallSummary }.trim()
+            if (reasoningText.isNotBlank()) {
+                displayItems += ChatDisplayItem.AssistantReasoningBlock(
+                    messageId = node.messageId,
+                    item = item,
+                    node = node,
+                    reasoningText = reasoningText,
+                )
+            }
+            continue
+        }
+
         val node = if (item.isAssistantMarkdownBlock()) {
-            markdownBlocksByPayloadRef[item.payloadRef]
+            messageBlocksByPayloadRef[item.payloadRef]
         } else {
             null
         }
@@ -2776,17 +2842,27 @@ private fun ChatDisplayItem.topSpacingAfter(previous: ChatDisplayItem?): Dp {
     if (previous == null) return 0.dp
     return when {
         this is ChatDisplayItem.AssistantMarkdownBlock &&
-            previous is ChatDisplayItem.AssistantMarkdownBlock &&
-            messageId == previous.messageId -> 10.dp
+                previous is ChatDisplayItem.AssistantMarkdownBlock &&
+                messageId == previous.messageId -> 10.dp
+
+        this is ChatDisplayItem.AssistantMarkdownBlock &&
+                previous is ChatDisplayItem.AssistantReasoningBlock &&
+                messageId == previous.messageId -> 8.dp
+
         this is ChatDisplayItem.AssistantActions &&
-            previous is ChatDisplayItem.AssistantMarkdownBlock &&
-            messageId == previous.messageId -> 8.dp
+                previous is ChatDisplayItem.AssistantMarkdownBlock &&
+                messageId == previous.messageId -> 8.dp
+
         else -> 12.dp
     }
 }
 
 private fun UiTimelineItem.isAssistantMarkdownBlock(): Boolean {
     return contentType == "assistant_markdown_block" || contentType == "assistant_pending_block"
+}
+
+private fun UiTimelineItem.isAssistantReasoningBlock(): Boolean {
+    return contentType == "assistant_reasoning_block"
 }
 
 private fun shortTraceId(id: String): String {

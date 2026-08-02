@@ -3,7 +3,7 @@ use std::sync::Arc;
 use hambur_core::{new_id, now_ms};
 use hambur_db::{
     AppSettingRecord, AppSnapshot, AttachmentRecord, ConfigAuditRecord, DefaultModelGroupRecord,
-    MarkdownBlockPayloadRecord, MessageRecord, ModelGroupMemberRecord, ModelGroupRecord,
+    MessageBlockPayloadRecord, MessageRecord, ModelGroupMemberRecord, ModelGroupRecord,
     ProviderModelRecord, PublicProviderRecord, SessionSummary, TimelineItemSnapshot,
 };
 use hambur_markdown::{
@@ -148,11 +148,12 @@ pub struct TimelineItemDTO {
     pub attachments: Vec<AttachmentDTO>,
 }
 
-pub struct MarkdownBlockPayloadDTO {
+pub struct MessageBlockPayloadDTO {
     pub id: String,
     pub session_id: String,
     pub message_id: String,
     pub block_id: u64,
+    pub block_type: String,
     pub stable_key: String,
     pub committed: bool,
     pub node: MarkdownBlockNodeDTO,
@@ -187,7 +188,7 @@ pub struct AppSnapshotDTO {
     pub sessions: Vec<SessionSummaryDTO>,
     pub selected_session_id: String,
     pub timeline_items: Vec<TimelineItemDTO>,
-    pub markdown_block_payloads: Vec<MarkdownBlockPayloadDTO>,
+    pub message_block_payloads: Vec<MessageBlockPayloadDTO>,
     pub pending_attachments: Vec<AttachmentDTO>,
 }
 
@@ -289,7 +290,7 @@ pub struct SessionSnapshotDTO {
     pub created_at_ms: u64,
     pub session: Option<SessionSummaryDTO>,
     pub timeline_items: Vec<TimelineItemDTO>,
-    pub markdown_block_payloads: Vec<MarkdownBlockPayloadDTO>,
+    pub message_block_payloads: Vec<MessageBlockPayloadDTO>,
 }
 
 pub struct TimelinePageDTO {
@@ -297,7 +298,7 @@ pub struct TimelinePageDTO {
     pub created_at_ms: u64,
     pub session_id: String,
     pub items: Vec<TimelineItemDTO>,
-    pub markdown_block_payloads: Vec<MarkdownBlockPayloadDTO>,
+    pub message_block_payloads: Vec<MessageBlockPayloadDTO>,
     pub next_before_cursor: u64,
     pub has_more: bool,
 }
@@ -664,10 +665,10 @@ impl From<RuntimeSessionSnapshot> for SessionSnapshotDTO {
                 .into_iter()
                 .map(TimelineItemDTO::from)
                 .collect(),
-            markdown_block_payloads: value
-                .markdown_block_payloads
+            message_block_payloads: value
+                .message_block_payloads
                 .into_iter()
-                .map(MarkdownBlockPayloadDTO::from)
+                .map(MessageBlockPayloadDTO::from)
                 .collect(),
         }
     }
@@ -680,10 +681,10 @@ impl From<RuntimeTimelinePage> for TimelinePageDTO {
             created_at_ms: value.created_at_ms,
             session_id: value.session_id,
             items: value.items.into_iter().map(TimelineItemDTO::from).collect(),
-            markdown_block_payloads: value
-                .markdown_block_payloads
+            message_block_payloads: value
+                .message_block_payloads
                 .into_iter()
-                .map(MarkdownBlockPayloadDTO::from)
+                .map(MessageBlockPayloadDTO::from)
                 .collect(),
             next_before_cursor: value.next_before_cursor,
             has_more: value.has_more,
@@ -853,10 +854,10 @@ impl From<AppSnapshot> for AppSnapshotDTO {
                 .into_iter()
                 .map(TimelineItemDTO::from)
                 .collect(),
-            markdown_block_payloads: value
-                .markdown_block_payloads
+            message_block_payloads: value
+                .message_block_payloads
                 .into_iter()
-                .map(MarkdownBlockPayloadDTO::from)
+                .map(MessageBlockPayloadDTO::from)
                 .collect(),
             pending_attachments: value
                 .pending_attachments
@@ -1010,8 +1011,8 @@ impl From<TimelineItemSnapshot> for TimelineItemDTO {
     }
 }
 
-impl From<MarkdownBlockPayloadRecord> for MarkdownBlockPayloadDTO {
-    fn from(value: MarkdownBlockPayloadRecord) -> Self {
+impl From<MessageBlockPayloadRecord> for MessageBlockPayloadDTO {
+    fn from(value: MessageBlockPayloadRecord) -> Self {
         let node =
             serde_json::from_str::<MarkdownBlockNode>(&value.payload_json).unwrap_or_else(|_| {
                 MarkdownBlockNode {
@@ -1030,6 +1031,7 @@ impl From<MarkdownBlockPayloadRecord> for MarkdownBlockPayloadDTO {
             session_id: value.session_id,
             message_id: value.message_id,
             block_id: value.block_id,
+            block_type: value.block_type,
             stable_key: value.stable_key,
             committed: value.committed,
             node: node.into(),

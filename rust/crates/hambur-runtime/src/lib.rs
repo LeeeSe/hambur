@@ -14,8 +14,8 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use hambur_core::{DTO_SCHEMA_VERSION, HamburError, HamburResult, new_id, now_ms};
 use hambur_db::{
-    AppSnapshot, AttachmentRecord, HamburDatabase, MarkdownBlockPayloadRecord, MessageRecord,
-    ModelRouteSnapshot, NewAttachment, NewFileRecord, NewMarkdownBlockPayload, NewTimelineItem,
+    AppSnapshot, AttachmentRecord, HamburDatabase, MessageBlockPayloadRecord, MessageRecord,
+    ModelRouteSnapshot, NewAttachment, NewFileRecord, NewMessageBlockPayload, NewTimelineItem,
     NewToolCall, NewToolResult, NewTraceSpan, ProviderModelOverride, ProviderModelUpsert,
     ProviderUpsert, SessionReviewRecord, SessionSummary, SettingsSnapshot, TimelineItemSnapshot,
 };
@@ -172,7 +172,7 @@ pub struct RuntimeSessionSnapshot {
     pub created_at_ms: u64,
     pub session: Option<SessionSummary>,
     pub timeline_items: Vec<TimelineItemSnapshot>,
-    pub markdown_block_payloads: Vec<MarkdownBlockPayloadRecord>,
+    pub message_block_payloads: Vec<MessageBlockPayloadRecord>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -181,7 +181,7 @@ pub struct RuntimeTimelinePage {
     pub created_at_ms: u64,
     pub session_id: String,
     pub items: Vec<TimelineItemSnapshot>,
-    pub markdown_block_payloads: Vec<MarkdownBlockPayloadRecord>,
+    pub message_block_payloads: Vec<MessageBlockPayloadRecord>,
     pub next_before_cursor: u64,
     pub has_more: bool,
 }

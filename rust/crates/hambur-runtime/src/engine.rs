@@ -798,6 +798,14 @@ impl RuntimeEngine {
                 semantic_delta_started: true,
             };
         }
+        let _ = self
+            .persist_reasoning_block_for_timeline(
+                &session_id,
+                &turn_id,
+                &assistant_message_id,
+                &state.reasoning,
+            )
+            .await;
         let snapshot = self
             .database
             .session_snapshot(&session_id)
@@ -1083,6 +1091,14 @@ impl RuntimeEngine {
                                 "streaming",
                                 "",
                                 "",
+                            )
+                            .await;
+                        let _ = self
+                            .persist_reasoning_block_for_timeline(
+                                session_id,
+                                turn_id,
+                                assistant_message_id,
+                                &state.reasoning,
                             )
                             .await;
                         let snapshot = self
@@ -3620,6 +3636,14 @@ impl RuntimeEngine {
             )
             .await;
         let _ = self
+            .persist_reasoning_block_for_timeline(
+                session_id,
+                turn_id,
+                assistant_message_id,
+                reasoning,
+            )
+            .await;
+        let _ = self
             .database
             .fail_turn(turn_id, "Cancelled", "Cancelled", "turn cancelled")
             .await;
@@ -3658,6 +3682,14 @@ impl RuntimeEngine {
                 "failed_partial",
                 "error",
                 error.code().as_str(),
+            )
+            .await;
+        let _ = self
+            .persist_reasoning_block_for_timeline(
+                session_id,
+                turn_id,
+                assistant_message_id,
+                reasoning,
             )
             .await;
         let _ = self
@@ -3776,16 +3808,19 @@ impl RuntimeEngine {
             file_kind: String::new(),
         };
         let payload_json = serde_json::to_string(&node).map_err(|error| {
-            HamburError::Internal(format!("serialize initial pending markdown block payload: {error}"))
+            HamburError::Internal(format!(
+                "serialize initial pending markdown block payload: {error}"
+            ))
         })?;
         self.database
-            .upsert_markdown_block_payload(
+            .upsert_message_block_payload(
                 session_id,
                 turn_id,
-                NewMarkdownBlockPayload {
+                NewMessageBlockPayload {
                     id: String::new(),
                     message_id: message_id.to_string(),
                     block_id: 0,
+                    block_type: "content".to_string(),
                     stable_key,
                     committed: false,
                     payload_json,
@@ -3810,13 +3845,14 @@ impl RuntimeEngine {
                 HamburError::Internal(format!("serialize markdown block payload: {error}"))
             })?;
             self.database
-                .upsert_markdown_block_payload(
+                .upsert_message_block_payload(
                     session_id,
                     turn_id,
-                    NewMarkdownBlockPayload {
+                    NewMessageBlockPayload {
                         id: String::new(),
                         message_id: update.message_id.clone(),
                         block_id: node.block_id,
+                        block_type: "content".to_string(),
                         stable_key: node.stable_key.clone(),
                         committed: true,
                         payload_json,
@@ -3831,13 +3867,14 @@ impl RuntimeEngine {
                 HamburError::Internal(format!("serialize pending markdown block payload: {error}"))
             })?;
             self.database
-                .upsert_markdown_block_payload(
+                .upsert_message_block_payload(
                     session_id,
                     turn_id,
-                    NewMarkdownBlockPayload {
+                    NewMessageBlockPayload {
                         id: String::new(),
                         message_id: update.message_id.clone(),
                         block_id: node.block_id,
+                        block_type: "content".to_string(),
                         stable_key: hambur_db::pending_markdown_stable_key(&update.message_id),
                         committed: false,
                         payload_json,
@@ -3851,6 +3888,60 @@ impl RuntimeEngine {
                 .remove_pending_markdown_block(session_id, &update.message_id)
                 .await?;
         }
+        Ok(())
+    }
+
+    pub(crate) async fn persist_reasoning_block_for_timeline(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        message_id: &str,
+        reasoning: &str,
+    ) -> HamburResult<()> {
+        if message_id.trim().is_empty() || reasoning.trim().is_empty() {
+            return Ok(());
+        }
+        let stable_key = hambur_db::reasoning_block_stable_key(message_id);
+        let node = MarkdownBlockNode {
+            message_id: message_id.to_string(),
+            block_id: 0,
+            stable_key: stable_key.clone(),
+            source_kind: "assistant_reasoning".to_string(),
+            node_kind: "reasoning".to_string(),
+            committed: true,
+            level: 0,
+            inlines: Vec::new(),
+            language: String::new(),
+            text: reasoning.to_string(),
+            raw: reasoning.to_string(),
+            children_json: String::new(),
+            items_json: String::new(),
+            table_header: Vec::new(),
+            table_rows: Vec::new(),
+            table_alignments: Vec::new(),
+            path: String::new(),
+            file_kind: String::new(),
+        };
+        let payload_json = serde_json::to_string(&node).map_err(|error| {
+            HamburError::Internal(format!("serialize reasoning block payload: {error}"))
+        })?;
+        self.database
+            .upsert_message_block_payload(
+                session_id,
+                turn_id,
+                NewMessageBlockPayload {
+                    id: String::new(),
+                    message_id: message_id.to_string(),
+                    block_id: 0,
+                    block_type: "reasoning".to_string(),
+                    stable_key,
+                    committed: true,
+                    payload_json,
+                    raw: reasoning.to_string(),
+                    small_summary: reasoning.chars().take(160).collect(),
+                },
+            )
+            .await?;
         Ok(())
     }
     pub fn delete_skill(&self, identifier: String) -> RuntimeCommandAck {

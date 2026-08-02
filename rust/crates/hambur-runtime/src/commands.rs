@@ -1681,6 +1681,13 @@ impl RuntimeEngine {
                 &native_finish_reason.if_blank("tool_calls".to_string()),
             )
             .await?;
+        self.persist_reasoning_block_for_timeline(
+            session_id,
+            turn_id,
+            assistant_message_id,
+            reasoning,
+        )
+        .await?;
 
         self.database
             .update_turn_status(turn_id, "ExecutingTools", false)

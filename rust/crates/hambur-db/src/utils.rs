@@ -629,29 +629,31 @@ pub(crate) fn timeline_item_from_row(row: &Row) -> HamburResult<TimelineItemSnap
     })
 }
 
-pub(crate) fn markdown_block_from_row(row: &Row) -> HamburResult<MarkdownBlockPayloadRecord> {
-    Ok(MarkdownBlockPayloadRecord {
+pub(crate) fn message_block_from_row(row: &Row) -> HamburResult<MessageBlockPayloadRecord> {
+    Ok(MessageBlockPayloadRecord {
         id: row.get::<String>(0).map_err(database_error)?,
         session_id: row.get::<String>(1).map_err(database_error)?,
         message_id: row.get::<String>(2).map_err(database_error)?,
         block_id: unsigned_ms(row.get::<i64>(3).map_err(database_error)?),
-        stable_key: row.get::<String>(4).map_err(database_error)?,
-        committed: row.get::<i64>(5).map_err(database_error)? != 0,
-        payload_json: row.get::<String>(6).map_err(database_error)?,
-        raw: row.get::<String>(7).map_err(database_error)?,
-        small_summary: row.get::<String>(8).map_err(database_error)?,
-        version_sequence: unsigned_ms(row.get::<i64>(9).map_err(database_error)?),
-        created_at_ms: unsigned_ms(row.get::<i64>(10).map_err(database_error)?),
-        updated_at_ms: unsigned_ms(row.get::<i64>(11).map_err(database_error)?),
+        block_type: row.get::<String>(4).map_err(database_error)?,
+        stable_key: row.get::<String>(5).map_err(database_error)?,
+        committed: row.get::<i64>(6).map_err(database_error)? != 0,
+        payload_json: row.get::<String>(7).map_err(database_error)?,
+        raw: row.get::<String>(8).map_err(database_error)?,
+        small_summary: row.get::<String>(9).map_err(database_error)?,
+        version_sequence: unsigned_ms(row.get::<i64>(10).map_err(database_error)?),
+        created_at_ms: unsigned_ms(row.get::<i64>(11).map_err(database_error)?),
+        updated_at_ms: unsigned_ms(row.get::<i64>(12).map_err(database_error)?),
     })
 }
 
-pub(crate) fn markdown_payload_refs(items: &[TimelineItemSnapshot]) -> Vec<String> {
+pub(crate) fn message_block_payload_refs(items: &[TimelineItemSnapshot]) -> Vec<String> {
     items
         .iter()
         .filter(|item| {
             item.content_type == "assistant_markdown_block"
                 || item.content_type == "assistant_pending_block"
+                || item.content_type == "assistant_reasoning_block"
         })
         .map(|item| item.payload_ref.clone())
         .collect()
@@ -659,6 +661,10 @@ pub(crate) fn markdown_payload_refs(items: &[TimelineItemSnapshot]) -> Vec<Strin
 
 pub fn pending_markdown_stable_key(message_id: &str) -> String {
     format!("{message_id}:pending")
+}
+
+pub fn reasoning_block_stable_key(message_id: &str) -> String {
+    format!("{message_id}:reasoning")
 }
 
 pub(crate) fn message_from_row(row: &Row) -> HamburResult<MessageRecord> {

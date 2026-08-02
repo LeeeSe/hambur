@@ -128,11 +128,11 @@ impl HamburDatabase {
         file_from_row(&row)
     }
 
-    pub(crate) async fn markdown_block_by_stable_key(
+    pub(crate) async fn message_block_by_stable_key(
         &self,
         session_id: &str,
         stable_key: &str,
-    ) -> HamburResult<MarkdownBlockPayloadRecord> {
+    ) -> HamburResult<MessageBlockPayloadRecord> {
         let mut rows = self
             .connection
             .query(
@@ -142,6 +142,7 @@ impl HamburDatabase {
                     session_id,
                     message_id,
                     block_id,
+                    block_type,
                     stable_key,
                     committed,
                     payload_json,
@@ -150,7 +151,7 @@ impl HamburDatabase {
                     version_sequence,
                     created_at_ms,
                     updated_at_ms
-                FROM markdown_blocks
+                FROM message_blocks
                 WHERE session_id = ?1 AND stable_key = ?2
                 LIMIT 1
                 ",
@@ -164,13 +165,13 @@ impl HamburDatabase {
                 "markdown block not found after upsert: {stable_key}"
             )));
         };
-        markdown_block_from_row(&row)
+        message_block_from_row(&row)
     }
-    pub(crate) async fn markdown_blocks_for_payload_refs(
+    pub(crate) async fn message_blocks_for_payload_refs(
         &self,
         session_id: &str,
         payload_refs: &[String],
-    ) -> HamburResult<Vec<MarkdownBlockPayloadRecord>> {
+    ) -> HamburResult<Vec<MessageBlockPayloadRecord>> {
         let mut blocks = Vec::new();
         for payload_ref in payload_refs {
             if payload_ref.trim().is_empty() {
@@ -185,6 +186,7 @@ impl HamburDatabase {
                         session_id,
                         message_id,
                         block_id,
+                        block_type,
                         stable_key,
                         committed,
                         payload_json,
@@ -193,7 +195,7 @@ impl HamburDatabase {
                         version_sequence,
                         created_at_ms,
                         updated_at_ms
-                    FROM markdown_blocks
+                    FROM message_blocks
                     WHERE session_id = ?1 AND id = ?2
                     LIMIT 1
                     ",
@@ -202,7 +204,7 @@ impl HamburDatabase {
                 .await
                 .map_err(database_error)?;
             if let Some(row) = rows.next().await.map_err(database_error)? {
-                blocks.push(markdown_block_from_row(&row)?);
+                blocks.push(message_block_from_row(&row)?);
             }
         }
         Ok(blocks)
@@ -292,9 +294,9 @@ impl HamburDatabase {
         let mut page = self
             .timeline_items_page(session_id, before_cursor, limit)
             .await?;
-        let payload_refs = markdown_payload_refs(&page.items);
-        page.markdown_block_payloads = self
-            .markdown_blocks_for_payload_refs(session_id, &payload_refs)
+        let payload_refs = message_block_payload_refs(&page.items);
+        page.message_block_payloads = self
+            .message_blocks_for_payload_refs(session_id, &payload_refs)
             .await?;
         Ok(page)
     }
@@ -362,12 +364,15 @@ impl HamburDatabase {
                           AND (
                               EXISTS (
                                   SELECT 1
-                                  FROM markdown_blocks mb
+                                  FROM message_blocks mb
                                   JOIN timeline_items ti
                                     ON ti.session_id = mb.session_id
                                    AND ti.payload_ref = mb.id
                                    AND ti.visible = 1
-                                   AND ti.content_type = 'assistant_markdown_block'
+                                   AND ti.content_type IN (
+                                       'assistant_markdown_block',
+                                       'assistant_reasoning_block'
+                                   )
                                   WHERE mb.session_id = m.session_id
                                     AND mb.message_id = m.id
                               )
@@ -813,11 +818,11 @@ impl HamburDatabase {
             self.timeline_items_for_session(&selected_session_id)
                 .await?
         };
-        let markdown_block_payloads = if selected_session_id.is_empty() {
+        let message_block_payloads = if selected_session_id.is_empty() {
             Vec::new()
         } else {
-            let payload_refs = markdown_payload_refs(&timeline_items);
-            self.markdown_blocks_for_payload_refs(&selected_session_id, &payload_refs)
+            let payload_refs = message_block_payload_refs(&timeline_items);
+            self.message_blocks_for_payload_refs(&selected_session_id, &payload_refs)
                 .await?
         };
         let pending_attachments = if selected_session_id.is_empty() {
@@ -831,7 +836,7 @@ impl HamburDatabase {
             sessions,
             selected_session_id,
             timeline_items,
-            markdown_block_payloads,
+            message_block_payloads,
             pending_attachments,
         })
     }
@@ -1033,7 +1038,7 @@ impl HamburDatabase {
 
         Ok(TimelinePageData {
             items,
-            markdown_block_payloads: Vec::new(),
+            message_block_payloads: Vec::new(),
             next_before_cursor,
             has_more,
         })

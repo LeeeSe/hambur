@@ -1058,21 +1058,27 @@ impl HamburDatabase {
             .await
     }
 
-    pub async fn upsert_markdown_block_payload(
+    pub async fn upsert_message_block_payload(
         &self,
         session_id: &str,
         _turn_id: &str,
-        input: NewMarkdownBlockPayload,
-    ) -> HamburResult<MarkdownBlockPayloadRecord> {
+        input: NewMessageBlockPayload,
+    ) -> HamburResult<MessageBlockPayloadRecord> {
         self.ensure_session_exists(session_id).await?;
         if input.message_id.trim().is_empty() {
             return Err(HamburError::InvalidCommand(
-                "markdown block message_id must not be empty".to_string(),
+                "message block message_id must not be empty".to_string(),
             ));
         }
         if input.stable_key.trim().is_empty() {
             return Err(HamburError::InvalidCommand(
-                "markdown block stable_key must not be empty".to_string(),
+                "message block stable_key must not be empty".to_string(),
+            ));
+        }
+        let block_type = input.block_type.trim();
+        if block_type.is_empty() {
+            return Err(HamburError::InvalidCommand(
+                "message block block_type must not be empty".to_string(),
             ));
         }
 
@@ -1085,12 +1091,13 @@ impl HamburDatabase {
         let stable_key = input.stable_key.clone();
         self.connection
             .execute(
-                "INSERT INTO markdown_blocks
+                "INSERT INTO message_blocks
                     (
                         id,
                         session_id,
                         message_id,
                         block_id,
+                        block_type,
                         stable_key,
                         committed,
                         payload_json,
@@ -1100,21 +1107,23 @@ impl HamburDatabase {
                         created_at_ms,
                         updated_at_ms
                     )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?10)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?11)
                  ON CONFLICT(session_id, stable_key) DO UPDATE SET
                     message_id = excluded.message_id,
                     block_id = excluded.block_id,
+                    block_type = excluded.block_type,
                     committed = excluded.committed,
                     payload_json = excluded.payload_json,
                     raw = excluded.raw,
                     small_summary = excluded.small_summary,
-                    version_sequence = markdown_blocks.version_sequence + 1,
+                    version_sequence = message_blocks.version_sequence + 1,
                     updated_at_ms = excluded.updated_at_ms",
                 params![
                     id.clone(),
                     session_id,
                     input.message_id,
                     input.block_id as i64,
+                    block_type,
                     stable_key.clone(),
                     if input.committed { 1_i64 } else { 0_i64 },
                     input.payload_json,
@@ -1128,34 +1137,45 @@ impl HamburDatabase {
         self.touch_session(session_id, now).await?;
 
         let record = self
-            .markdown_block_by_stable_key(session_id, &stable_key)
+            .message_block_by_stable_key(session_id, &stable_key)
             .await?;
         let display_base = self
             .message_by_id(&record.message_id)
             .await?
             .map(|message| message.created_at_ms)
             .unwrap_or(record.created_at_ms);
+        let (content_type, display_sequence, kind) = if record.block_type == "reasoning" {
+            (
+                "assistant_reasoning_block".to_string(),
+                display_base.saturating_sub(1),
+                "AssistantReasoningBlock".to_string(),
+            )
+        } else if record.committed {
+            (
+                "assistant_markdown_block".to_string(),
+                display_base.saturating_add(record.block_id),
+                "AssistantMarkdownBlock".to_string(),
+            )
+        } else {
+            (
+                "assistant_pending_block".to_string(),
+                display_base.saturating_add(record.block_id),
+                "AssistantPendingBlock".to_string(),
+            )
+        };
         self.upsert_timeline_item(
             session_id,
             NewTimelineItem {
                 stable_key: record.stable_key.clone(),
-                content_type: if record.committed {
-                    "assistant_markdown_block".to_string()
-                } else {
-                    "assistant_pending_block".to_string()
-                },
-                display_sequence: display_base.saturating_add(record.block_id),
+                content_type,
+                display_sequence,
                 payload_ref: record.id.clone(),
                 small_summary: record.small_summary.clone(),
-                kind: if record.committed {
-                    "AssistantMarkdownBlock".to_string()
-                } else {
-                    "AssistantPendingBlock".to_string()
-                },
+                kind,
             },
         )
         .await?;
-        if record.committed {
+        if record.block_type == "content" && record.committed {
             self.hide_timeline_item(session_id, &pending_markdown_stable_key(&record.message_id))
                 .await?;
         }
@@ -1500,7 +1520,7 @@ impl HamburDatabase {
                  WHERE session_id = ?2
                    AND visible = 1
                    AND payload_ref IN (
-                       SELECT id FROM markdown_blocks
+                       SELECT id FROM message_blocks
                        WHERE session_id = ?2 AND message_id = ?3
                    )",
                 params![now as i64, session_id, message_id],
@@ -2182,6 +2202,124 @@ impl HamburDatabase {
 
                 CREATE INDEX IF NOT EXISTS idx_markdown_blocks_session_message
                     ON markdown_blocks(session_id, message_id, block_id);
+
+                CREATE TABLE IF NOT EXISTS message_blocks (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    message_id TEXT NOT NULL,
+                    block_id INTEGER NOT NULL,
+                    block_type TEXT NOT NULL,
+                    stable_key TEXT NOT NULL,
+                    committed INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    raw TEXT NOT NULL,
+                    small_summary TEXT NOT NULL,
+                    version_sequence INTEGER NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL,
+                    UNIQUE(session_id, stable_key)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_message_blocks_session_message
+                    ON message_blocks(session_id, message_id, block_type, block_id);
+
+                INSERT OR IGNORE INTO message_blocks
+                    (
+                        id,
+                        session_id,
+                        message_id,
+                        block_id,
+                        block_type,
+                        stable_key,
+                        committed,
+                        payload_json,
+                        raw,
+                        small_summary,
+                        version_sequence,
+                        created_at_ms,
+                        updated_at_ms
+                    )
+                SELECT
+                    id,
+                    session_id,
+                    message_id,
+                    block_id,
+                    'content',
+                    stable_key,
+                    committed,
+                    payload_json,
+                    raw,
+                    small_summary,
+                    version_sequence,
+                    created_at_ms,
+                    updated_at_ms
+                FROM markdown_blocks;
+
+                INSERT OR IGNORE INTO message_blocks
+                    (
+                        id,
+                        session_id,
+                        message_id,
+                        block_id,
+                        block_type,
+                        stable_key,
+                        committed,
+                        payload_json,
+                        raw,
+                        small_summary,
+                        version_sequence,
+                        created_at_ms,
+                        updated_at_ms
+                    )
+                SELECT
+                    m.id || ':reasoning:block',
+                    m.session_id,
+                    m.id,
+                    0,
+                    'reasoning',
+                    m.id || ':reasoning',
+                    1,
+                    '',
+                    m.reasoning_content,
+                    substr(m.reasoning_content, 1, 160),
+                    m.version_sequence,
+                    m.created_at_ms,
+                    m.created_at_ms
+                FROM messages m
+                WHERE m.role = 'assistant'
+                  AND trim(m.reasoning_content) != '';
+
+                INSERT OR IGNORE INTO timeline_items
+                    (
+                        id,
+                        session_id,
+                        stable_key,
+                        content_type,
+                        display_sequence,
+                        version_sequence,
+                        payload_ref,
+                        small_summary,
+                        kind,
+                        visible,
+                        created_at_ms,
+                        updated_at_ms
+                    )
+                SELECT
+                    mb.id || ':timeline',
+                    mb.session_id,
+                    mb.stable_key,
+                    'assistant_reasoning_block',
+                    max(m.created_at_ms - 1, 0),
+                    mb.version_sequence,
+                    mb.id,
+                    mb.small_summary,
+                    'AssistantReasoningBlock',
+                    1,
+                    mb.created_at_ms,
+                    mb.updated_at_ms
+                FROM message_blocks mb
+                JOIN messages m ON m.id = mb.message_id
+                WHERE mb.block_type = 'reasoning';
 
                 CREATE TABLE IF NOT EXISTS turns (
                     id TEXT PRIMARY KEY NOT NULL,

@@ -48,11 +48,12 @@ pub struct TimelineItemSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MarkdownBlockPayloadRecord {
+pub struct MessageBlockPayloadRecord {
     pub id: String,
     pub session_id: String,
     pub message_id: String,
     pub block_id: u64,
+    pub block_type: String,
     pub stable_key: String,
     pub committed: bool,
     pub payload_json: String,
@@ -135,10 +136,11 @@ pub struct NewTimelineItem {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NewMarkdownBlockPayload {
+pub struct NewMessageBlockPayload {
     pub id: String,
     pub message_id: String,
     pub block_id: u64,
+    pub block_type: String,
     pub stable_key: String,
     pub committed: bool,
     pub payload_json: String,
@@ -515,14 +517,14 @@ pub struct AppSnapshot {
     pub sessions: Vec<SessionSummary>,
     pub selected_session_id: String,
     pub timeline_items: Vec<TimelineItemSnapshot>,
-    pub markdown_block_payloads: Vec<MarkdownBlockPayloadRecord>,
+    pub message_block_payloads: Vec<MessageBlockPayloadRecord>,
     pub pending_attachments: Vec<AttachmentRecord>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TimelinePageData {
     pub items: Vec<TimelineItemSnapshot>,
-    pub markdown_block_payloads: Vec<MarkdownBlockPayloadRecord>,
+    pub message_block_payloads: Vec<MessageBlockPayloadRecord>,
     pub next_before_cursor: u64,
     pub has_more: bool,
 }

@@ -94,7 +94,7 @@ impl RuntimeEngine {
             created_at_ms: now_ms(),
             session,
             timeline_items: snapshot.timeline_items,
-            markdown_block_payloads: snapshot.markdown_block_payloads,
+            message_block_payloads: snapshot.message_block_payloads,
         }
     }
 
@@ -116,7 +116,7 @@ impl RuntimeEngine {
             created_at_ms: now_ms(),
             session_id,
             items: page.items,
-            markdown_block_payloads: page.markdown_block_payloads,
+            message_block_payloads: page.message_block_payloads,
             next_before_cursor: page.next_before_cursor,
             has_more: page.has_more,
         }
@@ -545,7 +545,11 @@ fn should_skip_rootfs_size_path(root: &std::path::Path, path: &std::path::Path) 
     let mut components = relative.components();
     match components.next() {
         None => false,
-        Some(std::path::Component::Normal(name)) if name == "proc" || name == "sys" || name == "dev" => true,
+        Some(std::path::Component::Normal(name))
+            if name == "proc" || name == "sys" || name == "dev" =>
+        {
+            true
+        }
         Some(std::path::Component::Normal(name)) if name == "var" => {
             matches!(
                 components.next(),

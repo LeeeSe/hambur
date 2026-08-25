@@ -39,7 +39,7 @@ serde_json = "1.0.145"
 base64 = "0.22.1"
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 uniffi = { version = "0.31.2", features = ["build"] }
-mdstream = { path = "/Users/ls/Downloads/mdstream/mdstream" }
+mdstream = "0.3.0"
 pulldown-cmark = "0.13"
 reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "rustls-tls", "stream"] }
 tar = "0.4.43"

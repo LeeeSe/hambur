@@ -141,7 +141,6 @@ import com.composables.icons.lucide.CircleX
 import com.composables.icons.lucide.Copy
 import com.composables.icons.lucide.FileText
 import com.composables.icons.lucide.Folder
-import com.composables.icons.lucide.Globe
 import com.composables.icons.lucide.Image
 import com.composables.icons.lucide.Lucide
 import com.composables.icons.lucide.MessageCirclePlus
@@ -159,13 +158,19 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.net.Uri
+import android.os.Build
 import android.util.Log
 import android.view.HapticFeedbackConstants
+import android.view.View
 import android.widget.Toast
 import com.hambur.chat.R
 import com.hambur.chat.perf.ChatJankTracer
 import com.hambur.chat.reducer.HamburUiState
 import com.hambur.chat.reducer.HamburUiStore
+import com.hambur.chat.reducer.THINKING_BLOCK_DISPLAY_AUTO_COLLAPSE
+import com.hambur.chat.reducer.THINKING_BLOCK_DISPLAY_AUTO_EXPAND
+import com.hambur.chat.reducer.THINKING_BLOCK_DISPLAY_COLLAPSED
+import com.hambur.chat.reducer.THINKING_BLOCK_DISPLAY_MODE_KEY
 import com.hambur.chat.reducer.UiMessageSnapshot
 import com.hambur.chat.reducer.UiPendingAttachment
 import com.hambur.chat.reducer.UiSessionSummary
@@ -206,6 +211,7 @@ fun HamburChatScreen(
 ) {
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
+    val haptics = rememberSemanticHaptics()
     var searchQuery by rememberSaveable { mutableStateOf("") }
     var draftTitle by rememberSaveable { mutableStateOf("") }
     var draftMessage by rememberSaveable { mutableStateOf("") }
@@ -300,9 +306,11 @@ fun HamburChatScreen(
     val newSessionBlank = state.isNewSessionBlank()
     fun handleNewChatClick() {
         if (newSessionBlank) {
+            haptics.reject()
             Toast.makeText(context, "已经在新聊天", Toast.LENGTH_SHORT).show()
             return
         }
+        haptics.confirm()
         store.createSession("New chat")
     }
 
@@ -443,7 +451,6 @@ fun HamburChatScreen(
                         },
                         canCreateNewChat = !newSessionBlank,
                         onNewChat = ::handleNewChatClick,
-                        onOpenBrowser = onOpenBrowser,
                     )
 
                     Box(
@@ -477,6 +484,7 @@ fun HamburChatScreen(
                             pendingAttachments = visibleState.pendingAttachments,
                             editing = editingMessageId.isNotBlank(),
                             onToggleThinking = {
+                                haptics.toggle(turningOn = !thinkingEnabled)
                                 Log.i(
                                     "ThinkingToggle",
                                     "brain click session=${visibleState.selectedSessionId.ifBlank { "<draft>" }} from=$thinkingEnabled to=${!thinkingEnabled}",
@@ -486,7 +494,10 @@ fun HamburChatScreen(
                                     !thinkingEnabled,
                                 )
                             },
-                            onToggleAttachmentPanel = { attachmentPanelOpen = !attachmentPanelOpen },
+                            onToggleAttachmentPanel = {
+                                haptics.toggle(turningOn = !attachmentPanelOpen)
+                                attachmentPanelOpen = !attachmentPanelOpen
+                            },
                             onImportAttachment = { displayName, mimeType, byteSize, uri, sourcePath ->
                                 store.importAttachmentMetadata(
                                     sessionId = visibleState.selectedSessionId,
@@ -506,6 +517,7 @@ fun HamburChatScreen(
                                 draftMessage = ""
                             },
                             onSend = {
+                                haptics.confirm()
                                 if (editingMessageId.isNotBlank()) {
                                     store.editMessage(visibleState.selectedSessionId, editingMessageId, draftMessage)
                                     editingMessageId = ""
@@ -578,7 +590,6 @@ private fun ChatHeader(
     onOpenDrawer: () -> Unit,
     canCreateNewChat: Boolean,
     onNewChat: () -> Unit,
-    onOpenBrowser: () -> Unit,
 ) {
     val tokens = HamburTheme.tokens.chat
     Row(
@@ -612,14 +623,6 @@ private fun ChatHeader(
         )
 
         Row {
-            ChatIconButton(onClick = onOpenBrowser, size = tokens.headerIconButtonSize) {
-                Icon(
-                    imageVector = Lucide.Globe,
-                    contentDescription = "Browser",
-                    tint = MaterialTheme.colorScheme.onBackground,
-                    modifier = Modifier.size(tokens.headerBrowserIconSize),
-                )
-            }
             ChatIconButton(
                 onClick = onNewChat,
                 size = tokens.headerIconButtonSize,
@@ -1047,6 +1050,7 @@ private fun ChatTimeline(
 
     val markdownStyle = rememberMarkdownStyle()
     val markdownCache = rememberMarkdownRenderCache()
+    val thinkingDisplayMode = state.thinkingBlockDisplayMode()
     LazyColumn(
         state = listState,
         modifier = modifier.onGloballyPositioned {
@@ -1089,6 +1093,7 @@ private fun ChatTimeline(
                                     }
                                 },
                                 onEditMessage = { message?.let(onEditMessage) },
+                                thinkingDisplayMode = thinkingDisplayMode,
                                 modifier = Modifier.padding(top = topPadding),
                             )
                         }
@@ -1110,9 +1115,12 @@ private fun ChatTimeline(
                 }
 
                 is ChatDisplayItem.AssistantReasoningBlock -> {
+                    val activeTurnId = state.activeTurnIds[sessionId].orEmpty()
+                    val blockTurnId = state.messagesById[item.messageId]?.turnId.orEmpty()
                     ThinkingBlock(
                         text = item.reasoningText,
-                        isGenerating = state.activeTurnIds.containsKey(sessionId),
+                        isGenerating = activeTurnId.isNotBlank() && blockTurnId == activeTurnId,
+                        displayMode = thinkingDisplayMode,
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(top = topPadding),
@@ -1226,6 +1234,7 @@ private fun MessageTimelineItem(
     onSelectText: (String) -> Unit,
     onRetryMessage: () -> Unit,
     onEditMessage: () -> Unit,
+    thinkingDisplayMode: String,
     modifier: Modifier = Modifier,
 ) {
     val role = message?.role ?: item.kind
@@ -1260,6 +1269,7 @@ private fun MessageTimelineItem(
                         ThinkingBlock(
                             text = message.reasoningContent,
                             isGenerating = false,
+                            displayMode = thinkingDisplayMode,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .padding(bottom = 8.dp),
@@ -1403,13 +1413,20 @@ private fun MessageLongPressMenuBox(
 private fun ThinkingBlock(
     text: String,
     isGenerating: Boolean,
+    displayMode: String,
     modifier: Modifier = Modifier,
 ) {
-    var isExpanded by rememberSaveable { mutableStateOf(isGenerating) }
+    var isExpanded by rememberSaveable {
+        mutableStateOf(initialThinkingBlockExpanded(displayMode, isGenerating))
+    }
+    var manuallyToggled by rememberSaveable { mutableStateOf(false) }
 
-    LaunchedEffect(isGenerating) {
-        if (isGenerating) {
-            isExpanded = true
+    LaunchedEffect(isGenerating, displayMode) {
+        if (manuallyToggled) return@LaunchedEffect
+        when (displayMode) {
+            THINKING_BLOCK_DISPLAY_AUTO_COLLAPSE -> isExpanded = isGenerating
+            THINKING_BLOCK_DISPLAY_AUTO_EXPAND -> if (isGenerating) isExpanded = true
+            else -> Unit
         }
     }
 
@@ -1441,7 +1458,10 @@ private fun ThinkingBlock(
             modifier = Modifier
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(8.dp))
-                .clickable { isExpanded = !isExpanded }
+                .clickable {
+                    manuallyToggled = true
+                    isExpanded = !isExpanded
+                }
                 .padding(vertical = 6.dp, horizontal = 4.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
@@ -1711,6 +1731,35 @@ private fun rememberSystemLongPressHapticFeedback(): () -> Unit {
     return remember(view) {
         { view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS) }
     }
+}
+
+// TOGGLE_ON/TOGGLE_OFF/CONFIRM/REJECT 是 API 34 新增常量，minSdk 31 需版本守卫
+private class SemanticHaptics(private val view: View) {
+    fun toggle(turningOn: Boolean) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            view.performHapticFeedback(
+                if (turningOn) HapticFeedbackConstants.TOGGLE_ON else HapticFeedbackConstants.TOGGLE_OFF,
+            )
+        }
+    }
+
+    fun confirm() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            view.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+        }
+    }
+
+    fun reject() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            view.performHapticFeedback(HapticFeedbackConstants.REJECT)
+        }
+    }
+}
+
+@Composable
+private fun rememberSemanticHaptics(): SemanticHaptics {
+    val view = LocalView.current
+    return remember(view) { SemanticHaptics(view) }
 }
 
 private fun copyTextToClipboard(
@@ -2020,7 +2069,7 @@ private fun ChatInputPanel(
                         Icon(
                             imageVector = Lucide.Brain,
                             contentDescription = "Think",
-                            tint = if (thinkingEnabled) MaterialTheme.colorScheme.primary else primaryText,
+                            tint = if (thinkingEnabled) Color(THINKING_ACTIVE_COLOR) else primaryText,
                             modifier = Modifier.size(tokens.inputIconSize),
                         )
                     }
@@ -2868,4 +2917,19 @@ private fun UiTimelineItem.isAssistantReasoningBlock(): Boolean {
 private fun shortTraceId(id: String): String {
     if (id.isBlank()) return "-"
     return if (id.length <= 10) id else id.take(4) + ".." + id.takeLast(6)
+}
+
+private const val THINKING_ACTIVE_COLOR = 0xFF4D6BFE
+
+internal fun initialThinkingBlockExpanded(displayMode: String, isGenerating: Boolean): Boolean {
+    return when (displayMode) {
+        THINKING_BLOCK_DISPLAY_COLLAPSED -> false
+        THINKING_BLOCK_DISPLAY_AUTO_COLLAPSE -> isGenerating
+        else -> true
+    }
+}
+
+private fun HamburUiState.thinkingBlockDisplayMode(): String {
+    return appSettings.firstOrNull { it.key == THINKING_BLOCK_DISPLAY_MODE_KEY }?.value
+        ?: THINKING_BLOCK_DISPLAY_AUTO_EXPAND
 }

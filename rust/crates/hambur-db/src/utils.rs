@@ -68,6 +68,7 @@ pub(crate) fn normalize_app_setting_key(value: &str) -> HamburResult<String> {
         "themeMode",
         "fontScale",
         "startupChatMode",
+        "thinkingBlockDisplayMode",
         "lastSelectedSessionId",
         "loggingEnabled",
         "predictiveBackEnabled",
@@ -175,6 +176,11 @@ pub(crate) fn normalize_app_setting_value(key: &str, value: &str) -> HamburResul
             normalize_enum_setting(key, value, &["small", "default", "large", "extra_large"])
         }
         "startupChatMode" => normalize_enum_setting(key, value, &["new_chat", "last_chat"]),
+        "thinkingBlockDisplayMode" => normalize_enum_setting(
+            key,
+            value,
+            &["auto_expand", "collapsed", "auto_collapse"],
+        ),
         "rootfsBackend" => normalize_enum_setting(key, value, &["chroot", "proot"]),
         "webFetchBackend" => normalize_enum_setting(key, value, &["local", "tinyfish"]),
         "viewImageScaleMode" => normalize_enum_setting(key, value, &["original", "resize_fit"]),

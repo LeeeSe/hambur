@@ -287,7 +287,6 @@ class HamburUiStore(
     private val commandCounter = AtomicLong()
     private var markdownFlushScheduled = false
     private var baselineApplied = false
-    private var defaultProviderConfigured = false
     private var sessionUiStatePersistScheduled = false
     private var creatingSession = false
 
@@ -885,7 +884,6 @@ class HamburUiStore(
             val targetSessionId = sessionId.ifBlank { ensureSessionForNewMessage() }
             if (targetSessionId.isBlank()) return@launch
             setSessionThinkingEnabled(targetSessionId, deepThinkingEnabled)
-            ensureDefaultTextProvider()
             val payload = sendPayloadJson(attachmentIds, deepThinkingEnabled, searchEnabled)
             Log.i(
                 "ThinkingToggle",
@@ -913,7 +911,6 @@ class HamburUiStore(
     fun regenerateMessage(sessionId: String, sourceMessageId: String) {
         if (sessionId.isBlank() || sourceMessageId.isBlank()) return
         scope.launch {
-            ensureDefaultTextProvider()
             val payload = sendPayloadJson(
                 attachmentIds = emptyList(),
                 deepThinkingEnabled = _state.value.thinkingEnabledForSession(sessionId),
@@ -935,7 +932,6 @@ class HamburUiStore(
     fun retryMessage(sessionId: String, sourceMessageId: String) {
         if (sessionId.isBlank() || sourceMessageId.isBlank()) return
         scope.launch {
-            ensureDefaultTextProvider()
             val payload = sendPayloadJson(
                 attachmentIds = emptyList(),
                 deepThinkingEnabled = _state.value.thinkingEnabledForSession(sessionId),
@@ -957,7 +953,6 @@ class HamburUiStore(
     fun editMessage(sessionId: String, sourceMessageId: String, content: String) {
         if (sessionId.isBlank() || sourceMessageId.isBlank() || content.isBlank()) return
         scope.launch {
-            ensureDefaultTextProvider()
             val payload = sendPayloadJson(
                 attachmentIds = emptyList(),
                 deepThinkingEnabled = _state.value.thinkingEnabledForSession(sessionId),
@@ -1655,44 +1650,6 @@ class HamburUiStore(
         }
     }
 
-    private suspend fun ensureDefaultTextProvider() {
-        if (defaultProviderConfigured) return
-
-        val providerId = "provider-openai-compatible-default"
-        if (_state.value.providers.any { it.id == providerId }) {
-            defaultProviderConfigured = true
-            return
-        }
-
-        val providerAck = runtime.dispatch(
-            backendCommand(
-                kind = "UpdateProvider",
-                idempotencyKey = "$providerId:update:default",
-                providerId = providerId,
-                title = "OpenAI Compatible",
-                chunk = "https://api.openai.com/v1",
-                payloadJson = "android-secret://providers/default-openai-compatible",
-            ),
-        )
-        applyRejectedAck(providerAck)
-        if (!providerAck.accepted) return
-
-        val modelsJson = """
-            {"data":[{"id":"hambur-openai-compatible-text","display_name":"OpenAI Compatible Text","supports_reasoning":true,"supports_tool_call":true,"supports_image_input":false,"supports_structured_output":false,"supports_temperature":true,"context_limit":32000,"output_limit":4096}]}
-        """.trimIndent()
-        val modelsAck = runtime.dispatch(
-            backendCommand(
-                kind = "RefreshProviderModels",
-                idempotencyKey = "$providerId:refresh:default",
-                providerId = providerId,
-                modelId = "hambur-openai-compatible-text",
-                payloadJson = modelsJson,
-            ),
-        )
-        applyRejectedAck(modelsAck)
-        defaultProviderConfigured = modelsAck.accepted
-    }
-
     private fun backendCommand(
         kind: String,
         idempotencyKey: String,
@@ -2364,3 +2321,8 @@ private fun SettingsSnapshotDto?.settingBool(key: String, fallback: Boolean): Bo
 
 private const val SESSION_CACHE_LIMIT = 8
 private const val NEW_SESSION_THINKING_KEY = "__new_session__"
+
+const val THINKING_BLOCK_DISPLAY_MODE_KEY = "thinkingBlockDisplayMode"
+const val THINKING_BLOCK_DISPLAY_AUTO_EXPAND = "auto_expand"
+const val THINKING_BLOCK_DISPLAY_COLLAPSED = "collapsed"
+const val THINKING_BLOCK_DISPLAY_AUTO_COLLAPSE = "auto_collapse"

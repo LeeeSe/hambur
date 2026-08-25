@@ -60,6 +60,10 @@ import com.composables.icons.lucide.Terminal
 import com.composables.icons.lucide.Wrench
 import com.hambur.chat.reducer.HamburUiState
 import com.hambur.chat.reducer.HamburUiStore
+import com.hambur.chat.reducer.THINKING_BLOCK_DISPLAY_AUTO_COLLAPSE
+import com.hambur.chat.reducer.THINKING_BLOCK_DISPLAY_AUTO_EXPAND
+import com.hambur.chat.reducer.THINKING_BLOCK_DISPLAY_COLLAPSED
+import com.hambur.chat.reducer.THINKING_BLOCK_DISPLAY_MODE_KEY
 import com.hambur.chat.reducer.UiConfigAudit
 import com.hambur.chat.reducer.UiModelGroupSettings
 import com.hambur.chat.reducer.UiProviderModelSettings
@@ -1291,6 +1295,10 @@ fun AppearanceSettingsScreen(
         HamburThemeDefaults.FontScale,
     )
     val startupChatMode = state.settingValue("startupChatMode", "last_chat")
+    val thinkingBlockMode = state.settingValue(
+        THINKING_BLOCK_DISPLAY_MODE_KEY,
+        THINKING_BLOCK_DISPLAY_AUTO_EXPAND,
+    )
 
     SettingsPage(title = "Appearance", onBack = onBack) {
         item {
@@ -1336,10 +1344,25 @@ fun AppearanceSettingsScreen(
             }
         }
         item {
+            HamburSection(title = "Thinking") {
+                ChoiceRow(
+                    title = "Thinking block display",
+                    current = thinkingBlockMode,
+                    options = listOf(
+                        THINKING_BLOCK_DISPLAY_AUTO_EXPAND to "Auto expand",
+                        THINKING_BLOCK_DISPLAY_COLLAPSED to "Keep collapsed",
+                        THINKING_BLOCK_DISPLAY_AUTO_COLLAPSE to "Expand while thinking, collapse when done",
+                    ),
+                    onSelect = { store.saveRawAppSetting(THINKING_BLOCK_DISPLAY_MODE_KEY, it) },
+                )
+            }
+        }
+        item {
             HamburSection(title = "Current settings") {
                 SummaryLine(label = "themeMode", value = themeMode)
                 SummaryLine(label = "fontScale", value = fontScale)
                 SummaryLine(label = "startupChatMode", value = startupChatMode)
+                SummaryLine(label = "thinkingBlockDisplayMode", value = thinkingBlockMode)
             }
         }
     }

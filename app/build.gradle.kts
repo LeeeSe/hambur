@@ -8,7 +8,7 @@ plugins {
 }
 
 val uniffiVersion = "0.31.2"
-val androidNdkVersion = "28.2.13676358"
+val androidNdkVersion = "30.0.15729638"
 val rustDir = rootProject.layout.projectDirectory.dir("rust")
 val uniffiUdl = rustDir.file("crates/hambur-uniffi/src/hambur_uniffi.udl")
 val uniffiConfig = rustDir.file("crates/hambur-uniffi/uniffi.toml")
@@ -200,4 +200,6 @@ dependencies {
     implementation("net.java.dev.jna:jna:5.17.0@aar")
 
     debugImplementation("androidx.compose.ui:ui-tooling:1.11.2")
+
+    testImplementation("junit:junit:4.13.2")
 }

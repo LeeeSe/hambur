@@ -683,6 +683,20 @@ pub(crate) fn disabled_skill_paths_from_snapshot(snapshot: SettingsSnapshot) -> 
         .collect()
 }
 
+pub(crate) fn disabled_tool_names_from_snapshot(snapshot: &SettingsSnapshot) -> HashSet<String> {
+    snapshot
+        .settings
+        .iter()
+        .filter_map(|setting| {
+            setting
+                .key
+                .strip_prefix("tool_enabled:")
+                .filter(|_| setting.value == "false")
+                .map(ToString::to_string)
+        })
+        .collect()
+}
+
 pub(crate) fn format_skills_index_prompt(skills: Vec<RuntimeSkillSummary>) -> String {
     if skills.is_empty() {
         return String::new();

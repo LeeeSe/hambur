@@ -58,6 +58,7 @@ pub(crate) fn normalize_default_group_key(value: &str) -> HamburResult<String> {
 pub(crate) fn normalize_app_setting_key(value: &str) -> HamburResult<String> {
     let key = value.trim();
     if key.starts_with("skill_enabled:")
+        || key.starts_with("tool_enabled:")
         || key.starts_with("startup_task:")
         || key.starts_with("rootfs_setting:")
     {
@@ -192,6 +193,7 @@ pub(crate) fn normalize_app_setting_value(key: &str, value: &str) -> HamburResul
         "lastSelectedSessionId" => Ok(value.chars().take(160).collect()),
         "browser_tool_settings" => normalize_browser_tool_settings(value),
         key if key.starts_with("skill_enabled:") => normalize_bool_setting(key, value),
+        key if key.starts_with("tool_enabled:") => normalize_bool_setting(key, value),
         "tool_settings"
         | "skills"
         | "memory_projections"

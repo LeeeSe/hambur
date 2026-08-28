@@ -1401,7 +1401,7 @@ impl RuntimeEngine {
             );
         };
         let fallback_policy = plan.fallback_policy;
-        let tools_json = self.tools.schemas().compile_openai_tools_json();
+        let tools_json = self.compile_enabled_main_tools_json();
         let skills_index_prompt = self.build_skills_index_prompt();
         let memory_system_prompt = self.build_memory_system_prompt();
         let stream_sources_by_route = route_snapshots
@@ -1970,7 +1970,7 @@ impl RuntimeEngine {
         let continuation_source = tool_continuation_stream_source(
             current_request,
             &continuation_route,
-            &self.tools.schemas().compile_openai_tools_json(),
+            &self.compile_enabled_main_tools_json(),
             content,
             reasoning,
             assistant_tool_calls,
@@ -2034,11 +2034,25 @@ impl RuntimeEngine {
     ) -> HamburResult<Vec<ToolExecutionRecord>> {
         let mut regular = Vec::new();
         let mut records = Vec::new();
+        let disabled_tools = self.disabled_tool_names_async().await;
         let delegate_task_count = invocations
             .iter()
             .filter(|invocation| invocation.name == "delegate_task")
             .count();
         for invocation in invocations {
+            if disabled_tools.contains(invocation.name.as_str()) {
+                records.push(ToolExecutionRecord {
+                    result: ToolResult::failed(
+                        &invocation.tool_call_id,
+                        &invocation.name,
+                        format!("tool is disabled: {}", invocation.name),
+                    ),
+                    invocation,
+                    started_at_ms: now_ms(),
+                    ended_at_ms: now_ms(),
+                });
+                continue;
+            }
             match invocation.name.as_str() {
                 "view_image" => {
                     records.push(

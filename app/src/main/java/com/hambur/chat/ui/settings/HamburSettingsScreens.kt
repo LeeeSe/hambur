@@ -1087,7 +1087,12 @@ fun ToolsListScreen(
                     "delegate_task" to "Spawn isolated leaf subagents.",
                     "view_image" to "View a local image file from the sandbox.",
                 ).forEach { (name, description) ->
-                    ToolListRow(name, description, onOpenTool)
+                    ToolListRow(
+                        name = name,
+                        description = description,
+                        enabled = state.settingValue("tool_enabled:$name", "true") == "true",
+                        onOpenTool = onOpenTool,
+                    )
                 }
             }
         }
@@ -1110,7 +1115,21 @@ fun ToolDetailScreen(
     val webFetchBackend = state.settingValue("webFetchBackend", "local")
     val viewImageScaleMode = state.settingValue("viewImageScaleMode", "resize_fit")
     val browserSettings = state.browserToolSettings()
+    val toolEnabled = state.settingValue("tool_enabled:$toolName", "true") == "true"
     SettingsPage(title = "Tool Detail", subtitle = toolName, onBack = onBack) {
+        item {
+            HamburSection(title = "Status") {
+                SettingsSwitchRow(
+                    title = "Enabled",
+                    summary = if (toolEnabled) "The model can see and call this tool."
+                    else "Hidden from the model; calls to it are rejected.",
+                    checked = toolEnabled,
+                    onCheckedChange = {
+                        store.saveRawAppSetting("tool_enabled:$toolName", it.toString())
+                    },
+                )
+            }
+        }
         item {
             HamburSection(title = "Description") {
                 SummaryLine(label = "Name", value = toolName)
@@ -2029,6 +2048,7 @@ private fun MemoryListRow(
 private fun ToolListRow(
     name: String,
     description: String,
+    enabled: Boolean,
     onOpenTool: (String) -> Unit,
 ) {
     Surface(
@@ -2039,7 +2059,11 @@ private fun ToolListRow(
         onClick = { onOpenTool(name) },
     ) {
         Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Text(name, fontWeight = FontWeight.SemiBold)
+            Text(
+                if (enabled) name else "$name (disabled)",
+                fontWeight = FontWeight.SemiBold,
+                color = if (enabled) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
+            )
             Text(description, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
         }
     }

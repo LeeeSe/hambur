@@ -451,7 +451,7 @@ impl RuntimeEngine {
                     .get(attempt_index)
                     .cloned()
                     .unwrap_or_else(|| {
-                        let tools_json = self.tools.schemas().compile_openai_tools_json();
+                        let tools_json = self.compile_enabled_main_tools_json();
                         provider_stream_source(
                             &session_id,
                             &turn_id,
@@ -1391,7 +1391,7 @@ impl RuntimeEngine {
     ) -> HamburResult<bool> {
         let mut executed_memory_tool = false;
         let tools_json = compile_named_tools_json(
-            &self.tools.schemas().compile_openai_tools_json(),
+            &self.compile_enabled_main_tools_json(),
             &["memory"],
         )?;
         for _ in 0..MAX_MEMORY_REVIEW_TOOL_ITERATIONS {
@@ -3446,7 +3446,7 @@ impl RuntimeEngine {
             payload_json,
             ..RuntimeCommand::default()
         };
-        let tools_json = self.tools.schemas().compile_delegate_openai_tools_json();
+        let tools_json = self.compile_enabled_delegate_tools_json();
         let skills_index_prompt = self.build_skills_index_prompt_async().await;
         let memory_system_prompt = self.build_memory_system_prompt_async().await;
         let stream_sources_by_route = route_candidates
@@ -4366,6 +4366,30 @@ impl RuntimeEngine {
             .await
             .map(disabled_skill_paths_from_snapshot)
             .unwrap_or_default()
+    }
+    pub(crate) fn disabled_tool_names(&self) -> HashSet<String> {
+        self.safe_block_on(self.database.settings_snapshot())
+            .map(|snapshot| disabled_tool_names_from_snapshot(&snapshot))
+            .unwrap_or_default()
+    }
+    pub(crate) async fn disabled_tool_names_async(&self) -> HashSet<String> {
+        self.database
+            .settings_snapshot()
+            .await
+            .map(|snapshot| disabled_tool_names_from_snapshot(&snapshot))
+            .unwrap_or_default()
+    }
+    pub(crate) fn compile_enabled_main_tools_json(&self) -> String {
+        let disabled = self.disabled_tool_names();
+        self.tools
+            .schemas()
+            .compile_openai_tools_json_excluding(&disabled)
+    }
+    pub(crate) fn compile_enabled_delegate_tools_json(&self) -> String {
+        let disabled = self.disabled_tool_names();
+        self.tools
+            .schemas()
+            .compile_delegate_openai_tools_json_excluding(&disabled)
     }
     pub(crate) fn build_skills_index_prompt(&self) -> String {
         let skills = self

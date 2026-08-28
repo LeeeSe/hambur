@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -548,9 +548,29 @@ impl ToolSchemaCompiler {
         self.compile_named_openai_tools_json(DELEGATE_OPENAI_TOOL_NAMES)
     }
 
+    pub fn compile_openai_tools_json_excluding(&self, disabled: &HashSet<String>) -> String {
+        self.compile_named_openai_tools_json_excluding(MAIN_OPENAI_TOOL_NAMES, disabled)
+    }
+
+    pub fn compile_delegate_openai_tools_json_excluding(
+        &self,
+        disabled: &HashSet<String>,
+    ) -> String {
+        self.compile_named_openai_tools_json_excluding(DELEGATE_OPENAI_TOOL_NAMES, disabled)
+    }
+
     pub fn compile_named_openai_tools_json(&self, names: &[&str]) -> String {
+        self.compile_named_openai_tools_json_excluding(names, &HashSet::new())
+    }
+
+    pub fn compile_named_openai_tools_json_excluding(
+        &self,
+        names: &[&str],
+        disabled: &HashSet<String>,
+    ) -> String {
         let tools = self
             .schemas_for_names(names)
+            .filter(|schema| !disabled.contains(&schema.name))
             .map(|schema| {
                 json!({
                     "type": "function",

@@ -14,6 +14,7 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.snap
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image as ComposeImage
@@ -82,6 +83,7 @@ import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -229,7 +231,7 @@ fun HamburChatScreen(
     var attachmentPanelOpen by rememberSaveable { mutableStateOf(false) }
     var pendingOpenSessionId by remember { mutableStateOf("") }
     var delayedOpenSessionJob by remember { mutableStateOf<Job?>(null) }
-    var baseInputHeightPx by remember { mutableStateOf(0) }
+    var chatInputPanelHeightPx by remember { mutableIntStateOf(0) }
     val density = LocalDensity.current
     val configuration = LocalConfiguration.current
     val chatTokens = HamburTheme.tokens.chat
@@ -251,9 +253,15 @@ fun HamburChatScreen(
     }
     val thinkingEnabled = visibleState.thinkingEnabledForSession()
     val attachmentPanelHeight = 220.dp
+    val imeBottomPx = WindowInsets.ime.getBottom(density)
+    val isImeActive = imeBottomPx > 0
     val attachmentPanelSlotHeight by animateDpAsState(
         targetValue = if (attachmentPanelOpen) attachmentPanelHeight + chatTokens.inputOuterGap else 0.dp,
-        animationSpec = tween(durationMillis = 250, easing = FastOutSlowInEasing),
+        animationSpec = if (isImeActive) {
+            snap()
+        } else {
+            tween(durationMillis = 250, easing = FastOutSlowInEasing)
+        },
         label = "attachmentPanelSlotHeight",
     )
     val drawerBackgroundColor = MaterialTheme.colorScheme.background
@@ -262,8 +270,8 @@ fun HamburChatScreen(
     var drawerOffset by remember { mutableFloatStateOf(0f) }
     val drawerAnimation = remember { Animatable(0f) }
     val messageListBottomPadding = with(density) {
-        baseInputHeightPx.toDp()
-    } + attachmentPanelSlotHeight + chatTokens.timelineBottomGap
+        chatInputPanelHeightPx.toDp()
+    } + chatTokens.timelineBottomGap
     val consumeDrawerDelta: (Float) -> Float = { delta ->
         val previousOffset = drawerOffset
         drawerOffset = (drawerOffset + delta).coerceIn(0f, maxDrawerOffset)
@@ -513,6 +521,7 @@ fun HamburChatScreen(
                                 onClick = {
                                     focusManager.clearFocus()
                                     keyboardController?.hide()
+                                    attachmentPanelOpen = false
                                 },
                             ),
                     ) {
@@ -618,12 +627,8 @@ fun HamburChatScreen(
                             modifier = Modifier
                                 .align(Alignment.BottomCenter)
                                 .onSizeChanged { size ->
-                                    val attachmentSlotHeightPx = with(density) {
-                                        attachmentPanelSlotHeight.roundToPx()
-                                    }
-                                    val inputHeight = (size.height - attachmentSlotHeightPx).coerceAtLeast(0)
-                                    if (baseInputHeightPx != inputHeight) {
-                                        baseInputHeightPx = inputHeight
+                                    if (chatInputPanelHeightPx != size.height) {
+                                        chatInputPanelHeightPx = size.height
                                     }
                                 },
                         )
@@ -2042,17 +2047,47 @@ private fun ChatInputPanel(
 
     val navInsets = WindowInsets.navigationBars
     val imeInsets = WindowInsets.ime
+    val density = LocalDensity.current
     val bgColor = MaterialTheme.colorScheme.background
+
+    var isInputFocused by remember { mutableStateOf(false) }
+
+    val navBottom = with(density) { navInsets.getBottom(this).toDp() }
+    val imeBottom = with(density) { imeInsets.getBottom(this).toDp() }
+    val systemBottom = with(density) { navInsets.union(imeInsets).getBottom(this).toDp() }
+
+    val panelTotalHeight = if (attachmentPanelSlotHeight > 0.dp) {
+        attachmentPanelSlotHeight + navBottom
+    } else {
+        0.dp
+    }
+    val effectiveBottomSlotHeight = maxOf(panelTotalHeight, systemBottom)
+
+    LaunchedEffect(isInputFocused, attachmentPanelOpen) {
+        if (isInputFocused && attachmentPanelOpen) {
+            var elapsed = 0
+            while (isInputFocused && attachmentPanelOpen && elapsed < 350) {
+                delay(32)
+                elapsed += 32
+                val currentSystem = navInsets.union(imeInsets).getBottom(density)
+                val currentPanelPx = with(density) { panelTotalHeight.roundToPx() }
+                val currentIme = imeInsets.getBottom(density)
+                if (currentIme > 0 && (currentSystem >= currentPanelPx || elapsed >= 250)) {
+                    onCloseAttachmentPanel()
+                    break
+                }
+            }
+        }
+    }
 
     Column(
         modifier = modifier
             .fillMaxWidth()
             .padding(top = tokens.inputOuterTopPadding)
             .drawBehind {
-                val insetsHeightPx = navInsets.union(imeInsets).getBottom(this)
-                val attachmentSlotHeightPx = attachmentPanelSlotHeight.toPx()
+                val bottomAreaPx = with(density) { (tokens.inputOuterBottomPadding + effectiveBottomSlotHeight).toPx() }
                 val extraHeightPx = (tokens.inputOuterBottomPadding * 4).toPx()
-                val totalHeightPx = insetsHeightPx + attachmentSlotHeightPx + extraHeightPx
+                val totalHeightPx = bottomAreaPx + extraHeightPx
 
                 drawRect(
                     color = bgColor,
@@ -2151,9 +2186,7 @@ private fun ChatInputPanel(
                             .fillMaxWidth()
                             .padding(start = tokens.inputTextStartPadding)
                             .onFocusChanged { focusState ->
-                                if (focusState.isFocused && attachmentPanelOpen) {
-                                    onCloseAttachmentPanel()
-                                }
+                                isInputFocused = focusState.isFocused
                             },
                     )
                 }
@@ -2237,10 +2270,15 @@ private fun ChatInputPanel(
                 }
             }
         }
+        Spacer(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(tokens.inputOuterBottomPadding)
+        )
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(attachmentPanelSlotHeight)
+                .height(effectiveBottomSlotHeight)
                 .clipToBounds(),
         ) {
             if (attachmentPanelSlotHeight > 0.dp) {
@@ -2257,15 +2295,6 @@ private fun ChatInputPanel(
                 )
             }
         }
-        Spacer(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(tokens.inputOuterBottomPadding)
-        )
-        Spacer(
-            modifier = Modifier
-                .windowInsetsBottomHeight(WindowInsets.navigationBars.union(WindowInsets.ime))
-        )
     }
 }
 

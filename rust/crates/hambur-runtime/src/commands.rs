@@ -1241,7 +1241,6 @@ impl RuntimeEngine {
         };
 
         let visible_user_content = content.clone();
-        let model_user_content = format_user_content_with_attachments(&content, &pending_attachments);
         let can_reuse_source_user = matches!(command_kind, "RetryTurn" | "RegenerateMessage")
             && command.content.trim().is_empty()
             && command.chunk.trim().is_empty()
@@ -1258,9 +1257,13 @@ impl RuntimeEngine {
             let user_message = if reuse_existing_user {
                 reusable_user_message.expect("checked reusable user message")
             } else {
+                let prompt_prefix = format!(
+                    "[Current Time: {}]",
+                    format_beijing_timestamp_with_weekday(now_ms())
+                );
                 let user_message = self
                     .database
-                    .insert_message_with_route(
+                    .insert_message_with_route_and_prefix(
                         &command.session_id,
                         "user",
                         &visible_user_content,
@@ -1268,6 +1271,7 @@ impl RuntimeEngine {
                         "completed",
                         &turn.id,
                         &route,
+                        &prompt_prefix,
                     )
                     .await?;
                 let attachment_ids = pending_attachments
@@ -1325,6 +1329,11 @@ impl RuntimeEngine {
                 &turn.id,
                 &assistant_message.id,
             ).await?;
+            let model_user_content = format_user_content_with_prefix(
+                &user_message.prompt_prefix,
+                &content,
+                &pending_attachments,
+            );
             let chat_context = self
                 .build_chat_context_messages(
                     &command.session_id,
@@ -1336,6 +1345,10 @@ impl RuntimeEngine {
                 )
                 .await?;
             let snapshot = self.database.session_snapshot(&command.session_id).await?;
+            let disabled_tools = self.disabled_tool_names_async().await;
+            let tools_json = self.tools.schemas().compile_openai_tools_json_excluding(&disabled_tools);
+            let skills_index_prompt = self.build_skills_index_prompt_async().await;
+            let memory_system_prompt = self.build_memory_system_prompt_async().await;
             Ok::<_, HamburError>((
                 turn,
                 user_message,
@@ -1343,17 +1356,29 @@ impl RuntimeEngine {
                 chat_context,
                 snapshot,
                 !reuse_existing_user,
+                tools_json,
+                skills_index_prompt,
+                memory_system_prompt,
             ))
         });
 
-        let (turn, _user_message, assistant_message, chat_context, snapshot, user_was_inserted) =
-            match setup {
-                Ok(value) => value,
-                Err(error) => {
-                    let _ = self.emit_error(error.clone());
-                    return rejected_ack(command.command_id, command.idempotency_key, error);
-                }
-            };
+        let (
+            turn,
+            _user_message,
+            assistant_message,
+            chat_context,
+            snapshot,
+            user_was_inserted,
+            tools_json,
+            skills_index_prompt,
+            memory_system_prompt,
+        ) = match setup {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = self.emit_error(error.clone());
+                return rejected_ack(command.command_id, command.idempotency_key, error);
+            }
+        };
 
         let cancel = Arc::new(AtomicBool::new(false));
         if let Ok(mut active_turns) = self.active_turns.lock() {
@@ -1401,9 +1426,6 @@ impl RuntimeEngine {
             );
         };
         let fallback_policy = plan.fallback_policy;
-        let tools_json = self.compile_enabled_main_tools_json();
-        let skills_index_prompt = self.build_skills_index_prompt();
-        let memory_system_prompt = self.build_memory_system_prompt();
         let stream_sources_by_route = route_snapshots
             .iter()
             .map(|route| {
@@ -2086,7 +2108,7 @@ impl RuntimeEngine {
                             .await,
                     );
                 }
-                "web_fetch" | "web_search" => {
+                "web_search" => {
                     records.push(self.execute_web_tool(invocation).await);
                 }
                 "delegate_task" | "submit_delegate_result" => {

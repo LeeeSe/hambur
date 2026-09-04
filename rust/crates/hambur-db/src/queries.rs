@@ -340,7 +340,8 @@ impl HamburDatabase {
                     m.native_finish_reason,
                     m.tool_call_id,
                     m.tool_name,
-                    m.tool_title
+                    m.tool_title,
+                    m.prompt_prefix
                 FROM messages m
                 WHERE m.session_id = ?1
                   AND (
@@ -490,7 +491,8 @@ impl HamburDatabase {
                     native_finish_reason,
                     tool_call_id,
                     tool_name,
-                    tool_title
+                    tool_title,
+                    prompt_prefix
                 FROM messages
                 WHERE session_id = ?1
                   AND role = 'user'
@@ -1204,7 +1206,8 @@ impl HamburDatabase {
                     native_finish_reason,
                     tool_call_id,
                     tool_name,
-                    tool_title
+                    tool_title,
+                    prompt_prefix
                 FROM messages
                 WHERE id = ?1
                 LIMIT 1
@@ -1245,7 +1248,8 @@ impl HamburDatabase {
                     native_finish_reason,
                     tool_call_id,
                     tool_name,
-                    tool_title
+                    tool_title,
+                    prompt_prefix
                 FROM messages
                 WHERE session_id = ?1
                 ORDER BY created_at_ms ASC, id ASC

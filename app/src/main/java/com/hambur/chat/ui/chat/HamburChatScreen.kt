@@ -105,13 +105,17 @@ import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalView
+import kotlin.math.abs
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
@@ -123,6 +127,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.LayoutDirection
+import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Popup
@@ -211,6 +216,8 @@ fun HamburChatScreen(
 ) {
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
+    val focusManager = LocalFocusManager.current
+    val keyboardController = LocalSoftwareKeyboardController.current
     val haptics = rememberSemanticHaptics()
     var searchQuery by rememberSaveable { mutableStateOf("") }
     var draftTitle by rememberSaveable { mutableStateOf("") }
@@ -263,6 +270,10 @@ fun HamburChatScreen(
         drawerOffset - previousOffset
     }
     val animateDrawerTo: suspend (Float) -> Unit = { targetOffset ->
+        if (targetOffset > 0f) {
+            focusManager.clearFocus()
+            keyboardController?.hide()
+        }
         drawerAnimation.snapTo(drawerOffset)
         drawerAnimation.animateTo(
             targetValue = targetOffset,
@@ -273,6 +284,10 @@ fun HamburChatScreen(
         drawerOffset = targetOffset
     }
     val drawerScrollableState = rememberScrollableState { delta ->
+        if (delta > 0f && drawerOffset < maxDrawerOffset) {
+            focusManager.clearFocus()
+            keyboardController?.hide()
+        }
         consumeDrawerDelta(delta)
     }
     val drawerNestedScrollConnection = remember {
@@ -281,8 +296,40 @@ fun HamburChatScreen(
                 if (source != NestedScrollSource.UserInput || drawerOffset <= 0f || available.x == 0f) {
                     return Offset.Zero
                 }
+                if (available.x > 0f && drawerOffset < maxDrawerOffset) {
+                    focusManager.clearFocus()
+                    keyboardController?.hide()
+                }
                 val consumed = consumeDrawerDelta(available.x)
                 return Offset(consumed, 0f)
+            }
+        }
+    }
+    val chatContentNestedScrollConnection = remember {
+        object : NestedScrollConnection {
+            override fun onPostScroll(
+                consumed: Offset,
+                available: Offset,
+                source: NestedScrollSource,
+            ): Offset {
+                // When drawer is closed, do NOT allow any child's horizontal scroll margin (overscroll)
+                // to bubble up and drag open the drawer.
+                if (drawerOffset <= 0f && available.x > 0f) {
+                    return Offset(available.x, 0f)
+                }
+                return Offset.Zero
+            }
+
+            override suspend fun onPostFling(
+                consumed: Velocity,
+                available: Velocity,
+            ): Velocity {
+                // When drawer is closed, do NOT allow any child's residual horizontal fling velocity
+                // to fling open the drawer.
+                if (drawerOffset <= 0f && available.x > 0f) {
+                    return Velocity(available.x, 0f)
+                }
+                return Velocity.Zero
             }
         }
     }
@@ -408,6 +455,7 @@ fun HamburChatScreen(
         Column(
             modifier = Modifier
                 .fillMaxSize()
+                .nestedScroll(chatContentNestedScrollConnection)
                 .graphicsLayer {
                     translationX = drawerOffset
                     scaleX = mainScale
@@ -447,6 +495,8 @@ fun HamburChatScreen(
                     ChatHeader(
                         title = visibleState.selectedSessionTitle(),
                         onOpenDrawer = {
+                            focusManager.clearFocus()
+                            keyboardController?.hide()
                             scope.launch { animateDrawerTo(maxDrawerOffset) }
                         },
                         canCreateNewChat = !newSessionBlank,
@@ -456,7 +506,15 @@ fun HamburChatScreen(
                     Box(
                         modifier = Modifier
                             .weight(1f)
-                            .fillMaxWidth(),
+                            .fillMaxWidth()
+                            .clickable(
+                                interactionSource = remember { MutableInteractionSource() },
+                                indication = null,
+                                onClick = {
+                                    focusManager.clearFocus()
+                                    keyboardController?.hide()
+                                },
+                            ),
                     ) {
                         ChatTimeline(
                             state = visibleState,
@@ -495,9 +553,15 @@ fun HamburChatScreen(
                                 )
                             },
                             onToggleAttachmentPanel = {
-                                haptics.toggle(turningOn = !attachmentPanelOpen)
-                                attachmentPanelOpen = !attachmentPanelOpen
+                                val willOpen = !attachmentPanelOpen
+                                haptics.toggle(turningOn = willOpen)
+                                if (willOpen) {
+                                    focusManager.clearFocus()
+                                    keyboardController?.hide()
+                                }
+                                attachmentPanelOpen = willOpen
                             },
+                            onCloseAttachmentPanel = { attachmentPanelOpen = false },
                             onImportAttachment = { displayName, mimeType, byteSize, uri, sourcePath ->
                                 store.importAttachmentMetadata(
                                     sessionId = visibleState.selectedSessionId,
@@ -1051,9 +1115,33 @@ private fun ChatTimeline(
     val markdownStyle = rememberMarkdownStyle()
     val markdownCache = rememberMarkdownRenderCache()
     val thinkingDisplayMode = state.thinkingBlockDisplayMode()
+    val focusManager = LocalFocusManager.current
+    val keyboardController = LocalSoftwareKeyboardController.current
+    val dismissKeyboardScrollConnection = remember(focusManager, keyboardController) {
+        object : NestedScrollConnection {
+            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                if (source == NestedScrollSource.UserInput && (abs(available.y) > 0.5f || abs(available.x) > 0.5f)) {
+                    focusManager.clearFocus()
+                    keyboardController?.hide()
+                }
+                return Offset.Zero
+            }
+        }
+    }
+
     LazyColumn(
         state = listState,
-        modifier = modifier.onGloballyPositioned {
+        modifier = modifier
+            .nestedScroll(dismissKeyboardScrollConnection)
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = {
+                    focusManager.clearFocus()
+                    keyboardController?.hide()
+                },
+            )
+            .onGloballyPositioned {
             ChatJankTracer.markSessionSwitchOnce(
                 phase = "timeline_first_layout",
                 key = "timeline_first_layout:$sessionId",
@@ -1164,10 +1252,20 @@ private fun EmptyChatState(
     bottomPadding: Dp,
     modifier: Modifier = Modifier,
 ) {
+    val focusManager = LocalFocusManager.current
+    val keyboardController = LocalSoftwareKeyboardController.current
     val tokens = HamburTheme.tokens.chat
     Box(
         modifier = modifier
             .fillMaxSize()
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = {
+                    focusManager.clearFocus()
+                    keyboardController?.hide()
+                },
+            )
             .padding(bottom = bottomPadding),
         contentAlignment = Alignment.Center,
     ) {
@@ -1925,6 +2023,7 @@ private fun ChatInputPanel(
     editing: Boolean,
     onToggleThinking: () -> Unit,
     onToggleAttachmentPanel: () -> Unit,
+    onCloseAttachmentPanel: () -> Unit = {},
     onImportAttachment: (String, String, ULong, String, String) -> Unit,
     onPickImage: (((String, String, ULong, String, String) -> Unit) -> Unit),
     onPickFile: (((String, String, ULong, String, String) -> Unit) -> Unit),
@@ -2050,7 +2149,12 @@ private fun ChatInputPanel(
                         cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(start = tokens.inputTextStartPadding),
+                            .padding(start = tokens.inputTextStartPadding)
+                            .onFocusChanged { focusState ->
+                                if (focusState.isFocused && attachmentPanelOpen) {
+                                    onCloseAttachmentPanel()
+                                }
+                            },
                     )
                 }
                 Row(
@@ -2217,7 +2321,12 @@ private fun AttachmentPickerPanel(
         }
     }
 
+    val focusManager = LocalFocusManager.current
+    val keyboardController = LocalSoftwareKeyboardController.current
+
     LaunchedEffect(Unit) {
+        focusManager.clearFocus()
+        keyboardController?.hide()
         checkAndLoadImages()
     }
 
@@ -2260,11 +2369,37 @@ private fun AttachmentPickerPanel(
         }
     }
 
+    val pickerNestedScrollConnection = remember {
+        object : NestedScrollConnection {
+            override fun onPostScroll(
+                consumed: Offset,
+                available: Offset,
+                source: NestedScrollSource,
+            ): Offset {
+                // Absorb any excess horizontal scroll delta so it never bubbles up
+                return if (available.x != 0f) Offset(available.x, 0f) else Offset.Zero
+            }
+
+            override suspend fun onPostFling(
+                consumed: Velocity,
+                available: Velocity,
+            ): Velocity {
+                // Absorb any excess horizontal fling velocity so it never bubbles up
+                return if (available.x != 0f) Velocity(available.x, 0f) else Velocity.Zero
+            }
+        }
+    }
+
     Column(
         modifier = modifier
             .fillMaxWidth()
             .height(220.dp)
             .background(panelBgColor)
+            .nestedScroll(pickerNestedScrollConnection)
+            .scrollable(
+                state = rememberScrollableState { 0f },
+                orientation = Orientation.Horizontal,
+            )
             .clickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
@@ -2278,6 +2413,7 @@ private fun AttachmentPickerPanel(
                 state = recentImageListState,
                 modifier = Modifier
                     .fillMaxWidth()
+                    .nestedScroll(pickerNestedScrollConnection)
                     .padding(bottom = 20.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {

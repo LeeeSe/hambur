@@ -697,6 +697,7 @@ pub(crate) fn message_from_row(row: &Row) -> HamburResult<MessageRecord> {
         tool_call_id: row.get::<String>(17).map_err(database_error)?,
         tool_name: row.get::<String>(18).map_err(database_error)?,
         tool_title: row.get::<String>(19).map_err(database_error)?,
+        prompt_prefix: row.get::<String>(20).map_err(database_error)?,
         attachments: Vec::new(),
     })
 }

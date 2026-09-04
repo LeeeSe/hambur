@@ -32,7 +32,8 @@ impl RuntimeEngine {
         for session in &snapshot.sessions {
             let _ = sandbox.prepare_session(&session.id);
         }
-        let tools = ToolScheduler::new(PathBuf::from(&bootstrap.app_files_dir).join("offloads"))?;
+        let tools = ToolScheduler::new(PathBuf::from(&bootstrap.app_files_dir).join("offloads"))?
+            .with_app_files_dir(&bootstrap.app_files_dir);
         let (sender, receiver) = mpsc::channel(64);
         let engine = Arc::new(Self {
             tokio,
@@ -219,7 +220,20 @@ impl RuntimeEngine {
         let mut open_tool_call_ids = HashSet::<String>::new();
 
         for entry in transcript {
-            append_transcript_entry_to_context(&mut messages, &mut open_tool_call_ids, entry)?;
+            let attachments = if entry.message.role == "user" {
+                self.database
+                    .attachments_for_message(&entry.message.id)
+                    .await
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            append_transcript_entry_to_context(
+                &mut messages,
+                &mut open_tool_call_ids,
+                entry,
+                &attachments,
+            )?;
         }
 
         if !open_tool_call_ids.is_empty() {
@@ -1622,7 +1636,9 @@ impl RuntimeEngine {
                 status: "failed".to_string(),
             },
         };
-        self.tools.normalize_raw(raw).unwrap_or_else(|error| {
+        self.tools
+            .normalize_raw_with_session(raw, Some(&invocation.session_id))
+            .unwrap_or_else(|error| {
             ToolResult::failed(
                 &invocation.tool_call_id,
                 &invocation.name,
@@ -2626,7 +2642,9 @@ impl RuntimeEngine {
                     command_or_url: arguments.to_string(),
                     status,
                 };
-                self.tools.normalize_raw(raw).unwrap_or_else(|error| {
+                self.tools
+                    .normalize_raw_with_session(raw, Some(&invocation.session_id))
+                    .unwrap_or_else(|error| {
                     ToolResult::failed(
                         &invocation.tool_call_id,
                         &invocation.name,
@@ -2737,16 +2755,6 @@ impl RuntimeEngine {
         }
 
         let raw = match invocation.name.as_str() {
-            "web_fetch" => {
-                let backend = self
-                    .database
-                    .settings_snapshot()
-                    .await
-                    .ok()
-                    .map(|snapshot| setting_value(&snapshot, "webFetchBackend", "local"))
-                    .unwrap_or_else(|| "local".to_string());
-                run_web_fetch(invocation, arguments, &backend)
-            }
             "web_search" => RawToolOutput {
                 tool_call_id: invocation.tool_call_id.clone(),
                 tool_name: invocation.name.clone(),
@@ -2769,7 +2777,9 @@ impl RuntimeEngine {
             },
         };
 
-        self.tools.normalize_raw(raw).unwrap_or_else(|error| {
+        self.tools
+            .normalize_raw_with_session(raw, Some(&invocation.session_id))
+            .unwrap_or_else(|error| {
             ToolResult::failed(
                 &invocation.tool_call_id,
                 &invocation.name,
@@ -3449,6 +3459,11 @@ impl RuntimeEngine {
         let tools_json = self.compile_enabled_delegate_tools_json();
         let skills_index_prompt = self.build_skills_index_prompt_async().await;
         let memory_system_prompt = self.build_memory_system_prompt_async().await;
+        let child_model_content = format!(
+            "[Current Time: {}]\n\n{}",
+            format_beijing_timestamp_with_weekday(now_ms()),
+            child_content.trim()
+        );
         let stream_sources_by_route = route_candidates
             .iter()
             .map(|candidate| {
@@ -3458,7 +3473,7 @@ impl RuntimeEngine {
                     &child_content,
                     vec![ModelMessage {
                         role: "user".to_string(),
-                        content: child_content.clone(),
+                        content: child_model_content.clone(),
                         ..Default::default()
                     }],
                     candidate,

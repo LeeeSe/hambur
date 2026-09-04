@@ -86,6 +86,7 @@ pub struct MessageRecord {
     pub tool_call_id: String,
     pub tool_name: String,
     pub tool_title: String,
+    pub prompt_prefix: String,
     pub attachments: Vec<AttachmentRecord>,
 }
 

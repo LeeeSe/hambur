@@ -1069,7 +1069,6 @@ fun ToolsListScreen(
         item {
             HamburSection(title = "Built-in tools") {
                 listOf(
-                    "get_current_time" to "Get the current date and time from the user's device.",
                     "skills_list" to "List available skills with minimal metadata.",
                     "skill_view" to "Load a skill's main content or linked file.",
                     "terminal" to "Run a shell command inside the Linux sandbox.",
@@ -1080,7 +1079,6 @@ fun ToolsListScreen(
                     "search_files" to "Search file contents or find files by name.",
                     "hambur_config" to "Read and update Hambur app configuration.",
                     "web_search" to "Search the web for information.",
-                    "web_fetch" to "Extract readable text from web page URLs.",
                     "browser_use" to "Control the shared Android WebView browser.",
                     "session_search" to "Search past chat sessions stored locally.",
                     "memory" to "Save durable information to persistent memory.",
@@ -1112,7 +1110,6 @@ fun ToolDetailScreen(
     var toolSettings by rememberSaveable(toolName) {
         mutableStateOf(state.appSettings.firstOrNull { it.key == "tool_settings" }?.value ?: """{"enabled":true}""")
     }
-    val webFetchBackend = state.settingValue("webFetchBackend", "local")
     val viewImageScaleMode = state.settingValue("viewImageScaleMode", "resize_fit")
     val browserSettings = state.browserToolSettings()
     val toolEnabled = state.settingValue("tool_enabled:$toolName", "true") == "true"
@@ -1134,18 +1131,6 @@ fun ToolDetailScreen(
             HamburSection(title = "Description") {
                 SummaryLine(label = "Name", value = toolName)
                 SummaryLine(label = "Backend", value = if (toolName == "browser_use") "AndroidPlatformAdapter browser actions" else "Rust tool registry")
-            }
-        }
-        if (toolName == "web_fetch") {
-            item {
-                HamburSection(title = "Configuration") {
-                    ChoiceRow(
-                        title = "Backend",
-                        current = webFetchBackend,
-                        options = listOf("local" to "Local", "tinyfish" to "TinyFish"),
-                        onSelect = { store.saveRawAppSetting("webFetchBackend", it) },
-                    )
-                }
             }
         }
         if (toolName == "view_image") {

@@ -154,6 +154,7 @@ impl HamburDatabase {
             tool_call_id: String::new(),
             tool_name: String::new(),
             tool_title: String::new(),
+            prompt_prefix: String::new(),
             attachments: Vec::new(),
         })
     }
@@ -168,6 +169,31 @@ impl HamburDatabase {
         status: &str,
         turn_id: &str,
         route: &ModelRouteSnapshot,
+    ) -> HamburResult<MessageRecord> {
+        self.insert_message_with_route_and_prefix(
+            session_id,
+            role,
+            content_text,
+            reasoning_content,
+            status,
+            turn_id,
+            route,
+            "",
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_message_with_route_and_prefix(
+        &self,
+        session_id: &str,
+        role: &str,
+        content_text: &str,
+        reasoning_content: &str,
+        status: &str,
+        turn_id: &str,
+        route: &ModelRouteSnapshot,
+        prompt_prefix: &str,
     ) -> HamburResult<MessageRecord> {
         self.ensure_session_exists(session_id).await?;
 
@@ -195,9 +221,10 @@ impl HamburDatabase {
                         model_name_snapshot,
                         model_group_id,
                         finish_reason,
-                        native_finish_reason
+                        native_finish_reason,
+                        prompt_prefix
                     )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11, ?12, ?13, ?14, '', '')",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11, ?12, ?13, ?14, '', '', ?15)",
                 params![
                     id.clone(),
                     session_id,
@@ -212,7 +239,8 @@ impl HamburDatabase {
                     route.provider_protocol.clone(),
                     route.model_id.clone(),
                     route.model_display_name.clone(),
-                    route.model_group_id.clone()
+                    route.model_group_id.clone(),
+                    prompt_prefix
                 ],
             )
             .await
@@ -240,6 +268,7 @@ impl HamburDatabase {
             tool_call_id: String::new(),
             tool_name: String::new(),
             tool_title: String::new(),
+            prompt_prefix: prompt_prefix.to_string(),
             attachments: Vec::new(),
         })
     }
@@ -2159,7 +2188,8 @@ impl HamburDatabase {
                     native_finish_reason TEXT NOT NULL DEFAULT '',
                     tool_call_id TEXT NOT NULL DEFAULT '',
                     tool_name TEXT NOT NULL DEFAULT '',
-                    tool_title TEXT NOT NULL DEFAULT ''
+                    tool_title TEXT NOT NULL DEFAULT '',
+                    prompt_prefix TEXT NOT NULL DEFAULT ''
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_messages_session_order
@@ -2595,6 +2625,8 @@ impl HamburDatabase {
         self.add_column_if_missing("messages", "tool_name", "TEXT NOT NULL DEFAULT ''")
             .await?;
         self.add_column_if_missing("messages", "tool_title", "TEXT NOT NULL DEFAULT ''")
+            .await?;
+        self.add_column_if_missing("messages", "prompt_prefix", "TEXT NOT NULL DEFAULT ''")
             .await?;
         self.add_column_if_missing("timeline_items", "visible", "INTEGER NOT NULL DEFAULT 1")
             .await?;

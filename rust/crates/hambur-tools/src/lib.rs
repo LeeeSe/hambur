@@ -22,7 +22,6 @@ pub struct ToolSchema {
 }
 
 const MAIN_OPENAI_TOOL_NAMES: &[&str] = &[
-    "get_current_time",
     "skills_list",
     "skill_view",
     "terminal",
@@ -33,7 +32,6 @@ const MAIN_OPENAI_TOOL_NAMES: &[&str] = &[
     "search_files",
     "hambur_config",
     "web_search",
-    "web_fetch",
     "browser_use",
     "session_search",
     "memory",
@@ -42,7 +40,6 @@ const MAIN_OPENAI_TOOL_NAMES: &[&str] = &[
 ];
 
 const DELEGATE_OPENAI_TOOL_NAMES: &[&str] = &[
-    "get_current_time",
     "skills_list",
     "skill_view",
     "terminal",
@@ -53,7 +50,6 @@ const DELEGATE_OPENAI_TOOL_NAMES: &[&str] = &[
     "search_files",
     "hambur_config",
     "web_search",
-    "web_fetch",
     "browser_use",
     "session_search",
     "memory",
@@ -69,15 +65,6 @@ pub struct ToolSchemaCompiler {
 impl ToolSchemaCompiler {
     pub fn with_builtin_tools() -> HamburResult<Self> {
         let mut compiler = Self::default();
-        compiler.register(ToolSchema {
-            name: "get_current_time".to_string(),
-            description: "Get the current date and time from the user's device.".to_string(),
-            parameters_json_schema: object_schema(json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            })),
-        })?;
         compiler.register(ToolSchema {
             name: "session_search".to_string(),
             description: "Search past chat sessions stored locally on this phone, or read/scroll inside one. Calling shapes: (1) pass query for discovery; (2) pass session_id + around_message_id to scroll around a message; (3) pass session_id only to read a session; (4) pass no args to browse recent sessions. Use this for questions like what did we discuss about X, where did we leave Y, or find the session where Z.".to_string(),
@@ -325,24 +312,6 @@ impl ToolSchemaCompiler {
                     "query": {"type": "string", "description": "The search query to look up on the web. You may include backend-supported operators such as site:example.com, filetype:pdf, intitle:word, -term, or \"exact phrase\"."}
                 },
                 "required": ["query"],
-                "additionalProperties": false
-            })),
-        })?;
-        compiler.register(ToolSchema {
-            name: "web_fetch".to_string(),
-            description: "Extract readable text from web page URLs. Returns simplified text from HTML or raw text for non-HTML responses. Pass up to 5 URLs per call. PDF conversion is not implemented yet on this phone agent.".to_string(),
-            parameters_json_schema: object_schema(json!({
-                "type": "object",
-                "properties": {
-                    "urls": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "List of HTTP or HTTPS URLs to extract content from. Max 5 URLs per call.",
-                        "maxItems": 5
-                    },
-                    "max_chars": {"type": "integer", "minimum": 1000, "maximum": 50000}
-                },
-                "required": ["urls"],
                 "additionalProperties": false
             })),
         })?;
@@ -807,6 +776,7 @@ pub struct RawToolOutput {
 
 #[derive(Debug, Clone)]
 pub struct ToolResultNormalizer {
+    app_files_dir: Option<PathBuf>,
     offload_dir: PathBuf,
     sandbox_offload_dir: String,
     large_result_threshold_bytes: usize,
@@ -818,10 +788,16 @@ impl ToolResultNormalizer {
             HamburError::Internal(format!("create tool offload directory: {error}"))
         })?;
         Ok(Self {
+            app_files_dir: None,
             offload_dir,
             sandbox_offload_dir: "/var/hambur/offloads".to_string(),
             large_result_threshold_bytes: DEFAULT_LARGE_RESULT_THRESHOLD_BYTES,
         })
+    }
+
+    pub fn with_app_files_dir(mut self, dir: PathBuf) -> Self {
+        self.app_files_dir = Some(dir);
+        self
     }
 
     pub fn with_threshold(mut self, threshold: usize) -> Self {
@@ -830,6 +806,14 @@ impl ToolResultNormalizer {
     }
 
     pub fn normalize(&self, raw: RawToolOutput) -> HamburResult<ToolResult> {
+        self.normalize_with_session(raw, None)
+    }
+
+    pub fn normalize_with_session(
+        &self,
+        raw: RawToolOutput,
+        session_id: Option<&str>,
+    ) -> HamburResult<ToolResult> {
         let bytes = raw.content.len();
         let untrusted = raw.trust_level == "untrusted";
         let wrapped_content = if untrusted {
@@ -845,6 +829,24 @@ impl ToolResultNormalizer {
             fs::write(&host_path, raw.content.as_bytes()).map_err(|error| {
                 HamburError::Internal(format!("write tool offload file: {error}"))
             })?;
+
+            let mut final_host_path = host_path.clone();
+            if let (Some(app_files), Some(sid)) = (&self.app_files_dir, session_id) {
+                let target_dirs = [
+                    app_files.join("sandbox").join("sessions").join(sid).join("offloads"),
+                    app_files.join("sessions").join(sid).join("offloads"),
+                    app_files.join("sandbox").join("offloads"),
+                ];
+                for dir in &target_dirs {
+                    if fs::create_dir_all(dir).is_ok() {
+                        let file = dir.join(&file_name);
+                        if fs::write(&file, raw.content.as_bytes()).is_ok() && dir.to_string_lossy().contains("sandbox") {
+                            final_host_path = file;
+                        }
+                    }
+                }
+            }
+
             let sandbox_path = format!("{}/{}", self.sandbox_offload_dir, file_name);
             let context_stub = large_result_stub(
                 &raw.tool_name,
@@ -869,7 +871,7 @@ impl ToolResultNormalizer {
                 trust_level: raw.trust_level,
                 truncated: true,
                 offloaded_file_id: offload_file_id,
-                offloaded_path: host_path.to_string_lossy().to_string(),
+                offloaded_path: final_host_path.to_string_lossy().to_string(),
                 context_stub,
             })
         } else {
@@ -927,8 +929,21 @@ impl ToolScheduler {
         self
     }
 
+    pub fn with_app_files_dir(mut self, dir: impl AsRef<Path>) -> Self {
+        self.normalizer = self.normalizer.with_app_files_dir(dir.as_ref().to_path_buf());
+        self
+    }
+
     pub fn normalize_raw(&self, raw: RawToolOutput) -> HamburResult<ToolResult> {
         self.normalizer.normalize(raw)
+    }
+
+    pub fn normalize_raw_with_session(
+        &self,
+        raw: RawToolOutput,
+        session_id: Option<&str>,
+    ) -> HamburResult<ToolResult> {
+        self.normalizer.normalize_with_session(raw, session_id)
     }
 
     pub async fn execute_batch(
@@ -1026,7 +1041,7 @@ async fn execute_one_tool(
             status: error.code().as_str().to_string(),
         },
     };
-    let result = normalizer.normalize(raw)?;
+    let result = normalizer.normalize_with_session(raw, Some(&invocation.session_id))?;
     Ok(ToolExecutionRecord {
         invocation,
         result,
@@ -1037,23 +1052,6 @@ async fn execute_one_tool(
 
 fn run_builtin_tool(invocation: &ToolInvocation, arguments: &Value) -> RawToolOutput {
     match invocation.name.as_str() {
-        "get_current_time" => {
-            let content = json!({
-                "epoch_ms": now_ms(),
-                "timezone": "UTC"
-            })
-            .to_string();
-            RawToolOutput {
-                tool_call_id: invocation.tool_call_id.clone(),
-                tool_name: invocation.name.clone(),
-                is_error: false,
-                content,
-                summary: "Current time returned".to_string(),
-                trust_level: "trusted".to_string(),
-                command_or_url: "clock".to_string(),
-                status: "ok".to_string(),
-            }
-        }
         "session_search" => {
             let query = arguments
                 .get("query")
@@ -1131,7 +1129,7 @@ fn run_builtin_tool(invocation: &ToolInvocation, arguments: &Value) -> RawToolOu
             command_or_url: invocation.arguments_json.clone(),
             status: "PlatformRequestUnavailable".to_string(),
         },
-        "web_search" | "web_fetch" => RawToolOutput {
+        "web_search" => RawToolOutput {
             tool_call_id: invocation.tool_call_id.clone(),
             tool_name: invocation.name.clone(),
             is_error: true,
@@ -1166,7 +1164,6 @@ fn run_builtin_tool(invocation: &ToolInvocation, arguments: &Value) -> RawToolOu
 
 fn display_title(name: &str, arguments_json: &str) -> String {
     match name {
-        "get_current_time" => "Get current time".to_string(),
         "session_search" => {
             let query = serde_json::from_str::<Value>(arguments_json)
                 .ok()
@@ -1233,7 +1230,6 @@ fn display_title(name: &str, arguments_json: &str) -> String {
                 format!("Search web: {query}")
             }
         }
-        "web_fetch" => "Fetch web URLs".to_string(),
         "browser_use" => {
             let action = serde_json::from_str::<Value>(arguments_json)
                 .ok()
@@ -1265,7 +1261,7 @@ fn risk_level(name: &str) -> String {
         | "hambur_config"
         | "delegate_task"
         | "submit_delegate_result" => "high",
-        "web_search" | "web_fetch" | "browser_use" => "medium",
+        "web_search" | "browser_use" => "medium",
         _ => "low",
     }
     .to_string()
@@ -1278,7 +1274,7 @@ fn requires_approval(name: &str) -> bool {
 fn timeout_ms(name: &str) -> u64 {
     match name {
         "terminal" | "process" => 120_000,
-        "web_search" | "web_fetch" | "browser_use" => 60_000,
+        "web_search" | "browser_use" => 60_000,
         "delegate_task" => 600_000,
         _ => 30_000,
     }
@@ -1288,7 +1284,6 @@ fn is_parallel_tool(name: &str) -> bool {
     matches!(
         name,
         "web_search"
-            | "web_fetch"
             | "read_file"
             | "search_files"
             | "terminal"
@@ -1296,7 +1291,6 @@ fn is_parallel_tool(name: &str) -> bool {
             | "skill_list"
             | "skills_list"
             | "skill_view"
-            | "get_current_time"
             | "echo"
             | "view_image"
     )
@@ -1365,4 +1359,50 @@ fn trim_to_char_boundary(content: &str, max_bytes: usize) -> &str {
     }
     &content[..end]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalizer_session_offload() {
+        let temp_dir = std::env::temp_dir().join(format!("hambur_test_{}", now_ms()));
+        let offload_dir = temp_dir.join("offloads");
+        let normalizer = ToolResultNormalizer::new(offload_dir.clone())
+            .unwrap()
+            .with_app_files_dir(temp_dir.clone())
+            .with_threshold(100);
+
+        let large_content = "A".repeat(1000);
+        let raw = RawToolOutput {
+            tool_call_id: "call_123".to_string(),
+            tool_name: "web_search".to_string(),
+            is_error: false,
+            content: large_content.clone(),
+            summary: "Fetched large url".to_string(),
+            trust_level: "untrusted".to_string(),
+            command_or_url: "http://example.com".to_string(),
+            status: "ok".to_string(),
+        };
+
+        let result = normalizer.normalize_with_session(raw, Some("test_session")).unwrap();
+        assert!(result.truncated);
+        assert!(!result.offloaded_file_id.is_empty());
+
+        let expected_sandbox_offload = temp_dir
+            .join("sandbox")
+            .join("sessions")
+            .join("test_session")
+            .join("offloads")
+            .join(format!("{}.txt", result.offloaded_file_id));
+
+        assert!(expected_sandbox_offload.exists(), "File must exist in sandbox session offload dir");
+        let saved_content = fs::read_to_string(&expected_sandbox_offload).unwrap();
+        assert_eq!(saved_content, large_content);
+
+        // cleanup
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+}
+
 

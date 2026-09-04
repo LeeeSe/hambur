@@ -1075,14 +1075,20 @@ pub(crate) fn append_transcript_entry_to_context(
     messages: &mut Vec<ModelMessage>,
     open_tool_call_ids: &mut HashSet<String>,
     entry: hambur_db::ChatTranscriptEntry,
+    attachments: &[AttachmentRecord],
 ) -> HamburResult<()> {
     let message = entry.message;
     match message.role.as_str() {
         "user" => {
             if message.status == "completed" && !message.content_text.trim().is_empty() {
+                let content = format_user_content_with_prefix(
+                    &message.prompt_prefix,
+                    &message.content_text,
+                    attachments,
+                );
                 messages.push(ModelMessage {
                     role: "user".to_string(),
-                    content: message.content_text,
+                    content,
                     ..Default::default()
                 });
             }
@@ -1313,10 +1319,13 @@ pub(crate) fn provider_stream_source(
         system_blocks.push(memory_system_prompt.to_string());
     }
     if search_enabled {
-        system_blocks.push(
-            "Web/search assistance is enabled for this turn. Use available search or fetch tools when current external information is needed."
-                .to_string(),
-        );
+        let has_web_tools = tools_json.contains("\"web_search\"") || tools_json.contains("\"browser_use\"");
+        if has_web_tools {
+            system_blocks.push(
+                "Web assistance is enabled for this turn. Use available web search or browser tools when current external information is needed."
+                    .to_string(),
+            );
+        }
     }
     RouteStreamSource::Provider(ModelRequest {
         request_id: new_id("llm_req"),
@@ -1694,32 +1703,85 @@ impl SendOptions {
     }
 }
 
+pub(crate) fn format_beijing_timestamp_with_weekday(now_ms: u64) -> String {
+    // Beijing Time is UTC+8: add 8 hours (8 * 3600 seconds = 28,800 seconds)
+    let beijing_secs = (now_ms / 1000).saturating_add(8 * 3600);
+    let day_secs = beijing_secs % 86400;
+    let hour = day_secs / 3600;
+    let minute = (day_secs % 3600) / 60;
+    let second = beijing_secs % 60;
+
+    let days = beijing_secs / 86400;
+    let (weekday_en, weekday_zh) = match (days + 4) % 7 {
+        0 => ("Sunday", "星期日"),
+        1 => ("Monday", "星期一"),
+        2 => ("Tuesday", "星期二"),
+        3 => ("Wednesday", "星期三"),
+        4 => ("Thursday", "星期四"),
+        5 => ("Friday", "星期五"),
+        _ => ("Saturday", "星期六"),
+    };
+
+    let z = days as i64 + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    format!("{y:04}-{m:02}-{d:02} {hour:02}:{minute:02}:{second:02} (UTC+8 / 北京时间), {weekday_en} ({weekday_zh})")
+}
+
+pub(crate) fn format_user_content_with_prefix(
+    prompt_prefix: &str,
+    content: &str,
+    attachments: &[AttachmentRecord],
+) -> String {
+    let trimmed = content.trim();
+    let mut formatted = if prompt_prefix.trim().is_empty() {
+        trimmed.to_string()
+    } else {
+        format!("{prompt_prefix}\n\n{trimmed}")
+    };
+    if !attachments.is_empty() {
+        formatted.push_str("\n\nAttachments:");
+        for attachment in attachments {
+            if attachment.kind == "image" {
+                formatted.push_str(&format!(
+                    "\n- 用户附加了一张图片：{}，大小：{} bytes。路径：{}。需要查看时请调用 view_image。",
+                    attachment.display_name, attachment.byte_size, attachment.sandbox_path
+                ));
+            } else {
+                formatted.push_str(&format!(
+                    "\n- 用户附加了文件：{}，大小：{} bytes。路径：{}。需要查看时请使用文件工具读取。",
+                    attachment.display_name, attachment.byte_size, attachment.sandbox_path
+                ));
+            }
+        }
+    }
+    formatted
+}
+
+pub(crate) fn format_user_content_for_model(
+    content: &str,
+    attachments: &[AttachmentRecord],
+    now_ms: u64,
+) -> String {
+    let time_str = format_beijing_timestamp_with_weekday(now_ms);
+    let prefix = format!("[Current Time: {time_str}]");
+    format_user_content_with_prefix(&prefix, content, attachments)
+}
+
+#[allow(dead_code)]
 pub(crate) fn format_user_content_with_attachments(
     content: &str,
     attachments: &[AttachmentRecord],
 ) -> String {
-    if attachments.is_empty() {
-        return content.to_string();
-    }
-    let mut formatted = content.trim().to_string();
-    if !formatted.is_empty() {
-        formatted.push_str("\n\n");
-    }
-    formatted.push_str("Attachments:");
-    for attachment in attachments {
-        if attachment.kind == "image" {
-            formatted.push_str(&format!(
-                "\n- 用户附加了一张图片：{}，大小：{} bytes。路径：{}。需要查看时请调用 view_image。",
-                attachment.display_name, attachment.byte_size, attachment.sandbox_path
-            ));
-        } else {
-            formatted.push_str(&format!(
-                "\n- 用户附加了文件：{}，大小：{} bytes。路径：{}。需要查看时请使用文件工具读取。",
-                attachment.display_name, attachment.byte_size, attachment.sandbox_path
-            ));
-        }
-    }
-    formatted
+    format_user_content_for_model(content, attachments, now_ms())
 }
 
 pub(crate) fn format_synthetic_view_image_message(context_stubs: &[String]) -> String {
@@ -2006,238 +2068,54 @@ pub(crate) fn markdown_block_summary(node: &hambur_markdown::MarkdownBlockNode) 
         .collect()
 }
 
-pub(crate) const TINYFISH_API_KEY: &str = "sk-tinyfish-nOfH8Vi9QMLd88_lfB0MKZbWg_O23YN-";
-
-pub(crate) fn run_web_fetch(
-    invocation: &ToolInvocation,
-    arguments: &Value,
-    backend: &str,
-) -> RawToolOutput {
-    let urls = arguments
-        .get("urls")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|value| value.as_str().map(str::to_string))
-        .collect::<Vec<_>>();
-    if urls.is_empty() {
-        return RawToolOutput {
-            tool_call_id: invocation.tool_call_id.clone(),
-            tool_name: invocation.name.clone(),
-            is_error: true,
-            content: "web_fetch urls must not be empty".to_string(),
-            summary: "No URLs to fetch".to_string(),
-            trust_level: "trusted".to_string(),
-            command_or_url: arguments.to_string(),
-            status: "InvalidCommand".to_string(),
-        };
+#[allow(dead_code)]
+pub(crate) fn is_known_binary_content_type(content_type: &str) -> bool {
+    let lower = content_type.to_ascii_lowercase();
+    let mime = lower.split(';').next().unwrap_or("").trim();
+    if mime == "image/svg+xml" {
+        return false;
     }
-    if urls.len() > 5 {
-        return RawToolOutput {
-            tool_call_id: invocation.tool_call_id.clone(),
-            tool_name: invocation.name.clone(),
-            is_error: true,
-            content: "web_fetch supports at most 5 URLs per call".to_string(),
-            summary: "Too many URLs".to_string(),
-            trust_level: "trusted".to_string(),
-            command_or_url: arguments.to_string(),
-            status: "InvalidCommand".to_string(),
-        };
-    }
-    let max_chars = arguments
-        .get("max_chars")
-        .and_then(Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or(20_000)
-        .clamp(1_000, 50_000);
-    let max_bytes = arguments
-        .get("max_bytes")
-        .and_then(Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or(max_chars.saturating_mul(4))
-        .clamp(1_024, 10_000_000);
-    let mut fetched = Vec::new();
-    let mut errors = Vec::new();
-    for url in urls {
-        let fetch_url = url.clone();
-        let backend = backend.to_string();
-        let result = thread::spawn(move || {
-            if backend == "tinyfish" {
-                fetch_tinyfish_url(&fetch_url)
-            } else {
-                fetch_http_url(&fetch_url, max_bytes)
-            }
-        })
-        .join()
-        .unwrap_or_else(|_| Err("web_fetch worker panicked".to_string()));
-        match result {
-            Ok(mut value) => {
-                let content_key = if value.get("content").is_some() {
-                    "content"
-                } else {
-                    "text"
-                };
-                if let Some(content) = value.get(content_key).and_then(Value::as_str) {
-                    let truncated = content.chars().count() > max_chars;
-                    value["content"] = Value::String(content.chars().take(max_chars).collect());
-                    value["truncated"] = Value::Bool(truncated);
-                    if content_key == "text" {
-                        value.as_object_mut().map(|object| object.remove("text"));
-                    }
-                }
-                fetched.push(value);
-            }
-            Err(error) => errors.push(json!({
-                "url": url,
-                "error": error
-            })),
-        }
-    }
-    let fetched_count = fetched.len();
-    let error_count = errors.len();
-    let content = json!({
-        "fetched": fetched,
-        "errors": errors
-    });
-    RawToolOutput {
-        tool_call_id: invocation.tool_call_id.clone(),
-        tool_name: invocation.name.clone(),
-        is_error: error_count > 0 && fetched_count == 0,
-        content: content.to_string(),
-        summary: format!("Fetched {fetched_count} URLs, {error_count} failed"),
-        trust_level: "untrusted".to_string(),
-        command_or_url: arguments.to_string(),
-        status: if error_count == 0 { "ok" } else { "partial" }.to_string(),
-    }
+    mime.starts_with("image/")
+        || mime.starts_with("audio/")
+        || mime.starts_with("video/")
+        || mime == "application/pdf"
+        || mime == "application/zip"
+        || mime == "application/gzip"
+        || mime == "application/x-tar"
+        || mime == "application/octet-stream"
+        || mime == "application/vnd.android.package-archive"
+        || mime.ends_with("wasm")
+        || mime.ends_with("protobuf")
 }
 
-pub(crate) fn fetch_tinyfish_url(url: &str) -> Result<Value, String> {
-    validate_web_fetch_url(url)?;
-    let client = reqwest::blocking::Client::builder()
-        .timeout(StdDuration::from_secs(30))
-        .build()
-        .map_err(|error| format!("build TinyFish client failed: {error}"))?;
-    let body = serde_json::to_string(&json!({ "urls": [url] }))
-        .map_err(|error| format!("serialize TinyFish request failed: {error}"))?;
-    let response = client
-        .post("https://api.fetch.tinyfish.ai")
-        .header("X-API-Key", TINYFISH_API_KEY)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(body)
-        .send()
-        .map_err(|error| format!("TinyFish request failed: {error}"))?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(format!("TinyFish HTTP {}", status.as_u16()));
+pub(crate) fn is_binary_bytes(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
     }
-    let body = response
-        .text()
-        .map_err(|error| format!("TinyFish response read failed: {error}"))?;
-    let value: Value = serde_json::from_str(&body)
-        .map_err(|error| format!("TinyFish response JSON parse failed: {error}"))?;
-    let text = value
-        .get("results")
-        .and_then(Value::as_array)
-        .and_then(|items| items.first())
-        .and_then(|item| item.get("text"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    if text.is_empty() {
-        return Err("Empty result from TinyFish".to_string());
+    let sample_len = bytes.len().min(4096);
+    let sample = &bytes[..sample_len];
+    if sample.contains(&0) {
+        return true;
     }
-    Ok(json!({
-        "url": url,
-        "transport": "tinyfish",
-        "content_type": "text/html",
-        "content": text,
-        "truncated": false
-    }))
-}
-
-pub(crate) fn fetch_http_url(url: &str, max_bytes: usize) -> Result<Value, String> {
-    validate_web_fetch_url(url)?;
-    let client = reqwest::blocking::Client::builder()
-        .timeout(StdDuration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .build()
-        .map_err(|error| format!("build web client failed: {error}"))?;
-    let mut response = client
-        .get(url)
-        .header(
-            reqwest::header::ACCEPT,
-            "text/*, application/json;q=0.9, */*;q=0.1",
-        )
-        .header(reqwest::header::USER_AGENT, "Hambur/0.1")
-        .send()
-        .map_err(|error| format!("fetch failed: {error}"))?;
-    let status = response.status().as_u16();
-    let headers = response_headers_json(response.headers());
-    let mut bytes = Vec::new();
-    response
-        .copy_to(&mut LimitedWrite::new(&mut bytes, max_bytes))
-        .map_err(|error| format!("read response failed: {error}"))?;
-    let truncated = bytes.len() >= max_bytes;
-    let body = String::from_utf8_lossy(&bytes).to_string();
-    Ok(json!({
-        "url": url,
-        "status": status,
-        "headers": headers,
-        "text": body,
-        "truncated": truncated
-    }))
-}
-
-pub(crate) fn validate_web_fetch_url(url: &str) -> Result<(), String> {
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
-        return Err("web_fetch URL must start with http:// or https://".to_string());
-    }
-    let parsed = reqwest::Url::parse(url).map_err(|error| format!("invalid URL: {error}"))?;
-    if parsed.host_str().unwrap_or_default().trim().is_empty() {
-        return Err("web_fetch host must not be empty".to_string());
-    }
-    Ok(())
-}
-
-pub(crate) fn response_headers_json(headers: &reqwest::header::HeaderMap) -> Value {
-    let values = headers
+    let non_text = sample
         .iter()
-        .map(|(name, value)| {
-            json!({
-                "name": name.as_str(),
-                "value": value.to_str().unwrap_or_default()
-            })
-        })
-        .collect::<Vec<_>>();
-    Value::Array(values)
-}
-
-pub(crate) struct LimitedWrite<'a> {
-    target: &'a mut Vec<u8>,
-    limit: usize,
-}
-
-impl<'a> LimitedWrite<'a> {
-    fn new(target: &'a mut Vec<u8>, limit: usize) -> Self {
-        Self { target, limit }
+        .filter(|&&b| (b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r') || b == 0x7f)
+        .count();
+    if (non_text * 100) / sample_len > 5 {
+        return true;
     }
-}
-
-impl Write for LimitedWrite<'_> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if self.target.len() >= self.limit {
-            return Ok(buf.len());
+    // If the entire buffer is valid UTF-8, it is definitely text!
+    if std::str::from_utf8(bytes).is_ok() {
+        return false;
+    }
+    // If the whole buffer failed, test the sample up to char boundary
+    match std::str::from_utf8(sample) {
+        Ok(_) => false,
+        Err(e) => {
+            // error_len().is_some() indicates an invalid byte sequence was encountered (binary).
+            // error_len().is_none() means the slice ended cleanly on an incomplete multi-byte character (valid UTF-8 prefix).
+            e.error_len().is_some()
         }
-        let remaining = self.limit - self.target.len();
-        let take = remaining.min(buf.len());
-        self.target.extend_from_slice(&buf[..take]);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
     }
 }
 
@@ -2787,15 +2665,6 @@ pub(crate) fn hambur_config_fields() -> Vec<HamburConfigFieldSpec> {
             false,
         ),
         (
-            "tools.webFetchBackend",
-            "Web fetch backend",
-            "Backend used by web_fetch.",
-            "one of: local, tinyfish",
-            "readwrite",
-            "normal",
-            true,
-        ),
-        (
             "tools.viewImageScaleMode",
             "View image scale mode",
             "Image preprocessing mode for view_image.",
@@ -3122,10 +2991,6 @@ pub(crate) fn app_setting_for_hambur_config_path(
         "logs.enabled" => ("loggingEnabled", string_value),
         "sandbox.rootfsBackend" => ("rootfsBackend", string_value),
         "startup_tasks.enabled" => ("startupTasksEnabled", string_value),
-        "tools.webFetchBackend" => (
-            "webFetchBackend",
-            normalize_web_fetch_backend_value(&string_value),
-        ),
         "tools.viewImageScaleMode" => (
             "viewImageScaleMode",
             normalize_view_image_scale_value(&string_value),
@@ -3176,14 +3041,6 @@ pub(crate) fn normalize_startup_chat_value(value: &str) -> String {
         "lastChat" => "last_chat".to_string(),
         "NEW_CHAT" => "new_chat".to_string(),
         "LAST_CHAT" => "last_chat".to_string(),
-        _ => value.to_string(),
-    }
-}
-
-pub(crate) fn normalize_web_fetch_backend_value(value: &str) -> String {
-    match value {
-        "LOCAL" => "local".to_string(),
-        "TINYFISH" => "tinyfish".to_string(),
         _ => value.to_string(),
     }
 }
@@ -3692,3 +3549,60 @@ pub(crate) fn get_rootfs_backend(settings: &[hambur_db::AppSettingRecord]) -> &s
     }
     "proot"
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_binary_bytes_multilingual_utf8() {
+        let text = "Unicode UTF-8 多语种测试：\n\
+            中文：你好世界，这是一段纯文本。\n\
+            Ελληνικά: Γειά σου κόσμε!\n\
+            Русский: Здравствуй, мир!\n\
+            العربية: مرحباً بالعالم\n\
+            עברית: שלום עולם\n\
+            日本語: こんにちは世界\n\
+            한국어: 안녕하세요 세계\n";
+        let repeated = text.repeat(30);
+        assert!(!is_binary_bytes(repeated.as_bytes()));
+    }
+
+    #[test]
+    fn test_is_binary_bytes_truncated_boundary() {
+        let text = "你好世界，测试截断边界。";
+        let bytes = text.as_bytes();
+        assert!(!is_binary_bytes(&bytes[..2]));
+    }
+
+    #[test]
+    fn test_is_binary_bytes_binary() {
+        assert!(is_binary_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"));
+        assert!(is_binary_bytes(&[0u8; 100]));
+        let random = (0..500).map(|i| (i % 256) as u8).collect::<Vec<_>>();
+        assert!(is_binary_bytes(&random));
+    }
+
+    #[test]
+    fn test_format_beijing_timestamp_with_weekday() {
+        assert_eq!(
+            format_beijing_timestamp_with_weekday(0),
+            "1970-01-01 08:00:00 (UTC+8 / 北京时间), Thursday (星期四)"
+        );
+        assert_eq!(
+            format_beijing_timestamp_with_weekday(1704067200000),
+            "2024-01-01 08:00:00 (UTC+8 / 北京时间), Monday (星期一)"
+        );
+    }
+
+    #[test]
+    fn test_format_user_content_for_model() {
+        let content = "Hello world";
+        let formatted = format_user_content_for_model(content, &[], 0);
+        assert_eq!(
+            formatted,
+            "[Current Time: 1970-01-01 08:00:00 (UTC+8 / 北京时间), Thursday (星期四)]\n\nHello world"
+        );
+    }
+}
+

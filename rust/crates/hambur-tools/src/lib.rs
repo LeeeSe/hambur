@@ -33,6 +33,7 @@ const MAIN_OPENAI_TOOL_NAMES: &[&str] = &[
     "hambur_config",
     "web_search",
     "browser_use",
+    "android_cli",
     "session_search",
     "memory",
     "delegate_task",
@@ -51,6 +52,7 @@ const DELEGATE_OPENAI_TOOL_NAMES: &[&str] = &[
     "hambur_config",
     "web_search",
     "browser_use",
+    "android_cli",
     "session_search",
     "memory",
     "view_image",
@@ -357,6 +359,52 @@ impl ToolSchemaCompiler {
                     "keywords": {"type": "string", "description": "Cookie name filter. Split multiple keywords with spaces."},
                     "fuzzy": {"type": "boolean", "description": "Cookie keyword matching mode. true means contains match; false means exact match."},
                     "timeout": {"type": "integer", "description": "Timeout in seconds for wait_for_dom_stable or long JavaScript actions."}
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            })),
+        })?;
+        compiler.register(ToolSchema {
+            name: "android_cli".to_string(),
+            description: "Access native Android system and hardware capabilities on-demand without background daemons. Actions: get_location (GPS and network coordinates), get_battery (percentage, charging status, temperature), get_device_info (hardware model, brand, Android version, network connectivity), clipboard_get (read system clipboard text), clipboard_set (write text to system clipboard), vibrate (haptic vibration feedback), send_notification (post system status bar notification), torch (turn flashlight on/off).".to_string(),
+            parameters_json_schema: object_schema(json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "get_location",
+                            "get_battery",
+                            "get_device_info",
+                            "clipboard_get",
+                            "clipboard_set",
+                            "vibrate",
+                            "send_notification",
+                            "torch"
+                        ],
+                        "description": "Android device action to perform."
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Text content to write into the clipboard for clipboard_set."
+                    },
+                    "duration_ms": {
+                        "type": "integer",
+                        "description": "Vibration duration in milliseconds for vibrate (default 200).",
+                        "default": 200
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Notification title for send_notification."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Notification body content for send_notification."
+                    },
+                    "enabled": {
+                        "type": "boolean",
+                        "description": "Flashlight toggle state (true=on, false=off) for torch."
+                    }
                 },
                 "required": ["action"],
                 "additionalProperties": false
@@ -1129,6 +1177,16 @@ fn run_builtin_tool(invocation: &ToolInvocation, arguments: &Value) -> RawToolOu
             command_or_url: invocation.arguments_json.clone(),
             status: "PlatformRequestUnavailable".to_string(),
         },
+        "android_cli" => RawToolOutput {
+            tool_call_id: invocation.tool_call_id.clone(),
+            tool_name: invocation.name.clone(),
+            is_error: true,
+            content: "android_cli requires an Android platform AndroidCliAction request".to_string(),
+            summary: "Android CLI platform adapter unavailable".to_string(),
+            trust_level: "trusted".to_string(),
+            command_or_url: invocation.arguments_json.clone(),
+            status: "PlatformRequestUnavailable".to_string(),
+        },
         "web_search" => RawToolOutput {
             tool_call_id: invocation.tool_call_id.clone(),
             tool_name: invocation.name.clone(),
@@ -1246,6 +1304,22 @@ fn display_title(name: &str, arguments_json: &str) -> String {
                 format!("Browser: {action}")
             }
         }
+        "android_cli" => {
+            let action = serde_json::from_str::<Value>(arguments_json)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("action")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            if action.is_empty() {
+                "Android CLI".to_string()
+            } else {
+                format!("Android: {action}")
+            }
+        }
         "delegate_task" => "Delegate task".to_string(),
         "submit_delegate_result" => "Submit delegate result".to_string(),
         _ => name.replace('_', " "),
@@ -1275,6 +1349,7 @@ fn timeout_ms(name: &str) -> u64 {
     match name {
         "terminal" | "process" => 120_000,
         "web_search" | "browser_use" => 60_000,
+        "android_cli" => 20_000,
         "delegate_task" => 600_000,
         _ => 30_000,
     }

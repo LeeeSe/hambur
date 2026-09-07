@@ -1080,6 +1080,7 @@ fun ToolsListScreen(
                     "hambur_config" to "Read and update Hambur app configuration.",
                     "web_search" to "Search the web for information.",
                     "browser_use" to "Control the shared Android WebView browser.",
+                    "android_cli" to "Access native Android hardware and system features on demand.",
                     "session_search" to "Search past chat sessions stored locally.",
                     "memory" to "Save durable information to persistent memory.",
                     "delegate_task" to "Spawn isolated leaf subagents.",
@@ -1130,7 +1131,14 @@ fun ToolDetailScreen(
         item {
             HamburSection(title = "Description") {
                 SummaryLine(label = "Name", value = toolName)
-                SummaryLine(label = "Backend", value = if (toolName == "browser_use") "AndroidPlatformAdapter browser actions" else "Rust tool registry")
+                SummaryLine(
+                    label = "Backend",
+                    value = when (toolName) {
+                        "browser_use" -> "AndroidPlatformAdapter browser actions"
+                        "android_cli" -> "AndroidPlatformAdapter native device CLI"
+                        else -> "Rust tool registry"
+                    }
+                )
             }
         }
         if (toolName == "view_image") {

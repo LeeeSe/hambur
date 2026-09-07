@@ -2681,6 +2681,141 @@ impl RuntimeEngine {
             }
         }
     }
+    pub(crate) async fn resolve_android_cli_tool_result(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        invocation: &ToolInvocation,
+        arguments: &Value,
+    ) -> ToolResult {
+        if let Err(error) = self
+            .tools
+            .schemas()
+            .validate_arguments(&invocation.name, arguments)
+        {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                error.to_string(),
+            );
+        }
+
+        let request_id = new_id("platform_req");
+        let timeout_ms = argument_seconds_or_ms(arguments, "timeout", "timeout_ms", 20_000)
+            .clamp(1_000, 60_000);
+        let request = PlatformRequest {
+            request_id: request_id.clone(),
+            session_id: session_id.to_string(),
+            turn_id: turn_id.to_string(),
+            kind: "AndroidCliAction".to_string(),
+            payload_json: json!({
+                "toolCallId": invocation.tool_call_id,
+                "action": arguments
+            })
+            .to_string(),
+            timeout_ms,
+            cancellable: true,
+        };
+        let (sender, receiver) = oneshot::channel();
+        if let Ok(mut requests) = self.platform_requests.lock() {
+            requests.insert(request_id.clone(), sender);
+        } else {
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                "platform request registry unavailable",
+            );
+        }
+        let snapshot = self
+            .database
+            .session_snapshot(session_id)
+            .await
+            .unwrap_or_default();
+        if let Err(error) = self.emit_platform_request_event(request, snapshot) {
+            let _ = self
+                .platform_requests
+                .lock()
+                .ok()
+                .and_then(|mut requests| requests.remove(&request_id));
+            return ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                error.to_string(),
+            );
+        }
+
+        match timeout(Duration::from_millis(timeout_ms), receiver).await {
+            Ok(Ok(result)) => {
+                let is_error = result.is_error;
+                let payload_json = result.payload_json;
+                let error_code = result.error_code;
+                let message = result.message;
+                let content = if payload_json.trim().is_empty() {
+                    message
+                } else {
+                    payload_json
+                };
+                let summary = if is_error {
+                    error_code
+                        .clone()
+                        .if_blank("Android CLI action failed".to_string())
+                } else {
+                    "Android CLI action completed".to_string()
+                };
+                let status = if is_error {
+                    error_code
+                } else {
+                    "ok".to_string()
+                };
+                let raw = RawToolOutput {
+                    tool_call_id: invocation.tool_call_id.clone(),
+                    tool_name: invocation.name.clone(),
+                    is_error,
+                    content,
+                    summary,
+                    trust_level: "trusted".to_string(),
+                    command_or_url: arguments.to_string(),
+                    status,
+                };
+                self.tools
+                    .normalize_raw_with_session(raw, Some(&invocation.session_id))
+                    .unwrap_or_else(|error| {
+                        ToolResult::failed(
+                            &invocation.tool_call_id,
+                            &invocation.name,
+                            error.to_string(),
+                        )
+                    })
+            }
+            _ => {
+                let _ = self
+                    .platform_requests
+                    .lock()
+                    .ok()
+                    .and_then(|mut requests| requests.remove(&request_id));
+                let snapshot = self
+                    .database
+                    .session_snapshot(session_id)
+                    .await
+                    .unwrap_or_default();
+                let _ = self.emit_session_event(
+                    RuntimeEventKind::PlatformRequestTimedOut,
+                    session_id.to_string(),
+                    turn_id.to_string(),
+                    snapshot,
+                    request_id,
+                    Some(&HamburError::InvalidCommand(
+                        "PlatformRequestTimeout".to_string(),
+                    )),
+                );
+                ToolResult::failed(
+                    &invocation.tool_call_id,
+                    &invocation.name,
+                    "PlatformRequestTimeout",
+                )
+            }
+        }
+    }
     pub(crate) async fn materialize_browser_artifacts(
         &self,
         session_id: &str,

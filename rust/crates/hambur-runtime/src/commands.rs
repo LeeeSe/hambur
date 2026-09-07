@@ -2108,6 +2108,12 @@ impl RuntimeEngine {
                             .await,
                     );
                 }
+                "android_cli" => {
+                    records.push(
+                        self.execute_android_cli_tool(session_id, turn_id, invocation)
+                            .await,
+                    );
+                }
                 "web_search" => {
                     records.push(self.execute_web_tool(invocation).await);
                 }
@@ -2299,6 +2305,31 @@ impl RuntimeEngine {
         let result = match invocation.arguments_value() {
             Ok(arguments) => {
                 self.resolve_browser_tool_result(session_id, turn_id, &invocation, &arguments)
+                    .await
+            }
+            Err(error) => ToolResult::failed(
+                &invocation.tool_call_id,
+                &invocation.name,
+                error.to_string(),
+            ),
+        };
+        ToolExecutionRecord {
+            invocation,
+            result,
+            started_at_ms,
+            ended_at_ms: now_ms(),
+        }
+    }
+    pub(crate) async fn execute_android_cli_tool(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        invocation: ToolInvocation,
+    ) -> ToolExecutionRecord {
+        let started_at_ms = now_ms();
+        let result = match invocation.arguments_value() {
+            Ok(arguments) => {
+                self.resolve_android_cli_tool_result(session_id, turn_id, &invocation, &arguments)
                     .await
             }
             Err(error) => ToolResult::failed(

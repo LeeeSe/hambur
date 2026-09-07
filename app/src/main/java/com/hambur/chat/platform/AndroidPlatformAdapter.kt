@@ -1,13 +1,34 @@
 package com.hambur.chat.platform
 
+import android.Manifest
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
+import android.location.Location
+import android.location.LocationManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
+import android.os.BatteryManager
+import android.os.Build
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.util.Base64
 import android.view.View
 import android.webkit.CookieManager
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import com.hambur.chat.uniffi.PlatformRequestDto
 import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
@@ -57,6 +78,7 @@ class AndroidPlatformAdapter(
         return when (request.kind) {
             "BrowserAction" -> handleBrowserAction(request)
             "ResolveSecret" -> handleResolveSecret(request)
+            "AndroidCliAction" -> handleAndroidCliAction(request)
             else -> PlatformResult(
                 requestId = request.requestId,
                 isError = true,
@@ -505,6 +527,259 @@ class AndroidPlatformAdapter(
             } finally {
                 connection.disconnect()
             }
+        }
+    }
+
+    private suspend fun handleAndroidCliAction(request: PlatformRequestDto): PlatformResult {
+        return runCatching {
+            val root = JSONObject(request.payloadJson)
+            val actionObj = root.optJSONObject("action")
+                ?: throw IllegalArgumentException("Missing action object in payload")
+            val action = actionObj.optString("action").ifBlank {
+                throw IllegalArgumentException("Missing action name in action payload")
+            }
+
+            val resultPayload: JSONObject = when (action) {
+                "get_location" -> getLocation()
+                "get_battery" -> getBattery()
+                "get_device_info" -> getDeviceInfo()
+                "clipboard_get" -> getClipboard()
+                "clipboard_set" -> setClipboard(actionObj.optString("text"))
+                "vibrate" -> triggerVibrate(actionObj.optLong("duration_ms", 200L))
+                "send_notification" -> sendNotification(
+                    actionObj.optString("title", "Hambur Notification"),
+                    actionObj.optString("content", "")
+                )
+                "torch" -> setTorch(actionObj.optBoolean("enabled", false))
+                else -> throw IllegalArgumentException("Unsupported android_cli action: $action")
+            }
+
+            PlatformResult(
+                requestId = request.requestId,
+                isError = false,
+                payloadJson = resultPayload.toString(),
+            )
+        }.getOrElse { error ->
+            PlatformResult(
+                requestId = request.requestId,
+                isError = true,
+                errorCode = "AndroidCliActionFailed",
+                message = error.message ?: "android_cli action failed",
+            )
+        }
+    }
+
+    private suspend fun getLocation(): JSONObject {
+        val hasFine = ContextCompat.checkSelfPermission(
+            appContext,
+            Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+        val hasCoarse = ContextCompat.checkSelfPermission(
+            appContext,
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+
+        if (!hasFine && !hasCoarse) {
+            return JSONObject()
+                .put("status", "PermissionDenied")
+                .put("message", "Location permission (ACCESS_FINE_LOCATION or ACCESS_COARSE_LOCATION) is not granted")
+        }
+
+        val lm = appContext.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+            ?: return JSONObject().put("status", "Unavailable").put("message", "LocationManager unavailable")
+
+        var bestLocation: Location? = null
+        val providers = listOf(
+            LocationManager.GPS_PROVIDER,
+            LocationManager.NETWORK_PROVIDER,
+            LocationManager.PASSIVE_PROVIDER
+        )
+        for (provider in providers) {
+            try {
+                if (lm.isProviderEnabled(provider)) {
+                    val loc = lm.getLastKnownLocation(provider)
+                    if (loc != null && (bestLocation == null || loc.time > bestLocation.time)) {
+                        bestLocation = loc
+                    }
+                }
+            } catch (_: SecurityException) {
+            }
+        }
+
+        if (bestLocation != null) {
+            return JSONObject()
+                .put("status", "Success")
+                .put("latitude", bestLocation.latitude)
+                .put("longitude", bestLocation.longitude)
+                .put("altitude", if (bestLocation.hasAltitude()) bestLocation.altitude else null)
+                .put("accuracy", if (bestLocation.hasAccuracy()) bestLocation.accuracy else null)
+                .put("provider", bestLocation.provider)
+                .put("timestamp", bestLocation.time)
+        }
+
+        return JSONObject()
+            .put("status", "LocationUnavailable")
+            .put("message", "No recent location cached; please ensure GPS/location services are enabled on the device.")
+    }
+
+    private fun getBattery(): JSONObject {
+        val filter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+        val batteryStatus = appContext.registerReceiver(null, filter)
+
+        val level = batteryStatus?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+        val scale = batteryStatus?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
+        val batteryPct = if (level >= 0 && scale > 0) (level * 100 / scale.toFloat()) else -1f
+
+        val status = batteryStatus?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+        val isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+                status == BatteryManager.BATTERY_STATUS_FULL
+        val chargePlug = batteryStatus?.getIntExtra(BatteryManager.EXTRA_PLUGGED, -1) ?: -1
+        val plugType = when (chargePlug) {
+            BatteryManager.BATTERY_PLUGGED_AC -> "AC"
+            BatteryManager.BATTERY_PLUGGED_USB -> "USB"
+            BatteryManager.BATTERY_PLUGGED_WIRELESS -> "Wireless"
+            else -> "Unplugged"
+        }
+        val tempRaw = batteryStatus?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0
+        val tempCelsius = tempRaw / 10.0
+
+        return JSONObject()
+            .put("level_percent", batteryPct)
+            .put("is_charging", isCharging)
+            .put("plug_type", plugType)
+            .put("temperature_celsius", tempCelsius)
+    }
+
+    private fun getDeviceInfo(): JSONObject {
+        val cm = appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        val activeNet = cm?.activeNetwork
+        val caps = cm?.getNetworkCapabilities(activeNet)
+
+        val isWifi = caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+        val isCellular = caps?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true
+        val isEthernet = caps?.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) == true
+
+        val netType = when {
+            isWifi -> "WiFi"
+            isCellular -> "Cellular"
+            isEthernet -> "Ethernet"
+            activeNet != null -> "Other"
+            else -> "Disconnected"
+        }
+
+        return JSONObject()
+            .put("brand", Build.BRAND)
+            .put("manufacturer", Build.MANUFACTURER)
+            .put("model", Build.MODEL)
+            .put("device", Build.DEVICE)
+            .put("android_release", Build.VERSION.RELEASE)
+            .put("sdk_int", Build.VERSION.SDK_INT)
+            .put("network_status", netType)
+            .put("internet_connected", caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true)
+    }
+
+    private suspend fun getClipboard(): JSONObject {
+        return withContext(Dispatchers.Main) {
+            val cm = appContext.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            val item = cm?.primaryClip?.getItemAt(0)
+            val text = item?.text?.toString().orEmpty()
+            JSONObject()
+                .put("status", "Success")
+                .put("text", text)
+                .put("length", text.length)
+        }
+    }
+
+    private suspend fun setClipboard(text: String): JSONObject {
+        return withContext(Dispatchers.Main) {
+            val cm = appContext.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            val clip = ClipData.newPlainText("hambur_cli", text)
+            cm?.setPrimaryClip(clip)
+            JSONObject()
+                .put("status", "Success")
+                .put("length", text.length)
+        }
+    }
+
+    private fun triggerVibrate(durationMs: Long): JSONObject {
+        val clampedDuration = durationMs.coerceIn(10L, 5000L)
+        val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val vm = appContext.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager
+            vm?.defaultVibrator
+        } else {
+            @Suppress("DEPRECATION")
+            appContext.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+        }
+
+        return if (vibrator != null && vibrator.hasVibrator()) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                vibrator.vibrate(
+                    VibrationEffect.createOneShot(
+                        clampedDuration,
+                        VibrationEffect.DEFAULT_AMPLITUDE
+                    )
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                vibrator.vibrate(clampedDuration)
+            }
+            JSONObject().put("status", "Success").put("duration_ms", clampedDuration)
+        } else {
+            JSONObject().put("status", "Unavailable").put("message", "Device has no vibrator")
+        }
+    }
+
+    private fun sendNotification(title: String, content: String): JSONObject {
+        val nm = appContext.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            ?: return JSONObject().put("status", "Unavailable").put("message", "NotificationManager unavailable")
+
+        val channelId = "hambur_cli_channel"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                channelId,
+                "Hambur Assistant",
+                NotificationManager.IMPORTANCE_DEFAULT
+            ).apply {
+                description = "Notifications from Hambur CLI tools"
+            }
+            nm.createNotificationChannel(channel)
+        }
+
+        val notification = NotificationCompat.Builder(appContext, channelId)
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setContentTitle(title)
+            .setContentText(content)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(content))
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setAutoCancel(true)
+            .build()
+
+        val notificationId = (System.currentTimeMillis() % 100000).toInt()
+        nm.notify(notificationId, notification)
+
+        return JSONObject()
+            .put("status", "Success")
+            .put("notification_id", notificationId)
+            .put("title", title)
+    }
+
+    private fun setTorch(enabled: Boolean): JSONObject {
+        val cm = appContext.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
+            ?: return JSONObject().put("status", "Unavailable").put("message", "CameraManager unavailable")
+
+        return try {
+            val cameraId = cm.cameraIdList.firstOrNull { id ->
+                cm.getCameraCharacteristics(id)
+                    .get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+            }
+            if (cameraId != null) {
+                cm.setTorchMode(cameraId, enabled)
+                JSONObject().put("status", "Success").put("torch_enabled", enabled)
+            } else {
+                JSONObject().put("status", "Unavailable").put("message", "No camera with flash found")
+            }
+        } catch (e: Exception) {
+            JSONObject().put("status", "Error").put("message", e.message ?: "Failed to set torch mode")
         }
     }
 }

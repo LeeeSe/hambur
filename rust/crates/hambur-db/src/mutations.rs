@@ -1598,7 +1598,7 @@ impl HamburDatabase {
         let name = normalize_title(&input.name);
         let icon_name = input.icon_name.trim().chars().take(80).collect::<String>();
         let api_type = input.api_type.trim();
-        if api_type != "OpenAiCompatible" {
+        if api_type != "OpenAiCompatible" && api_type != "OpenAiResponses" {
             return Err(HamburError::InvalidCommand(format!(
                 "unsupported provider api_type: {api_type}"
             )));
@@ -1671,7 +1671,7 @@ impl HamburDatabase {
 
         self.connection
             .execute(
-                "DELETE FROM provider_models WHERE provider_id = ?1",
+                "DELETE FROM provider_models WHERE provider_id = ?1 AND (metadata_json NOT LIKE '%\"custom\":true%' AND metadata_json NOT LIKE '%\"custom\": true%')",
                 params![provider_id],
             )
             .await
@@ -1708,7 +1708,19 @@ impl HamburDatabase {
                             metadata_json,
                             synced_at_ms
                         )
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                     ON CONFLICT(provider_id, model_id) DO UPDATE SET
+                        display_name = excluded.display_name,
+                        supports_tool_call = excluded.supports_tool_call,
+                        supports_reasoning = excluded.supports_reasoning,
+                        supports_image_input = excluded.supports_image_input,
+                        supports_structured_output = excluded.supports_structured_output,
+                        supports_temperature = excluded.supports_temperature,
+                        context_limit = excluded.context_limit,
+                        output_limit = excluded.output_limit,
+                        reasoning_field = excluded.reasoning_field,
+                        metadata_json = excluded.metadata_json,
+                        synced_at_ms = excluded.synced_at_ms",
                     params![
                         row_id,
                         provider_id,
@@ -1736,6 +1748,29 @@ impl HamburDatabase {
                 .await?;
         }
         Ok(saved)
+    }
+
+    pub async fn delete_provider_model(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+    ) -> HamburResult<()> {
+        self.provider_by_id(provider_id).await?;
+        self.connection
+            .execute(
+                "DELETE FROM provider_models WHERE provider_id = ?1 AND model_id = ?2",
+                params![provider_id, model_id],
+            )
+            .await
+            .map_err(database_error)?;
+        self.connection
+            .execute(
+                "DELETE FROM model_group_members WHERE provider_id = ?1 AND model_id = ?2",
+                params![provider_id, model_id],
+            )
+            .await
+            .map_err(database_error)?;
+        Ok(())
     }
 
     pub async fn upsert_provider_model_override(

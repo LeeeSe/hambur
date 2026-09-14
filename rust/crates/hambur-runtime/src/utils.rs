@@ -537,13 +537,65 @@ pub(crate) fn is_review_status_entry(content: &str) -> bool {
 }
 
 pub(crate) fn normalize_tool_sandbox_path(path: &str) -> String {
-    let trimmed = path.trim();
+    let mut trimmed = path.trim();
+    if let Some(stripped) = trimmed.strip_prefix("hambur://") {
+        trimmed = stripped;
+    } else if let Some(stripped) = trimmed.strip_prefix("hambur:") {
+        trimmed = stripped;
+    } else if let Some(stripped) = trimmed.strip_prefix("file://") {
+        trimmed = stripped;
+    }
+    let trimmed = trimmed.trim();
     if trimmed.is_empty() {
         "/var/hambur/workspace".to_string()
     } else if trimmed.starts_with('/') {
         trimmed.to_string()
+    } else if trimmed.starts_with("var/hambur/") {
+        format!("/{trimmed}")
+    } else if let Some(first) = trimmed.split('/').next() {
+        if matches!(first, "workspace" | "shared" | "attachments" | "browser" | "offloads" | "skills" | "download" | "memory") {
+            format!("/var/hambur/{trimmed}")
+        } else {
+            format!("/var/hambur/workspace/{trimmed}")
+        }
     } else {
         format!("/var/hambur/workspace/{trimmed}")
+    }
+}
+
+pub(crate) fn detect_mime_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        Some("bmp") => "image/bmp",
+        Some("svg") => "image/svg+xml",
+        Some("mp3") => "audio/mpeg",
+        Some("m4a") => "audio/mp4",
+        Some("wav") => "audio/wav",
+        Some("ogg") => "audio/ogg",
+        Some("flac") => "audio/flac",
+        Some("mp4") => "video/mp4",
+        Some("webm") => "video/webm",
+        Some("mkv") => "video/x-matroska",
+        Some("txt") | Some("log") => "text/plain",
+        Some("md") | Some("markdown") => "text/markdown",
+        Some("json") | Some("jsonl") => "application/json",
+        Some("html") | Some("htm") => "text/html",
+        Some("css") => "text/css",
+        Some("js") => "application/javascript",
+        Some("ts") => "application/typescript",
+        Some("py") => "text/x-python",
+        Some("sh") => "text/x-shellscript",
+        Some("rs") => "text/rust",
+        Some("pdf") => "application/pdf",
+        _ => "application/octet-stream",
     }
 }
 
@@ -831,6 +883,24 @@ pub(crate) fn validate_command(command: &RuntimeCommand) -> HamburResult<()> {
             }
             Ok(())
         }
+        "DeleteProviderModel" | "DeleteModel" => {
+            if command.provider_id.is_empty()
+                && command.message_id.is_empty()
+                && config_payload_string(&command.payload_json, "providerId").is_empty()
+            {
+                return Err(HamburError::InvalidCommand(
+                    "provider_id must not be empty".to_string(),
+                ));
+            }
+            if command.model_id.is_empty()
+                && config_payload_string(&command.payload_json, "modelId").is_empty()
+            {
+                return Err(HamburError::InvalidCommand(
+                    "model_id must not be empty".to_string(),
+                ));
+            }
+            Ok(())
+        }
         "UpdateModelOverride" | "UpdateModelDetail" => {
             if command.provider_id.is_empty()
                 && command.message_id.is_empty()
@@ -1111,6 +1181,7 @@ pub(crate) fn append_transcript_entry_to_context(
                 reasoning_content: message.reasoning_content,
                 tool_calls_json,
                 tool_call_id: String::new(),
+                ..Default::default()
             });
         }
         "tool" => {
@@ -1126,6 +1197,7 @@ pub(crate) fn append_transcript_entry_to_context(
                 reasoning_content: String::new(),
                 tool_calls_json: String::new(),
                 tool_call_id: message.tool_call_id,
+                ..Default::default()
             });
         }
         _ => {}
@@ -1358,6 +1430,7 @@ pub(crate) fn tool_continuation_stream_source(
     assistant_reasoning: &str,
     tool_calls: Vec<CompleteToolCall>,
     tool_result_messages: Vec<ModelMessage>,
+    continuation_user_messages: Vec<ModelMessage>,
     mut continuation_sse: Vec<String>,
     scripted_source: bool,
 ) -> HamburResult<RouteStreamSource> {
@@ -1374,8 +1447,10 @@ pub(crate) fn tool_continuation_stream_source(
         reasoning_content: assistant_reasoning.to_string(),
         tool_calls_json: complete_tool_calls_json(&tool_calls)?,
         tool_call_id: String::new(),
+        ..Default::default()
     });
     request.messages.extend(tool_result_messages);
+    request.messages.extend(continuation_user_messages);
 
     if continuation_sse.is_empty() {
         if scripted_source {
@@ -1421,7 +1496,14 @@ pub(crate) fn openai_non_stream_request(
     target: &ProviderTarget,
     api_key: &str,
 ) -> HamburResult<hambur_llm::HttpRequestSpec> {
-    let mut spec = OpenAiCompatibleAdapter::build_stream_request(request, target, api_key)?;
+    let mut spec = match target.provider.protocol.as_str() {
+        OPENAI_RESPONSES_PROTOCOL => {
+            ResponsesApiAdapter::build_stream_request(request, target, api_key)?
+        }
+        _ => {
+            OpenAiCompatibleAdapter::build_stream_request(request, target, api_key)?
+        }
+    };
     let mut body: Value = serde_json::from_str(&spec.body_json)
         .map_err(|error| HamburError::InvalidCommand(format!("invalid request body: {error}")))?;
     body["stream"] = json!(false);
@@ -3548,6 +3630,77 @@ pub(crate) fn get_rootfs_backend(settings: &[hambur_db::AppSettingRecord]) -> &s
         }
     }
     "proot"
+}
+
+pub(crate) fn parse_image_dimensions(bytes: &[u8]) -> (u32, u32) {
+    if bytes.len() >= 24 && &bytes[0..8] == b"\x89PNG\r\n\x1a\n" {
+        let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+        let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+        return (width, height);
+    }
+    if bytes.len() >= 10 && (&bytes[0..6] == b"GIF87a" || &bytes[0..6] == b"GIF89a") {
+        let width = u16::from_le_bytes([bytes[6], bytes[7]]) as u32;
+        let height = u16::from_le_bytes([bytes[8], bytes[9]]) as u32;
+        return (width, height);
+    }
+    if bytes.len() >= 4 && bytes[0] == 0xFF && bytes[1] == 0xD8 {
+        let mut i = 2;
+        while i + 4 < bytes.len() {
+            if bytes[i] != 0xFF {
+                i += 1;
+                continue;
+            }
+            while i < bytes.len() && bytes[i] == 0xFF {
+                i += 1;
+            }
+            if i >= bytes.len() {
+                break;
+            }
+            let marker = bytes[i];
+            i += 1;
+            if marker == 0xD9 || marker == 0xDA {
+                break;
+            }
+            if marker == 0xD8 || (0xD0..=0xD7).contains(&marker) {
+                continue;
+            }
+            if i + 2 > bytes.len() {
+                break;
+            }
+            let len = u16::from_be_bytes([bytes[i], bytes[i + 1]]) as usize;
+            if (0xC0..=0xCF).contains(&marker) && marker != 0xC4 && marker != 0xC8 && marker != 0xCC {
+                if i + 7 <= bytes.len() {
+                    let height = u16::from_be_bytes([bytes[i + 3], bytes[i + 4]]) as u32;
+                    let width = u16::from_be_bytes([bytes[i + 5], bytes[i + 6]]) as u32;
+                    return (width, height);
+                }
+            }
+            if len < 2 {
+                break;
+            }
+            i += len;
+        }
+    }
+    if bytes.len() >= 30 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        if &bytes[12..16] == b"VP8 " && bytes.len() >= 30 {
+            let width = (u16::from_le_bytes([bytes[26], bytes[27]]) & 0x3FFF) as u32;
+            let height = (u16::from_le_bytes([bytes[28], bytes[29]]) & 0x3FFF) as u32;
+            return (width, height);
+        } else if &bytes[12..16] == b"VP8L" && bytes.len() >= 25 {
+            let b0 = bytes[21] as u32;
+            let b1 = bytes[22] as u32;
+            let b2 = bytes[23] as u32;
+            let b3 = bytes[24] as u32;
+            let width = 1 + (((b1 & 0x3F) << 8) | b0);
+            let height = 1 + (((b3 & 0x0F) << 10) | (b2 << 2) | ((b1 & 0xC0) >> 6));
+            return (width, height);
+        } else if &bytes[12..16] == b"VP8X" && bytes.len() >= 30 {
+            let width = 1 + (bytes[24] as u32 | ((bytes[25] as u32) << 8) | ((bytes[26] as u32) << 16));
+            let height = 1 + (bytes[27] as u32 | ((bytes[28] as u32) << 8) | ((bytes[29] as u32) << 16));
+            return (width, height);
+        }
+    }
+    (0, 0)
 }
 
 #[cfg(test)]

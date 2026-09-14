@@ -192,7 +192,14 @@ const VIRTUAL_ROOTS: &[VirtualRoot] = &[
         host_prefix: "skills",
         name: "skills",
         session_scoped: false,
-        writable: false,
+        writable: true,
+    },
+    VirtualRoot {
+        sandbox_prefix: "/var/hambur/download",
+        host_prefix: "download",
+        name: "download",
+        session_scoped: false,
+        writable: true,
     },
     VirtualRoot {
         sandbox_prefix: AUTOSTART_PREFIX,
@@ -281,6 +288,23 @@ impl SandboxService {
 
         let mut host_path = self.root.clone();
         let guard_root: &Path;
+        let android_download = Path::new("/storage/emulated/0/Download");
+        if virtual_root.name == "download" && android_download.exists() {
+            host_path = android_download.to_path_buf();
+            guard_root = android_download;
+            for segment in &tail {
+                host_path.push(segment);
+            }
+            ensure_inside_root(guard_root, &host_path)?;
+            let relative_path = format!("download/{}", tail.join("/"));
+            return Ok(SandboxPathResolution {
+                sandbox_path: normalized,
+                host_path,
+                relative_path,
+                root: virtual_root.name.to_string(),
+                writable,
+            });
+        }
         if virtual_root.session_scoped {
             let session_id = normalize_session_id(session_id)?;
             host_path.push("sessions");
@@ -477,6 +501,9 @@ impl SandboxService {
             var_hambur.join("shared"),
             var_hambur.join("skills"),
             var_hambur.join("workspace"),
+            var_hambur.join("download"),
+            self.rootfs_dir.join("storage/emulated/0/Download"),
+            self.rootfs_dir.join("etc"),
             self.rootfs_dir.join("var/minis/autostart"),
             self.rootfs_dir.join("dev"),
             self.rootfs_dir.join("proc"),
@@ -489,8 +516,12 @@ impl SandboxService {
                 HamburError::Internal(format!("create rootfs skeleton dir {}: {e}", dir.display()))
             })?;
         }
+        let resolv_conf = self.rootfs_dir.join("etc/resolv.conf");
+        if !resolv_conf.exists() || fs::read_to_string(&resolv_conf).map(|s| s.trim().is_empty()).unwrap_or(true) {
+            let _ = fs::write(&resolv_conf, "nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 114.114.114.114\n");
+        }
         let global = self.root.join("global");
-        for name in &["memory", "skills", "shared"] {
+        for name in &["memory", "skills", "shared", "download"] {
             fs::create_dir_all(global.join(name))
                 .map_err(|e| HamburError::Internal(format!("create global dir {}: {e}", name)))?;
         }
@@ -1120,28 +1151,40 @@ impl SandboxService {
         if status.backend == "chroot" {
             let result = self.execute_chroot(session_id, command, cwd, timeout_ms);
             match result {
-                Ok(ref r) if r.stdout.contains("__HAMBUR_SANDBOX_READY__") => {
-                    let mut clean_r = r.clone();
-                    clean_r.stdout = r
-                        .stdout
-                        .replace("__HAMBUR_SANDBOX_READY__\n", "")
-                        .replace("__HAMBUR_SANDBOX_READY__\r\n", "")
-                        .replace("__HAMBUR_SANDBOX_READY__", "")
-                        .trim()
-                        .to_string();
-                    return Ok(clean_r);
+                Ok(mut r) => {
+                    let has_marker = r.stdout.contains("__HAMBUR_SANDBOX_READY__");
+                    if has_marker {
+                        if let Some(stripped) = r.stdout.strip_prefix("__HAMBUR_SANDBOX_READY__\n") {
+                            r.stdout = stripped.to_string();
+                        } else if let Some(stripped) = r.stdout.strip_prefix("__HAMBUR_SANDBOX_READY__\r\n") {
+                            r.stdout = stripped.to_string();
+                        } else {
+                            r.stdout = r
+                                .stdout
+                                .replace("__HAMBUR_SANDBOX_READY__\n", "")
+                                .replace("__HAMBUR_SANDBOX_READY__\r\n", "")
+                                .replace("__HAMBUR_SANDBOX_READY__", "");
+                        }
+                    }
+                    if has_marker || r.exit_code >= 0 || r.timed_out || !self.probe_proot_available() {
+                        return Ok(r);
+                    }
+                    let mut pr = self.execute_proot(session_id, command, cwd, timeout_ms)?;
+                    pr.fallback_from = Some("chroot".to_string());
+                    pr.warning = Some(format!(
+                        "chroot setup failed (exit={}); fell back to proot",
+                        r.exit_code
+                    ));
+                    return Ok(pr);
                 }
-                _ => {
-                    let mut r = self.execute_proot(session_id, command, cwd, timeout_ms)?;
-                    r.fallback_from = Some("chroot".to_string());
-                    r.warning = Some(match result {
-                        Ok(ref res) => format!(
-                            "chroot setup failed (exit={}); fell back to proot",
-                            res.exit_code
-                        ),
-                        Err(e) => format!("chroot setup error: {}; fell back to proot", e),
-                    });
-                    return Ok(r);
+                Err(e) => {
+                    if !self.probe_proot_available() {
+                        return Err(e);
+                    }
+                    let mut pr = self.execute_proot(session_id, command, cwd, timeout_ms)?;
+                    pr.fallback_from = Some("chroot".to_string());
+                    pr.warning = Some(format!("chroot setup error: {e}; fell back to proot"));
+                    return Ok(pr);
                 }
             }
         }
@@ -1259,7 +1302,7 @@ impl SandboxService {
             shell_quote(cwd),
             command
         );
-        let args = vec![
+        let mut args = vec![
             "-0".to_string(),
             "-r".to_string(),
             self.rootfs_dir.to_string_lossy().into_owned(),
@@ -1300,12 +1343,20 @@ impl SandboxService {
                 "{}:/var/hambur/workspace",
                 session_paths.workspace.to_string_lossy()
             ),
+        ];
+        if Path::new("/storage/emulated/0/Download").is_dir() {
+            args.push("-b".to_string());
+            args.push("/storage/emulated/0/Download:/storage/emulated/0/Download".to_string());
+            args.push("-b".to_string());
+            args.push("/storage/emulated/0/Download:/var/hambur/download".to_string());
+        }
+        args.extend([
             "-w".to_string(),
             cwd.to_string(),
             "/bin/sh".to_string(),
             "-lc".to_string(),
             inner_script,
-        ];
+        ]);
         let tmp_dir = self.app_files_dir.join("tmp/proot");
         let _ = fs::create_dir_all(&tmp_dir);
         let tmp_dir_str = tmp_dir.to_string_lossy().into_owned();
@@ -1386,7 +1437,7 @@ impl SandboxService {
              echo $$ > \"$PIDFILE\"\n\
              umount_if_mounted() {{ grep -q \" $1 \" /proc/mounts 2>/dev/null && umount -l \"$1\" 2>/dev/null || true; }}\n\
              bind_dir() {{ mkdir -p \"$2\" && umount_if_mounted \"$2\" && mount -o bind \"$1\" \"$2\"; }}\n\
-             cleanup() {{ STATUS=$?; if [ -n \"${{CHILD:-}}\" ]; then kill -TERM \"$CHILD\" 2>/dev/null || true; wait \"$CHILD\" 2>/dev/null || true; fi; for target in \"$ROOT/var/hambur/workspace\" \"$ROOT/var/hambur/offloads\" \"$ROOT/var/hambur/mounts\" \"$ROOT/var/hambur/browser\" \"$ROOT/var/hambur/attachments\" \"$ROOT/var/hambur/shared\" \"$ROOT/var/hambur/skills\" \"$ROOT/var/hambur/memory\" \"$ROOT/sys\" \"$ROOT/proc\" \"$ROOT/dev\"; do umount_if_mounted \"$target\"; done; rm -f \"$PIDFILE\"; exit $STATUS; }}\n\
+             cleanup() {{ STATUS=$?; if [ -n \"${{CHILD:-}}\" ]; then kill -TERM \"$CHILD\" 2>/dev/null || true; wait \"$CHILD\" 2>/dev/null || true; fi; for target in \"$ROOT/var/hambur/workspace\" \"$ROOT/var/hambur/offloads\" \"$ROOT/var/hambur/mounts\" \"$ROOT/var/hambur/browser\" \"$ROOT/var/hambur/attachments\" \"$ROOT/var/hambur/shared\" \"$ROOT/var/hambur/skills\" \"$ROOT/var/hambur/memory\" \"$ROOT/var/hambur/download\" \"$ROOT/storage/emulated/0/Download\" \"$ROOT/sys\" \"$ROOT/proc\" \"$ROOT/dev\"; do umount_if_mounted \"$target\"; done; rm -f \"$PIDFILE\"; exit $STATUS; }}\n\
              trap cleanup EXIT INT TERM\n\
              mount --make-rprivate / 2>/dev/null || true\n\
              umount_if_mounted \"$ROOT/dev\"\n\
@@ -1398,6 +1449,11 @@ impl SandboxService {
              bind_dir {} \"$ROOT/var/hambur/memory\"\n\
              bind_dir {} \"$ROOT/var/hambur/skills\"\n\
              bind_dir {} \"$ROOT/var/hambur/shared\"\n\
+             if [ -d /storage/emulated/0/Download ]; then \
+               bind_dir /storage/emulated/0/Download \"$ROOT/storage/emulated/0/Download\"; \
+               bind_dir /storage/emulated/0/Download \"$ROOT/var/hambur/download\"; \
+               ln -sf /storage/emulated/0/Download \"$ROOT/sdcard/Download\" 2>/dev/null || true; \
+             fi\n\
              bind_dir {} \"$ROOT/var/hambur/attachments\"\n\
              bind_dir {} \"$ROOT/var/hambur/browser\"\n\
              bind_dir {} \"$ROOT/var/hambur/mounts\"\n\
@@ -1444,11 +1500,36 @@ impl SandboxService {
         for (k, v) in env {
             cmd.env(k, v);
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
         let mut child = cmd
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| HamburError::Internal(format!("spawn {program}: {e}")))?;
+
+        let mut stdout_handle = child.stdout.take();
+        let mut stderr_handle = child.stderr.take();
+
+        let stdout_thread = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut out) = stdout_handle.take() {
+                let _ = out.read_to_end(&mut buf);
+            }
+            buf
+        });
+
+        let stderr_thread = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut err) = stderr_handle.take() {
+                let _ = err.read_to_end(&mut buf);
+            }
+            buf
+        });
+
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
         let mut exit_code = -1;
         let mut timed_out = false;
@@ -1460,6 +1541,13 @@ impl SandboxService {
                 }
                 Ok(None) => {
                     if std::time::Instant::now() >= deadline {
+                        #[cfg(unix)]
+                        {
+                            let pid = child.id() as i32;
+                            unsafe {
+                                libc::killpg(pid, libc::SIGKILL);
+                            }
+                        }
                         let _ = child.kill();
                         let _ = child.wait();
                         timed_out = true;
@@ -1468,20 +1556,23 @@ impl SandboxService {
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
                 Err(_) => {
+                    #[cfg(unix)]
+                    {
+                        let pid = child.id() as i32;
+                        unsafe {
+                            libc::killpg(pid, libc::SIGKILL);
+                        }
+                    }
                     let _ = child.kill();
                     let _ = child.wait();
                     break;
                 }
             }
         }
-        let mut stdout_str = String::new();
-        let mut stderr_str = String::new();
-        if let Some(mut out) = child.stdout.take() {
-            let _ = out.read_to_string(&mut stdout_str);
-        }
-        if let Some(mut err) = child.stderr.take() {
-            let _ = err.read_to_string(&mut stderr_str);
-        }
+        let stdout_bytes = stdout_thread.join().unwrap_or_default();
+        let stderr_bytes = stderr_thread.join().unwrap_or_default();
+        let stdout_str = String::from_utf8_lossy(&stdout_bytes).into_owned();
+        let stderr_str = String::from_utf8_lossy(&stderr_bytes).into_owned();
         let elapsed_ms = start_time.elapsed().as_millis() as u64;
         Ok(SandboxExecResult {
             backend: backend.to_string(),
@@ -1502,7 +1593,7 @@ impl SandboxService {
         let script = format!(
             "ROOT='{}'\n\
              umount_if_mounted() {{ grep -q \" $1 \" /proc/mounts 2>/dev/null && umount -l \"$1\" 2>/dev/null || true; }}\n\
-             for target in \"$ROOT/var/hambur/workspace\" \"$ROOT/var/hambur/offloads\" \"$ROOT/var/hambur/mounts\" \"$ROOT/var/hambur/browser\" \"$ROOT/var/hambur/attachments\" \"$ROOT/var/hambur/shared\" \"$ROOT/var/hambur/skills\" \"$ROOT/var/hambur/memory\" \"$ROOT/sys\" \"$ROOT/proc\" \"$ROOT/dev\"; do umount_if_mounted \"$target\"; done",
+             for target in \"$ROOT/var/hambur/workspace\" \"$ROOT/var/hambur/offloads\" \"$ROOT/var/hambur/mounts\" \"$ROOT/var/hambur/browser\" \"$ROOT/var/hambur/attachments\" \"$ROOT/var/hambur/shared\" \"$ROOT/var/hambur/skills\" \"$ROOT/var/hambur/memory\" \"$ROOT/var/hambur/download\" \"$ROOT/storage/emulated/0/Download\" \"$ROOT/sys\" \"$ROOT/proc\" \"$ROOT/dev\"; do umount_if_mounted \"$target\"; done",
             rootfs_str.replace('\'', "'\\''")
         );
         let _ = std::process::Command::new("su")
@@ -1565,6 +1656,11 @@ impl SandboxService {
              bind_dir {} \"$ROOT/var/hambur/memory\"\n\
              bind_dir {} \"$ROOT/var/hambur/skills\"\n\
              bind_dir {} \"$ROOT/var/hambur/shared\"\n\
+             if [ -d /storage/emulated/0/Download ]; then \
+               bind_dir /storage/emulated/0/Download \"$ROOT/storage/emulated/0/Download\"; \
+               bind_dir /storage/emulated/0/Download \"$ROOT/var/hambur/download\"; \
+               ln -sf /storage/emulated/0/Download \"$ROOT/sdcard/Download\" 2>/dev/null || true; \
+             fi\n\
              chroot \"$ROOT\" /bin/busybox --install -s /bin >/dev/null 2>&1 || true",
             shell_quote(&root),
             shell_quote(&global_memory.to_string_lossy()),
@@ -1698,18 +1794,41 @@ fn normalize_session_id(session_id: &str) -> HamburResult<String> {
     Ok(session_id.chars().take(160).collect())
 }
 
-fn normalize_sandbox_path(path: &str) -> HamburResult<String> {
+fn normalize_sandbox_path(raw_path: &str) -> HamburResult<String> {
+    let mut path = raw_path.trim();
+    if let Some(stripped) = path.strip_prefix("hambur://") {
+        path = stripped;
+    } else if let Some(stripped) = path.strip_prefix("hambur:") {
+        path = stripped;
+    } else if let Some(stripped) = path.strip_prefix("file://") {
+        path = stripped;
+    }
     let path = path.trim();
     if path.is_empty() {
         return Err(HamburError::InvalidCommand(
             "sandbox path must not be empty".to_string(),
         ));
     }
-    if !path.starts_with('/') {
-        return Err(HamburError::InvalidCommand(
-            "sandbox path must be absolute".to_string(),
-        ));
-    }
+
+    let owned_path: String;
+    let path = if path.starts_with('/') {
+        path
+    } else if path.starts_with("var/hambur/") {
+        owned_path = format!("/{path}");
+        &owned_path
+    } else if let Some(first_segment) = path.split('/').next() {
+        if VIRTUAL_ROOTS.iter().any(|r| r.name == first_segment) {
+            owned_path = format!("{HAMBUR_PREFIX}/{path}");
+            &owned_path
+        } else {
+            owned_path = format!("{HAMBUR_PREFIX}/workspace/{path}");
+            &owned_path
+        }
+    } else {
+        owned_path = format!("{HAMBUR_PREFIX}/workspace/{path}");
+        &owned_path
+    };
+
     if !(path == HAMBUR_PREFIX
         || path.starts_with(&format!("{HAMBUR_PREFIX}/"))
         || path == AUTOSTART_PREFIX

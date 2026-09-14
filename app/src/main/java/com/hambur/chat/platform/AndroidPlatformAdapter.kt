@@ -23,23 +23,30 @@ import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
 import android.util.Base64
+import android.util.Log
 import android.view.View
 import android.webkit.CookieManager
+import android.webkit.URLUtil
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.hambur.chat.uniffi.PlatformRequestDto
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import kotlin.coroutines.resume
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 
 data class PlatformResult(
@@ -50,10 +57,17 @@ data class PlatformResult(
     val message: String = "",
 )
 
+fun interface PermissionRequester {
+    suspend fun requestPermissions(permissions: Array<String>): Map<String, Boolean>
+}
+
 class AndroidPlatformAdapter(
     private val appContext: Context,
+    var permissionRequester: PermissionRequester? = null,
 ) {
     private val browserMutex = Mutex()
+    private val coroutineScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var activeSessionId: String = ""
     private val secretStore = AndroidSecretStore(appContext)
     private var sharedWebView: WebView? = null
 
@@ -130,6 +144,13 @@ class AndroidPlatformAdapter(
         return runCatching {
             val payload = when (actionName) {
                 "fetch" -> fetchUrl(action, request.timeoutMs.toLong())
+                "download" -> downloadFileFromUrl(
+                    sessionId = request.sessionId,
+                    url = action.optString("url").ifBlank {
+                        throw IllegalArgumentException("browser download url must not be empty")
+                    },
+                    timeoutMs = request.timeoutMs.toLong(),
+                )
                 "navigate",
                 "get_text",
                 "get_page_info",
@@ -145,7 +166,7 @@ class AndroidPlatformAdapter(
                 "get_cookies",
                 "scroll_and_collect",
                 "wait_for_dom_stable",
-                -> runWebViewAction(actionName, action, request.timeoutMs.toLong())
+                -> runWebViewAction(request.sessionId, actionName, action, request.timeoutMs.toLong())
                 else -> throw IllegalArgumentException("Unsupported browser action: $actionName")
             }
             PlatformResult(
@@ -164,14 +185,19 @@ class AndroidPlatformAdapter(
     }
 
     private suspend fun runWebViewAction(
+        sessionId: String,
         actionName: String,
         action: JSONObject,
         timeoutMs: Long,
     ): JSONObject = browserMutex.withLock {
+        activeSessionId = sessionId
         withContext(Dispatchers.Main.immediate) {
             withTimeout(timeoutMs.coerceIn(1_000L, 120_000L)) {
                 val webView = browserView()
-                navigateIfRequested(webView, action)
+                val downloadResult = navigateIfRequested(webView, action, sessionId, timeoutMs)
+                if (downloadResult != null) {
+                    return@withTimeout downloadResult
+                }
                 when (actionName) {
                     "navigate",
                     "get_text",
@@ -202,22 +228,89 @@ class AndroidPlatformAdapter(
             settings.domStorageEnabled = true
             settings.loadWithOverviewMode = true
             settings.useWideViewPort = true
+            setDownloadListener { downloadUrl, userAgent, contentDisposition, mimetype, _ ->
+                val currentSession = activeSessionId
+                coroutineScope.launch {
+                    try {
+                        downloadFileFromUrl(
+                            sessionId = currentSession,
+                            url = downloadUrl,
+                            userAgent = userAgent,
+                            contentDisposition = contentDisposition,
+                            mimeType = mimetype,
+                        )
+                    } catch (e: Throwable) {
+                        Log.e("AndroidPlatformAdapter", "Background download failed", e)
+                    }
+                }
+            }
         }.also { sharedWebView = it }
     }
 
-    private suspend fun navigateIfRequested(webView: WebView, action: JSONObject) {
+    private suspend fun navigateIfRequested(
+        webView: WebView,
+        action: JSONObject,
+        sessionId: String,
+        timeoutMs: Long,
+    ): JSONObject? {
         val url = action.optString("url")
         if (url.isBlank()) {
             if (webView.url.isNullOrBlank()) {
                 throw IllegalArgumentException("browser action url must not be empty")
             }
-            return
+            return null
         }
-        if (webView.url == url) return
-        suspendCancellableCoroutine { continuation ->
+        if (webView.url == url) return null
+
+        var downloadResult: JSONObject? = null
+
+        suspendCancellableCoroutine<Unit> { continuation ->
+            webView.setDownloadListener { downloadUrl, userAgent, contentDisposition, mimetype, _ ->
+                coroutineScope.launch {
+                    try {
+                        downloadResult = downloadFileFromUrl(
+                            sessionId = sessionId,
+                            url = downloadUrl,
+                            userAgent = userAgent,
+                            contentDisposition = contentDisposition,
+                            mimeType = mimetype,
+                            timeoutMs = timeoutMs,
+                        )
+                    } catch (e: Throwable) {
+                        Log.e("AndroidPlatformAdapter", "Download during navigation failed", e)
+                    } finally {
+                        if (continuation.isActive) {
+                            continuation.resume(Unit)
+                        }
+                    }
+                }
+            }
+
             webView.webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView, finishedUrl: String) {
                     if (continuation.isActive) {
+                        continuation.resume(Unit)
+                    }
+                }
+
+                @Deprecated("Deprecated in Java")
+                override fun onReceivedError(
+                    view: WebView,
+                    errorCode: Int,
+                    description: String?,
+                    failingUrl: String?,
+                ) {
+                    if (continuation.isActive) {
+                        continuation.resume(Unit)
+                    }
+                }
+
+                override fun onReceivedError(
+                    view: WebView,
+                    request: android.webkit.WebResourceRequest?,
+                    error: android.webkit.WebResourceError?,
+                ) {
+                    if (request?.isForMainFrame == true && continuation.isActive) {
                         continuation.resume(Unit)
                     }
                 }
@@ -227,6 +320,8 @@ class AndroidPlatformAdapter(
             }
             webView.loadUrl(url)
         }
+
+        return downloadResult
     }
 
     private suspend fun pageSnapshot(webView: WebView, action: String): JSONObject {
@@ -530,6 +625,63 @@ class AndroidPlatformAdapter(
         }
     }
 
+    private suspend fun downloadFileFromUrl(
+        sessionId: String,
+        url: String,
+        userAgent: String? = null,
+        contentDisposition: String? = null,
+        mimeType: String? = null,
+        timeoutMs: Long = 60_000L,
+    ): JSONObject = withContext(Dispatchers.IO) {
+        val guessedName = URLUtil.guessFileName(url, contentDisposition, mimeType)
+        val fileName = File(guessedName).name.ifBlank { "download_${System.currentTimeMillis()}" }
+        val targetDir = if (sessionId.isNotBlank()) {
+            File(appContext.filesDir, "sandbox/sessions/$sessionId/browser")
+        } else {
+            File(appContext.filesDir, "sandbox/global/browser")
+        }
+        if (!targetDir.exists()) {
+            targetDir.mkdirs()
+        }
+        val targetFile = File(targetDir, fileName)
+
+        val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+            connectTimeout = timeoutMs.coerceIn(1_000L, 120_000L).toInt()
+            readTimeout = timeoutMs.coerceIn(1_000L, 120_000L).toInt()
+            requestMethod = "GET"
+            instanceFollowRedirects = true
+            userAgent?.let { setRequestProperty("User-Agent", it) }
+            val cookies = CookieManager.getInstance().getCookie(url)
+            if (!cookies.isNullOrBlank()) {
+                setRequestProperty("Cookie", cookies)
+            }
+        }
+
+        try {
+            val status = connection.responseCode
+            if (status >= 400) {
+                throw IllegalStateException("Download failed with HTTP status $status")
+            }
+            val finalMimeType = connection.contentType ?: mimeType ?: "application/octet-stream"
+            connection.inputStream.use { input ->
+                targetFile.outputStream().use { output ->
+                    input.copyTo(output)
+                }
+            }
+            JSONObject()
+                .put("action", "download")
+                .put("downloaded", true)
+                .put("fileName", fileName)
+                .put("sandboxPath", "/var/hambur/browser/$fileName")
+                .put("hostPath", targetFile.absolutePath)
+                .put("mimeType", finalMimeType)
+                .put("size", targetFile.length())
+                .put("url", url)
+        } finally {
+            connection.disconnect()
+        }
+    }
+
     private suspend fun handleAndroidCliAction(request: PlatformRequestDto): PlatformResult {
         return runCatching {
             val root = JSONObject(request.payloadJson)
@@ -570,19 +722,32 @@ class AndroidPlatformAdapter(
     }
 
     private suspend fun getLocation(): JSONObject {
-        val hasFine = ContextCompat.checkSelfPermission(
+        val finePerm = Manifest.permission.ACCESS_FINE_LOCATION
+        val coarsePerm = Manifest.permission.ACCESS_COARSE_LOCATION
+
+        var hasFine = ContextCompat.checkSelfPermission(
             appContext,
-            Manifest.permission.ACCESS_FINE_LOCATION
+            finePerm
         ) == PackageManager.PERMISSION_GRANTED
-        val hasCoarse = ContextCompat.checkSelfPermission(
+        var hasCoarse = ContextCompat.checkSelfPermission(
             appContext,
-            Manifest.permission.ACCESS_COARSE_LOCATION
+            coarsePerm
         ) == PackageManager.PERMISSION_GRANTED
+
+        if (!hasFine && !hasCoarse) {
+            val grants = permissionRequester?.requestPermissions(arrayOf(finePerm, coarsePerm))
+            if (grants != null) {
+                hasFine = grants[finePerm] == true ||
+                    ContextCompat.checkSelfPermission(appContext, finePerm) == PackageManager.PERMISSION_GRANTED
+                hasCoarse = grants[coarsePerm] == true ||
+                    ContextCompat.checkSelfPermission(appContext, coarsePerm) == PackageManager.PERMISSION_GRANTED
+            }
+        }
 
         if (!hasFine && !hasCoarse) {
             return JSONObject()
                 .put("status", "PermissionDenied")
-                .put("message", "Location permission (ACCESS_FINE_LOCATION or ACCESS_COARSE_LOCATION) is not granted")
+                .put("message", "Location permission (ACCESS_FINE_LOCATION or ACCESS_COARSE_LOCATION) was denied by user")
         }
 
         val lm = appContext.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
@@ -603,6 +768,35 @@ class AndroidPlatformAdapter(
                     }
                 }
             } catch (_: SecurityException) {
+            }
+        }
+
+        if (bestLocation == null) {
+            for (provider in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)) {
+                try {
+                    if (lm.isProviderEnabled(provider)) {
+                        val freshLoc = runCatching {
+                            withTimeoutOrNull(5000L) {
+                                suspendCancellableCoroutine<Location?> { cont ->
+                                    val cancelSignal = android.os.CancellationSignal()
+                                    cont.invokeOnCancellation { cancelSignal.cancel() }
+                                    lm.getCurrentLocation(
+                                        provider,
+                                        cancelSignal,
+                                        ContextCompat.getMainExecutor(appContext)
+                                    ) { loc ->
+                                        if (cont.isActive) cont.resume(loc)
+                                    }
+                                }
+                            }
+                        }.getOrNull()
+                        if (freshLoc != null) {
+                            bestLocation = freshLoc
+                            break
+                        }
+                    }
+                } catch (_: SecurityException) {
+                }
             }
         }
 
@@ -651,20 +845,25 @@ class AndroidPlatformAdapter(
     }
 
     private fun getDeviceInfo(): JSONObject {
-        val cm = appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-        val activeNet = cm?.activeNetwork
-        val caps = cm?.getNetworkCapabilities(activeNet)
+        var netType = "Unknown"
+        var isConnected = false
+        runCatching {
+            val cm = appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            val activeNet = cm?.activeNetwork
+            val caps = cm?.getNetworkCapabilities(activeNet)
 
-        val isWifi = caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
-        val isCellular = caps?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true
-        val isEthernet = caps?.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) == true
+            val isWifi = caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+            val isCellular = caps?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true
+            val isEthernet = caps?.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) == true
 
-        val netType = when {
-            isWifi -> "WiFi"
-            isCellular -> "Cellular"
-            isEthernet -> "Ethernet"
-            activeNet != null -> "Other"
-            else -> "Disconnected"
+            netType = when {
+                isWifi -> "WiFi"
+                isCellular -> "Cellular"
+                isEthernet -> "Ethernet"
+                activeNet != null -> "Other"
+                else -> "Disconnected"
+            }
+            isConnected = caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
         }
 
         return JSONObject()
@@ -675,7 +874,7 @@ class AndroidPlatformAdapter(
             .put("android_release", Build.VERSION.RELEASE)
             .put("sdk_int", Build.VERSION.SDK_INT)
             .put("network_status", netType)
-            .put("internet_connected", caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true)
+            .put("internet_connected", isConnected)
     }
 
     private suspend fun getClipboard(): JSONObject {
@@ -729,7 +928,24 @@ class AndroidPlatformAdapter(
         }
     }
 
-    private fun sendNotification(title: String, content: String): JSONObject {
+    private suspend fun sendNotification(title: String, content: String): JSONObject {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val perm = Manifest.permission.POST_NOTIFICATIONS
+            var hasPerm = ContextCompat.checkSelfPermission(appContext, perm) == PackageManager.PERMISSION_GRANTED
+            if (!hasPerm) {
+                val grants = permissionRequester?.requestPermissions(arrayOf(perm))
+                if (grants != null) {
+                    hasPerm = grants[perm] == true ||
+                        ContextCompat.checkSelfPermission(appContext, perm) == PackageManager.PERMISSION_GRANTED
+                }
+            }
+            if (!hasPerm) {
+                return JSONObject()
+                    .put("status", "PermissionDenied")
+                    .put("message", "Notification permission (POST_NOTIFICATIONS) was not granted")
+            }
+        }
+
         val nm = appContext.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
             ?: return JSONObject().put("status", "Unavailable").put("message", "NotificationManager unavailable")
 
@@ -763,7 +979,22 @@ class AndroidPlatformAdapter(
             .put("title", title)
     }
 
-    private fun setTorch(enabled: Boolean): JSONObject {
+    private suspend fun setTorch(enabled: Boolean): JSONObject {
+        val perm = Manifest.permission.CAMERA
+        var hasPerm = ContextCompat.checkSelfPermission(appContext, perm) == PackageManager.PERMISSION_GRANTED
+        if (!hasPerm) {
+            val grants = permissionRequester?.requestPermissions(arrayOf(perm))
+            if (grants != null) {
+                hasPerm = grants[perm] == true ||
+                    ContextCompat.checkSelfPermission(appContext, perm) == PackageManager.PERMISSION_GRANTED
+            }
+        }
+        if (!hasPerm) {
+            return JSONObject()
+                .put("status", "PermissionDenied")
+                .put("message", "Camera permission (CAMERA) is required for torch mode and was not granted")
+        }
+
         val cm = appContext.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
             ?: return JSONObject().put("status", "Unavailable").put("message", "CameraManager unavailable")
 

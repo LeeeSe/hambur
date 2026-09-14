@@ -161,9 +161,10 @@ impl RuntimeEngine {
         session_id: String,
         sandbox_path: String,
     ) -> RuntimeFileResolution {
+        let clean_path = normalize_tool_sandbox_path(&sandbox_path);
         let resolved = match self
             .sandbox
-            .resolve(&session_id, &sandbox_path, SandboxAccess::Read)
+            .resolve(&session_id, &clean_path, SandboxAccess::Read)
         {
             Ok(resolved) => resolved,
             Err(_) => return RuntimeFileResolution::default(),
@@ -176,6 +177,10 @@ impl RuntimeEngine {
                     .resolve_file_by_sandbox_path(&session_id, &resolved.sandbox_path),
             )
             .ok();
+        let mime_type = db_file
+            .as_ref()
+            .map(|file| file.mime_type.clone())
+            .unwrap_or_else(|| detect_mime_type(&resolved.host_path).to_string());
         RuntimeFileResolution {
             sandbox_path: resolved.sandbox_path,
             host_path: resolved.host_path.to_string_lossy().to_string(),
@@ -184,10 +189,7 @@ impl RuntimeEngine {
             writable: resolved.writable,
             exists: metadata.is_some(),
             is_file: metadata.as_ref().is_some_and(|metadata| metadata.is_file()),
-            mime_type: db_file
-                .as_ref()
-                .map(|file| file.mime_type.clone())
-                .unwrap_or_else(|| "application/octet-stream".to_string()),
+            mime_type,
             byte_size: metadata
                 .as_ref()
                 .map(|metadata| metadata.len())
@@ -452,44 +454,74 @@ impl RuntimeEngine {
             .unwrap_or(50)
             .clamp(1, 500) as usize;
         let offset = arguments.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
-        let resolved =
-            self.resolve_tool_sandbox_path(&invocation.session_id, path, SandboxAccess::Read)?;
-        let mut files = Vec::new();
-        if resolved.host_path.is_file() {
-            files.push(resolved.host_path.clone());
-        } else {
-            collect_all_files(&resolved.host_path, &mut files)?;
-        }
-        let mut results = Vec::new();
-        if target == "files" {
-            for file in files {
-                let relative = file
-                    .strip_prefix(&resolved.host_path)
-                    .unwrap_or(&file)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                if file
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or_default()
-                    .contains(pattern)
-                    || relative.contains(pattern)
-                {
-                    results.push(json!({"path": path_for_search_result(&resolved, &file)}));
+        let clean_path = path.trim().trim_end_matches('/');
+        let resolved_roots: Vec<hambur_sandbox::SandboxPathResolution> =
+            if clean_path == "/var/hambur" || clean_path.is_empty() {
+                let root_candidates = [
+                    "/var/hambur/workspace",
+                    "/var/hambur/shared",
+                    "/var/hambur/attachments",
+                    "/var/hambur/browser",
+                    "/var/hambur/offloads",
+                    "/var/hambur/skills",
+                    "/var/hambur/download",
+                ];
+                let mut list = Vec::new();
+                for r in root_candidates {
+                    if let Ok(res) =
+                        self.resolve_tool_sandbox_path(&invocation.session_id, r, SandboxAccess::Read)
+                    {
+                        if res.host_path.exists() {
+                            list.push(res);
+                        }
+                    }
                 }
+                list
+            } else {
+                vec![self.resolve_tool_sandbox_path(
+                    &invocation.session_id,
+                    path,
+                    SandboxAccess::Read,
+                )?]
+            };
+        let mut results = Vec::new();
+        for resolved in resolved_roots {
+            let mut files = Vec::new();
+            if resolved.host_path.is_file() {
+                files.push(resolved.host_path.clone());
+            } else {
+                collect_all_files(&resolved.host_path, &mut files)?;
             }
-        } else {
-            for file in files {
-                let Ok(content) = fs::read_to_string(&file) else {
-                    continue;
-                };
-                for (index, line) in content.lines().enumerate() {
-                    if line.contains(pattern) {
-                        results.push(json!({
-                            "path": path_for_search_result(&resolved, &file),
-                            "line": index + 1,
-                            "content": line
-                        }));
+            if target == "files" {
+                for file in files {
+                    let relative = file
+                        .strip_prefix(&resolved.host_path)
+                        .unwrap_or(&file)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    if file
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or_default()
+                        .contains(pattern)
+                        || relative.contains(pattern)
+                    {
+                        results.push(json!({"path": path_for_search_result(&resolved, &file)}));
+                    }
+                }
+            } else {
+                for file in files {
+                    let Ok(content) = fs::read_to_string(&file) else {
+                        continue;
+                    };
+                    for (index, line) in content.lines().enumerate() {
+                        if line.contains(pattern) {
+                            results.push(json!({
+                                "path": path_for_search_result(&resolved, &file),
+                                "line": index + 1,
+                                "content": line
+                            }));
+                        }
                     }
                 }
             }

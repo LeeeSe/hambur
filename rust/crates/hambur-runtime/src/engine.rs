@@ -34,7 +34,7 @@ impl RuntimeEngine {
         }
         let tools = ToolScheduler::new(PathBuf::from(&bootstrap.app_files_dir).join("offloads"))?
             .with_app_files_dir(&bootstrap.app_files_dir);
-        let (sender, receiver) = mpsc::channel(64);
+        let (sender, receiver) = mpsc::channel(1024);
         let engine = Arc::new(Self {
             tokio,
             self_ref: Mutex::new(Weak::new()),
@@ -237,10 +237,14 @@ impl RuntimeEngine {
         }
 
         if !open_tool_call_ids.is_empty() {
-            return Err(HamburError::InvalidCommand(format!(
-                "visible transcript has assistant tool calls without tool results: {}",
-                open_tool_call_ids.len()
-            )));
+            for call_id in open_tool_call_ids {
+                messages.push(ModelMessage {
+                    role: "tool".to_string(),
+                    content: "Tool execution was cancelled or interrupted before completion.".to_string(),
+                    tool_call_id: call_id,
+                    ..Default::default()
+                });
+            }
         }
 
         if append_current_user {
@@ -582,6 +586,7 @@ impl RuntimeEngine {
                             &assistant_message_id,
                             &cancel,
                             &chunk,
+                            &route.provider_protocol,
                             true,
                         )
                         .await
@@ -605,9 +610,15 @@ impl RuntimeEngine {
                     }
                 };
                 let target = provider_target_from_route(route.clone());
-                let spec = match OpenAiCompatibleAdapter::build_stream_request(
-                    &request, &target, &api_key,
-                ) {
+                let spec_result = match target.provider.protocol.as_str() {
+                    OPENAI_RESPONSES_PROTOCOL => {
+                        ResponsesApiAdapter::build_stream_request(&request, &target, &api_key)
+                    }
+                    _ => {
+                        OpenAiCompatibleAdapter::build_stream_request(&request, &target, &api_key)
+                    }
+                };
+                let spec = match spec_result {
                     Ok(spec) => spec,
                     Err(error) => {
                         return StreamAttemptResult::Failed {
@@ -690,6 +701,7 @@ impl RuntimeEngine {
                             &assistant_message_id,
                             &cancel,
                             chunk.as_ref(),
+                            &route.provider_protocol,
                             false,
                         )
                         .await
@@ -953,6 +965,7 @@ impl RuntimeEngine {
         assistant_message_id: &str,
         cancel: &Arc<AtomicBool>,
         chunk: &[u8],
+        provider_protocol: &str,
         delay_scripted_chunk: bool,
     ) -> Option<StreamAttemptResult> {
         if cancel.load(Ordering::SeqCst) || self.shutdown.load(Ordering::SeqCst) {
@@ -992,25 +1005,20 @@ impl RuntimeEngine {
         };
 
         for payload in payloads {
-            if let Some(trace) =
+            if let Some(_trace) =
                 provider_payload_thinking_trace(&payload.data, state.thinking_raw_trace_count + 1)
             {
                 state.thinking_raw_trace_count += 1;
-                let snapshot = self
-                    .database
-                    .session_snapshot(session_id)
-                    .await
-                    .unwrap_or_default();
-                let _ = self.emit_session_event(
-                    RuntimeEventKind::TurnStateChanged,
-                    session_id.to_string(),
-                    turn_id.to_string(),
-                    snapshot,
-                    trace,
-                    None,
-                );
             }
-            let events = match OpenAiCompatibleAdapter::parse_stream_payload(&payload) {
+            let parsed_events = match provider_protocol {
+                OPENAI_RESPONSES_PROTOCOL => {
+                    ResponsesApiAdapter::parse_stream_payload(&payload)
+                }
+                _ => {
+                    OpenAiCompatibleAdapter::parse_stream_payload(&payload)
+                }
+            };
+            let events = match parsed_events {
                 Ok(events) => events,
                 Err(error) => {
                     if state.semantic_delta_started {
@@ -1050,112 +1058,90 @@ impl RuntimeEngine {
                         state.semantic_delta_started = true;
                         state.content.push_str(&delta);
                         state.thinking_parsed_trace_count += 1;
-                        let snapshot = self
-                            .database
-                            .session_snapshot(session_id)
-                            .await
-                            .unwrap_or_default();
-                        let _ = self.emit_session_event(
-                            RuntimeEventKind::TurnStateChanged,
-                            session_id.to_string(),
-                            turn_id.to_string(),
-                            snapshot.clone(),
-                            format!(
-                                "ThinkingToggle parsed content_delta parsedIndex={} deltaLen={} totalContentLen={} totalReasoningLen={}",
-                                state.thinking_parsed_trace_count,
-                                delta.chars().count(),
-                                state.content.chars().count(),
-                                state.reasoning.chars().count(),
-                            ),
-                            None,
-                        );
-                        let _ = self.emit_session_event(
-                            RuntimeEventKind::AssistantContentDelta,
-                            session_id.to_string(),
-                            turn_id.to_string(),
-                            snapshot.clone(),
-                            delta.clone(),
-                            None,
-                        );
+                        if !state.reasoning.is_empty() && !state.reasoning_persisted {
+                            state.reasoning_persisted = true;
+                            let _ = self
+                                .persist_reasoning_block_for_timeline(
+                                    session_id,
+                                    turn_id,
+                                    assistant_message_id,
+                                    &state.reasoning,
+                                )
+                                .await;
+                        }
                         if let Some(update) = self.append_stream_markdown(
                             session_id,
                             assistant_message_id,
                             &delta,
                             false,
                         ) {
-                            let _ = self
-                                .emit_markdown_event_async(
+                            if !update.committed_nodes.is_empty() {
+                                let _ = self
+                                    .emit_markdown_event_async(
+                                        session_id.to_string(),
+                                        turn_id.to_string(),
+                                        update,
+                                    )
+                                    .await;
+                            } else {
+                                let _ = self.emit_markdown_event_with_snapshot(
                                     session_id.to_string(),
                                     turn_id.to_string(),
+                                    AppSnapshot::default(),
                                     update,
-                                )
-                                .await;
+                                );
+                            }
                         }
                     }
                     ProviderStreamEvent::ReasoningDelta(delta) => {
                         state.semantic_delta_started = true;
                         state.reasoning.push_str(&delta);
                         state.thinking_parsed_trace_count += 1;
-                        let _ = self
-                            .database
-                            .update_message_stream_result(
-                                assistant_message_id,
-                                &state.content,
-                                &state.reasoning,
-                                "streaming",
-                                "",
-                                "",
-                            )
-                            .await;
-                        let _ = self
-                            .persist_reasoning_block_for_timeline(
-                                session_id,
-                                turn_id,
-                                assistant_message_id,
-                                &state.reasoning,
-                            )
-                            .await;
-                        let snapshot = self
-                            .database
-                            .session_snapshot(session_id)
-                            .await
-                            .unwrap_or_default();
-                        let _ = self.emit_session_event(
-                            RuntimeEventKind::TurnStateChanged,
-                            session_id.to_string(),
-                            turn_id.to_string(),
-                            snapshot.clone(),
-                            format!(
-                                "ThinkingToggle parsed reasoning_delta parsedIndex={} deltaLen={} totalReasoningLen={} totalContentLen={}",
-                                state.thinking_parsed_trace_count,
-                                delta.chars().count(),
-                                state.reasoning.chars().count(),
-                                state.content.chars().count(),
-                            ),
-                            None,
-                        );
-                        let _ = self.emit_session_event(
-                            RuntimeEventKind::AssistantReasoningDelta,
-                            session_id.to_string(),
-                            turn_id.to_string(),
-                            snapshot,
-                            delta,
-                            None,
-                        );
+                        let should_persist =
+                            !state.reasoning_persisted && !state.reasoning.is_empty();
+                        if should_persist {
+                            state.reasoning_persisted = true;
+                            let _ = self
+                                .persist_reasoning_block_for_timeline(
+                                    session_id,
+                                    turn_id,
+                                    assistant_message_id,
+                                    &state.reasoning,
+                                )
+                                .await;
+                            let snapshot = self
+                                .database
+                                .session_snapshot(session_id)
+                                .await
+                                .unwrap_or_default();
+                            let _ = self.emit_session_event(
+                                RuntimeEventKind::AssistantReasoningDelta,
+                                session_id.to_string(),
+                                turn_id.to_string(),
+                                snapshot,
+                                delta,
+                                None,
+                            );
+                        } else {
+                            let _ = self.emit_session_event(
+                                RuntimeEventKind::AssistantReasoningDelta,
+                                session_id.to_string(),
+                                turn_id.to_string(),
+                                AppSnapshot::default(),
+                                delta,
+                                None,
+                            );
+                        }
                     }
-                    ProviderStreamEvent::ToolCallDelta { .. } => {
+                    ProviderStreamEvent::ToolCallDelta { .. }
+                    | ProviderStreamEvent::ToolCallDone { .. } => {
                         state.semantic_delta_started = true;
                         state.saw_tool_delta = true;
-                        let snapshot = self
-                            .database
-                            .session_snapshot(session_id)
-                            .await
-                            .unwrap_or_default();
                         let _ = self.emit_session_event(
                             RuntimeEventKind::ToolCallDelta,
                             session_id.to_string(),
                             turn_id.to_string(),
-                            snapshot,
+                            AppSnapshot::default(),
                             "Tool call delta".to_string(),
                             None,
                         );
@@ -1433,6 +1419,7 @@ impl RuntimeEngine {
                 reasoning_content: String::new(),
                 tool_calls_json: complete_tool_calls_json(&assistant.tool_calls)?,
                 tool_call_id: String::new(),
+                ..Default::default()
             });
             for call in assistant.tool_calls {
                 let invocation = ToolInvocation::from_model_call(
@@ -1450,6 +1437,7 @@ impl RuntimeEngine {
                     reasoning_content: String::new(),
                     tool_calls_json: String::new(),
                     tool_call_id: result.tool_call_id,
+                    ..Default::default()
                 });
             }
         }
@@ -2825,6 +2813,42 @@ impl RuntimeEngine {
         let Ok(mut value) = serde_json::from_str::<Value>(content) else {
             return Ok(content.to_string());
         };
+        if value.get("downloaded").and_then(Value::as_bool) == Some(true) {
+            if let Some(sandbox_path) = value.get("sandboxPath").and_then(Value::as_str) {
+                if let Ok(resolved) = self.sandbox.resolve(session_id, sandbox_path, SandboxAccess::Read) {
+                    if let Ok(meta) = fs::metadata(&resolved.host_path) {
+                        let mime_type = value
+                            .get("mimeType")
+                            .and_then(Value::as_str)
+                            .unwrap_or_else(|| detect_mime_type(&resolved.host_path));
+                        let file_id = new_id("file");
+                        let _ = self
+                            .database
+                            .upsert_file_record(NewFileRecord {
+                                id: file_id.clone(),
+                                scope: "session".to_string(),
+                                session_id: session_id.to_string(),
+                                relative_path: resolved.relative_path.clone(),
+                                sandbox_path: resolved.sandbox_path.clone(),
+                                mime_type: mime_type.to_string(),
+                                byte_size: meta.len(),
+                                sha256: String::new(),
+                                retention_policy: "delete_with_session".to_string(),
+                            })
+                            .await;
+                        if let Some(object) = value.as_object_mut() {
+                            object.insert("fileId".to_string(), json!(file_id));
+                            object.insert(
+                                "hostPath".to_string(),
+                                json!(resolved.host_path.to_string_lossy().to_string()),
+                            );
+                            object.insert("materialized".to_string(), json!(true));
+                        }
+                    }
+                }
+            }
+            return Ok(value.to_string());
+        }
         let Some(base64_value) = value.get("base64").and_then(Value::as_str) else {
             return Ok(content.to_string());
         };
@@ -3699,58 +3723,152 @@ impl RuntimeEngine {
             );
         }
 
-        let file = match self
-            .database
-            .resolve_file_by_sandbox_path(session_id, path)
-            .await
+        let normalized_path = normalize_tool_sandbox_path(path);
+
+        // Attempt 1: Resolve from sandbox filesystem
+        let found_in_sandbox = match self
+            .sandbox
+            .resolve(session_id, &normalized_path, SandboxAccess::Read)
         {
-            Ok(file) => file,
-            Err(error) => {
-                return ToolResult::failed(
-                    &invocation.tool_call_id,
-                    &invocation.name,
-                    error.to_string(),
-                );
-            }
+            Ok(res) if res.host_path.is_file() => Some(res),
+            _ => None,
         };
-        if !file.mime_type.starts_with("image/") {
+
+        let (host_path, sandbox_path, relative_path, mime_type, file_id) = if let Some(res) =
+            found_in_sandbox
+        {
+            let ext = res
+                .host_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or_default()
+                .to_lowercase();
+            let detected_mime = match ext.as_str() {
+                "jpg" | "jpeg" => "image/jpeg",
+                "png" => "image/png",
+                "webp" => "image/webp",
+                "gif" => "image/gif",
+                "bmp" => "image/bmp",
+                "svg" => "image/svg+xml",
+                "ico" => "image/x-icon",
+                "heic" => "image/heic",
+                "heif" => "image/heif",
+                _ => "application/octet-stream",
+            };
+            let existing_db = self
+                .database
+                .resolve_file_by_sandbox_path(session_id, &res.sandbox_path)
+                .await
+                .ok();
+            let (mime, fid) = if let Some(db_f) = existing_db {
+                (db_f.mime_type, db_f.id)
+            } else {
+                let fid = new_id("file");
+                let byte_size = fs::metadata(&res.host_path).map(|m| m.len()).unwrap_or(0);
+                let scope = if res.root == "workspace"
+                    || res.root == "attachments"
+                    || res.root == "browser"
+                    || res.root == "mounts"
+                    || res.root == "offloads"
+                {
+                    "session".to_string()
+                } else {
+                    "global".to_string()
+                };
+                let _ = self
+                    .database
+                    .upsert_file_record(NewFileRecord {
+                        id: fid.clone(),
+                        scope,
+                        session_id: session_id.to_string(),
+                        relative_path: res.relative_path.clone(),
+                        sandbox_path: res.sandbox_path.clone(),
+                        mime_type: detected_mime.to_string(),
+                        byte_size,
+                        sha256: String::new(),
+                        retention_policy: "delete_with_session".to_string(),
+                    })
+                    .await;
+                (detected_mime.to_string(), fid)
+            };
+            (res.host_path, res.sandbox_path, res.relative_path, mime, fid)
+        } else {
+            // Attempt 2: Fall back to database + filestore
+            let db_res = self
+                .database
+                .resolve_file_by_sandbox_path(session_id, &normalized_path)
+                .await;
+            let db_file = match db_res {
+                Ok(file) => Ok(file),
+                Err(_) => self.database.resolve_file_by_sandbox_path(session_id, path).await,
+            };
+            let db_file = match db_file {
+                Ok(file) => file,
+                Err(_) => {
+                    return ToolResult::failed(
+                        &invocation.tool_call_id,
+                        &invocation.name,
+                        format!("file not found for sandbox path: {path}"),
+                    );
+                }
+            };
+            let host_path = match self.filestore.host_path_for_relative(&db_file.relative_path) {
+                Ok(hp) if hp.is_file() => hp,
+                _ => {
+                    return ToolResult::failed(
+                        &invocation.tool_call_id,
+                        &invocation.name,
+                        format!("file not found for sandbox path: {path}"),
+                    );
+                }
+            };
+            (
+                host_path,
+                db_file.sandbox_path,
+                db_file.relative_path,
+                db_file.mime_type,
+                db_file.id,
+            )
+        };
+
+        if !mime_type.starts_with("image/") {
             return ToolResult::failed(
                 &invocation.tool_call_id,
                 &invocation.name,
                 "view_image requires an image file",
             );
         }
+        let (width, height) = match std::fs::read(&host_path) {
+            Ok(bytes) => parse_image_dimensions(&bytes),
+            Err(error) => {
+                eprintln!("failed to read host image file {}: {error}", host_path.display());
+                (0, 0)
+            }
+        };
+        let normalized_detail = normalize_image_detail(detail);
         let image_attached_to_next_request =
             route.supports_image_input || vision_handoff_target(route_candidates, route).is_some();
         let content = json!({
             "path": path,
-            "resolvedPath": file.sandbox_path,
-            "detail": normalize_image_detail(detail),
-            "width": 0,
-            "height": 0,
-            "mimeType": file.mime_type,
-            "fileId": file.id,
+            "resolvedPath": sandbox_path,
+            "relativePath": relative_path,
+            "hostPath": host_path.to_string_lossy().to_string(),
+            "detail": normalized_detail,
+            "width": width,
+            "height": height,
+            "mimeType": mime_type,
+            "fileId": file_id,
             "imageAttachedToNextRequest": image_attached_to_next_request
         });
         let context_stub = format!(
-            "Image returned by view_image for tool_call_id={}: ImagePart(fileId={}, path={}, mimeType={}, detail={})",
+            "Image returned by view_image for tool_call_id={}: ImagePart(fileId={}, path={}, mimeType={}, detail={}, width={}, height={})",
             invocation.tool_call_id,
-            content
-                .get("fileId")
-                .and_then(Value::as_str)
-                .unwrap_or_default(),
-            content
-                .get("resolvedPath")
-                .and_then(Value::as_str)
-                .unwrap_or_default(),
-            content
-                .get("mimeType")
-                .and_then(Value::as_str)
-                .unwrap_or_default(),
-            content
-                .get("detail")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
+            file_id,
+            sandbox_path,
+            mime_type,
+            normalized_detail,
+            width,
+            height
         );
         ToolResult {
             tool_call_id: invocation.tool_call_id.clone(),
@@ -4048,7 +4166,7 @@ impl RuntimeEngine {
         message_id: &str,
         reasoning: &str,
     ) -> HamburResult<()> {
-        if message_id.trim().is_empty() || reasoning.trim().is_empty() {
+        if message_id.trim().is_empty() || reasoning.is_empty() {
             return Ok(());
         }
         let stable_key = hambur_db::reasoning_block_stable_key(message_id);

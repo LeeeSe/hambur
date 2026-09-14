@@ -108,13 +108,32 @@ fun HamburFilePreviewScreen(
     onOpenFile: (String) -> Unit,
 ) {
     val resolved = remember(path, state.selectedSessionId) {
+        val cleanPath = when {
+            path.startsWith("file://") -> Uri.parse(path).path.orEmpty()
+            path.startsWith("hambur://") -> {
+                val parsed = Uri.parse(path)
+                val p = parsed.path.orEmpty()
+                if (p.isNotBlank()) p else "/" + path.removePrefix("hambur://").trimStart('/')
+            }
+            else -> path
+        }
+        val hostPath = when {
+            cleanPath.startsWith("/var/hambur/") -> {
+                store.resolveSandboxHostPath(state.selectedSessionId, cleanPath).ifBlank {
+                    if (File(cleanPath).exists()) cleanPath else ""
+                }
+            }
+            cleanPath.isNotBlank() && File(cleanPath).exists() -> cleanPath
+            cleanPath.isNotBlank() -> {
+                store.resolveSandboxHostPath(state.selectedSessionId, cleanPath).ifBlank {
+                    if (File(cleanPath).exists()) cleanPath else ""
+                }
+            }
+            else -> ""
+        }
         resolvePreviewFile(
             path = path,
-            sandboxHostPath = if (path.startsWith("/var/hambur/")) {
-                store.resolveSandboxHostPath(state.selectedSessionId, path)
-            } else {
-                ""
-            },
+            sandboxHostPath = hostPath,
         )
     }
 
@@ -297,6 +316,9 @@ private fun MarkdownFilePreview(
                     style = markdownStyle,
                     renderCache = markdownCache,
                     onOpenDestination = onOpenFile,
+                    onResolveHostPath = { path ->
+                        store.resolveSandboxHostPath(state.selectedSessionId, path)
+                    },
                 )
             }
         }
@@ -550,13 +572,16 @@ private fun resolvePreviewFile(path: String, sandboxHostPath: String = ""): Reso
     if (path.isBlank()) return null
     val normalized = when {
         path.startsWith("file://") -> Uri.parse(path).path.orEmpty()
-        path.startsWith("hambur://") -> Uri.parse(path).path.orEmpty().ifBlank {
-            path.removePrefix("hambur://")
+        path.startsWith("hambur://") -> {
+            val parsed = Uri.parse(path)
+            val p = parsed.path.orEmpty()
+            if (p.isNotBlank()) p else "/" + path.removePrefix("hambur://").trimStart('/')
         }
         else -> path
     }
     if (normalized.isBlank()) return null
-    val file = File(sandboxHostPath.ifBlank { normalized })
+    val targetPath = if (sandboxHostPath.isNotBlank()) sandboxHostPath else normalized
+    val file = File(targetPath)
     val extension = file.extension.lowercase()
     val kind = when {
         extension in setOf("png", "jpg", "jpeg", "webp", "gif", "bmp", "heic", "heif") -> PreviewFileKind.Image

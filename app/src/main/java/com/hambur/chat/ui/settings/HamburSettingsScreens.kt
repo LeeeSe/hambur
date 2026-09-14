@@ -417,6 +417,27 @@ fun ModelDetailScreen(
                 }
             }
         }
+        item {
+            HamburSection(title = "Danger zone") {
+                var pendingDeleteModel by rememberSaveable(modelId) { mutableStateOf(false) }
+                if (pendingDeleteModel) {
+                    ConfirmDangerDialog(
+                        title = "Delete model",
+                        text = "Are you sure you want to delete model '$modelId'?",
+                        confirmText = "Delete",
+                        onConfirm = {
+                            store.deleteProviderModel(providerId, modelId)
+                            pendingDeleteModel = false
+                            onBack()
+                        },
+                        onDismiss = { pendingDeleteModel = false }
+                    )
+                }
+                TextButton(onClick = { pendingDeleteModel = true }) {
+                    Text("Delete model", color = MaterialTheme.colorScheme.error)
+                }
+            }
+        }
     }
 }
 
@@ -438,7 +459,14 @@ private fun ProviderEditorScreen(
     var enabled by rememberSaveable(providerId) { mutableStateOf(provider?.enabled ?: true) }
     var iconName by rememberSaveable(providerId) { mutableStateOf(provider?.iconName ?: "brain") }
     var apiType by rememberSaveable(providerId) { mutableStateOf(provider?.apiType ?: "OpenAiCompatible") }
-    var refreshModelId by rememberSaveable(providerId) { mutableStateOf("hambur-openai-compatible-text") }
+    var showAddCustomModelDialog by rememberSaveable(providerId) { mutableStateOf(false) }
+    var customModelId by rememberSaveable(providerId) { mutableStateOf("") }
+    var customDisplayName by rememberSaveable(providerId) { mutableStateOf("") }
+    var customSupportsReasoning by rememberSaveable(providerId) { mutableStateOf(true) }
+    var customSupportsToolCall by rememberSaveable(providerId) { mutableStateOf(true) }
+    var customSupportsImageInput by rememberSaveable(providerId) { mutableStateOf(false) }
+    var customContextLimit by rememberSaveable(providerId) { mutableStateOf("32000") }
+    var customOutputLimit by rememberSaveable(providerId) { mutableStateOf("4096") }
 
     val context = LocalContext.current
     var lastCommandSequence by rememberSaveable(providerId) { mutableStateOf(0L) }
@@ -453,6 +481,10 @@ private fun ProviderEditorScreen(
                 pendingAction = ""
             } else if (pendingAction == "Save" && state.latestEventKind == "SettingsChanged") {
                 Toast.makeText(context, "Provider saved successfully", Toast.LENGTH_SHORT).show()
+                lastCommandSequence = 0L
+                pendingAction = ""
+            } else if (pendingAction == "AddModel" && state.latestEventKind == "SettingsChanged") {
+                Toast.makeText(context, "Model added successfully", Toast.LENGTH_SHORT).show()
                 lastCommandSequence = 0L
                 pendingAction = ""
             } else if (state.runtimeStatus == "Error") {
@@ -473,6 +505,41 @@ private fun ProviderEditorScreen(
                 OutlinedTextField(value = baseUrl, onValueChange = { baseUrl = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Base URL") })
                 OutlinedTextField(value = apiKey, onValueChange = { apiKey = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("API Key (leave blank to keep current)") })
                 
+                Text("API Protocol", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 8.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    listOf(
+                        "OpenAiCompatible" to "Chat Completions (/v1/chat/completions)",
+                        "OpenAiResponses" to "Responses API (/v1/responses)"
+                    ).forEach { (typeKey, label) ->
+                        val selected = apiType == typeKey
+                        OutlinedCard(
+                            onClick = { apiType = typeKey },
+                            colors = CardDefaults.outlinedCardColors(
+                                containerColor = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface
+                            ),
+                            border = BorderStroke(
+                                width = if (selected) 2.dp else 1.dp,
+                                color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
+                            ),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Box(
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp, horizontal = 8.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = label,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+                                )
+                            }
+                        }
+                    }
+                }
+
                 Text("Select Icon", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 8.dp))
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
@@ -521,26 +588,158 @@ private fun ProviderEditorScreen(
         }
         item {
             HamburSection(title = "Model sync") {
-                OutlinedTextField(value = refreshModelId, onValueChange = { refreshModelId = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Model id") })
-                SecondaryActionButton(
-                    text = "Refresh models",
-                    enabled = id.isNotBlank(),
-                    onClick = {
-                        lastCommandSequence = state.lastAppliedSequence.toLong()
-                        pendingAction = "Refresh"
-                        Toast.makeText(context, "Syncing models from provider...", Toast.LENGTH_SHORT).show()
-                        store.refreshProviderModels(
-                            providerId = id,
-                            baseUrl = baseUrl,
-                            apiKey = apiKey,
-                            secretRef = secretRef,
-                            modelId = refreshModelId
-                        )
-                    },
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    SecondaryActionButton(
+                        text = "Refresh models",
+                        enabled = id.isNotBlank() && provider != null,
+                        onClick = {
+                            lastCommandSequence = state.lastAppliedSequence.toLong()
+                            pendingAction = "Refresh"
+                            Toast.makeText(context, "Syncing models from provider...", Toast.LENGTH_SHORT).show()
+                            store.refreshProviderModels(
+                                providerId = id,
+                                baseUrl = baseUrl,
+                                apiKey = apiKey,
+                                secretRef = secretRef,
+                                modelId = ""
+                            )
+                        },
+                    )
+                    SecondaryActionButton(
+                        text = "Add model",
+                        enabled = id.isNotBlank() && provider != null,
+                        onClick = {
+                            showAddCustomModelDialog = true
+                        },
+                    )
+                }
+                if (provider == null) {
+                    Text(
+                        "Please save provider first to sync or add models.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 4.dp)
+                    )
+                }
             }
         }
         extraContent()
+    }
+
+    if (showAddCustomModelDialog) {
+        AlertDialog(
+            onDismissRequest = { showAddCustomModelDialog = false },
+            title = { Text("Add Model") },
+            text = {
+                Column(
+                    modifier = Modifier.verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedTextField(
+                        value = customModelId,
+                        onValueChange = { customModelId = it },
+                        label = { Text("Model ID *") },
+                        placeholder = { Text("e.g. gpt-4o, deepseek-chat") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    OutlinedTextField(
+                        value = customDisplayName,
+                        onValueChange = { customDisplayName = it },
+                        label = { Text("Display Name") },
+                        placeholder = { Text("Optional") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    OutlinedTextField(
+                        value = customContextLimit,
+                        onValueChange = { customContextLimit = it.filter(Char::isDigit) },
+                        label = { Text("Context Limit") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    OutlinedTextField(
+                        value = customOutputLimit,
+                        onValueChange = { customOutputLimit = it.filter(Char::isDigit) },
+                        label = { Text("Output Limit") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text("Supports Reasoning")
+                        Switch(
+                            checked = customSupportsReasoning,
+                            onCheckedChange = { customSupportsReasoning = it }
+                        )
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text("Supports Tool Call")
+                        Switch(
+                            checked = customSupportsToolCall,
+                            onCheckedChange = { customSupportsToolCall = it }
+                        )
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text("Supports Vision / Image")
+                        Switch(
+                            checked = customSupportsImageInput,
+                            onCheckedChange = { customSupportsImageInput = it }
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    enabled = customModelId.isNotBlank(),
+                    onClick = {
+                        lastCommandSequence = state.lastAppliedSequence.toLong()
+                        pendingAction = "AddModel"
+                        Toast.makeText(context, "Adding model...", Toast.LENGTH_SHORT).show()
+                        store.saveModelOverride(
+                            providerId = id,
+                            modelId = customModelId.trim(),
+                            displayName = customDisplayName.trim().ifBlank { customModelId.trim() },
+                            supportsToolCall = customSupportsToolCall,
+                            supportsReasoning = customSupportsReasoning,
+                            supportsImageInput = customSupportsImageInput,
+                            contextLimit = customContextLimit.toUIntOrNull() ?: 32000u,
+                            outputLimit = customOutputLimit.toUIntOrNull() ?: 4096u,
+                            custom = true,
+                        )
+                        showAddCustomModelDialog = false
+                        customModelId = ""
+                        customDisplayName = ""
+                        customSupportsReasoning = true
+                        customSupportsToolCall = true
+                        customSupportsImageInput = false
+                        customContextLimit = "32000"
+                        customOutputLimit = "4096"
+                    }
+                ) {
+                    Text("Add")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showAddCustomModelDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
     }
 }
 

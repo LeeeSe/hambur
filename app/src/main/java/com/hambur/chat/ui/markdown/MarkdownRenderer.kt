@@ -1,5 +1,6 @@
 package com.hambur.chat.ui.markdown
 
+import android.net.Uri
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -7,6 +8,9 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.ui.layout.ContentScale
+import coil3.compose.AsyncImage
+import java.io.File
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -190,6 +194,7 @@ fun MarkdownBlock(
     style: MarkdownStyle? = null,
     renderCache: MarkdownRenderCache? = null,
     onOpenDestination: (String) -> Unit = {},
+    onResolveHostPath: ((String) -> String)? = null,
 ) {
     val markdownStyle = style ?: rememberMarkdownStyle()
     SideEffect {
@@ -235,6 +240,7 @@ fun MarkdownBlock(
             node = node,
             markdownStyle = markdownStyle,
             onOpenDestination = onOpenDestination,
+            onResolveHostPath = onResolveHostPath,
             modifier = modifier,
         )
         "HtmlBlock", "MathBlock" -> MarkdownPlainBlock(
@@ -801,6 +807,7 @@ private fun MarkdownFileBlock(
     node: MarkdownBlockNodeDto,
     markdownStyle: MarkdownStyle,
     onOpenDestination: (String) -> Unit,
+    onResolveHostPath: ((String) -> String)? = null,
     modifier: Modifier = Modifier,
 ) {
     val clickableModifier = if (node.path.isNotBlank()) {
@@ -808,6 +815,37 @@ private fun MarkdownFileBlock(
     } else {
         Modifier
     }
+
+    val cleanPath = when {
+        node.path.startsWith("hambur://") -> node.path.removePrefix("hambur://")
+        node.path.startsWith("hambur:") -> node.path.removePrefix("hambur:")
+        else -> node.path
+    }
+    val hostPath = remember(node.path, onResolveHostPath) {
+        if (cleanPath.startsWith("/") && File(cleanPath).exists()) {
+            cleanPath
+        } else {
+            onResolveHostPath?.invoke(node.path).orEmpty()
+        }
+    }
+    val imageFile = remember(hostPath) {
+        if (hostPath.isNotBlank()) File(hostPath) else null
+    }
+    val isImage = remember(node.fileKind, node.path) {
+        node.fileKind.equals("image", ignoreCase = true) ||
+            listOf(".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg").any {
+                node.path.substringBefore('?').endsWith(it, ignoreCase = true)
+            }
+    }
+    val imageModel: Any? = remember(node.path, hostPath, imageFile) {
+        when {
+            node.path.startsWith("http://") || node.path.startsWith("https://") -> node.path
+            node.path.startsWith("content://") -> Uri.parse(node.path)
+            imageFile?.exists() == true -> imageFile
+            else -> null
+        }
+    }
+
     Surface(
         modifier = modifier
             .fillMaxWidth()
@@ -818,18 +856,32 @@ private fun MarkdownFileBlock(
     ) {
         Column(
             modifier = Modifier.padding(markdownStyle.blockPadding),
-            verticalArrangement = Arrangement.spacedBy(4.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Text(
-                text = node.text.ifBlank { node.fileKind.ifBlank { "file" } },
-                style = MaterialTheme.typography.titleSmall,
-                fontWeight = FontWeight.SemiBold,
-            )
-            Text(
-                text = node.path,
-                style = markdownStyle.smallTextStyle,
-                color = markdownStyle.onSurfaceVariantColor,
-            )
+            if (isImage && imageModel != null) {
+                AsyncImage(
+                    model = imageModel,
+                    contentDescription = node.text.ifBlank { node.path },
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(markdownStyle.cornerRadius)),
+                )
+            }
+            Column(
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Text(
+                    text = node.text.ifBlank { node.fileKind.ifBlank { "file" } },
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    text = node.path,
+                    style = markdownStyle.smallTextStyle,
+                    color = markdownStyle.onSurfaceVariantColor,
+                )
+            }
         }
     }
 }

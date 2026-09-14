@@ -339,6 +339,7 @@ impl ToolSchemaCompiler {
                             "get_readable",
                             "get_backbone",
                             "fetch",
+                            "download",
                             "get_cookies",
                             "scroll_and_collect",
                             "wait_for_dom_stable"
@@ -1348,8 +1349,7 @@ fn requires_approval(name: &str) -> bool {
 fn timeout_ms(name: &str) -> u64 {
     match name {
         "terminal" | "process" => 120_000,
-        "web_search" | "browser_use" => 60_000,
-        "android_cli" => 20_000,
+        "web_search" | "browser_use" | "android_cli" => 60_000,
         "delegate_task" => 600_000,
         _ => 30_000,
     }

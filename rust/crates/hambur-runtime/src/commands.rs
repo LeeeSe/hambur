@@ -92,6 +92,9 @@ impl RuntimeEngine {
             "UpdateProvider" => self.execute_update_provider(command),
             "DeleteProvider" => self.execute_delete_provider(command),
             "RefreshProviderModels" => self.execute_refresh_provider_models(command),
+            "DeleteProviderModel" | "DeleteModel" => {
+                self.execute_delete_provider_model(command)
+            }
             "UpdateModelOverride" | "UpdateModelDetail" => {
                 self.execute_update_model_override(command)
             }
@@ -328,7 +331,8 @@ impl RuntimeEngine {
                     name: command.title.clone(),
                     icon_name: config_payload_string(&command.payload_json, "iconName")
                         .if_blank("sparkles".to_string()),
-                    api_type: OPENAI_COMPATIBLE_PROTOCOL.to_string(),
+                    api_type: config_payload_string(&command.payload_json, "apiType")
+                        .if_blank(OPENAI_COMPATIBLE_PROTOCOL.to_string()),
                     base_url: command.chunk.clone(),
                     secret_ref: provider_secret_ref_from_payload(&command.payload_json),
                     enabled: config_payload_bool(&command.payload_json, "enabled", true),
@@ -481,6 +485,11 @@ impl RuntimeEngine {
         {
             Ok(models) => {
                 for (index, model) in models.iter().enumerate() {
+                    if model.metadata_json.contains("\"custom\":true")
+                        || model.metadata_json.contains("\"custom\": true")
+                    {
+                        continue;
+                    }
                     let _ = self
                         .tokio
                         .block_on(self.database.upsert_primary_chat_member(
@@ -519,6 +528,46 @@ impl RuntimeEngine {
             }
         }
     }
+    pub(crate) fn execute_delete_provider_model(
+        &self,
+        command: RuntimeCommand,
+    ) -> RuntimeCommandAck {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return rejected_ack(
+                command.command_id,
+                command.idempotency_key,
+                HamburError::RuntimeClosed,
+            );
+        }
+        let payload = config_payload_value(&command.payload_json);
+        let provider_id = command
+            .provider_id
+            .clone()
+            .if_blank(config_string(&payload, "providerId").if_blank(command.message_id.clone()));
+        let model_id = command
+            .model_id
+            .clone()
+            .if_blank(config_string(&payload, "modelId"));
+        let result = self.tokio.block_on(async {
+            self.database
+                .delete_provider_model(&provider_id, &model_id)
+                .await?;
+            self.database
+                .insert_config_audit(
+                    &command.command_id,
+                    "user",
+                    "DeleteProviderModel",
+                    "provider_model",
+                    &format!("{}/{}", provider_id, model_id),
+                    "Provider model deleted",
+                    false,
+                    "",
+                )
+                .await?;
+            self.database.bootstrap_snapshot().await
+        });
+        self.finish_settings_command(command, result, "Model deleted")
+    }
     pub(crate) fn execute_update_model_override(
         &self,
         command: RuntimeCommand,
@@ -540,6 +589,19 @@ impl RuntimeEngine {
             .clone()
             .if_blank(config_string(&payload, "modelId"));
         let result = self.tokio.block_on(async {
+            let is_custom = config_bool(&payload, "custom", false);
+            let mut metadata_value: Value = serde_json::from_str(&config_object_string(
+                &payload,
+                "metadataJson",
+            ))
+            .unwrap_or_else(|_| serde_json::json!({}));
+            if is_custom && metadata_value.get("custom").is_none() {
+                if let Some(obj) = metadata_value.as_object_mut() {
+                    obj.insert("custom".to_string(), Value::Bool(true));
+                }
+            }
+            let metadata_json = metadata_value.to_string();
+
             let model = self
                 .database
                 .upsert_provider_model_override(ProviderModelOverride {
@@ -561,7 +623,7 @@ impl RuntimeEngine {
                     context_limit: config_u32(&payload, "contextLimit", 32000),
                     output_limit: config_u32(&payload, "outputLimit", 4096),
                     reasoning_field: config_string(&payload, "reasoningField"),
-                    metadata_json: config_object_string(&payload, "metadataJson"),
+                    metadata_json,
                 })
                 .await?;
             self.database
@@ -1253,113 +1315,120 @@ impl RuntimeEngine {
                 .database
                 .create_turn_with_route(&command.session_id, "StreamingAssistant", &route)
                 .await?;
-            let reuse_existing_user = can_reuse_source_user && reusable_user_message.is_some();
-            let user_message = if reuse_existing_user {
-                reusable_user_message.expect("checked reusable user message")
-            } else {
-                let prompt_prefix = format!(
-                    "[Current Time: {}]",
-                    format_beijing_timestamp_with_weekday(now_ms())
-                );
-                let user_message = self
-                    .database
-                    .insert_message_with_route_and_prefix(
+            let res = async {
+                let reuse_existing_user = can_reuse_source_user && reusable_user_message.is_some();
+                let user_message = if reuse_existing_user {
+                    reusable_user_message.expect("checked reusable user message")
+                } else {
+                    let prompt_prefix = format!(
+                        "[Current Time: {}]",
+                        format_beijing_timestamp_with_weekday(now_ms())
+                    );
+                    let user_message = self
+                        .database
+                        .insert_message_with_route_and_prefix(
+                            &command.session_id,
+                            "user",
+                            &visible_user_content,
+                            "",
+                            "completed",
+                            &turn.id,
+                            &route,
+                            &prompt_prefix,
+                        )
+                        .await?;
+                    let attachment_ids = pending_attachments
+                        .iter()
+                        .map(|attachment| attachment.id.clone())
+                        .collect::<Vec<_>>();
+                    self.database
+                        .attach_pending_to_message(
+                            &command.session_id,
+                            &user_message.id,
+                            &attachment_ids,
+                        )
+                        .await?;
+                    self.database
+                        .upsert_timeline_item(
+                            &command.session_id,
+                            NewTimelineItem {
+                                stable_key: user_message.id.clone(),
+                                content_type: "user_message".to_string(),
+                                display_sequence: user_message.created_at_ms,
+                                payload_ref: user_message.id.clone(),
+                                small_summary: visible_user_content.chars().take(160).collect(),
+                                kind: if command_kind == "EditMessage" {
+                                    "EditedUserMessage".to_string()
+                                } else {
+                                    "UserMessage".to_string()
+                                },
+                            },
+                        )
+                        .await?;
+                    self.maybe_title_session_from_first_user_message(
                         &command.session_id,
-                        "user",
                         &visible_user_content,
+                    )
+                    .await?;
+                    user_message
+                };
+                let assistant_message = self
+                    .database
+                    .insert_message_with_route(
+                        &command.session_id,
+                        "assistant",
                         "",
-                        "completed",
+                        "",
+                        "streaming",
                         &turn.id,
                         &route,
-                        &prompt_prefix,
                     )
                     .await?;
-                let attachment_ids = pending_attachments
-                    .iter()
-                    .map(|attachment| attachment.id.clone())
-                    .collect::<Vec<_>>();
-                self.database
-                    .attach_pending_to_message(
-                        &command.session_id,
-                        &user_message.id,
-                        &attachment_ids,
-                    )
-                    .await?;
-                self.database
-                    .upsert_timeline_item(
-                        &command.session_id,
-                        NewTimelineItem {
-                            stable_key: user_message.id.clone(),
-                            content_type: "user_message".to_string(),
-                            display_sequence: user_message.created_at_ms,
-                            payload_ref: user_message.id.clone(),
-                            small_summary: visible_user_content.chars().take(160).collect(),
-                            kind: if command_kind == "EditMessage" {
-                                "EditedUserMessage".to_string()
-                            } else {
-                                "UserMessage".to_string()
-                            },
-                        },
-                    )
-                    .await?;
-                self.maybe_title_session_from_first_user_message(
+                let engine = self.self_ref.lock().ok().and_then(|value| value.upgrade()).ok_or_else(|| {
+                    HamburError::Internal("runtime self reference unavailable".to_string())
+                })?;
+                engine.insert_initial_pending_markdown_block(
                     &command.session_id,
-                    &visible_user_content,
-                )
-                .await?;
-                user_message
-            };
-            let assistant_message = self
-                .database
-                .insert_message_with_route(
-                    &command.session_id,
-                    "assistant",
-                    "",
-                    "",
-                    "streaming",
                     &turn.id,
-                    &route,
-                )
-                .await?;
-            let engine = self.self_ref.lock().ok().and_then(|value| value.upgrade()).ok_or_else(|| {
-                HamburError::Internal("runtime self reference unavailable".to_string())
-            })?;
-            engine.insert_initial_pending_markdown_block(
-                &command.session_id,
-                &turn.id,
-                &assistant_message.id,
-            ).await?;
-            let model_user_content = format_user_content_with_prefix(
-                &user_message.prompt_prefix,
-                &content,
-                &pending_attachments,
-            );
-            let chat_context = self
-                .build_chat_context_messages(
-                    &command.session_id,
-                    &user_message,
+                    &assistant_message.id,
+                ).await?;
+                let model_user_content = format_user_content_with_prefix(
+                    &user_message.prompt_prefix,
+                    &content,
                     &pending_attachments,
-                    &route,
-                    true,
-                    &model_user_content,
-                )
-                .await?;
-            let snapshot = self.database.session_snapshot(&command.session_id).await?;
-            let disabled_tools = self.disabled_tool_names_async().await;
-            let tools_json = self.tools.schemas().compile_openai_tools_json_excluding(&disabled_tools);
-            let skills_index_prompt = self.build_skills_index_prompt_async().await;
-            let memory_system_prompt = self.build_memory_system_prompt_async().await;
-            Ok::<_, HamburError>((
-                turn,
-                user_message,
-                assistant_message,
-                chat_context,
-                snapshot,
-                !reuse_existing_user,
-                tools_json,
-                skills_index_prompt,
-                memory_system_prompt,
-            ))
+                );
+                let chat_context = self
+                    .build_chat_context_messages(
+                        &command.session_id,
+                        &user_message,
+                        &pending_attachments,
+                        &route,
+                        true,
+                        &model_user_content,
+                    )
+                    .await?;
+                let snapshot = self.database.session_snapshot(&command.session_id).await?;
+                let disabled_tools = self.disabled_tool_names_async().await;
+                let tools_json = self.tools.schemas().compile_openai_tools_json_excluding(&disabled_tools);
+                let skills_index_prompt = self.build_skills_index_prompt_async().await;
+                let memory_system_prompt = self.build_memory_system_prompt_async().await;
+                Ok::<_, HamburError>((
+                    turn.clone(),
+                    user_message,
+                    assistant_message,
+                    chat_context,
+                    snapshot,
+                    !reuse_existing_user,
+                    tools_json,
+                    skills_index_prompt,
+                    memory_system_prompt,
+                ))
+            }.await;
+
+            if let Err(ref e) = res {
+                let _ = self.database.fail_turn(&turn.id, "Failed", "SetupError", &e.to_string()).await;
+            }
+            res
         });
 
         let (
@@ -1382,13 +1451,15 @@ impl RuntimeEngine {
 
         let cancel = Arc::new(AtomicBool::new(false));
         if let Ok(mut active_turns) = self.active_turns.lock() {
-            active_turns.insert(
+            if let Some(prev) = active_turns.insert(
                 command.session_id.clone(),
                 ActiveTurn {
                     turn_id: turn.id.clone(),
                     cancel: cancel.clone(),
                 },
-            );
+            ) {
+                prev.cancel.store(true, Ordering::SeqCst);
+            }
         }
 
         let _ = self.emit_session_event(
@@ -1811,7 +1882,7 @@ impl RuntimeEngine {
         let view_image_handoff = select_view_image_handoff_route(route, route_candidates, &records);
         let mut tool_result_messages = Vec::new();
         let mut context_stubs = Vec::new();
-        for record in records {
+        for record in &records {
             let tool_message = self
                 .database
                 .insert_tool_result_message(
@@ -1894,10 +1965,11 @@ impl RuntimeEngine {
             context_stubs.push(record.result.context_stub.clone());
             tool_result_messages.push(ModelMessage {
                 role: "tool".to_string(),
-                content: record.result.context_stub,
+                content: record.result.context_stub.clone(),
                 reasoning_content: String::new(),
                 tool_calls_json: String::new(),
-                tool_call_id: record.invocation.tool_call_id,
+                tool_call_id: record.invocation.tool_call_id.clone(),
+                ..Default::default()
             });
         }
 
@@ -1941,7 +2013,7 @@ impl RuntimeEngine {
             .iter()
             .any(|stub| stub.contains("ImagePart(fileId="))
         {
-            let synthetic = self
+            let _synthetic = self
                 .database
                 .insert_message_with_route(
                     session_id,
@@ -1953,19 +2025,57 @@ impl RuntimeEngine {
                     &continuation_route,
                 )
                 .await?;
-            self.database
-                .upsert_timeline_item(
-                    session_id,
-                    NewTimelineItem {
-                        stable_key: synthetic.id.clone(),
-                        content_type: "user_message".to_string(),
-                        display_sequence: synthetic.created_at_ms,
-                        payload_ref: synthetic.id.clone(),
-                        small_summary: synthetic.content_text.chars().take(160).collect(),
-                        kind: "SyntheticUserMessage".to_string(),
-                    },
-                )
-                .await?;
+        }
+
+        let mut continuation_images = Vec::new();
+        for record in &records {
+            if record.invocation.name == "view_image" && !record.result.is_error {
+                if let Ok(value) = serde_json::from_str::<Value>(&record.result.content_json) {
+                    let relative_path = value
+                        .get("relativePath")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let mime_type = value
+                        .get("mimeType")
+                        .and_then(Value::as_str)
+                        .unwrap_or("image/png");
+                    let detail = value
+                        .get("detail")
+                        .and_then(Value::as_str)
+                        .unwrap_or("high");
+                    let host_path = value
+                        .get("hostPath")
+                        .and_then(Value::as_str)
+                        .map(std::path::PathBuf::from)
+                        .filter(|p| p.is_file())
+                        .or_else(|| {
+                            if !relative_path.is_empty() {
+                                self.filestore.host_path_for_relative(relative_path).ok()
+                            } else {
+                                None
+                            }
+                        });
+                    if let Some(host_path) = host_path {
+                        if let Ok(bytes) = std::fs::read(&host_path) {
+                            continuation_images.push(ModelImagePart {
+                                mime_type: mime_type.to_string(),
+                                data_base64: BASE64_STANDARD.encode(&bytes),
+                                detail: detail.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut continuation_user_messages = Vec::new();
+        if !continuation_images.is_empty() {
+            continuation_user_messages.push(ModelMessage {
+                role: "user".to_string(),
+                content: format_synthetic_view_image_message(&context_stubs),
+                images: continuation_images,
+                ..Default::default()
+            });
         }
 
         let continuation_message = self
@@ -1997,6 +2107,7 @@ impl RuntimeEngine {
             reasoning,
             assistant_tool_calls,
             tool_result_messages,
+            continuation_user_messages,
             continuation_sse,
             scripted_source,
         )?;

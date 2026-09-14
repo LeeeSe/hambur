@@ -1,15 +1,24 @@
 package com.hambur.chat
 
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import com.hambur.chat.platform.AndroidPlatformAdapter
 import com.hambur.chat.ui.app.HamburApp
 import java.io.File
 import java.util.UUID
+import kotlin.coroutines.resume
+import kotlinx.coroutines.CancellableContinuation
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
     private var pendingPickedAttachment: ((String, String, ULong, String, String) -> Unit)? = null
@@ -20,10 +29,52 @@ class MainActivity : ComponentActivity() {
         handlePickedAttachment(uri)
     }
 
+    private val permissionMutex = Mutex()
+    private var pendingPermissionContinuation: CancellableContinuation<Map<String, Boolean>>? = null
+    private val permissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { results ->
+        val cont = pendingPermissionContinuation
+        pendingPermissionContinuation = null
+        cont?.resume(results)
+    }
+
+    private suspend fun requestPermissionsInternal(permissions: Array<String>): Map<String, Boolean> {
+        val results = mutableMapOf<String, Boolean>()
+        val needed = mutableListOf<String>()
+        for (perm in permissions) {
+            if (ContextCompat.checkSelfPermission(this, perm) == PackageManager.PERMISSION_GRANTED) {
+                results[perm] = true
+            } else {
+                needed.add(perm)
+            }
+        }
+        if (needed.isEmpty()) {
+            return results
+        }
+
+        val requestedResults = permissionMutex.withLock {
+            withContext(Dispatchers.Main.immediate) {
+                suspendCancellableCoroutine { continuation ->
+                    pendingPermissionContinuation = continuation
+                    continuation.invokeOnCancellation {
+                        pendingPermissionContinuation = null
+                    }
+                    permissionLauncher.launch(needed.toTypedArray())
+                }
+            }
+        }
+        results.putAll(requestedResults)
+        return results
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        val platformAdapter = AndroidPlatformAdapter(applicationContext)
+        val platformAdapter = AndroidPlatformAdapter(
+            appContext = applicationContext,
+            permissionRequester = { permissions -> requestPermissionsInternal(permissions) },
+        )
 
         setContent {
             HamburApp(

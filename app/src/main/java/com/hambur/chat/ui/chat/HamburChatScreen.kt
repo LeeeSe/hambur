@@ -29,7 +29,9 @@ import androidx.compose.foundation.gestures.Orientation
 import androidx.compose.foundation.gestures.ScrollScope
 import androidx.compose.foundation.gestures.rememberScrollableState
 import androidx.compose.foundation.gestures.scrollable
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsDraggedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
@@ -77,9 +79,11 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
@@ -136,29 +140,41 @@ import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupPositionProvider
 import androidx.compose.ui.window.PopupProperties
 import coil3.compose.AsyncImage
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.ui.graphics.vector.ImageVector
+import com.composables.icons.lucide.Bot
 import com.composables.icons.lucide.Brain
-import com.composables.icons.lucide.ChevronRight
 import com.composables.icons.lucide.Camera
-import com.composables.icons.lucide.Check
 import com.composables.icons.lucide.ChartNoAxesGantt
+import com.composables.icons.lucide.Check
+import com.composables.icons.lucide.ChevronRight
 import com.composables.icons.lucide.CircleArrowUp
 import com.composables.icons.lucide.CirclePause
 import com.composables.icons.lucide.CirclePlus
 import com.composables.icons.lucide.CircleX
 import com.composables.icons.lucide.Copy
+import com.composables.icons.lucide.FileDiff
+import com.composables.icons.lucide.FilePen
 import com.composables.icons.lucide.FileText
 import com.composables.icons.lucide.Folder
+import com.composables.icons.lucide.FolderSearch
+import com.composables.icons.lucide.Globe
 import com.composables.icons.lucide.Image
 import com.composables.icons.lucide.Lucide
 import com.composables.icons.lucide.MessageCirclePlus
+import com.composables.icons.lucide.MessageSquare
 import com.composables.icons.lucide.Pencil
 import com.composables.icons.lucide.Pin
 import com.composables.icons.lucide.RefreshCw
 import com.composables.icons.lucide.Search
 import com.composables.icons.lucide.Settings
+import com.composables.icons.lucide.Sparkles
+import com.composables.icons.lucide.Terminal
 import com.composables.icons.lucide.Trash2
 import com.composables.icons.lucide.Type
 import com.composables.icons.lucide.User
+import com.composables.icons.lucide.WandSparkles
+import com.composables.icons.lucide.Wrench
 import com.composables.icons.lucide.X
 import androidx.compose.ui.draw.drawBehind
 import android.content.ClipData
@@ -1088,6 +1104,7 @@ private fun ChatTimeline(
     val displayItems = remember(
         state.timelineItems,
         state.messageBlocksByPayloadRef,
+        state.messagesById,
     ) {
         ChatJankTracer.timeSessionSwitch(
             phase = "display_items_build",
@@ -1096,7 +1113,10 @@ private fun ChatTimeline(
             always = true,
             extra = "timelineItems=${state.timelineItems.size} markdownBlocks=${state.messageBlocksByPayloadRef.size}",
         ) {
-            state.timelineItems.toChatDisplayItems(state.messageBlocksByPayloadRef)
+            state.timelineItems.toChatDisplayItems(
+                messageBlocksByPayloadRef = state.messageBlocksByPayloadRef,
+                messagesById = state.messagesById,
+            )
         }
     }
     LaunchedEffect(sessionId, listState) {
@@ -1132,6 +1152,44 @@ private fun ChatTimeline(
                 return Offset.Zero
             }
         }
+    }
+
+    val density = LocalDensity.current
+    val isDragged by listState.interactionSource.collectIsDraggedAsState()
+    val isNearBottom by remember(listState) {
+        derivedStateOf {
+            val layoutInfo = listState.layoutInfo
+            val visibleItems = layoutInfo.visibleItemsInfo
+            if (visibleItems.isEmpty()) return@derivedStateOf true
+            val total = layoutInfo.totalItemsCount
+            if (total <= 2) return@derivedStateOf true
+            visibleItems.last().index >= total - 2
+        }
+    }
+
+    var lastBottomPaddingPx by remember(sessionId) {
+        mutableFloatStateOf(with(density) { bottomPadding.toPx() })
+    }
+
+    LaunchedEffect(bottomPadding) {
+        val currentBottomPx = with(density) { bottomPadding.toPx() }
+        val deltaPx = currentBottomPx - lastBottomPaddingPx
+        lastBottomPaddingPx = currentBottomPx
+        if (deltaPx > 0.5f && isNearBottom && !isDragged) {
+            listState.scrollBy(deltaPx)
+        }
+    }
+
+    var previousItemCount by remember(sessionId) {
+        mutableIntStateOf(displayItems.size)
+    }
+    LaunchedEffect(displayItems.size) {
+        if (displayItems.size > previousItemCount) {
+            if (isNearBottom && !isDragged && displayItems.isNotEmpty()) {
+                listState.animateScrollToItem(displayItems.size)
+            }
+        }
+        previousItemCount = displayItems.size
     }
 
     LazyColumn(
@@ -1173,7 +1231,7 @@ private fun ChatTimeline(
                 is ChatDisplayItem.Timeline -> {
                     val timelineItem = item.item
                     when {
-                        timelineItem.contentType == "user_message" -> {
+                        timelineItem.contentType == "user_message" && timelineItem.kind != "SyntheticUserMessage" -> {
                             val message = state.messagesById[timelineItem.payloadRef]
                             MessageTimelineItem(
                                 item = timelineItem,
@@ -1192,7 +1250,7 @@ private fun ChatTimeline(
                         }
 
                         timelineItem.contentType == "trace" || timelineItem.kind.contains("Trace") -> {
-                            ToolTraceItem(
+                            StandaloneToolTraceItem(
                                 item = timelineItem,
                                 modifier = Modifier.padding(top = topPadding),
                             )
@@ -1207,12 +1265,16 @@ private fun ChatTimeline(
                     }
                 }
 
-                is ChatDisplayItem.AssistantReasoningBlock -> {
+                is ChatDisplayItem.AssistantProcessBlock -> {
                     val activeTurnId = state.activeTurnIds[sessionId].orEmpty()
-                    val blockTurnId = state.messagesById[item.messageId]?.turnId.orEmpty()
-                    ThinkingBlock(
-                        text = item.reasoningText,
-                        isGenerating = activeTurnId.isNotBlank() && blockTurnId == activeTurnId,
+                    val blockTurnId = if (item.turnId.isNotBlank()) item.turnId else state.messagesById[item.messageId]?.turnId.orEmpty()
+                    val isGenerating = activeTurnId.isNotBlank() && (blockTurnId == activeTurnId || (blockTurnId.isBlank() && index >= displayItems.size - 2))
+                    val durationSec = state.turnDurationSeconds[blockTurnId]
+                        ?: if (item.estimatedDurationSeconds > 0) item.estimatedDurationSeconds else null
+                    ExecutionProcessBlock(
+                        steps = item.steps,
+                        isGenerating = isGenerating,
+                        durationSeconds = durationSec,
                         displayMode = thinkingDisplayMode,
                         modifier = Modifier
                             .fillMaxWidth()
@@ -1231,6 +1293,9 @@ private fun ChatTimeline(
                             store.regenerateMessage(state.selectedSessionId, item.messageId)
                         },
                         onSelectText = onSelectText,
+                        onResolveHostPath = { path ->
+                            store.resolveSandboxHostPath(sessionId, path)
+                        },
                         modifier = Modifier.padding(top = topPadding),
                     )
                 }
@@ -1369,9 +1434,15 @@ private fun MessageTimelineItem(
                     modifier = Modifier.padding(horizontal = 18.dp, vertical = 13.dp),
                 ) {
                     if (!message?.reasoningContent.isNullOrBlank()) {
-                        ThinkingBlock(
-                            text = message.reasoningContent,
+                        ExecutionProcessBlock(
+                            steps = listOf(
+                                ProcessStep.Reasoning(
+                                    id = message.id,
+                                    text = message.reasoningContent,
+                                )
+                            ),
                             isGenerating = false,
+                            durationSeconds = null,
                             displayMode = thinkingDisplayMode,
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -1513,12 +1584,15 @@ private fun MessageLongPressMenuBox(
 }
 
 @Composable
-private fun ThinkingBlock(
-    text: String,
+private fun ExecutionProcessBlock(
+    steps: List<ProcessStep>,
     isGenerating: Boolean,
+    durationSeconds: Int?,
     displayMode: String,
     modifier: Modifier = Modifier,
 ) {
+    if (steps.isEmpty()) return
+
     var isExpanded by rememberSaveable {
         mutableStateOf(initialThinkingBlockExpanded(displayMode, isGenerating))
     }
@@ -1533,7 +1607,7 @@ private fun ThinkingBlock(
         }
     }
 
-    val infiniteTransition = rememberInfiniteTransition(label = "brain_pulse")
+    val infiniteTransition = rememberInfiniteTransition(label = "process_pulse")
     val alpha by infiniteTransition.animateFloat(
         initialValue = 0.4f,
         targetValue = 1.0f,
@@ -1541,7 +1615,7 @@ private fun ThinkingBlock(
             animation = tween(1000, easing = FastOutSlowInEasing),
             repeatMode = RepeatMode.Reverse
         ),
-        label = "brain_alpha"
+        label = "process_alpha"
     )
 
     val rotationAngle by animateFloatAsState(
@@ -1551,6 +1625,18 @@ private fun ThinkingBlock(
     )
 
     val outlineColor = MaterialTheme.colorScheme.outlineVariant
+    val contentColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.85f)
+    val stepTextStyle = MaterialTheme.typography.bodyMedium.copy(
+        fontSize = 13.sp,
+        lineHeight = 20.sp,
+        fontWeight = FontWeight.Normal,
+    )
+
+    val headerTitle = when {
+        isGenerating -> "正在思考..."
+        durationSeconds != null && durationSeconds > 0 -> "已思考（用时 $durationSeconds 秒）"
+        else -> "已思考"
+    }
 
     Column(
         modifier = modifier
@@ -1569,25 +1655,26 @@ private fun ThinkingBlock(
             verticalAlignment = Alignment.CenterVertically
         ) {
             Icon(
-                imageVector = Lucide.Brain,
+                imageVector = Lucide.Sparkles,
                 contentDescription = null,
                 tint = if (isGenerating) {
                     MaterialTheme.colorScheme.primary.copy(alpha = alpha)
                 } else {
-                    MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+                    MaterialTheme.colorScheme.primary.copy(alpha = 0.85f)
                 },
-                modifier = Modifier.size(16.dp)
+                modifier = Modifier.size(15.dp)
             )
 
             Spacer(modifier = Modifier.width(8.dp))
 
             Text(
-                text = if (isGenerating) "正在思考..." else "已思考",
-                style = MaterialTheme.typography.labelLarge.copy(
+                text = headerTitle,
+                style = MaterialTheme.typography.bodyMedium.copy(
+                    fontSize = 13.sp,
                     fontWeight = FontWeight.Medium,
-                    fontSize = 13.sp
+                    lineHeight = 18.sp,
                 ),
-                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f),
+                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.88f),
                 modifier = Modifier.weight(1f)
             )
 
@@ -1596,38 +1683,208 @@ private fun ThinkingBlock(
                 contentDescription = if (isExpanded) "收起" else "展开",
                 tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
                 modifier = Modifier
-                    .size(16.dp)
+                    .size(15.dp)
                     .graphicsLayer(rotationZ = rotationAngle)
             )
         }
 
-        if (isExpanded && text.isNotBlank()) {
-            Box(
+        if (isExpanded) {
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(start = 12.dp, top = 4.dp, bottom = 8.dp)
-                    .drawBehind {
-                        val strokeWidth = 2.dp.toPx()
-                        drawLine(
-                            color = outlineColor.copy(alpha = 0.6f),
-                            start = Offset(0f, 0f),
-                            end = Offset(0f, size.height),
-                            strokeWidth = strokeWidth
-                        )
-                    }
-                    .padding(start = 14.dp)
+                    .padding(start = 2.dp, top = 4.dp, bottom = 6.dp)
             ) {
-                Text(
-                    text = text,
-                    style = MaterialTheme.typography.bodyMedium.copy(
-                        fontSize = 13.sp,
-                        lineHeight = 18.sp
-                    ),
-                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.65f),
-                    modifier = Modifier.fillMaxWidth()
-                )
+                val totalSteps = steps.size
+                steps.forEachIndexed { index, step ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .drawBehind {
+                                if (totalSteps > 1) {
+                                    val railX = 9.dp.toPx()
+                                    val nodeY = 10.dp.toPx()
+                                    val strokeW = 1.2.dp.toPx()
+                                    val lineColor = outlineColor.copy(alpha = 0.35f)
+
+                                    if (index > 0) {
+                                        drawLine(
+                                            color = lineColor,
+                                            start = Offset(railX, 0f),
+                                            end = Offset(railX, nodeY),
+                                            strokeWidth = strokeW,
+                                        )
+                                    }
+                                    if (index < totalSteps - 1) {
+                                        drawLine(
+                                            color = lineColor,
+                                            start = Offset(railX, nodeY),
+                                            end = Offset(railX, size.height),
+                                            strokeWidth = strokeW,
+                                        )
+                                    }
+                                }
+                            }
+                            .padding(vertical = 3.dp),
+                        verticalAlignment = Alignment.Top,
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .width(18.dp)
+                                .height(20.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            when (step) {
+                                is ProcessStep.Reasoning -> {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(5.dp)
+                                            .background(
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.55f),
+                                                shape = CircleShape,
+                                            )
+                                    )
+                                }
+                                is ProcessStep.ToolCall -> {
+                                    Icon(
+                                        imageVector = toolIconFor(step.toolName),
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f),
+                                        modifier = Modifier.size(14.dp),
+                                    )
+                                }
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.width(8.dp))
+
+                        Column(
+                            modifier = Modifier
+                                .weight(1f)
+                                .padding(end = 4.dp)
+                        ) {
+                            when (step) {
+                                is ProcessStep.Reasoning -> {
+                                    Text(
+                                        text = step.text,
+                                        style = stepTextStyle,
+                                        color = contentColor,
+                                        modifier = Modifier.fillMaxWidth(),
+                                    )
+                                }
+                                is ProcessStep.ToolCall -> {
+                                    ProcessToolStepRow(
+                                        step = step,
+                                        textStyle = stepTextStyle,
+                                        contentColor = contentColor,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
+    }
+}
+
+@Composable
+private fun ProcessToolStepRow(
+    step: ProcessStep.ToolCall,
+    textStyle: TextStyle,
+    contentColor: Color,
+    modifier: Modifier = Modifier,
+) {
+    val displayTitle = formatToolStepTitle(step.toolName, step.title)
+
+    Row(
+        modifier = modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Text(
+            text = displayTitle,
+            style = textStyle,
+            color = contentColor,
+            modifier = Modifier.weight(1f, fill = false),
+        )
+        if (step.status == "running") {
+            Text(
+                text = "(执行中...)",
+                style = textStyle.copy(
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium,
+                ),
+                color = MaterialTheme.colorScheme.primary,
+            )
+        } else if (step.status == "failed" || step.status == "error") {
+            Text(
+                text = "(失败)",
+                style = textStyle.copy(
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium,
+                ),
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+    }
+}
+
+private fun toolIconFor(toolName: String): ImageVector {
+    return when (toolName.lowercase().trim()) {
+        "web_search", "search" -> Lucide.Search
+        "browser_use", "browser", "browse" -> Lucide.Globe
+        "terminal", "run_command", "bash", "sh", "android_cli" -> Lucide.Terminal
+        "process" -> Lucide.Terminal
+        "read_file", "file_read", "cat" -> Lucide.FileText
+        "write_file", "file_write" -> Lucide.FilePen
+        "patch", "edit", "file_edit" -> Lucide.FileDiff
+        "search_files", "find_by_name", "grep_search" -> Lucide.FolderSearch
+        "session_search" -> Lucide.MessageSquare
+        "view_image" -> Lucide.Image
+        "skills_list", "skill_view" -> Lucide.WandSparkles
+        "delegate_task", "subagent", "agent" -> Lucide.Bot
+        else -> Lucide.Wrench
+    }
+}
+
+private fun formatToolStepTitle(toolName: String, rawTitle: String): String {
+    val title = rawTitle.trim()
+    return when {
+        title.startsWith("Search web: ") -> "搜索网页: " + title.removePrefix("Search web: ")
+        title == "Search web" -> "搜索网页"
+        title.startsWith("Search files: ") -> "搜索文件: " + title.removePrefix("Search files: ")
+        title == "Search files" -> "搜索文件"
+        title.startsWith("Browser: ") -> "浏览网页: " + title.removePrefix("Browser: ")
+        title == "Use browser" -> "浏览网页"
+        title.startsWith("Run terminal command: ") -> "执行终端命令: " + title.removePrefix("Run terminal command: ")
+        title == "Run terminal command" -> "执行终端命令"
+        title.startsWith("Read file: ") -> "读取文件: " + title.removePrefix("Read file: ")
+        title.startsWith("Write file: ") -> "写入文件: " + title.removePrefix("Write file: ")
+        title.startsWith("Patch file: ") -> "编辑文件: " + title.removePrefix("Patch file: ")
+        title.startsWith("Search sessions: ") -> "搜索历史对话: " + title.removePrefix("Search sessions: ")
+        title.startsWith("View image: ") -> "查看图片: " + title.removePrefix("View image: ")
+        title.startsWith("Delegate session") -> "委派子任务"
+        title.isNotBlank() -> title
+        toolName.isNotBlank() -> defaultToolTitle(toolName)
+        else -> "调用工具"
+    }
+}
+
+private fun defaultToolTitle(toolName: String): String {
+    return when (toolName.lowercase().trim()) {
+        "web_search", "search" -> "搜索网页"
+        "browser_use", "browser" -> "浏览网页"
+        "terminal", "run_command", "bash", "android_cli" -> "执行终端命令"
+        "process" -> "控制进程"
+        "read_file" -> "读取文件"
+        "write_file" -> "写入文件"
+        "patch" -> "编辑文件"
+        "search_files" -> "搜索文件"
+        "session_search" -> "搜索历史对话"
+        "view_image" -> "查看图片"
+        "skills_list", "skill_view" -> "加载技能"
+        "delegate_task" -> "委派子任务"
+        else -> "调用工具: $toolName"
     }
 }
 
@@ -1640,6 +1897,7 @@ private fun AssistantMarkdownBlockTimelineItem(
     onOpenFile: (String) -> Unit,
     onRegenerate: () -> Unit,
     onSelectText: (String) -> Unit,
+    onResolveHostPath: ((String) -> String)? = null,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
@@ -1669,6 +1927,7 @@ private fun AssistantMarkdownBlockTimelineItem(
                 style = markdownStyle,
                 renderCache = markdownCache,
                 onOpenDestination = onOpenFile,
+                onResolveHostPath = onResolveHostPath,
             )
         }
     }
@@ -1935,62 +2194,41 @@ private fun MessageAttachmentRow(
 }
 
 @Composable
-private fun ToolTraceItem(
+private fun StandaloneToolTraceItem(
     item: UiTimelineItem,
     modifier: Modifier = Modifier,
 ) {
-    val statusColor = when (item.traceStatus) {
-        "completed" -> MaterialTheme.colorScheme.primary
-        "failed" -> MaterialTheme.colorScheme.error
-        "running" -> MaterialTheme.colorScheme.tertiary
-        else -> MaterialTheme.colorScheme.onSurfaceVariant
-    }
-    Surface(
-        modifier = modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(8.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant,
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+    val displayTitle = formatToolStepTitle(item.toolName, item.traceTitle.ifBlank { item.smallSummary })
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 4.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        Column(
-            modifier = Modifier.padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    text = item.toolName.ifBlank { "Tool" },
-                    style = MaterialTheme.typography.labelLarge,
-                    color = statusColor,
-                    modifier = Modifier.width(92.dp),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Text(
-                    text = item.traceTitle.ifBlank { item.smallSummary },
-                    style = MaterialTheme.typography.bodyMedium,
-                    fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier.weight(1f),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Text(
-                    text = item.traceStatus.ifBlank { item.kind },
-                    style = MaterialTheme.typography.labelSmall,
-                    color = statusColor,
-                )
-            }
-            if (item.traceContent.isNotBlank()) {
-                Text(
-                    text = item.traceContent,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 6,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
+        Icon(
+            imageVector = toolIconFor(item.toolName),
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f),
+            modifier = Modifier.size(15.dp),
+        )
+        Text(
+            text = displayTitle,
+            style = MaterialTheme.typography.bodyMedium.copy(
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Normal,
+            ),
+            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.85f),
+            modifier = Modifier.weight(1f),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        if (item.traceStatus == "running") {
+            Text(
+                text = "(执行中...)",
+                style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
+                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.85f),
+            )
         }
     }
 }
@@ -2921,7 +3159,27 @@ private fun HamburUiState.selectedSessionTitle(): String {
     }
 }
 
-private sealed interface ChatDisplayItem {
+internal sealed interface ProcessStep {
+    val id: String
+    val displaySequence: ULong
+
+    data class Reasoning(
+        override val id: String,
+        val text: String,
+        override val displaySequence: ULong = 0UL,
+    ) : ProcessStep
+
+    data class ToolCall(
+        override val id: String,
+        val toolName: String,
+        val title: String,
+        val content: String = "",
+        val status: String = "",
+        override val displaySequence: ULong = 0UL,
+    ) : ProcessStep
+}
+
+internal sealed interface ChatDisplayItem {
     val stableKey: String
     val contentType: String
     val versionSequence: ULong
@@ -2945,15 +3203,17 @@ private sealed interface ChatDisplayItem {
         override val versionSequence: ULong = item.versionSequence
     }
 
-    data class AssistantReasoningBlock(
+    data class AssistantProcessBlock(
         val messageId: String,
-        val item: UiTimelineItem,
-        val node: MarkdownBlockNodeDto,
-        val reasoningText: String,
+        val turnId: String,
+        val steps: List<ProcessStep>,
+        val firstStableKey: String,
+        val lastVersionSequence: ULong,
+        val estimatedDurationSeconds: Int = 0,
     ) : ChatDisplayItem {
-        override val stableKey: String = "assistant-reasoning:$messageId:${item.stableKey}"
-        override val contentType: String = "assistant_reasoning_block_item"
-        override val versionSequence: ULong = item.versionSequence
+        override val stableKey: String = "assistant-process:$messageId:$turnId:$firstStableKey"
+        override val contentType: String = "assistant_process_block"
+        override val versionSequence: ULong = lastVersionSequence
     }
 
     data class AssistantActions(
@@ -2968,83 +3228,223 @@ private sealed interface ChatDisplayItem {
     }
 }
 
-private fun List<UiTimelineItem>.toChatDisplayItems(
+private fun List<ProcessStep>.mergeWith(newSteps: List<ProcessStep>): List<ProcessStep> {
+    if (isEmpty()) return newSteps.sortedBy { it.displaySequence }
+    if (newSteps.isEmpty()) return this
+    val result = this.toMutableList()
+    for (newStep in newSteps) {
+        val existingIndex = result.indexOfFirst { it.id == newStep.id }
+        if (existingIndex >= 0) {
+            result[existingIndex] = newStep
+            continue
+        }
+        if (newStep is ProcessStep.Reasoning) {
+            val duplicateText = result.any { it is ProcessStep.Reasoning && it.text == newStep.text }
+            if (duplicateText) {
+                continue
+            }
+        }
+        result.add(newStep)
+    }
+    result.sortBy { it.displaySequence }
+    return result
+}
+
+internal fun List<UiTimelineItem>.toChatDisplayItems(
     messageBlocksByPayloadRef: Map<String, MarkdownBlockNodeDto>,
+    messagesById: Map<String, UiMessageSnapshot> = emptyMap(),
 ): List<ChatDisplayItem> {
     val displayItems = mutableListOf<ChatDisplayItem>()
-    val groupItems = mutableListOf<UiTimelineItem>()
-    val groupNodes = mutableListOf<MarkdownBlockNodeDto>()
-    var groupMessageId = ""
+    val groupMarkdownItems = mutableListOf<UiTimelineItem>()
+    val groupMarkdownNodes = mutableListOf<MarkdownBlockNodeDto>()
+    var groupMarkdownMessageId = ""
 
-    fun flushGroup() {
-        if (groupItems.isNotEmpty() && groupNodes.isNotEmpty()) {
-            val assistantText = groupNodes
+    val groupProcessSteps = mutableListOf<ProcessStep>()
+    val groupProcessItems = mutableListOf<UiTimelineItem>()
+    var groupProcessMessageId = ""
+    var currentTurnId = ""
+    var lastUserMessageIndex = -1
+
+    fun flushMarkdownGroup() {
+        if (groupMarkdownItems.isNotEmpty() && groupMarkdownNodes.isNotEmpty()) {
+            val assistantText = groupMarkdownNodes
                 .joinToString(separator = "\n\n") { node ->
                     node.raw.ifBlank { node.text }
                 }
                 .trim()
-            groupItems.zip(groupNodes).forEach { (item, node) ->
-                displayItems += ChatDisplayItem.AssistantMarkdownBlock(
-                    messageId = groupMessageId,
-                    item = item,
-                    node = node,
-                    assistantText = assistantText,
-                )
-            }
             if (assistantText.isNotBlank()) {
+                groupMarkdownItems.zip(groupMarkdownNodes).forEach { (item, node) ->
+                    displayItems += ChatDisplayItem.AssistantMarkdownBlock(
+                        messageId = groupMarkdownMessageId,
+                        item = item,
+                        node = node,
+                        assistantText = assistantText,
+                    )
+                }
                 displayItems += ChatDisplayItem.AssistantActions(
-                    messageId = groupMessageId,
-                    firstStableKey = groupItems.firstOrNull()?.stableKey.orEmpty(),
-                    lastVersionSequence = groupItems.maxOfOrNull { it.versionSequence } ?: 0UL,
+                    messageId = groupMarkdownMessageId,
+                    firstStableKey = groupMarkdownItems.firstOrNull()?.stableKey.orEmpty(),
+                    lastVersionSequence = groupMarkdownItems.maxOfOrNull { it.versionSequence } ?: 0UL,
                     assistantText = assistantText,
                 )
             }
-        } else {
-            groupItems.forEach { displayItems += ChatDisplayItem.Timeline(it) }
         }
-        groupItems.clear()
-        groupNodes.clear()
-        groupMessageId = ""
+        groupMarkdownItems.clear()
+        groupMarkdownNodes.clear()
+        groupMarkdownMessageId = ""
+    }
+
+    fun flushProcessGroup() {
+        if (groupProcessSteps.isNotEmpty()) {
+            val firstKey = groupProcessItems.firstOrNull()?.stableKey.orEmpty().ifBlank {
+                groupProcessSteps.firstOrNull()?.id.orEmpty()
+            }
+            val maxSeq = groupProcessItems.maxOfOrNull { it.versionSequence } ?: 0UL
+            val resolvedTurnId = currentTurnId.ifBlank {
+                messagesById[groupProcessMessageId]?.turnId.orEmpty()
+            }
+
+            val minDisplaySeq = groupProcessItems.minOfOrNull { it.displaySequence } ?: 0UL
+            val maxDisplaySeq = groupProcessItems.maxOfOrNull { it.displaySequence } ?: 0UL
+            val estimatedDuration = if (maxDisplaySeq > minDisplaySeq && (maxDisplaySeq - minDisplaySeq) in 500UL..600_000UL) {
+                maxOf(1, ((maxDisplaySeq - minDisplaySeq) / 1000UL).toInt())
+            } else {
+                0
+            }
+
+            val existingProcessIndex = displayItems.indexOfLast { it is ChatDisplayItem.AssistantProcessBlock }
+            val sortedSteps = groupProcessSteps.sortedBy { it.displaySequence }
+            if (existingProcessIndex > lastUserMessageIndex) {
+                val existing = displayItems[existingProcessIndex] as ChatDisplayItem.AssistantProcessBlock
+                val mergedSteps = existing.steps.mergeWith(sortedSteps)
+                val newDuration = maxOf(existing.estimatedDurationSeconds, estimatedDuration)
+                val newMaxSeq = maxOf(existing.lastVersionSequence, maxSeq)
+                val finalTurnId = existing.turnId.ifBlank { resolvedTurnId }
+                val finalMsgId = existing.messageId.ifBlank { groupProcessMessageId }
+                displayItems[existingProcessIndex] = existing.copy(
+                    messageId = finalMsgId,
+                    turnId = finalTurnId,
+                    steps = mergedSteps,
+                    lastVersionSequence = newMaxSeq,
+                    estimatedDurationSeconds = newDuration,
+                )
+            } else {
+                displayItems += ChatDisplayItem.AssistantProcessBlock(
+                    messageId = groupProcessMessageId,
+                    turnId = resolvedTurnId,
+                    steps = sortedSteps,
+                    firstStableKey = firstKey,
+                    lastVersionSequence = maxSeq,
+                    estimatedDurationSeconds = estimatedDuration,
+                )
+            }
+        }
+        groupProcessSteps.clear()
+        groupProcessItems.clear()
+        groupProcessMessageId = ""
     }
 
     for (item in this) {
+        if (item.kind == "SyntheticUserMessage") {
+            continue
+        }
+
+        if (item.contentType == "user_message" || item.kind == "UserMessage") {
+            flushProcessGroup()
+            flushMarkdownGroup()
+            displayItems += ChatDisplayItem.Timeline(item)
+            lastUserMessageIndex = displayItems.size - 1
+            val userMsg = messagesById[item.payloadRef] ?: messagesById[item.stableKey]
+            currentTurnId = userMsg?.turnId.orEmpty()
+            continue
+        }
+
         if (item.isAssistantReasoningBlock()) {
-            flushGroup()
+            flushMarkdownGroup()
             val node = messageBlocksByPayloadRef[item.payloadRef]
-            if (node == null) {
-                displayItems += ChatDisplayItem.Timeline(item)
-                continue
-            }
-            val reasoningText = node.raw.ifBlank { node.text }.ifBlank { item.smallSummary }.trim()
+                ?: messageBlocksByPayloadRef[item.stableKey]
+                ?: messageBlocksByPayloadRef["reasoning:${item.stableKey.removeSuffix(":reasoning")}"]
+                ?: messageBlocksByPayloadRef["${item.stableKey.removePrefix("reasoning:")}:reasoning"]
+            val reasoningText = node?.raw?.ifBlank { node.text }?.ifBlank { item.smallSummary }?.trim()
+                ?: item.smallSummary.trim()
             if (reasoningText.isNotBlank()) {
-                displayItems += ChatDisplayItem.AssistantReasoningBlock(
-                    messageId = node.messageId,
-                    item = item,
-                    node = node,
-                    reasoningText = reasoningText,
+                if (groupProcessMessageId.isBlank() && node != null && node.messageId.isNotBlank()) {
+                    groupProcessMessageId = node.messageId
+                }
+                val stepTurnId = node?.messageId?.let { messagesById[it]?.turnId.orEmpty() }.orEmpty()
+                if (stepTurnId.isNotBlank() && currentTurnId.isBlank()) {
+                    currentTurnId = stepTurnId
+                }
+                val stepId = item.stableKey.ifBlank { item.id }
+                val reasoningStep = ProcessStep.Reasoning(
+                    id = stepId,
+                    text = reasoningText,
+                    displaySequence = item.displaySequence,
                 )
+                val existingIndex = groupProcessSteps.indexOfFirst { it.id == stepId }
+                if (existingIndex >= 0) {
+                    groupProcessSteps[existingIndex] = reasoningStep
+                } else if (groupProcessSteps.none { it is ProcessStep.Reasoning && it.text == reasoningText }) {
+                    groupProcessSteps += reasoningStep
+                }
+                groupProcessItems += item
             }
+            continue
+        }
+
+        if (item.isToolTraceItem()) {
+            flushMarkdownGroup()
+            val title = item.traceTitle.ifBlank { item.smallSummary }
+            val stepId = item.stableKey.ifBlank { item.id }
+            val toolStep = ProcessStep.ToolCall(
+                id = stepId,
+                toolName = item.toolName,
+                title = title,
+                content = item.traceContent,
+                status = item.traceStatus,
+                displaySequence = item.displaySequence,
+            )
+            val existingIndex = groupProcessSteps.indexOfFirst { it.id == stepId }
+            if (existingIndex >= 0) {
+                groupProcessSteps[existingIndex] = toolStep
+            } else {
+                groupProcessSteps += toolStep
+            }
+            groupProcessItems += item
             continue
         }
 
         val node = if (item.isAssistantMarkdownBlock()) {
-            messageBlocksByPayloadRef[item.payloadRef]
+            messageBlocksByPayloadRef[item.payloadRef] ?: messageBlocksByPayloadRef[item.stableKey]
         } else {
             null
         }
+
+        val nodeText = node?.raw?.ifBlank { node.text }?.trim().orEmpty()
+        if (item.isAssistantMarkdownBlock() && (node == null || nodeText.isBlank())) {
+            continue
+        }
+
         if (node == null) {
-            flushGroup()
+            flushProcessGroup()
+            flushMarkdownGroup()
             displayItems += ChatDisplayItem.Timeline(item)
             continue
         }
-        if (groupItems.isNotEmpty() && node.messageId != groupMessageId) {
-            flushGroup()
+
+        flushProcessGroup()
+
+        if (groupMarkdownItems.isNotEmpty() && node.messageId != groupMarkdownMessageId) {
+            flushMarkdownGroup()
         }
-        groupMessageId = node.messageId
-        groupItems += item
-        groupNodes += node
+        groupMarkdownMessageId = node.messageId
+        groupMarkdownItems += item
+        groupMarkdownNodes += node
     }
-    flushGroup()
+
+    flushProcessGroup()
+    flushMarkdownGroup()
+
     val lastActionIndex = displayItems.indexOfLast { it is ChatDisplayItem.AssistantActions }
     if (lastActionIndex < 0) return displayItems
     return displayItems.filterIndexed { index, item ->
@@ -3060,8 +3460,7 @@ private fun ChatDisplayItem.topSpacingAfter(previous: ChatDisplayItem?): Dp {
                 messageId == previous.messageId -> 10.dp
 
         this is ChatDisplayItem.AssistantMarkdownBlock &&
-                previous is ChatDisplayItem.AssistantReasoningBlock &&
-                messageId == previous.messageId -> 8.dp
+                previous is ChatDisplayItem.AssistantProcessBlock -> 8.dp
 
         this is ChatDisplayItem.AssistantActions &&
                 previous is ChatDisplayItem.AssistantMarkdownBlock &&
@@ -3077,6 +3476,10 @@ private fun UiTimelineItem.isAssistantMarkdownBlock(): Boolean {
 
 private fun UiTimelineItem.isAssistantReasoningBlock(): Boolean {
     return contentType == "assistant_reasoning_block"
+}
+
+private fun UiTimelineItem.isToolTraceItem(): Boolean {
+    return contentType == "trace" || kind == "ToolTrace" || kind.contains("Trace")
 }
 
 private fun shortTraceId(id: String): String {

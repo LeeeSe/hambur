@@ -586,6 +586,7 @@ version = "0.1.0"
 dependencies = [
  "flate2",
  "hambur-core",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

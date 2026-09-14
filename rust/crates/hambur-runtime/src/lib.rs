@@ -21,9 +21,9 @@ use hambur_db::{
 };
 use hambur_filestore::FileStore;
 use hambur_llm::{
-    CompleteToolCall, FallbackPolicy, ModelCapabilities, ModelMessage, ModelRequest, ModelRouter,
-    OPENAI_COMPATIBLE_PROTOCOL, OpenAiCompatibleAdapter, ProviderConfig, ProviderModel,
-    ProviderStreamEvent, ProviderTarget, ReasoningMode, RoutePlan, RouteRequirements,
+    CompleteToolCall, FallbackPolicy, ModelCapabilities, ModelImagePart, ModelMessage, ModelRequest, ModelRouter,
+    OPENAI_COMPATIBLE_PROTOCOL, OPENAI_RESPONSES_PROTOCOL, OpenAiCompatibleAdapter, ProviderConfig, ProviderModel,
+    ProviderStreamEvent, ProviderTarget, ReasoningMode, ResponsesApiAdapter, RoutePlan, RouteRequirements,
     RoutingStrategy, SseDecoder, ToolCallAccumulator, scripted_openai_sse_chunks, should_fallback,
 };
 use hambur_markdown::{MarkdownBlockNode, MarkdownPipeline, MarkdownRenderUpdate};
@@ -493,6 +493,7 @@ struct StreamAttemptState {
     decoder: SseDecoder,
     content: String,
     reasoning: String,
+    reasoning_persisted: bool,
     thinking_raw_trace_count: u32,
     thinking_parsed_trace_count: u32,
     semantic_delta_started: bool,

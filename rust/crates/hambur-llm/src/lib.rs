@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const OPENAI_COMPATIBLE_PROTOCOL: &str = "OpenAiCompatible";
+pub const OPENAI_RESPONSES_PROTOCOL: &str = "OpenAiResponses";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderConfig {
@@ -136,7 +137,8 @@ impl ModelRouter {
         plan.targets.retain(|target| {
             capability_matches(&target.model.capabilities, &requirements)
                 && target.provider.enabled
-                && target.provider.protocol == OPENAI_COMPATIBLE_PROTOCOL
+                && (target.provider.protocol == OPENAI_COMPATIBLE_PROTOCOL
+                    || target.provider.protocol == OPENAI_RESPONSES_PROTOCOL)
         });
         if plan.targets.is_empty() {
             return Err(HamburError::CapabilityMismatch(
@@ -239,6 +241,14 @@ pub struct ModelRequest {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelImagePart {
+    pub mime_type: String,
+    pub data_base64: String,
+    #[serde(default)]
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelMessage {
     pub role: String,
     pub content: String,
@@ -248,6 +258,8 @@ pub struct ModelMessage {
     pub tool_calls_json: String,
     #[serde(default)]
     pub tool_call_id: String,
+    #[serde(default)]
+    pub images: Vec<ModelImagePart>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -303,6 +315,12 @@ pub enum ProviderStreamEvent {
         name: String,
         arguments_delta: String,
     },
+    ToolCallDone {
+        index: u32,
+        id: String,
+        name: String,
+        arguments_json: String,
+    },
     Finish {
         finish_reason: String,
         native_finish_reason: String,
@@ -345,7 +363,30 @@ impl OpenAiCompatibleAdapter {
         for message in &request.messages {
             let mut object = serde_json::Map::new();
             object.insert("role".to_string(), json!(message.role));
-            object.insert("content".to_string(), json!(message.content));
+            if message.images.is_empty() {
+                object.insert("content".to_string(), json!(message.content));
+            } else {
+                let mut parts = Vec::new();
+                if !message.content.trim().is_empty() {
+                    parts.push(json!({
+                        "type": "text",
+                        "text": message.content,
+                    }));
+                }
+                for image in &message.images {
+                    let mut image_url = json!({
+                        "url": format!("data:{};base64,{}", image.mime_type, image.data_base64),
+                    });
+                    if !image.detail.trim().is_empty() {
+                        image_url["detail"] = json!(image.detail);
+                    }
+                    parts.push(json!({
+                        "type": "image_url",
+                        "image_url": image_url,
+                    }));
+                }
+                object.insert("content".to_string(), Value::Array(parts));
+            }
             if !message.reasoning_content.trim().is_empty() {
                 object.insert(
                     "reasoning_content".to_string(),
@@ -608,6 +649,433 @@ impl OpenAiCompatibleAdapter {
     }
 }
 
+pub struct ResponsesApiAdapter;
+
+impl ResponsesApiAdapter {
+    pub fn build_stream_request(
+        request: &ModelRequest,
+        target: &ProviderTarget,
+        api_key: &str,
+    ) -> HamburResult<HttpRequestSpec> {
+        if target.provider.protocol != OPENAI_RESPONSES_PROTOCOL {
+            return Err(HamburError::ProviderUnavailable(format!(
+                "unsupported provider protocol: {}",
+                target.provider.protocol
+            )));
+        }
+        if api_key.trim().is_empty() {
+            return Err(HamburError::InvalidCommand(
+                "Responses API request requires a resolved API key".to_string(),
+            ));
+        }
+
+        let mut input = Vec::new();
+        let mut instructions_parts = Vec::new();
+
+        for system in &request.system_blocks {
+            let trimmed = system.trim();
+            if !trimmed.is_empty() {
+                instructions_parts.push(trimmed);
+            }
+        }
+
+        for message in &request.messages {
+            match message.role.as_str() {
+                "user" => {
+                    if message.images.is_empty() {
+                        input.push(json!({
+                            "type": "message",
+                            "role": "user",
+                            "content": message.content,
+                        }));
+                    } else {
+                        let mut content_parts = Vec::new();
+                        if !message.content.trim().is_empty() {
+                            content_parts.push(json!({
+                                "type": "input_text",
+                                "text": message.content,
+                            }));
+                        }
+                        for img in &message.images {
+                            let data_url = format!("data:{};base64,{}", img.mime_type, img.data_base64);
+                            let mut img_part = json!({
+                                "type": "input_image",
+                                "image_url": data_url,
+                            });
+                            if !img.detail.trim().is_empty() {
+                                img_part["detail"] = json!(img.detail);
+                            }
+                            content_parts.push(img_part);
+                        }
+                        input.push(json!({
+                            "type": "message",
+                            "role": "user",
+                            "content": content_parts,
+                        }));
+                    }
+                }
+                "assistant" => {
+                    if !message.content.trim().is_empty() {
+                        input.push(json!({
+                            "type": "message",
+                            "role": "assistant",
+                            "content": message.content,
+                        }));
+                    }
+                    if !message.tool_calls_json.trim().is_empty() {
+                        if let Ok(tool_calls) = serde_json::from_str::<Value>(message.tool_calls_json.trim()) {
+                            if let Some(items) = tool_calls.as_array() {
+                                for item in items {
+                                    let call_id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+                                    let function = item.get("function").unwrap_or(&Value::Null);
+                                    let name = function.get("name").and_then(Value::as_str).unwrap_or_default();
+                                    let arguments = if let Some(s) = function.get("arguments").and_then(Value::as_str) {
+                                        s.to_string()
+                                    } else if let Some(obj) = function.get("arguments") {
+                                        obj.to_string()
+                                    } else {
+                                        String::new()
+                                    };
+                                    input.push(json!({
+                                        "type": "function_call",
+                                        "call_id": call_id,
+                                        "name": name,
+                                        "arguments": arguments,
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                }
+                "tool" => {
+                    input.push(json!({
+                        "type": "function_call_output",
+                        "call_id": message.tool_call_id,
+                        "output": message.content,
+                    }));
+                }
+                _ => {
+                    input.push(json!({
+                        "type": "message",
+                        "role": message.role,
+                        "content": message.content,
+                    }));
+                }
+            }
+        }
+
+        let mut body = json!({
+            "model": target.model.model_id,
+            "stream": true,
+            "input": input,
+        });
+
+        if !instructions_parts.is_empty() {
+            body["instructions"] = json!(instructions_parts.join("\n\n"));
+        }
+
+        let tools_json = request.tools_json.trim();
+        if !tools_json.is_empty() {
+            let tools: Value = serde_json::from_str(tools_json).map_err(|error| {
+                HamburError::InvalidCommand(format!("invalid Responses API tools JSON: {error}"))
+            })?;
+            if let Some(items) = tools.as_array() {
+                if !items.is_empty() {
+                    let mut responses_tools = Vec::new();
+                    for item in items {
+                        if let Some(function) = item.get("function") {
+                            let mut tool = json!({ "type": "function" });
+                            if let Some(name) = function.get("name") { tool["name"] = name.clone(); }
+                            if let Some(desc) = function.get("description") { tool["description"] = desc.clone(); }
+                            if let Some(params) = function.get("parameters") { tool["parameters"] = params.clone(); }
+                            if let Some(strict) = function.get("strict") { tool["strict"] = strict.clone(); }
+                            responses_tools.push(tool);
+                        } else {
+                            responses_tools.push(item.clone());
+                        }
+                    }
+                    body["tools"] = Value::Array(responses_tools);
+                    body["tool_choice"] = json!("auto");
+                }
+            }
+        }
+
+        if request.max_output_tokens > 0 {
+            body["max_output_tokens"] = json!(request.max_output_tokens);
+        }
+        if let Some(temperature) = request.temperature
+            && target.model.capabilities.supports_temperature
+        {
+            body["temperature"] = json!(temperature);
+        }
+        if target.model.capabilities.supports_reasoning {
+            body["reasoning"] = json!({
+                "effort": if request.reasoning_mode == ReasoningMode::Enabled {
+                    "high"
+                } else {
+                    "low"
+                }
+            });
+        }
+
+        let mut base_url = target.provider.base_url.trim().trim_end_matches('/').to_string();
+        if base_url.ends_with("/chat/completions") {
+            base_url = base_url.trim_end_matches("/chat/completions").trim_end_matches('/').to_string();
+        }
+        if base_url.ends_with("/responses") {
+            base_url = base_url.trim_end_matches("/responses").trim_end_matches('/').to_string();
+        }
+        let url = if base_url == "https://api.openai.com" {
+            "https://api.openai.com/v1/responses".to_string()
+        } else {
+            format!("{}/responses", base_url)
+        };
+
+        Ok(HttpRequestSpec {
+            method: "POST".to_string(),
+            url,
+            headers: vec![
+                (
+                    "Authorization".to_string(),
+                    format!("Bearer {}", api_key.trim()),
+                ),
+                ("Content-Type".to_string(), "application/json".to_string()),
+            ],
+            body_json: body.to_string(),
+        })
+    }
+
+    pub fn parse_stream_payload(payload: &StreamPayload) -> HamburResult<Vec<ProviderStreamEvent>> {
+        if payload.data.trim() == "[DONE]" {
+            return Ok(vec![ProviderStreamEvent::Finish {
+                finish_reason: "stop".to_string(),
+                native_finish_reason: "done".to_string(),
+            }]);
+        }
+
+        let value: Value = serde_json::from_str(&payload.data).map_err(|error| {
+            HamburError::SseParse(format!("parse Responses API stream payload: {error}"))
+        })?;
+
+        let error = value.get("error").or_else(|| {
+            value
+                .get("response")
+                .and_then(|r| r.get("status_details"))
+                .and_then(|sd| sd.get("error"))
+        });
+        if let Some(error) = error {
+            let code = error
+                .get("code")
+                .and_then(Value::as_str)
+                .or_else(|| error.get("type").and_then(Value::as_str))
+                .unwrap_or("ProviderError")
+                .to_string();
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("provider stream error")
+                .to_string();
+            return Ok(vec![ProviderStreamEvent::Error { code, message }]);
+        }
+
+        if value.get("choices").is_some() {
+            return OpenAiCompatibleAdapter::parse_stream_payload(payload);
+        }
+
+        let event_type = if !payload.event_name.trim().is_empty() {
+            payload.event_name.trim()
+        } else {
+            value.get("type").and_then(Value::as_str).unwrap_or_default()
+        };
+
+        let mut events = Vec::new();
+        match event_type {
+            "response.output_text.delta"
+            | "response.text.delta"
+            | "response.content_part.delta"
+            | "response.output_item.delta" => {
+                let delta = value
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .or_else(|| value.get("delta").and_then(|d| d.get("text")).and_then(Value::as_str))
+                    .or_else(|| value.get("text").and_then(Value::as_str))
+                    .or_else(|| value.get("part").and_then(|p| p.get("text")).and_then(Value::as_str))
+                    .unwrap_or_default();
+                if !delta.is_empty() {
+                    events.push(ProviderStreamEvent::ContentDelta(delta.to_string()));
+                }
+            }
+            "response.reasoning_text.delta"
+            | "response.reasoning.delta"
+            | "response.reasoning_content.delta"
+            | "response.reasoning_summary_text.delta" => {
+                let delta = value
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .or_else(|| value.get("delta").and_then(|d| d.get("text")).and_then(Value::as_str))
+                    .or_else(|| value.get("text").and_then(Value::as_str))
+                    .or_else(|| value.get("summary").and_then(Value::as_str))
+                    .unwrap_or_default();
+                if !delta.is_empty() {
+                    events.push(ProviderStreamEvent::ReasoningDelta(delta.to_string()));
+                }
+            }
+            "response.output_item.added" => {
+                if let Some(item) = value.get("item") {
+                    let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+                    if item_type == "function_call" {
+                        let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or_default();
+                        let item_id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+                        let id = if !call_id.is_empty() { call_id } else { item_id };
+                        let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+                        let index = value
+                            .get("output_index")
+                            .or_else(|| value.get("index"))
+                            .or_else(|| item.get("output_index"))
+                            .or_else(|| item.get("index"))
+                            .and_then(Value::as_u64)
+                            .and_then(|v| u32::try_from(v).ok())
+                            .unwrap_or_default();
+                        let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or_default();
+                        if !arguments.is_empty() && serde_json::from_str::<Value>(arguments).is_ok() {
+                            events.push(ProviderStreamEvent::ToolCallDone {
+                                index,
+                                id: id.to_string(),
+                                name: name.to_string(),
+                                arguments_json: arguments.to_string(),
+                            });
+                        } else {
+                            events.push(ProviderStreamEvent::ToolCallDelta {
+                                index,
+                                id: id.to_string(),
+                                name: name.to_string(),
+                                arguments_delta: String::new(),
+                            });
+                        }
+                    }
+                }
+            }
+            "response.function_call_arguments.delta" => {
+                let call_id = value.get("call_id").and_then(Value::as_str).unwrap_or_default();
+                let item_id = value.get("item_id").and_then(Value::as_str).unwrap_or_default();
+                let id = if !call_id.is_empty() { call_id } else { item_id };
+                let delta = value.get("delta").and_then(Value::as_str).unwrap_or_default();
+                let index = value
+                    .get("output_index")
+                    .or_else(|| value.get("index"))
+                    .and_then(Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok())
+                    .unwrap_or_default();
+                if !delta.is_empty() || !id.is_empty() {
+                    events.push(ProviderStreamEvent::ToolCallDelta {
+                        index,
+                        id: id.to_string(),
+                        name: String::new(),
+                        arguments_delta: delta.to_string(),
+                    });
+                }
+            }
+            "response.function_call_arguments.done" => {
+                let call_id = value.get("call_id").and_then(Value::as_str).unwrap_or_default();
+                let item_id = value.get("item_id").and_then(Value::as_str).unwrap_or_default();
+                let id = if !call_id.is_empty() { call_id } else { item_id };
+                let arguments = value.get("arguments").and_then(Value::as_str).unwrap_or_default();
+                let index = value
+                    .get("output_index")
+                    .or_else(|| value.get("index"))
+                    .and_then(Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok())
+                    .unwrap_or_default();
+                events.push(ProviderStreamEvent::ToolCallDone {
+                    index,
+                    id: id.to_string(),
+                    name: String::new(),
+                    arguments_json: arguments.to_string(),
+                });
+            }
+            "response.output_item.done" => {
+                if let Some(item) = value.get("item") {
+                    let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+                    let index = value
+                        .get("output_index")
+                        .or_else(|| value.get("index"))
+                        .or_else(|| item.get("output_index"))
+                        .or_else(|| item.get("index"))
+                        .and_then(Value::as_u64)
+                        .and_then(|v| u32::try_from(v).ok())
+                        .unwrap_or_default();
+                    if item_type == "function_call" {
+                        let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or_default();
+                        let item_id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+                        let id = if !call_id.is_empty() { call_id } else { item_id };
+                        let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+                        let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or_default();
+                        events.push(ProviderStreamEvent::ToolCallDone {
+                            index,
+                            id: id.to_string(),
+                            name: name.to_string(),
+                            arguments_json: arguments.to_string(),
+                        });
+                    }
+                }
+            }
+            "response.failed" => {
+                let error = value.get("error").or_else(|| {
+                    value
+                        .get("response")
+                        .and_then(|r| r.get("status_details"))
+                        .and_then(|sd| sd.get("error"))
+                });
+                let (code, message) = if let Some(err) = error {
+                    (
+                        err.get("code").and_then(Value::as_str).unwrap_or("ProviderError").to_string(),
+                        err.get("message").and_then(Value::as_str).unwrap_or("response failed").to_string(),
+                    )
+                } else {
+                    ("ProviderError".to_string(), "response failed".to_string())
+                };
+                events.push(ProviderStreamEvent::Error { code, message });
+            }
+            "response.done" | "response.completed" => {
+                let response_obj = value.get("response");
+                let status = response_obj
+                    .and_then(|r| r.get("status"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("completed");
+                if status == "failed" {
+                    let error = response_obj
+                        .and_then(|r| r.get("status_details"))
+                        .and_then(|sd| sd.get("error"));
+                    let (code, message) = if let Some(err) = error {
+                        (
+                            err.get("code").and_then(Value::as_str).unwrap_or("ProviderError").to_string(),
+                            err.get("message").and_then(Value::as_str).unwrap_or("response failed").to_string(),
+                        )
+                    } else {
+                        ("ProviderError".to_string(), "response failed".to_string())
+                    };
+                    events.push(ProviderStreamEvent::Error { code, message });
+                } else {
+                    events.push(ProviderStreamEvent::Finish {
+                        finish_reason: "stop".to_string(),
+                        native_finish_reason: status.to_string(),
+                    });
+                }
+            }
+            _ => {}
+        }
+
+        Ok(events)
+    }
+
+    pub fn parse_models_response(
+        provider_id: &str,
+        payload_json: &str,
+    ) -> HamburResult<Vec<ProviderModel>> {
+        OpenAiCompatibleAdapter::parse_models_response(provider_id, payload_json)
+    }
+}
+
 fn strip_pricing_fields(item: &Value) -> Value {
     let mut value = item.clone();
     if let Some(object) = value.as_object_mut() {
@@ -731,24 +1199,53 @@ pub struct ToolCallAccumulator {
 
 impl ToolCallAccumulator {
     pub fn apply(&mut self, event: &ProviderStreamEvent) -> Vec<CompleteToolCall> {
-        let ProviderStreamEvent::ToolCallDelta {
-            index,
-            id,
-            name,
-            arguments_delta,
-        } = event
-        else {
-            return Vec::new();
+        let (index, id, name, delta, done_json) = match event {
+            ProviderStreamEvent::ToolCallDelta {
+                index,
+                id,
+                name,
+                arguments_delta,
+            } => (*index, id.as_str(), name.as_str(), Some(arguments_delta.as_str()), None),
+            ProviderStreamEvent::ToolCallDone {
+                index,
+                id,
+                name,
+                arguments_json,
+            } => (*index, id.as_str(), name.as_str(), None, Some(arguments_json.as_str())),
+            _ => return Vec::new(),
         };
 
-        let call = self.calls.entry(*index).or_default();
+        let call = if !id.is_empty() {
+            if let Some((_, c)) = self.calls.iter_mut().find(|(_, c)| c.id == id || (!c.item_id.is_empty() && c.item_id == id)) {
+                c
+            } else {
+                self.calls.entry(index).or_default()
+            }
+        } else {
+            self.calls.entry(index).or_default()
+        };
+
         if !id.is_empty() {
-            call.id = id.clone();
+            if id.starts_with("item_") {
+                call.item_id = id.to_string();
+                if call.id.is_empty() {
+                    call.id = id.to_string();
+                }
+            } else if id.starts_with("call_") || call.id.is_empty() || call.id.starts_with("item_") {
+                call.id = id.to_string();
+            }
         }
         if !name.is_empty() {
-            call.name = name.clone();
+            call.name = name.to_string();
         }
-        call.arguments.push_str(arguments_delta);
+        if let Some(delta) = delta {
+            call.arguments.push_str(delta);
+        }
+        if let Some(done) = done_json {
+            if !done.is_empty() && (call.arguments.is_empty() || serde_json::from_str::<Value>(&call.arguments).is_err()) {
+                call.arguments = done.to_string();
+            }
+        }
 
         if call.completed {
             return Vec::new();
@@ -759,7 +1256,7 @@ impl ToolCallAccumulator {
 
         call.completed = true;
         vec![CompleteToolCall {
-            index: *index,
+            index,
             id: call.id.clone(),
             name: call.name.clone(),
             arguments_json: call.arguments.clone(),
@@ -795,6 +1292,7 @@ impl ToolCallAccumulator {
 #[derive(Debug, Clone, Default)]
 struct PartialToolCall {
     id: String,
+    item_id: String,
     name: String,
     arguments: String,
     completed: bool,
@@ -827,4 +1325,182 @@ pub fn scripted_openai_sse_chunks(content: &str, reasoning: &str) -> Vec<Vec<u8>
     }
     frames.push("data: [DONE]\n\n".to_string());
     frames.into_iter().map(String::into_bytes).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_responses_api_build_request() {
+        let target = ProviderTarget {
+            provider: ProviderConfig {
+                id: "test-provider".to_string(),
+                name: "Test Provider".to_string(),
+                protocol: OPENAI_RESPONSES_PROTOCOL.to_string(),
+                base_url: "https://api.openai.com/v1".to_string(),
+                secret_ref: "secret".to_string(),
+                enabled: true,
+            },
+            model: ProviderModel {
+                provider_id: "test-provider".to_string(),
+                model_id: "gpt-4o".to_string(),
+                display_name: "GPT-4o".to_string(),
+                capabilities: ModelCapabilities {
+                    supports_tool_call: true,
+                    supports_reasoning: true,
+                    supports_image_input: true,
+                    supports_structured_output: false,
+                    supports_temperature: true,
+                    context_limit: 128000,
+                    output_limit: 4096,
+                    reasoning_field: "reasoning_content".to_string(),
+                },
+                metadata_json: "{}".to_string(),
+            },
+            model_group_id: "default".to_string(),
+            model_group_name: "Default".to_string(),
+            position: 0,
+        };
+
+        let request = ModelRequest {
+            request_id: "req_1".to_string(),
+            session_id: "sess_1".to_string(),
+            turn_id: "turn_1".to_string(),
+            system_blocks: vec!["You are an AI assistant.".to_string()],
+            messages: vec![
+                ModelMessage {
+                    role: "user".to_string(),
+                    content: "Hello!".to_string(),
+                    ..Default::default()
+                },
+            ],
+            tools_json: r#"[{"type":"function","function":{"name":"search","description":"Search the web","parameters":{"type":"object"}}}]"#.to_string(),
+            temperature: Some(0.7),
+            max_output_tokens: 2048,
+            reasoning_mode: ReasoningMode::Enabled,
+            ..Default::default()
+        };
+
+        let spec = ResponsesApiAdapter::build_stream_request(&request, &target, "sk-test-key")
+            .expect("build request");
+        assert_eq!(spec.url, "https://api.openai.com/v1/responses");
+        assert_eq!(spec.method, "POST");
+
+        let body: Value = serde_json::from_str(&spec.body_json).expect("valid json body");
+        assert_eq!(body["model"], "gpt-4o");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["instructions"], "You are an AI assistant.");
+
+        let input = body["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 1); // 1 user message
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"], "Hello!");
+
+        let tools = body["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], "search");
+    }
+
+    #[test]
+    fn test_responses_api_parse_stream_events() {
+        // Output text delta (Responses API primary event)
+        let payload0 = StreamPayload {
+            data: r#"{"type":"response.output_text.delta","delta":"Hi!"}"#.to_string(),
+            event_name: "response.output_text.delta".to_string(),
+            event_id: "0".to_string(),
+            raw_frame_meta: String::new(),
+        };
+        let events0 = ResponsesApiAdapter::parse_stream_payload(&payload0).expect("parse output text delta");
+        assert_eq!(events0, vec![ProviderStreamEvent::ContentDelta("Hi!".to_string())]);
+
+        // Text delta (fallback event)
+        let payload1 = StreamPayload {
+            data: r#"{"type":"response.text.delta","delta":"Hello world"}"#.to_string(),
+            event_name: "response.text.delta".to_string(),
+            event_id: "1".to_string(),
+            raw_frame_meta: String::new(),
+        };
+        let events1 = ResponsesApiAdapter::parse_stream_payload(&payload1).expect("parse text delta");
+        assert_eq!(events1, vec![ProviderStreamEvent::ContentDelta("Hello world".to_string())]);
+
+        // Reasoning delta
+        let payload_reasoning = StreamPayload {
+            data: r#"{"type":"response.reasoning_text.delta","delta":"Thinking..."}"#.to_string(),
+            event_name: "response.reasoning_text.delta".to_string(),
+            event_id: "1r".to_string(),
+            raw_frame_meta: String::new(),
+        };
+        let events_r = ResponsesApiAdapter::parse_stream_payload(&payload_reasoning).expect("parse reasoning delta");
+        assert_eq!(events_r, vec![ProviderStreamEvent::ReasoningDelta("Thinking...".to_string())]);
+
+        // Function call item added (with top-level output_index)
+        let payload2 = StreamPayload {
+            data: r#"{"type":"response.output_item.added","output_index":1,"item":{"id":"item_call_1","type":"function_call","name":"view_image","call_id":"call_999"}}"#.to_string(),
+            event_name: "response.output_item.added".to_string(),
+            event_id: "2".to_string(),
+            raw_frame_meta: String::new(),
+        };
+        let events2 = ResponsesApiAdapter::parse_stream_payload(&payload2).expect("parse call added");
+        assert_eq!(events2, vec![ProviderStreamEvent::ToolCallDelta {
+            index: 1,
+            id: "call_999".to_string(),
+            name: "view_image".to_string(),
+            arguments_delta: String::new(),
+        }]);
+
+        // Function call arguments delta
+        let payload3 = StreamPayload {
+            data: r#"{"type":"response.function_call_arguments.delta","output_index":1,"call_id":"call_999","delta":"{\"path\":\"foo.png\"}"}"#.to_string(),
+            event_name: "response.function_call_arguments.delta".to_string(),
+            event_id: "3".to_string(),
+            raw_frame_meta: String::new(),
+        };
+        let events3 = ResponsesApiAdapter::parse_stream_payload(&payload3).expect("parse args delta");
+        assert_eq!(events3, vec![ProviderStreamEvent::ToolCallDelta {
+            index: 1,
+            id: "call_999".to_string(),
+            name: String::new(),
+            arguments_delta: "{\"path\":\"foo.png\"}".to_string(),
+        }]);
+
+        // Accumulator should complete the call
+        let mut acc = ToolCallAccumulator::default();
+        let _ = acc.apply(&events2[0]);
+        let completed = acc.apply(&events3[0]);
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].index, 1);
+        assert_eq!(completed[0].id, "call_999");
+        assert_eq!(completed[0].name, "view_image");
+        assert_eq!(completed[0].arguments_json, "{\"path\":\"foo.png\"}");
+
+        // Output item done with full arguments
+        let payload_done = StreamPayload {
+            data: r#"{"type":"response.output_item.done","output_index":1,"item":{"id":"item_call_1","type":"function_call","name":"view_image","call_id":"call_999","arguments":"{\"path\":\"foo.png\"}"}}"#.to_string(),
+            event_name: "response.output_item.done".to_string(),
+            event_id: "4".to_string(),
+            raw_frame_meta: String::new(),
+        };
+        let events_done = ResponsesApiAdapter::parse_stream_payload(&payload_done).expect("parse item done");
+        assert_eq!(events_done, vec![ProviderStreamEvent::ToolCallDone {
+            index: 1,
+            id: "call_999".to_string(),
+            name: "view_image".to_string(),
+            arguments_json: "{\"path\":\"foo.png\"}".to_string(),
+        }]);
+
+        // Response done
+        let payload4 = StreamPayload {
+            data: r#"{"type":"response.done","response":{"status":"completed"}}"#.to_string(),
+            event_name: "response.done".to_string(),
+            event_id: "5".to_string(),
+            raw_frame_meta: String::new(),
+        };
+        let events4 = ResponsesApiAdapter::parse_stream_payload(&payload4).expect("parse done");
+        assert_eq!(events4, vec![ProviderStreamEvent::Finish {
+            finish_reason: "stop".to_string(),
+            native_finish_reason: "completed".to_string(),
+        }]);
+    }
 }

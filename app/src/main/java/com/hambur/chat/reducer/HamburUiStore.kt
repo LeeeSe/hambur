@@ -67,6 +67,7 @@ data class UiTimelineItem(
     val toolCallId: String = "",
     val toolName: String = "",
     val attachments: List<UiPendingAttachment> = emptyList(),
+    val displaySequence: ULong = 0UL,
 )
 
 data class UiMessageSnapshot(
@@ -235,6 +236,8 @@ data class HamburUiState(
     val rootfsStatus: RootfsStatusDto? = null,
     val thinkingEnabledBySession: Map<String, Boolean> = emptyMap(),
     val defaultThinkingEnabled: Boolean = false,
+    val turnStartedAtMs: Map<String, Long> = emptyMap(),
+    val turnDurationSeconds: Map<String, Int> = emptyMap(),
 )
 
 data class UiSessionScrollPosition(
@@ -490,7 +493,7 @@ class HamburUiStore(
         baseUrl: String,
         apiKey: String,
         secretRef: String,
-        modelId: String
+        modelId: String = ""
     ) {
         if (providerId.isBlank()) return
         runCommand {
@@ -516,10 +519,11 @@ class HamburUiStore(
         supportsImageInput: Boolean,
         contextLimit: UInt,
         outputLimit: UInt,
+        custom: Boolean = false,
     ) {
         if (providerId.isBlank() || modelId.isBlank()) return
         val payload = """
-            {"providerId":"${providerId.jsonEscaped()}","modelId":"${modelId.jsonEscaped()}","displayName":"${displayName.jsonEscaped()}","supportsToolCall":$supportsToolCall,"supportsReasoning":$supportsReasoning,"supportsImageInput":$supportsImageInput,"supportsStructuredOutput":false,"supportsTemperature":true,"contextLimit":$contextLimit,"outputLimit":$outputLimit}
+            {"providerId":"${providerId.jsonEscaped()}","modelId":"${modelId.jsonEscaped()}","displayName":"${displayName.jsonEscaped()}","supportsToolCall":$supportsToolCall,"supportsReasoning":$supportsReasoning,"supportsImageInput":$supportsImageInput,"supportsStructuredOutput":false,"supportsTemperature":true,"contextLimit":$contextLimit,"outputLimit":$outputLimit,"custom":$custom}
         """.trimIndent()
         runCommand {
             runtime.dispatch(
@@ -529,6 +533,24 @@ class HamburUiStore(
                     providerId = providerId,
                     modelId = modelId,
                     title = displayName,
+                    payloadJson = payload,
+                ),
+            )
+        }
+    }
+
+    fun deleteProviderModel(providerId: String, modelId: String) {
+        if (providerId.isBlank() || modelId.isBlank()) return
+        val payload = """
+            {"providerId":"${providerId.jsonEscaped()}","modelId":"${modelId.jsonEscaped()}"}
+        """.trimIndent()
+        runCommand {
+            runtime.dispatch(
+                backendCommand(
+                    kind = "DeleteProviderModel",
+                    idempotencyKey = "model:$providerId:$modelId:delete:${nextCommandOrdinal()}",
+                    providerId = providerId,
+                    modelId = modelId,
                     payloadJson = payload,
                 ),
             )
@@ -901,6 +923,7 @@ class HamburUiStore(
             )
             applyRejectedAck(ack)
             if (ack.accepted) {
+                _state.update { it.copy(pendingAttachments = emptyList()) }
                 onAccepted()
             } else {
                 onRejected(ack.message.ifBlank { ack.rejectionCode })
@@ -1005,6 +1028,13 @@ class HamburUiStore(
 
     fun removePendingAttachment(sessionId: String, attachmentId: String) {
         if (sessionId.isBlank() || attachmentId.isBlank()) return
+        _state.update { state ->
+            if (state.selectedSessionId == sessionId) {
+                state.copy(pendingAttachments = state.pendingAttachments.filterNot { it.id == attachmentId })
+            } else {
+                state
+            }
+        }
         runCommand {
             runtime.dispatch(
                 backendCommand(
@@ -1019,6 +1049,13 @@ class HamburUiStore(
 
     fun clearPendingAttachments(sessionId: String) {
         if (sessionId.isBlank()) return
+        _state.update { state ->
+            if (state.selectedSessionId == sessionId) {
+                state.copy(pendingAttachments = emptyList())
+            } else {
+                state
+            }
+        }
         runCommand {
             runtime.dispatch(
                 backendCommand(
@@ -1081,10 +1118,12 @@ class HamburUiStore(
     private fun collectBackendEvents() {
         while (scope.isActive) {
             val event = runtime.nextEvent() ?: break
-            Log.i(
-                "HamburBackend",
-                "Collected backend event kind=${event.kind} sequence=${event.sequence}",
-            )
+            if (!event.isHighFrequencyStreamEvent()) {
+                Log.i(
+                    "HamburBackend",
+                    "Collected backend event kind=${event.kind} sequence=${event.sequence}",
+                )
+            }
 
             val shouldApplyNow = synchronized(startupLock) {
                 if (baselineApplied) {
@@ -1267,21 +1306,10 @@ class HamburUiStore(
                 creatingSession = false
             }
         }
-        if (event.kind == "AssistantReasoningDelta") {
-            Log.i(
-                "ThinkingToggle",
-                "ui event AssistantReasoningDelta session=${event.sessionId} turn=${event.turnId} deltaLen=${event.message.length}",
-            )
-        }
         if (event.kind == "PlatformRequest") {
             handlePlatformRequest(event)
         }
-        if (event.kind == "MarkdownRenderUpdate") {
-            ChatJankTracer.markSessionSwitch(
-                phase = "markdown_event_enqueue",
-                targetSessionId = targetSessionId,
-                extra = eventStats,
-            )
+        if (event.isHighFrequencyStreamEvent()) {
             enqueueMarkdownEvent(event)
             return
         }
@@ -1313,8 +1341,6 @@ class HamburUiStore(
             "SessionOpened",
             "MessageUpserted",
             "AssistantMessageStarted",
-            "AssistantContentDelta",
-            "AssistantReasoningDelta",
             "AssistantMessageFinished",
             "TurnFinished",
             "TurnFailed",
@@ -1602,7 +1628,7 @@ class HamburUiStore(
         val current = _state.value
         val userMessageIds = current.timelineItems
             .asSequence()
-            .filter { it.contentType == "user_message" && it.payloadRef.isNotBlank() }
+            .filter { it.contentType == "user_message" && it.payloadRef.isNotBlank() && it.kind != "SyntheticUserMessage" }
             .map { it.payloadRef to it.versionSequence }
         val assistantMessageIds = current.timelineItems
             .asSequence()
@@ -1631,12 +1657,6 @@ class HamburUiStore(
                 }.getOrNull()
             }
             if (loaded.isEmpty()) return@launch
-            loaded.forEach { message ->
-                Log.i(
-                    "ThinkingToggle",
-                    "ui snapshot message=${message.id} role=${message.role} contentLen=${message.contentText.length} reasoningLen=${message.reasoningContent.length}",
-                )
-            }
             _state.update { state ->
                 val loadedReasoning = loaded
                     .asSequence()
@@ -1765,12 +1785,15 @@ private fun HamburUiState.reduce(event: BackendEvent): HamburUiState {
 
     val snapshot = event.snapshot
     if (!targetsVisibleSession) {
+        val (nextTurnStarts, nextTurnDurations) = updateTurnTiming(event)
         return copy(
             latestEventKind = event.kind,
-            sessions = event.toUiSessionSummaries(),
+            sessions = if (snapshot.sessions.isNotEmpty()) event.toUiSessionSummaries() else sessions,
             lastAppliedSequence = lastAppliedSequence,
             appliedEventIds = nextAppliedEventIds,
             activeTurnIds = updateActiveTurnIds(event),
+            turnStartedAtMs = nextTurnStarts,
+            turnDurationSeconds = nextTurnDurations,
         )
     }
 
@@ -1839,49 +1862,188 @@ private fun HamburUiState.reduce(event: BackendEvent): HamburUiState {
         selectedSessionId.ifBlank { snapshot.selectedSessionId }
     }
     val sessionChanged = nextSelectedSessionId != selectedSessionId
-    val nextTimelineItems = snapshot.timelineItems.toUiTimelineItems()
+    var nextTimelineItems = if (snapshot.timelineItems.isNotEmpty() || sessionChanged) {
+        snapshot.timelineItems.toUiTimelineItems()
+    } else {
+        timelineItems
+    }
     val visibleMessageBlockPayloadRefs = nextTimelineItems
         .asSequence()
         .filter { it.isAssistantMarkdownBlock() }
-        .map { it.payloadRef }
+        .flatMap { sequenceOf(it.payloadRef, it.stableKey) }
         .filter { it.isNotBlank() }
-        .toSet()
+        .toMutableSet()
     val snapshotMessageBlocksByPayloadRef = snapshot.messageBlockPayloads.toMessageBlockMap()
-    val nextMessageBlocksByPayloadRef = (
+    val mutableMessageBlocks = (
         if (sessionChanged) {
             snapshotMessageBlocksByPayloadRef
         } else {
             messageBlocksByPayloadRef + snapshotMessageBlocksByPayloadRef
         }
-    ).filterKeys { it in visibleMessageBlockPayloadRefs }
+    ).toMutableMap()
+
+    if (event.kind == "MarkdownRenderUpdate") {
+        val update = event.markdownRenderUpdate
+        val messageId = update.messageId
+        val pendingKey = "md:pending:$messageId"
+        visibleMessageBlockPayloadRefs.add(pendingKey)
+        val pendingPayloadRef = nextTimelineItems.firstOrNull {
+            it.contentType == "assistant_pending_block" &&
+                (it.stableKey == pendingKey || it.stableKey.contains(messageId))
+        }?.payloadRef.orEmpty()
+        if (pendingPayloadRef.isNotBlank()) {
+            visibleMessageBlockPayloadRefs.add(pendingPayloadRef)
+        }
+
+        update.committedNodes.forEach { node ->
+            visibleMessageBlockPayloadRefs.add(node.stableKey)
+            mutableMessageBlocks[node.stableKey] = node
+        }
+        val pendingNode = update.pendingNode
+        if (pendingNode != null) {
+            visibleMessageBlockPayloadRefs.add(pendingNode.stableKey)
+            mutableMessageBlocks[pendingNode.stableKey] = pendingNode
+            mutableMessageBlocks[pendingKey] = pendingNode
+            if (pendingPayloadRef.isNotBlank()) {
+                mutableMessageBlocks[pendingPayloadRef] = pendingNode
+            }
+        }
+    }
+
     val snapshotReasoningByMessageId = messagesById
         .values
         .asSequence()
         .filter { it.role == "assistant" && it.reasoningContent.isNotBlank() }
         .associate { it.id to it.reasoningContent }
-    val nextReasoningByMessageId = if (sessionChanged) {
+    var nextReasoningByMessageId = if (sessionChanged) {
         snapshotReasoningByMessageId
     } else {
         reasoningByMessageId + snapshotReasoningByMessageId
     }
 
+    if (event.kind == "AssistantReasoningDelta" && event.message.isNotEmpty()) {
+        val delta = event.message
+        val lastUserMessageIndex = nextTimelineItems.indexOfLast {
+            it.contentType == "user_message" || it.kind == "UserMessage"
+        }
+        val existingReasoningItem = nextTimelineItems
+            .filterIndexed { index, item -> item.isAssistantReasoningBlock() && index > lastUserMessageIndex }
+            .lastOrNull()
+
+        val reasoningItem = if (existingReasoningItem != null) {
+            existingReasoningItem
+        } else {
+            val pendingMarkdownItem = nextTimelineItems
+                .filterIndexed { index, item -> item.contentType == "assistant_pending_block" && index > lastUserMessageIndex }
+                .lastOrNull()
+            val targetMsgId = pendingMarkdownItem?.stableKey
+                ?.removeSuffix(":pending")
+                ?.removePrefix("md:pending:")
+                ?.ifBlank { "stream-${event.turnId}" }
+                ?: "stream-${event.turnId}"
+            val reasoningKey = "$targetMsgId:reasoning"
+            val displaySeq = if ((pendingMarkdownItem?.displaySequence ?: 0UL) > 1UL) {
+                pendingMarkdownItem!!.displaySequence - 1UL
+            } else {
+                System.currentTimeMillis().toULong()
+            }
+            val syntheticItem = UiTimelineItem(
+                id = reasoningKey,
+                stableKey = reasoningKey,
+                contentType = "assistant_reasoning_block",
+                versionSequence = 1UL,
+                payloadRef = reasoningKey,
+                smallSummary = delta.take(160),
+                kind = "AssistantReasoningBlock",
+                displaySequence = displaySeq,
+            )
+            if (nextTimelineItems.none { it.stableKey == reasoningKey }) {
+                nextTimelineItems = nextTimelineItems + syntheticItem
+            }
+            syntheticItem
+        }
+
+        visibleMessageBlockPayloadRefs.add(reasoningItem.payloadRef)
+        visibleMessageBlockPayloadRefs.add(reasoningItem.stableKey)
+        val existingNode = mutableMessageBlocks[reasoningItem.payloadRef]
+            ?: mutableMessageBlocks[reasoningItem.stableKey]
+            ?: mutableMessageBlocks["reasoning:${reasoningItem.stableKey.removeSuffix(":reasoning")}"]
+            ?: mutableMessageBlocks["${reasoningItem.stableKey.removePrefix("reasoning:")}:reasoning"]
+        val currentRaw = existingNode?.raw.orEmpty()
+        val newRaw = currentRaw + delta
+        val targetMessageId = reasoningItem.stableKey
+            .removePrefix("reasoning:")
+            .removeSuffix(":reasoning")
+            .ifBlank { reasoningItem.id }
+        val updatedNode = (existingNode ?: MarkdownBlockNodeDto(
+            messageId = targetMessageId,
+            blockId = 0u,
+            stableKey = reasoningItem.stableKey,
+            sourceKind = "assistant_reasoning",
+            nodeKind = "reasoning",
+            committed = true,
+            level = 0u,
+            inlines = emptyList(),
+            language = "",
+            text = newRaw,
+            raw = newRaw,
+            childrenJson = "",
+            itemsJson = "",
+            tableHeader = emptyList(),
+            tableRows = emptyList(),
+            tableAlignments = emptyList(),
+            path = "",
+            fileKind = "",
+        )).copy(raw = newRaw, text = newRaw)
+
+        mutableMessageBlocks[reasoningItem.payloadRef] = updatedNode
+        mutableMessageBlocks[reasoningItem.stableKey] = updatedNode
+        if (targetMessageId.isNotBlank()) {
+            mutableMessageBlocks["reasoning:$targetMessageId"] = updatedNode
+            mutableMessageBlocks["$targetMessageId:reasoning"] = updatedNode
+            visibleMessageBlockPayloadRefs.add("reasoning:$targetMessageId")
+            visibleMessageBlockPayloadRefs.add("$targetMessageId:reasoning")
+            val existingReasoning = nextReasoningByMessageId[targetMessageId].orEmpty()
+            nextReasoningByMessageId = nextReasoningByMessageId + (targetMessageId to (existingReasoning + delta))
+        }
+    }
+
+    val nextMessageBlocksByPayloadRef = mutableMessageBlocks.filterKeys {
+        it in visibleMessageBlockPayloadRefs || it.startsWith("md:") || it.startsWith("reasoning:") || it.endsWith(":reasoning")
+    }
+
+    val nextSessions = if (snapshot.sessions.isNotEmpty() || sessionChanged) {
+        event.toUiSessionSummaries()
+    } else {
+        sessions
+    }
+
+    val nextPendingAttachments = snapshot.pendingAttachments.toUiPendingAttachments()
+    val (nextTurnStarts, nextTurnDurations) = updateTurnTiming(event)
+
     return copy(
         runtimeStatus = status,
         latestEventKind = event.kind,
         footer = footer,
-        sessions = event.toUiSessionSummaries(),
+        sessions = nextSessions,
         selectedSessionId = nextSelectedSessionId,
         timelineItems = nextTimelineItems,
         messagesById = if (sessionChanged) emptyMap() else messagesById,
         reasoningByMessageId = nextReasoningByMessageId,
-        pendingAttachments = snapshot.pendingAttachments.toUiPendingAttachments(),
+        pendingAttachments = nextPendingAttachments,
         messageBlocksByPayloadRef = nextMessageBlocksByPayloadRef,
         activePreviewPath = if (sessionChanged) "" else activePreviewPath,
         sharedBrowser = sharedBrowser,
         lastAppliedSequence = event.sequence,
         appliedEventIds = nextAppliedEventIds,
         activeTurnIds = updateActiveTurnIds(event),
+        turnStartedAtMs = nextTurnStarts,
+        turnDurationSeconds = nextTurnDurations,
     )
+}
+
+private fun BackendEvent.isHighFrequencyStreamEvent(): Boolean {
+    return kind == "MarkdownRenderUpdate" || kind == "AssistantReasoningDelta" || kind == "AssistantContentDelta"
 }
 
 private fun BackendEvent.switchesVisibleSession(): Boolean {
@@ -1957,6 +2119,31 @@ private fun HamburUiState.updateActiveTurnIds(event: BackendEvent): Map<String, 
     }
 }
 
+private fun HamburUiState.updateTurnTiming(event: BackendEvent): Pair<Map<String, Long>, Map<String, Int>> {
+    if (event.turnId.isBlank()) return turnStartedAtMs to turnDurationSeconds
+    return when (event.kind) {
+        "TurnStarted" -> {
+            val updatedStarts = turnStartedAtMs + (event.turnId to System.currentTimeMillis())
+            updatedStarts to turnDurationSeconds
+        }
+        "TurnFinished", "TurnFailed", "TurnCancelled" -> {
+            val startedAt = turnStartedAtMs[event.turnId]
+            val durationSec = if (startedAt != null && startedAt > 0L) {
+                maxOf(1, ((System.currentTimeMillis() - startedAt) / 1000L).toInt())
+            } else {
+                0
+            }
+            val updatedDurations = if (durationSec > 0) {
+                turnDurationSeconds + (event.turnId to durationSec)
+            } else {
+                turnDurationSeconds
+            }
+            turnStartedAtMs to updatedDurations
+        }
+        else -> turnStartedAtMs to turnDurationSeconds
+    }
+}
+
 fun HamburUiState.thinkingEnabledForSession(sessionId: String = selectedSessionId): Boolean {
     if (sessionId.isBlank()) {
         return thinkingEnabledBySession[NEW_SESSION_THINKING_KEY] ?: defaultThinkingEnabled
@@ -1996,6 +2183,7 @@ private fun List<TimelineItemDto>.toUiTimelineItems(): List<UiTimelineItem> {
             toolCallId = it.toolCallId,
             toolName = it.toolName,
             attachments = it.attachments.toUiPendingAttachments(),
+            displaySequence = it.displaySequence,
         )
     }
 }
@@ -2008,6 +2196,10 @@ private fun UiTimelineItem.isAssistantMarkdownBlock(): Boolean {
     return contentType == "assistant_markdown_block" ||
         contentType == "assistant_pending_block" ||
         contentType == "assistant_reasoning_block"
+}
+
+private fun UiTimelineItem.isAssistantReasoningBlock(): Boolean {
+    return contentType == "assistant_reasoning_block"
 }
 
 private fun traceShortId(id: String): String {

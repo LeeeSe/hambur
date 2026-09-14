@@ -304,15 +304,33 @@ fn hambur_file_block(
         return None;
     }
 
+    let dest_clean = destination.split('?').next().unwrap_or("").to_ascii_lowercase();
+    let has_image_ext = [".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg"]
+        .iter()
+        .any(|ext| dest_clean.ends_with(ext));
+    let has_video_ext = [".mp4", ".webm", ".mkv", ".mov", ".avi"]
+        .iter()
+        .any(|ext| dest_clean.ends_with(ext));
+    let has_audio_ext = [".mp3", ".m4a", ".aac", ".wav", ".ogg", ".flac"]
+        .iter()
+        .any(|ext| dest_clean.ends_with(ext));
+
     let file_kind = if inline.kind == "Image"
         || destination.starts_with("hambur://image")
         || destination.starts_with("hambur://media/image")
+        || has_image_ext
     {
         "image"
     } else if destination.starts_with("hambur://video")
         || destination.starts_with("hambur://media/video")
+        || has_video_ext
     {
         "video"
+    } else if destination.starts_with("hambur://audio")
+        || destination.starts_with("hambur://media/audio")
+        || has_audio_ext
+    {
+        "audio"
     } else {
         "file"
     };
@@ -338,7 +356,11 @@ fn hambur_file_block(
 }
 
 fn is_hambur_file_destination(destination: &str) -> bool {
-    destination.starts_with("hambur://") || destination.starts_with("file://")
+    destination.starts_with("hambur://")
+        || destination.starts_with("hambur:")
+        || destination.starts_with("file://")
+        || destination.starts_with("/var/hambur/")
+        || destination == "/var/hambur"
 }
 
 fn fill_list_node(node: &mut MarkdownBlockNode, events: &[Event<'_>]) {

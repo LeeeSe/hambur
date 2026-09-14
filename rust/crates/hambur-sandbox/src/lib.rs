@@ -1202,7 +1202,7 @@ impl SandboxService {
         let _guard = exec_lock
             .lock()
             .map_err(|_| HamburError::Internal("chroot execution lock poisoned".to_string()))?;
-        let (program, args, _env) = self.build_chroot_command(session_id, command, cwd, true)?;
+        let (program, args, _env) = self.build_chroot_command(session_id, command, cwd, true, timeout_ms)?;
         self.run_process_blocking(
             program,
             args,
@@ -1221,7 +1221,7 @@ impl SandboxService {
         cwd: &str,
         timeout_ms: u64,
     ) -> HamburResult<SandboxExecResult> {
-        let (program, args, env) = self.build_proot_command(session_id, command, cwd, false)?;
+        let (program, args, env) = self.build_proot_command(session_id, command, cwd, false, timeout_ms)?;
         self.run_process_blocking(program, args, env, timeout_ms, "proot", session_id, cwd)
     }
 
@@ -1231,6 +1231,7 @@ impl SandboxService {
         command: &str,
         cwd: &str,
         emit_ready_marker: bool,
+        timeout_ms: u64,
     ) -> HamburResult<(
         String,
         Vec<String>,
@@ -1243,15 +1244,37 @@ impl SandboxService {
             ""
         };
         self.prepare_chroot_mounts(session_id)?;
+        let run_cmd = if timeout_ms > 0 {
+            let timeout_secs = ((timeout_ms + 999) / 1000).max(1);
+            format!(
+                "/bin/busybox setsid /bin/sh -c {} &\n\
+                 CPID=$!\n\
+                 (\n\
+                     /bin/busybox sleep {}\n\
+                     kill -KILL -$CPID 2>/dev/null\n\
+                     /bin/busybox pkill -KILL -s $CPID 2>/dev/null\n\
+                 ) &\n\
+                 WPID=$!\n\
+                 wait $CPID 2>/dev/null\n\
+                 STATUS=$?\n\
+                 kill -KILL $WPID 2>/dev/null\n\
+                 exit $STATUS",
+                shell_quote(command),
+                timeout_secs
+            )
+        } else {
+            command.to_string()
+        };
         let inner_script = format!(
             "export HOME=/root\n\
              export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\
+             umask 000\n\
              {}\
              cd {} || exit 127\n\
              {}",
             marker_line,
             shell_quote(cwd),
-            command
+            run_cmd
         );
         let script = format!(
             "set +e\n\
@@ -1275,6 +1298,7 @@ impl SandboxService {
         command: &str,
         cwd: &str,
         emit_ready_marker: bool,
+        timeout_ms: u64,
     ) -> HamburResult<(
         String,
         Vec<String>,
@@ -1292,15 +1316,37 @@ impl SandboxService {
         } else {
             ""
         };
+        let run_cmd = if timeout_ms > 0 {
+            let timeout_secs = ((timeout_ms + 999) / 1000).max(1);
+            format!(
+                "/bin/busybox setsid /bin/sh -c {} &\n\
+                 CPID=$!\n\
+                 (\n\
+                     /bin/busybox sleep {}\n\
+                     kill -KILL -$CPID 2>/dev/null\n\
+                     /bin/busybox pkill -KILL -s $CPID 2>/dev/null\n\
+                 ) &\n\
+                 WPID=$!\n\
+                 wait $CPID 2>/dev/null\n\
+                 STATUS=$?\n\
+                 kill -KILL $WPID 2>/dev/null\n\
+                 exit $STATUS",
+                shell_quote(command),
+                timeout_secs
+            )
+        } else {
+            command.to_string()
+        };
         let inner_script = format!(
             "export HOME=/root\n\
              export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\
+             umask 000\n\
              {}\
              cd {} || exit 127\n\
              {}",
             marker_line,
             shell_quote(cwd),
-            command
+            run_cmd
         );
         let mut args = vec![
             "-0".to_string(),
@@ -1384,7 +1430,7 @@ impl SandboxService {
         if backend == "chroot" {
             self.build_chroot_background_command(session_id, command, cwd, process_session_id)
         } else {
-            self.build_proot_command(session_id, command, cwd, false)
+            self.build_proot_command(session_id, command, cwd, false, 0)
         }
     }
 
@@ -1425,6 +1471,7 @@ impl SandboxService {
         let inner_script = format!(
             "export HOME=/root\n\
              export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\
+             umask 000\n\
              cd {} || exit 127\n\
              {}",
             shell_quote(cwd),
@@ -1530,7 +1577,11 @@ impl SandboxService {
             buf
         });
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        let deadline = if timeout_ms > 0 {
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms + 1500))
+        } else {
+            None
+        };
         let mut exit_code = -1;
         let mut timed_out = false;
         loop {
@@ -1540,18 +1591,24 @@ impl SandboxService {
                     break;
                 }
                 Ok(None) => {
-                    if std::time::Instant::now() >= deadline {
-                        #[cfg(unix)]
-                        {
-                            let pid = child.id() as i32;
-                            unsafe {
-                                libc::killpg(pid, libc::SIGKILL);
+                    if let Some(dl) = deadline {
+                        if std::time::Instant::now() >= dl {
+                            #[cfg(unix)]
+                            {
+                                let pid = child.id() as i32;
+                                unsafe {
+                                    libc::killpg(pid, libc::SIGKILL);
+                                }
+                                let _ = std::process::Command::new("su")
+                                    .arg("-c")
+                                    .arg(format!("kill -KILL -{pid} 2>/dev/null; pkill -KILL -s {pid} 2>/dev/null"))
+                                    .output();
                             }
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            timed_out = true;
+                            break;
                         }
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        timed_out = true;
-                        break;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
@@ -1562,6 +1619,10 @@ impl SandboxService {
                         unsafe {
                             libc::killpg(pid, libc::SIGKILL);
                         }
+                        let _ = std::process::Command::new("su")
+                            .arg("-c")
+                            .arg(format!("kill -KILL -{pid} 2>/dev/null; pkill -KILL -s {pid} 2>/dev/null"))
+                            .output();
                     }
                     let _ = child.kill();
                     let _ = child.wait();
@@ -1574,6 +1635,7 @@ impl SandboxService {
         let stdout_str = String::from_utf8_lossy(&stdout_bytes).into_owned();
         let stderr_str = String::from_utf8_lossy(&stderr_bytes).into_owned();
         let elapsed_ms = start_time.elapsed().as_millis() as u64;
+        let timed_out = timed_out || exit_code == 137 || exit_code == 143;
         Ok(SandboxExecResult {
             backend: backend.to_string(),
             exit_code,
@@ -1796,11 +1858,11 @@ fn normalize_session_id(session_id: &str) -> HamburResult<String> {
 
 fn normalize_sandbox_path(raw_path: &str) -> HamburResult<String> {
     let mut path = raw_path.trim();
-    if let Some(stripped) = path.strip_prefix("hambur://") {
+    if let Some(stripped) = path.strip_prefix("file://") {
+        path = stripped;
+    } else if let Some(stripped) = path.strip_prefix("hambur://") {
         path = stripped;
     } else if let Some(stripped) = path.strip_prefix("hambur:") {
-        path = stripped;
-    } else if let Some(stripped) = path.strip_prefix("file://") {
         path = stripped;
     }
     let path = path.trim();
@@ -1816,17 +1878,10 @@ fn normalize_sandbox_path(raw_path: &str) -> HamburResult<String> {
     } else if path.starts_with("var/hambur/") {
         owned_path = format!("/{path}");
         &owned_path
-    } else if let Some(first_segment) = path.split('/').next() {
-        if VIRTUAL_ROOTS.iter().any(|r| r.name == first_segment) {
-            owned_path = format!("{HAMBUR_PREFIX}/{path}");
-            &owned_path
-        } else {
-            owned_path = format!("{HAMBUR_PREFIX}/workspace/{path}");
-            &owned_path
-        }
     } else {
-        owned_path = format!("{HAMBUR_PREFIX}/workspace/{path}");
-        &owned_path
+        return Err(HamburError::InvalidCommand(format!(
+            "invalid sandbox path: '{raw_path}'. All tools strictly require an absolute sandbox path starting with {HAMBUR_PREFIX}/ (e.g. {HAMBUR_PREFIX}/workspace/...)"
+        )));
     };
 
     if !(path == HAMBUR_PREFIX
@@ -1835,7 +1890,7 @@ fn normalize_sandbox_path(raw_path: &str) -> HamburResult<String> {
         || path.starts_with(&format!("{AUTOSTART_PREFIX}/")))
     {
         return Err(HamburError::InvalidCommand(format!(
-            "unsupported sandbox root: {path}"
+            "invalid sandbox path: '{raw_path}'. All tools strictly require an absolute sandbox path starting with {HAMBUR_PREFIX}/ (e.g. {HAMBUR_PREFIX}/workspace/...)"
         )));
     }
 

@@ -1,5 +1,4 @@
 use crate::*;
-use rusqlite::{Row as SqliteRow, Rows as SqliteRows, Statement};
 
 pub(crate) struct Connection {
     inner: Mutex<rusqlite::Connection>,
@@ -17,29 +16,29 @@ impl Connection {
         &self,
         sql: &str,
         params: SqlParams,
-    ) -> Ready<Result<usize, rusqlite::Error>> {
+    ) -> Result<usize, rusqlite::Error> {
         let result = self
             .inner
             .lock()
             .map_err(|_| rusqlite::Error::InvalidQuery)
             .and_then(|connection| connection.execute(sql, rusqlite::params_from_iter(params)));
-        ready(result)
+        result
     }
 
-    pub(crate) fn execute_batch(&self, sql: &str) -> Ready<Result<(), rusqlite::Error>> {
+    pub(crate) fn execute_batch(&self, sql: &str) -> Result<(), rusqlite::Error> {
         let result = self
             .inner
             .lock()
             .map_err(|_| rusqlite::Error::InvalidQuery)
             .and_then(|connection| connection.execute_batch(sql));
-        ready(result)
+        result
     }
 
     pub(crate) fn query(
         &self,
         sql: &str,
         params: SqlParams,
-    ) -> Ready<Result<Rows, rusqlite::Error>> {
+    ) -> Result<Rows, rusqlite::Error> {
         let result = self
             .inner
             .lock()
@@ -61,7 +60,7 @@ impl Connection {
                     next_index: 0,
                 })
             });
-        ready(result)
+        result
     }
 }
 
@@ -125,12 +124,12 @@ pub(crate) struct Rows {
 }
 
 impl Rows {
-    pub(crate) fn next(&mut self) -> Ready<Result<Option<Row>, rusqlite::Error>> {
+    pub(crate) fn next(&mut self) -> Result<Option<Row>, rusqlite::Error> {
         let row = self.rows.get(self.next_index).cloned();
         if row.is_some() {
             self.next_index += 1;
         }
-        ready(Ok(row))
+        Ok(row)
     }
 }
 

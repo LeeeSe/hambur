@@ -1,4 +1,3 @@
-use std::future::{Ready, ready};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -536,7 +535,7 @@ mod mutations;
 mod queries;
 mod utils;
 
-pub(crate) use connection::{Connection, IntoSqlValue, Row, Rows, SqlParams, database_error};
+pub(crate) use connection::{Connection, IntoSqlValue, Row, database_error};
 pub use utils::*;
 
 pub struct HamburDatabase {

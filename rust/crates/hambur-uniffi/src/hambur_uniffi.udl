@@ -35,17 +35,57 @@ dictionary BackendCommand {
     boolean finalize;
 };
 
+enum BackendEventKind {
+    "RuntimeReady",
+    "RuntimeClosed",
+    "RuntimeError",
+    "SessionCreated",
+    "SessionOpened",
+    "SessionDeleted",
+    "SessionRenamed",
+    "SessionPinnedChanged",
+    "ModelsUpdated",
+    "SettingsChanged",
+    "AttachmentImported",
+    "PendingAttachmentRemoved",
+    "PendingAttachmentsCleaned",
+    "TurnStarted",
+    "TurnStateChanged",
+    "TurnFinished",
+    "TurnFailed",
+    "TurnCancelled",
+    "MessageUpserted",
+    "AssistantMessageStarted",
+    "AssistantMessageFinished",
+    "AssistantReasoningDelta",
+    "MarkdownRenderUpdate",
+    "ToolCallStarted",
+    "ToolCallDelta",
+    "ToolCallFinished",
+    "ToolCallFailed",
+    "PlatformRequest",
+    "PlatformRequestTimedOut",
+};
+
+[Enum]
+interface BackendEventPayload {
+    None();
+    Snapshot(AppSnapshotDTO snapshot);
+    Delta(string message_id, string delta);
+    Markdown(MarkdownRenderUpdateDTO update);
+    Attachments(sequence<AttachmentDTO> attachments);
+    PlatformRequest(PlatformRequestDTO request);
+};
+
 dictionary BackendEvent {
     string event_id;
     u32 schema_version;
     u64 sequence;
     u64 created_at_ms;
-    string kind;
+    BackendEventKind kind;
     string session_id;
     string turn_id;
-    AppSnapshotDTO snapshot;
-    MarkdownRenderUpdateDTO markdown_render_update;
-    PlatformRequestDTO platform_request;
+    BackendEventPayload payload;
     string error_code;
     string message;
 };

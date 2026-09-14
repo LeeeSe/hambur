@@ -2,8 +2,7 @@ use crate::*;
 
 impl RuntimeEngine {
     pub(crate) fn get_startup_tasks_and_enabled(&self) -> (Vec<hambur_sandbox::StartupTask>, bool) {
-        let settings_snap = self
-            .safe_block_on(self.database.settings_snapshot())
+        let settings_snap = self.database.settings_snapshot()
             .unwrap_or_default();
         let mut tasks = Vec::new();
         let mut enabled = true;
@@ -63,13 +62,9 @@ impl RuntimeEngine {
         }
     }
     pub fn get_session_list_snapshot(&self, limit: u32, offset: u32) -> RuntimeSessionListSnapshot {
-        let sessions = self
-            .tokio
-            .block_on(self.database.session_list(limit, offset))
+        let sessions = self.database.session_list(limit, offset)
             .unwrap_or_default();
-        let selected_session_id = self
-            .tokio
-            .block_on(self.database.bootstrap_snapshot())
+        let selected_session_id = self.database.bootstrap_snapshot()
             .map(|snapshot| snapshot.selected_session_id)
             .unwrap_or_default();
         RuntimeSessionListSnapshot {
@@ -81,13 +76,9 @@ impl RuntimeEngine {
     }
 
     pub fn get_session_snapshot(&self, session_id: String) -> RuntimeSessionSnapshot {
-        let session = self
-            .tokio
-            .block_on(self.database.session_summary(&session_id))
+        let session = self.database.session_summary(&session_id)
             .ok();
-        let snapshot = self
-            .tokio
-            .block_on(self.database.session_snapshot(&session_id))
+        let snapshot = self.database.session_snapshot(&session_id)
             .unwrap_or_default();
         RuntimeSessionSnapshot {
             snapshot_sequence: self.snapshot_sequence(),
@@ -104,12 +95,8 @@ impl RuntimeEngine {
         before_cursor: u64,
         limit: u32,
     ) -> RuntimeTimelinePage {
-        let page = self
-            .tokio
-            .block_on(
-                self.database
-                    .timeline_page(&session_id, before_cursor, limit),
-            )
+        let page = self.database
+                    .timeline_page(&session_id, before_cursor, limit)
             .unwrap_or_default();
         RuntimeTimelinePage {
             snapshot_sequence: self.snapshot_sequence(),
@@ -126,9 +113,7 @@ impl RuntimeEngine {
         RuntimeMessageSnapshot {
             snapshot_sequence: self.snapshot_sequence(),
             created_at_ms: now_ms(),
-            message: self
-                .tokio
-                .block_on(self.database.message_snapshot(&message_id))
+            message: self.database.message_snapshot(&message_id)
                 .unwrap_or_default(),
         }
     }
@@ -137,9 +122,7 @@ impl RuntimeEngine {
         RuntimeSearchSnapshot {
             snapshot_sequence: self.snapshot_sequence(),
             created_at_ms: now_ms(),
-            sessions: self
-                .tokio
-                .block_on(self.database.search_sessions(&query, limit))
+            sessions: self.database.search_sessions(&query, limit)
                 .unwrap_or_default(),
             query,
         }
@@ -149,9 +132,7 @@ impl RuntimeEngine {
         RuntimeSettingsSnapshot {
             snapshot_sequence: self.snapshot_sequence(),
             created_at_ms: now_ms(),
-            settings: self
-                .tokio
-                .block_on(self.database.settings_snapshot())
+            settings: self.database.settings_snapshot()
                 .unwrap_or_default(),
         }
     }
@@ -170,12 +151,8 @@ impl RuntimeEngine {
             Err(_) => return RuntimeFileResolution::default(),
         };
         let metadata = fs::metadata(&resolved.host_path).ok();
-        let db_file = self
-            .tokio
-            .block_on(
-                self.database
-                    .resolve_file_by_sandbox_path(&session_id, &resolved.sandbox_path),
-            )
+        let db_file = self.database
+                    .resolve_file_by_sandbox_path(&session_id, &resolved.sandbox_path)
             .ok();
         let mime_type = db_file
             .as_ref()
@@ -200,9 +177,7 @@ impl RuntimeEngine {
     }
 
     pub fn get_rootfs_status(&self) -> RuntimeRootfsStatus {
-        let settings_snap = self
-            .tokio
-            .block_on(self.database.settings_snapshot())
+        let settings_snap = self.database.settings_snapshot()
             .unwrap_or_default();
         let requested_backend = get_rootfs_backend(&settings_snap.settings);
         eprintln!(
@@ -453,6 +428,19 @@ impl RuntimeEngine {
             .and_then(Value::as_u64)
             .unwrap_or(50)
             .clamp(1, 500) as usize;
+        let file_glob = arguments
+            .get("file_glob")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let output_mode = arguments
+            .get("output_mode")
+            .and_then(Value::as_str)
+            .unwrap_or("content");
+        let context = arguments
+            .get("context")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
         let offset = arguments.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
         let clean_path = path.trim().trim_end_matches('/');
         let resolved_roots: Vec<hambur_sandbox::SandboxPathResolution> =
@@ -478,12 +466,23 @@ impl RuntimeEngine {
                 }
                 list
             } else {
-                vec![self.resolve_tool_sandbox_path(
+                let res = self.resolve_tool_sandbox_path(
                     &invocation.session_id,
                     path,
                     SandboxAccess::Read,
-                )?]
+                )?;
+                if !res.host_path.exists() {
+                    return Err(HamburError::InvalidCommand(format!(
+                        "No such file or directory: {path}"
+                    )));
+                }
+                vec![res]
             };
+        let compiled_regex = if target == "content" {
+            regex::RegexBuilder::new(pattern).build().ok()
+        } else {
+            None
+        };
         let mut results = Vec::new();
         for resolved in resolved_roots {
             let mut files = Vec::new();
@@ -494,32 +493,76 @@ impl RuntimeEngine {
             }
             if target == "files" {
                 for file in files {
+                    let file_name = file
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or_default();
                     let relative = file
                         .strip_prefix(&resolved.host_path)
                         .unwrap_or(&file)
                         .to_string_lossy()
                         .replace('\\', "/");
-                    if file
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or_default()
-                        .contains(pattern)
-                        || relative.contains(pattern)
-                    {
+                    if matches_file_pattern(pattern, file_name, &relative) {
                         results.push(json!({"path": path_for_search_result(&resolved, &file)}));
                     }
                 }
             } else {
                 for file in files {
+                    let file_name = file
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or_default();
+                    let relative = file
+                        .strip_prefix(&resolved.host_path)
+                        .unwrap_or(&file)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    if let Some(glob) = file_glob {
+                        if !matches_file_pattern(glob, file_name, &relative) {
+                            continue;
+                        }
+                    }
                     let Ok(content) = fs::read_to_string(&file) else {
                         continue;
                     };
-                    for (index, line) in content.lines().enumerate() {
-                        if line.contains(pattern) {
+                    let all_lines: Vec<&str> = content.lines().collect();
+                    let mut file_match_count = 0usize;
+                    for (index, line) in all_lines.iter().enumerate() {
+                        let is_match = if let Some(ref re) = compiled_regex {
+                            re.is_match(line)
+                        } else {
+                            line.contains(pattern)
+                        };
+                        if is_match {
+                            file_match_count += 1;
+                            if output_mode == "content" {
+                                let mut item = json!({
+                                    "path": path_for_search_result(&resolved, &file),
+                                    "line": index + 1,
+                                    "content": line
+                                });
+                                if context > 0 {
+                                    let start_ctx = index.saturating_sub(context);
+                                    let end_ctx = (index + context + 1).min(all_lines.len());
+                                    let context_snippet = all_lines[start_ctx..end_ctx]
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(offset, l)| format!("{}|{}", start_ctx + offset + 1, l))
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+                                    item["context"] = json!(context_snippet);
+                                }
+                                results.push(item);
+                            }
+                        }
+                    }
+                    if file_match_count > 0 {
+                        if output_mode == "files_only" {
+                            results.push(json!({"path": path_for_search_result(&resolved, &file)}));
+                        } else if output_mode == "count" {
                             results.push(json!({
                                 "path": path_for_search_result(&resolved, &file),
-                                "line": index + 1,
-                                "content": line
+                                "count": file_match_count
                             }));
                         }
                     }

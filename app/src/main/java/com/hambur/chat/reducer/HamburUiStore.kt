@@ -3,9 +3,12 @@ package com.hambur.chat.reducer
 import android.util.Log
 import com.hambur.chat.perf.ChatJankTracer
 import com.hambur.chat.uniffi.AppBootstrapConfig
+import com.hambur.chat.uniffi.AppSnapshotDto
 import com.hambur.chat.uniffi.AttachmentDto
 import com.hambur.chat.uniffi.BackendCommand
 import com.hambur.chat.uniffi.BackendEvent
+import com.hambur.chat.uniffi.BackendEventKind
+import com.hambur.chat.uniffi.BackendEventPayload
 import com.hambur.chat.uniffi.CommandAck
 import com.hambur.chat.uniffi.ConfigAuditDto
 import com.hambur.chat.uniffi.DefaultModelGroupDto
@@ -16,9 +19,11 @@ import com.hambur.chat.uniffi.MemoryFileDetailDto
 import com.hambur.chat.uniffi.MemoryFileSummaryDto
 import com.hambur.chat.uniffi.ModelGroupDto
 import com.hambur.chat.uniffi.ModelGroupMemberDto
+import com.hambur.chat.uniffi.PlatformRequestDto
 import com.hambur.chat.uniffi.ProviderModelDto
 import com.hambur.chat.uniffi.PublicProviderDto
 import com.hambur.chat.uniffi.SessionListSnapshotDto
+import com.hambur.chat.uniffi.SessionSummaryDto
 import com.hambur.chat.uniffi.RootfsStatusDto
 import com.hambur.chat.uniffi.SettingsSnapshotDto
 import com.hambur.chat.uniffi.SkillDetailDto
@@ -1136,7 +1141,7 @@ class HamburUiStore(
             if (shouldApplyNow) {
                 applyEvent(event)
             }
-            if (event.kind == "RuntimeClosed") break
+            if (event.kind == BackendEventKind.RUNTIME_CLOSED) break
         }
 
         _state.update {
@@ -1301,12 +1306,12 @@ class HamburUiStore(
         if (event.message.startsWith("ThinkingToggle ")) {
             Log.i("ThinkingToggle", event.message)
         }
-        if (event.kind == "SessionCreated" || event.kind == "RuntimeError" || event.kind == "RuntimeClosed") {
+        if (event.kind == BackendEventKind.SESSION_CREATED || event.kind == BackendEventKind.RUNTIME_ERROR || event.kind == BackendEventKind.RUNTIME_CLOSED) {
             synchronized(sessionCacheLock) {
                 creatingSession = false
             }
         }
-        if (event.kind == "PlatformRequest") {
+        if (event.kind == BackendEventKind.PLATFORM_REQUEST) {
             handlePlatformRequest(event)
         }
         if (event.isHighFrequencyStreamEvent()) {
@@ -1324,7 +1329,7 @@ class HamburUiStore(
                 phase = "state_reduce",
                 targetSessionId = targetSessionId,
                 warnAtMs = 4.0,
-                always = event.kind == "SessionOpened",
+                always = event.kind == BackendEventKind.SESSION_OPENED,
                 extra = "$eventStats drainedMarkdown=${markdownEvents.size}",
             ) {
                 markdownEvents.fold(state) { nextState, markdownEvent ->
@@ -1333,31 +1338,32 @@ class HamburUiStore(
             }
         }
         rememberSessionCache(_state.value)
-        if (event.kind == "SettingsChanged" || event.kind == "ModelsUpdated") {
+        if (event.kind == BackendEventKind.SETTINGS_CHANGED || event.kind == BackendEventKind.MODELS_UPDATED) {
             refreshSettingsSnapshot()
         }
         when (event.kind) {
-            "SessionCreated",
-            "SessionOpened",
-            "MessageUpserted",
-            "AssistantMessageStarted",
-            "AssistantMessageFinished",
-            "TurnFinished",
-            "TurnFailed",
-            "TurnCancelled" -> refreshVisibleMessageSnapshots()
+            BackendEventKind.SESSION_CREATED,
+            BackendEventKind.SESSION_OPENED,
+            BackendEventKind.MESSAGE_UPSERTED,
+            BackendEventKind.ASSISTANT_MESSAGE_STARTED,
+            BackendEventKind.ASSISTANT_MESSAGE_FINISHED,
+            BackendEventKind.TURN_FINISHED,
+            BackendEventKind.TURN_FAILED,
+            BackendEventKind.TURN_CANCELLED -> refreshVisibleMessageSnapshots()
+            else -> Unit
         }
         ChatJankTracer.markDuration(
             phase = "event_apply",
             startNs = eventStartNs,
             targetSessionId = targetSessionId,
             warnAtMs = 6.0,
-            always = event.kind == "SessionOpened",
+            always = event.kind == BackendEventKind.SESSION_OPENED,
             extra = "$eventStats drainedMarkdown=${markdownEvents.size}",
         )
     }
 
     private fun handlePlatformRequest(event: BackendEvent) {
-        val request = event.platformRequest
+        val request = event.platformRequestOrNull() ?: return
         if (request.requestId.isBlank()) return
         val action = request.payloadJson.jsonStringAt("action", "action")
         val url = request.payloadJson.jsonStringAt("action", "url")
@@ -1777,18 +1783,18 @@ private fun HamburUiState.reduce(event: BackendEvent): HamburUiState {
     val targetsVisibleSession = event.targetsVisibleSession(selectedSessionId)
     if (isStaleTurnEvent(event)) {
         return copy(
-            latestEventKind = event.kind,
+            latestEventKind = event.kind.name,
             lastAppliedSequence = if (targetsVisibleSession) event.sequence else lastAppliedSequence,
             appliedEventIds = nextAppliedEventIds,
         )
     }
 
-    val snapshot = event.snapshot
+    val snapshot = event.snapshotOrNull()
     if (!targetsVisibleSession) {
         val (nextTurnStarts, nextTurnDurations) = updateTurnTiming(event)
         return copy(
-            latestEventKind = event.kind,
-            sessions = if (snapshot.sessions.isNotEmpty()) event.toUiSessionSummaries() else sessions,
+            latestEventKind = event.kind.name,
+            sessions = snapshot?.sessions?.takeIf { it.isNotEmpty() }?.toUiSessionSummaries() ?: sessions,
             lastAppliedSequence = lastAppliedSequence,
             appliedEventIds = nextAppliedEventIds,
             activeTurnIds = updateActiveTurnIds(event),
@@ -1798,71 +1804,72 @@ private fun HamburUiState.reduce(event: BackendEvent): HamburUiState {
     }
 
     val status = when (event.kind) {
-        "RuntimeReady",
-        "SessionCreated",
-        "SessionOpened",
-        "SessionDeleted",
-        "SessionRenamed",
-        "SessionPinnedChanged",
-        "ModelsUpdated",
-        "AttachmentImported",
-        "PendingAttachmentRemoved",
-        "PendingAttachmentsCleaned",
-        "SettingsChanged",
-        "MessageUpserted",
-        "AssistantMessageFinished",
-        "ToolCallFinished",
-        "TurnFinished",
-        "TurnCancelled" -> "Ready"
-        "TurnStarted",
-        "TurnStateChanged",
-        "AssistantMessageStarted",
-        "AssistantContentDelta",
-        "AssistantReasoningDelta",
-        "ToolCallStarted",
-        "ToolCallDelta",
-        "MarkdownRenderUpdate" -> "Streaming"
-        "ToolCallFailed",
-        "TurnFailed" -> "Error"
-        "RuntimeClosed" -> "Closed"
-        "RuntimeError" -> "Error"
-        else -> runtimeStatus
+        BackendEventKind.RUNTIME_READY,
+        BackendEventKind.SESSION_CREATED,
+        BackendEventKind.SESSION_OPENED,
+        BackendEventKind.SESSION_DELETED,
+        BackendEventKind.SESSION_RENAMED,
+        BackendEventKind.SESSION_PINNED_CHANGED,
+        BackendEventKind.MODELS_UPDATED,
+        BackendEventKind.ATTACHMENT_IMPORTED,
+        BackendEventKind.PENDING_ATTACHMENT_REMOVED,
+        BackendEventKind.PENDING_ATTACHMENTS_CLEANED,
+        BackendEventKind.SETTINGS_CHANGED,
+        BackendEventKind.MESSAGE_UPSERTED,
+        BackendEventKind.ASSISTANT_MESSAGE_FINISHED,
+        BackendEventKind.TOOL_CALL_FINISHED,
+        BackendEventKind.TURN_FINISHED,
+        BackendEventKind.TURN_CANCELLED -> "Ready"
+        BackendEventKind.TURN_STARTED,
+        BackendEventKind.TURN_STATE_CHANGED,
+        BackendEventKind.ASSISTANT_MESSAGE_STARTED,
+        BackendEventKind.ASSISTANT_REASONING_DELTA,
+        BackendEventKind.TOOL_CALL_STARTED,
+        BackendEventKind.TOOL_CALL_DELTA,
+        BackendEventKind.MARKDOWN_RENDER_UPDATE -> "Streaming"
+        BackendEventKind.TOOL_CALL_FAILED,
+        BackendEventKind.TURN_FAILED,
+        BackendEventKind.RUNTIME_ERROR -> "Error"
+        BackendEventKind.RUNTIME_CLOSED -> "Closed"
+        BackendEventKind.PLATFORM_REQUEST,
+        BackendEventKind.PLATFORM_REQUEST_TIMED_OUT -> runtimeStatus
     }
     val footer = when {
         event.errorCode.isNotBlank() -> event.message.ifBlank { event.errorCode }
-        event.kind == "RuntimeReady" -> "Snapshot loaded"
-        event.kind == "SessionCreated" -> "Session created"
-        event.kind == "SessionOpened" -> "Session opened"
-        event.kind == "SessionDeleted" -> "Session deleted"
-        event.kind == "SessionRenamed" -> "Session renamed"
-        event.kind == "SessionPinnedChanged" -> "Session pinned state updated"
-        event.kind == "ModelsUpdated" -> event.message.ifBlank { "Models updated" }
-        event.kind == "SettingsChanged" -> event.message.ifBlank { "Settings updated" }
-        event.kind == "AttachmentImported" -> event.message.ifBlank { "Attachment imported" }
-        event.kind == "PendingAttachmentRemoved" -> "Attachment removed"
-        event.kind == "PendingAttachmentsCleaned" -> "Pending attachments cleared"
-        event.kind == "TurnStarted" -> "Turn started"
-        event.kind == "AssistantMessageStarted" -> "Assistant streaming"
-        event.kind == "AssistantReasoningDelta" -> "Reasoning streamed"
-        event.kind == "AssistantContentDelta" -> "Content streamed"
-        event.kind == "ToolCallStarted" -> event.message.ifBlank { "Tool started" }
-        event.kind == "ToolCallDelta" -> "Tool call streamed"
-        event.kind == "ToolCallFinished" -> event.message.ifBlank { "Tool finished" }
-        event.kind == "ToolCallFailed" -> event.message.ifBlank { "Tool failed" }
-        event.kind == "AssistantMessageFinished" -> "Assistant finished"
-        event.kind == "TurnFinished" -> "Turn finished"
-        event.kind == "TurnCancelled" -> "Turn cancelled"
-        event.kind == "RuntimeClosed" -> "Runtime closed"
-        else -> footer
+        else -> when (event.kind) {
+            BackendEventKind.RUNTIME_READY -> "Snapshot loaded"
+            BackendEventKind.SESSION_CREATED -> "Session created"
+            BackendEventKind.SESSION_OPENED -> "Session opened"
+            BackendEventKind.SESSION_DELETED -> "Session deleted"
+            BackendEventKind.SESSION_RENAMED -> "Session renamed"
+            BackendEventKind.SESSION_PINNED_CHANGED -> "Session pinned state updated"
+            BackendEventKind.MODELS_UPDATED -> event.message.ifBlank { "Models updated" }
+            BackendEventKind.SETTINGS_CHANGED -> event.message.ifBlank { "Settings updated" }
+            BackendEventKind.ATTACHMENT_IMPORTED -> event.message.ifBlank { "Attachment imported" }
+            BackendEventKind.PENDING_ATTACHMENT_REMOVED -> "Attachment removed"
+            BackendEventKind.PENDING_ATTACHMENTS_CLEANED -> "Pending attachments cleared"
+            BackendEventKind.TURN_STARTED -> "Turn started"
+            BackendEventKind.ASSISTANT_MESSAGE_STARTED -> "Assistant streaming"
+            BackendEventKind.ASSISTANT_REASONING_DELTA -> "Reasoning streamed"
+            BackendEventKind.TOOL_CALL_STARTED -> event.message.ifBlank { "Tool started" }
+            BackendEventKind.TOOL_CALL_DELTA -> "Tool call streamed"
+            BackendEventKind.TOOL_CALL_FINISHED -> event.message.ifBlank { "Tool finished" }
+            BackendEventKind.TOOL_CALL_FAILED -> event.message.ifBlank { "Tool failed" }
+            BackendEventKind.ASSISTANT_MESSAGE_FINISHED -> "Assistant finished"
+            BackendEventKind.TURN_FINISHED -> "Turn finished"
+            BackendEventKind.TURN_CANCELLED -> "Turn cancelled"
+            BackendEventKind.RUNTIME_CLOSED -> "Runtime closed"
+            else -> footer
+        }
     }
 
     val nextSelectedSessionId = if (event.switchesVisibleSession()) {
-        snapshot.selectedSessionId
+        snapshot?.selectedSessionId ?: selectedSessionId
     } else {
-        selectedSessionId.ifBlank { snapshot.selectedSessionId }
+        selectedSessionId.ifBlank { snapshot?.selectedSessionId.orEmpty() }
     }
     val sessionChanged = nextSelectedSessionId != selectedSessionId
-    var nextTimelineItems = if (snapshot.timelineItems.isNotEmpty() || sessionChanged) {
+    var nextTimelineItems = if (snapshot != null && (snapshot.timelineItems.isNotEmpty() || sessionChanged)) {
         snapshot.timelineItems.toUiTimelineItems()
     } else {
         timelineItems
@@ -1873,7 +1880,7 @@ private fun HamburUiState.reduce(event: BackendEvent): HamburUiState {
         .flatMap { sequenceOf(it.payloadRef, it.stableKey) }
         .filter { it.isNotBlank() }
         .toMutableSet()
-    val snapshotMessageBlocksByPayloadRef = snapshot.messageBlockPayloads.toMessageBlockMap()
+    val snapshotMessageBlocksByPayloadRef = snapshot?.messageBlockPayloads?.toMessageBlockMap().orEmpty()
     val mutableMessageBlocks = (
         if (sessionChanged) {
             snapshotMessageBlocksByPayloadRef
@@ -1882,9 +1889,9 @@ private fun HamburUiState.reduce(event: BackendEvent): HamburUiState {
         }
     ).toMutableMap()
 
-    if (event.kind == "MarkdownRenderUpdate") {
-        val update = event.markdownRenderUpdate
-        val messageId = update.messageId
+    val markdownUpdate = (event.payload as? BackendEventPayload.Markdown)?.update
+    if (markdownUpdate != null) {
+        val messageId = markdownUpdate.messageId
         val pendingKey = "md:pending:$messageId"
         visibleMessageBlockPayloadRefs.add(pendingKey)
         val pendingPayloadRef = nextTimelineItems.firstOrNull {
@@ -1895,11 +1902,11 @@ private fun HamburUiState.reduce(event: BackendEvent): HamburUiState {
             visibleMessageBlockPayloadRefs.add(pendingPayloadRef)
         }
 
-        update.committedNodes.forEach { node ->
+        markdownUpdate.committedNodes.forEach { node ->
             visibleMessageBlockPayloadRefs.add(node.stableKey)
             mutableMessageBlocks[node.stableKey] = node
         }
-        val pendingNode = update.pendingNode
+        val pendingNode = markdownUpdate.pendingNode
         if (pendingNode != null) {
             visibleMessageBlockPayloadRefs.add(pendingNode.stableKey)
             mutableMessageBlocks[pendingNode.stableKey] = pendingNode
@@ -1921,8 +1928,13 @@ private fun HamburUiState.reduce(event: BackendEvent): HamburUiState {
         reasoningByMessageId + snapshotReasoningByMessageId
     }
 
-    if (event.kind == "AssistantReasoningDelta" && event.message.isNotEmpty()) {
-        val delta = event.message
+    val reasoningDelta = if (event.kind == BackendEventKind.ASSISTANT_REASONING_DELTA) {
+        (event.payload as? BackendEventPayload.Delta)?.delta?.takeIf { it.isNotEmpty() }
+    } else {
+        null
+    }
+    if (reasoningDelta != null) {
+        val delta = reasoningDelta
         val lastUserMessageIndex = nextTimelineItems.indexOfLast {
             it.contentType == "user_message" || it.kind == "UserMessage"
         }
@@ -2012,18 +2024,22 @@ private fun HamburUiState.reduce(event: BackendEvent): HamburUiState {
         it in visibleMessageBlockPayloadRefs || it.startsWith("md:") || it.startsWith("reasoning:") || it.endsWith(":reasoning")
     }
 
-    val nextSessions = if (snapshot.sessions.isNotEmpty() || sessionChanged) {
-        event.toUiSessionSummaries()
+    val nextSessions = if (snapshot != null && (snapshot.sessions.isNotEmpty() || sessionChanged)) {
+        snapshot.sessions.toUiSessionSummaries()
     } else {
         sessions
     }
 
-    val nextPendingAttachments = snapshot.pendingAttachments.toUiPendingAttachments()
+    val nextPendingAttachments = when (val payload = event.payload) {
+        is BackendEventPayload.Snapshot -> payload.snapshot.pendingAttachments.toUiPendingAttachments()
+        is BackendEventPayload.Attachments -> payload.attachments.toUiPendingAttachments()
+        else -> pendingAttachments
+    }
     val (nextTurnStarts, nextTurnDurations) = updateTurnTiming(event)
 
     return copy(
         runtimeStatus = status,
-        latestEventKind = event.kind,
+        latestEventKind = event.kind.name,
         footer = footer,
         sessions = nextSessions,
         selectedSessionId = nextSelectedSessionId,
@@ -2042,47 +2058,69 @@ private fun HamburUiState.reduce(event: BackendEvent): HamburUiState {
     )
 }
 
+private fun BackendEvent.snapshotOrNull(): AppSnapshotDto? {
+    return (payload as? BackendEventPayload.Snapshot)?.snapshot
+}
+
+private fun BackendEvent.platformRequestOrNull(): PlatformRequestDto? {
+    return (payload as? BackendEventPayload.PlatformRequest)?.request
+}
+
 private fun BackendEvent.isHighFrequencyStreamEvent(): Boolean {
-    return kind == "MarkdownRenderUpdate" || kind == "AssistantReasoningDelta" || kind == "AssistantContentDelta"
+    return when (kind) {
+        BackendEventKind.MARKDOWN_RENDER_UPDATE,
+        BackendEventKind.ASSISTANT_REASONING_DELTA,
+        BackendEventKind.TOOL_CALL_DELTA -> true
+        else -> false
+    }
 }
 
 private fun BackendEvent.switchesVisibleSession(): Boolean {
     return when (kind) {
-        "RuntimeReady",
-        "SessionCreated",
-        "SessionOpened",
-        "SessionDeleted" -> true
+        BackendEventKind.RUNTIME_READY,
+        BackendEventKind.SESSION_CREATED,
+        BackendEventKind.SESSION_OPENED,
+        BackendEventKind.SESSION_DELETED -> true
         else -> false
     }
 }
 
 private fun BackendEvent.traceTargetSessionId(): String {
+    val snapshotSelected = snapshotOrNull()?.selectedSessionId.orEmpty()
     return when {
-        snapshot.selectedSessionId.isNotBlank() -> snapshot.selectedSessionId
+        snapshotSelected.isNotBlank() -> snapshotSelected
         sessionId.isNotBlank() -> sessionId
         else -> ""
     }
 }
 
 private fun BackendEvent.traceStats(): String {
-    return "kind=$kind sequence=$sequence eventSession=${traceShortId(sessionId)} " +
-        "selected=${traceShortId(snapshot.selectedSessionId)} " +
-        "sessions=${snapshot.sessions.size} timelineItems=${snapshot.timelineItems.size} " +
-        "messageBlockPayloads=${snapshot.messageBlockPayloads.size}"
+    val payloadStats = when (val payload = payload) {
+        is BackendEventPayload.Snapshot ->
+            "selected=${traceShortId(payload.snapshot.selectedSessionId)} " +
+                "sessions=${payload.snapshot.sessions.size} timelineItems=${payload.snapshot.timelineItems.size} " +
+                "messageBlockPayloads=${payload.snapshot.messageBlockPayloads.size}"
+        is BackendEventPayload.Delta -> "delta=${payload.delta.length}"
+        is BackendEventPayload.Markdown ->
+            "committed=${payload.update.committedNodes.size} pending=${payload.update.pendingNode != null}"
+        is BackendEventPayload.Attachments -> "attachments=${payload.attachments.size}"
+        is BackendEventPayload.PlatformRequest -> "request=${payload.request.kind}"
+        BackendEventPayload.None -> "payload=none"
+    }
+    return "kind=$kind sequence=$sequence eventSession=${traceShortId(sessionId)} $payloadStats"
 }
 
 private fun BackendEvent.targetsVisibleSession(selectedSessionId: String): Boolean {
     if (switchesVisibleSession()) return true
     if (selectedSessionId.isBlank()) return false
-    return if (sessionId.isBlank()) {
-        snapshot.selectedSessionId == selectedSessionId
-    } else {
-        sessionId == selectedSessionId
-    }
+    if (sessionId.isNotBlank()) return sessionId == selectedSessionId
+    // Session-less events (settings, models, runtime errors) apply to whatever session is visible.
+    val snapshotSelected = snapshotOrNull()?.selectedSessionId ?: return true
+    return snapshotSelected == selectedSessionId
 }
 
-private fun BackendEvent.toUiSessionSummaries(): List<UiSessionSummary> {
-    return snapshot.sessions.map {
+private fun List<SessionSummaryDto>.toUiSessionSummaries(): List<UiSessionSummary> {
+    return map {
         UiSessionSummary(
             id = it.id,
             title = it.title,
@@ -2097,7 +2135,7 @@ private fun BackendEvent.toUiSessionSummaries(): List<UiSessionSummary> {
 }
 
 private fun HamburUiState.isStaleTurnEvent(event: BackendEvent): Boolean {
-    if (event.sessionId.isBlank() || event.turnId.isBlank() || event.kind == "TurnStarted") {
+    if (event.sessionId.isBlank() || event.turnId.isBlank() || event.kind == BackendEventKind.TURN_STARTED) {
         return false
     }
     val activeTurnId = activeTurnIds[event.sessionId] ?: return false
@@ -2107,8 +2145,10 @@ private fun HamburUiState.isStaleTurnEvent(event: BackendEvent): Boolean {
 private fun HamburUiState.updateActiveTurnIds(event: BackendEvent): Map<String, String> {
     if (event.sessionId.isBlank() || event.turnId.isBlank()) return activeTurnIds
     return when (event.kind) {
-        "TurnStarted" -> activeTurnIds + (event.sessionId to event.turnId)
-        "TurnFinished", "TurnFailed", "TurnCancelled" -> {
+        BackendEventKind.TURN_STARTED -> activeTurnIds + (event.sessionId to event.turnId)
+        BackendEventKind.TURN_FINISHED,
+        BackendEventKind.TURN_FAILED,
+        BackendEventKind.TURN_CANCELLED -> {
             if (activeTurnIds[event.sessionId] == event.turnId) {
                 activeTurnIds - event.sessionId
             } else {
@@ -2122,11 +2162,13 @@ private fun HamburUiState.updateActiveTurnIds(event: BackendEvent): Map<String, 
 private fun HamburUiState.updateTurnTiming(event: BackendEvent): Pair<Map<String, Long>, Map<String, Int>> {
     if (event.turnId.isBlank()) return turnStartedAtMs to turnDurationSeconds
     return when (event.kind) {
-        "TurnStarted" -> {
+        BackendEventKind.TURN_STARTED -> {
             val updatedStarts = turnStartedAtMs + (event.turnId to System.currentTimeMillis())
             updatedStarts to turnDurationSeconds
         }
-        "TurnFinished", "TurnFailed", "TurnCancelled" -> {
+        BackendEventKind.TURN_FINISHED,
+        BackendEventKind.TURN_FAILED,
+        BackendEventKind.TURN_CANCELLED -> {
             val startedAt = turnStartedAtMs[event.turnId]
             val durationSec = if (startedAt != null && startedAt > 0L) {
                 maxOf(1, ((System.currentTimeMillis() - startedAt) / 1000L).toInt())

@@ -11,5 +11,4 @@ serde_json.workspace = true
 rusqlite.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
 hambur-core.workspace = true

@@ -58,6 +58,7 @@ import com.composables.icons.lucide.ListTodo
 import com.composables.icons.lucide.Lucide
 import com.composables.icons.lucide.Terminal
 import com.composables.icons.lucide.Wrench
+import com.hambur.chat.uniffi.BackendEventKind
 import com.hambur.chat.reducer.HamburUiState
 import com.hambur.chat.reducer.HamburUiStore
 import com.hambur.chat.reducer.THINKING_BLOCK_DISPLAY_AUTO_COLLAPSE
@@ -475,15 +476,15 @@ private fun ProviderEditorScreen(
     LaunchedEffect(state.lastAppliedSequence) {
         val currentSequence = state.lastAppliedSequence.toLong()
         if (lastCommandSequence > 0L && currentSequence > lastCommandSequence) {
-            if (pendingAction == "Refresh" && state.latestEventKind == "ModelsUpdated") {
+            if (pendingAction == "Refresh" && state.latestEventKind == BackendEventKind.MODELS_UPDATED.name) {
                 Toast.makeText(context, state.footer.ifBlank { "Models refreshed successfully" }, Toast.LENGTH_SHORT).show()
                 lastCommandSequence = 0L
                 pendingAction = ""
-            } else if (pendingAction == "Save" && state.latestEventKind == "SettingsChanged") {
+            } else if (pendingAction == "Save" && state.latestEventKind == BackendEventKind.SETTINGS_CHANGED.name) {
                 Toast.makeText(context, "Provider saved successfully", Toast.LENGTH_SHORT).show()
                 lastCommandSequence = 0L
                 pendingAction = ""
-            } else if (pendingAction == "AddModel" && state.latestEventKind == "SettingsChanged") {
+            } else if (pendingAction == "AddModel" && state.latestEventKind == BackendEventKind.SETTINGS_CHANGED.name) {
                 Toast.makeText(context, "Model added successfully", Toast.LENGTH_SHORT).show()
                 lastCommandSequence = 0L
                 pendingAction = ""
@@ -894,7 +895,7 @@ fun ModelGroupDetailScreen(
     LaunchedEffect(state.lastAppliedSequence) {
         val currentSequence = state.lastAppliedSequence.toLong()
         if (lastCommandSequence > 0L && currentSequence > lastCommandSequence) {
-            if (pendingAction == "SaveGroup" && state.latestEventKind == "SettingsChanged") {
+            if (pendingAction == "SaveGroup" && state.latestEventKind == BackendEventKind.SETTINGS_CHANGED.name) {
                 Toast.makeText(context, "Model group saved successfully", Toast.LENGTH_SHORT).show()
                 lastCommandSequence = 0L
                 pendingAction = ""

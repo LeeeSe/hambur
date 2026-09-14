@@ -1,21 +1,21 @@
 use crate::*;
 
 impl HamburDatabase {
-    pub async fn create_session(&self, title: &str) -> HamburResult<AppSnapshot> {
-        let id = self.insert_session(title, "chat").await?;
-        self.set_active_session(Some(&id)).await?;
-        self.snapshot_for_selected(Some(&id)).await
+    pub fn create_session(&self, title: &str) -> HamburResult<AppSnapshot> {
+        let id = self.insert_session(title, "chat")?;
+        self.set_active_session(Some(&id))?;
+        self.snapshot_for_selected(Some(&id))
     }
 
-    pub async fn create_internal_session(
+    pub fn create_internal_session(
         &self,
         title: &str,
         purpose: &str,
     ) -> HamburResult<String> {
-        self.insert_session(title, purpose).await
+        self.insert_session(title, purpose)
     }
 
-    async fn insert_session(&self, title: &str, purpose: &str) -> HamburResult<String> {
+    fn insert_session(&self, title: &str, purpose: &str) -> HamburResult<String> {
         let id = new_id("ses");
         let now = now_ms();
         let title = normalize_title(title);
@@ -27,13 +27,13 @@ impl HamburDatabase {
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![id.clone(), title, purpose, now as i64, now as i64],
             )
-            .await
+            
             .map_err(database_error)?;
         Ok(id)
     }
 
-    pub async fn rename_session(&self, session_id: &str, title: &str) -> HamburResult<AppSnapshot> {
-        self.ensure_session_exists(session_id).await?;
+    pub fn rename_session(&self, session_id: &str, title: &str) -> HamburResult<AppSnapshot> {
+        self.ensure_session_exists(session_id)?;
         let now = now_ms();
         let title = normalize_title(title);
         let changed = self
@@ -44,22 +44,22 @@ impl HamburDatabase {
                  WHERE id = ?3 AND deleted_at_ms IS NULL",
                 params![title, now as i64, session_id],
             )
-            .await
+            
             .map_err(database_error)?;
         if changed == 0 {
             return Err(HamburError::InvalidCommand(format!(
                 "session not found: {session_id}"
             )));
         }
-        self.snapshot_for_selected(Some(session_id)).await
+        self.snapshot_for_selected(Some(session_id))
     }
 
-    pub async fn set_session_pinned(
+    pub fn set_session_pinned(
         &self,
         session_id: &str,
         pinned: bool,
     ) -> HamburResult<AppSnapshot> {
-        self.ensure_session_exists(session_id).await?;
+        self.ensure_session_exists(session_id)?;
         let now = now_ms();
         let pinned_at_ms = if pinned { now } else { 0 };
         let changed = self
@@ -70,17 +70,17 @@ impl HamburDatabase {
                  WHERE id = ?3 AND deleted_at_ms IS NULL",
                 params![pinned_at_ms as i64, now as i64, session_id],
             )
-            .await
+            
             .map_err(database_error)?;
         if changed == 0 {
             return Err(HamburError::InvalidCommand(format!(
                 "session not found: {session_id}"
             )));
         }
-        self.snapshot_for_selected(Some(session_id)).await
+        self.snapshot_for_selected(Some(session_id))
     }
 
-    pub async fn delete_session(&self, session_id: &str) -> HamburResult<AppSnapshot> {
+    pub fn delete_session(&self, session_id: &str) -> HamburResult<AppSnapshot> {
         let now = now_ms();
         let changed = self
             .connection
@@ -90,7 +90,7 @@ impl HamburDatabase {
                  WHERE id = ?2 AND deleted_at_ms IS NULL",
                 params![now as i64, session_id],
             )
-            .await
+            
             .map_err(database_error)?;
 
         if changed == 0 {
@@ -99,19 +99,19 @@ impl HamburDatabase {
             )));
         }
 
-        if self.active_session_id().await?.as_deref() == Some(session_id) {
-            self.set_active_session(None).await?;
+        if self.active_session_id()?.as_deref() == Some(session_id) {
+            self.set_active_session(None)?;
         }
-        self.snapshot_for_selected(None).await
+        self.snapshot_for_selected(None)
     }
 
-    pub async fn insert_message(
+    pub fn insert_message(
         &self,
         session_id: &str,
         role: &str,
         content_text: &str,
     ) -> HamburResult<MessageRecord> {
-        self.ensure_session_exists(session_id).await?;
+        self.ensure_session_exists(session_id)?;
 
         let id = new_id("msg");
         let now = now_ms();
@@ -129,9 +129,9 @@ impl HamburDatabase {
                     now as i64
                 ],
             )
-            .await
+            
             .map_err(database_error)?;
-        self.touch_session(session_id, now).await?;
+        self.touch_session(session_id, now)?;
 
         Ok(MessageRecord {
             id,
@@ -160,7 +160,7 @@ impl HamburDatabase {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn insert_message_with_route(
+    pub fn insert_message_with_route(
         &self,
         session_id: &str,
         role: &str,
@@ -180,11 +180,11 @@ impl HamburDatabase {
             route,
             "",
         )
-        .await
+        
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn insert_message_with_route_and_prefix(
+    pub fn insert_message_with_route_and_prefix(
         &self,
         session_id: &str,
         role: &str,
@@ -195,7 +195,7 @@ impl HamburDatabase {
         route: &ModelRouteSnapshot,
         prompt_prefix: &str,
     ) -> HamburResult<MessageRecord> {
-        self.ensure_session_exists(session_id).await?;
+        self.ensure_session_exists(session_id)?;
 
         let id = new_id("msg");
         let now = now_ms();
@@ -243,9 +243,9 @@ impl HamburDatabase {
                     prompt_prefix
                 ],
             )
-            .await
+            
             .map_err(database_error)?;
-        self.touch_session(session_id, now).await?;
+        self.touch_session(session_id, now)?;
 
         Ok(MessageRecord {
             id,
@@ -273,7 +273,7 @@ impl HamburDatabase {
         })
     }
 
-    pub async fn update_message_stream_result(
+    pub fn update_message_stream_result(
         &self,
         message_id: &str,
         content_text: &str,
@@ -303,7 +303,7 @@ impl HamburDatabase {
                     message_id
                 ],
             )
-            .await
+            
             .map_err(database_error)?;
 
         if changed == 0 {
@@ -312,11 +312,11 @@ impl HamburDatabase {
             )));
         }
         self.message_by_id(message_id)
-            .await?
+            ?
             .ok_or_else(|| HamburError::Internal(format!("message disappeared: {message_id}")))
     }
 
-    pub async fn update_message_route_snapshot(
+    pub fn update_message_route_snapshot(
         &self,
         message_id: &str,
         route: &ModelRouteSnapshot,
@@ -343,7 +343,7 @@ impl HamburDatabase {
                     message_id,
                 ],
             )
-            .await
+            
             .map_err(database_error)?;
 
         if changed == 0 {
@@ -352,11 +352,11 @@ impl HamburDatabase {
             )));
         }
         self.message_by_id(message_id)
-            .await?
+            ?
             .ok_or_else(|| HamburError::Internal(format!("message disappeared: {message_id}")))
     }
 
-    pub async fn insert_tool_result_message(
+    pub fn insert_tool_result_message(
         &self,
         session_id: &str,
         turn_id: &str,
@@ -365,7 +365,7 @@ impl HamburDatabase {
         content_text: &str,
         route: &ModelRouteSnapshot,
     ) -> HamburResult<MessageRecord> {
-        self.ensure_session_exists(session_id).await?;
+        self.ensure_session_exists(session_id)?;
 
         let id = new_id("msg");
         let now = now_ms();
@@ -411,17 +411,17 @@ impl HamburDatabase {
                     tool_name,
                 ],
             )
-            .await
+            
             .map_err(database_error)?;
-        self.touch_session(session_id, now).await?;
+        self.touch_session(session_id, now)?;
 
         self.message_by_id(&id)
-            .await?
+            ?
             .ok_or_else(|| HamburError::Internal(format!("tool message disappeared: {id}")))
     }
 
-    pub async fn insert_trace_span(&self, input: NewTraceSpan) -> HamburResult<TraceSpanRecord> {
-        self.ensure_session_exists(&input.session_id).await?;
+    pub fn insert_trace_span(&self, input: NewTraceSpan) -> HamburResult<TraceSpanRecord> {
+        self.ensure_session_exists(&input.session_id)?;
         let id = new_id("trace");
         let now = now_ms();
         let status = normalize_status(&input.status)?;
@@ -459,11 +459,11 @@ impl HamburDatabase {
                     input.visible,
                 ],
             )
-            .await
+            
             .map_err(database_error)?;
 
         if input.visible {
-            let trace = self.trace_span_by_id(&id).await?;
+            let trace = self.trace_span_by_id(&id)?;
             self.upsert_timeline_item(
                 &input.session_id,
                 NewTimelineItem {
@@ -479,13 +479,13 @@ impl HamburDatabase {
                     },
                 },
             )
-            .await?;
+            ?;
         }
 
-        self.trace_span_by_id(&id).await
+        self.trace_span_by_id(&id)
     }
 
-    pub async fn update_trace_span_status(
+    pub fn update_trace_span_status(
         &self,
         trace_id: &str,
         status: &str,
@@ -504,14 +504,14 @@ impl HamburDatabase {
                  WHERE id = ?5",
                 params![status, content, ended, now as i64, trace_id],
             )
-            .await
+            
             .map_err(database_error)?;
         if changed == 0 {
             return Err(HamburError::InvalidCommand(format!(
                 "trace span not found: {trace_id}"
             )));
         }
-        let trace = self.trace_span_by_id(trace_id).await?;
+        let trace = self.trace_span_by_id(trace_id)?;
         self.upsert_timeline_item(
             &trace.session_id,
             NewTimelineItem {
@@ -527,12 +527,12 @@ impl HamburDatabase {
                 },
             },
         )
-        .await?;
+        ?;
         Ok(trace)
     }
 
-    pub async fn insert_tool_call(&self, input: NewToolCall) -> HamburResult<ToolCallRecord> {
-        self.ensure_session_exists(&input.session_id).await?;
+    pub fn insert_tool_call(&self, input: NewToolCall) -> HamburResult<ToolCallRecord> {
+        self.ensure_session_exists(&input.session_id)?;
         let id = if input.id.trim().is_empty() {
             new_id("tool_call")
         } else {
@@ -586,13 +586,13 @@ impl HamburDatabase {
                     input.call_index as i64,
                 ],
             )
-            .await
+            
             .map_err(database_error)?;
 
-        self.tool_call_by_id(&id).await
+        self.tool_call_by_id(&id)
     }
 
-    pub async fn update_tool_call_status(
+    pub fn update_tool_call_status(
         &self,
         tool_call_id: &str,
         status: &str,
@@ -623,18 +623,18 @@ impl HamburDatabase {
                     tool_call_id,
                 ],
             )
-            .await
+            
             .map_err(database_error)?;
         if changed == 0 {
             return Err(HamburError::InvalidCommand(format!(
                 "tool call not found: {tool_call_id}"
             )));
         }
-        self.tool_call_by_id(tool_call_id).await
+        self.tool_call_by_id(tool_call_id)
     }
 
-    pub async fn insert_tool_result(&self, input: NewToolResult) -> HamburResult<ToolResultRecord> {
-        self.ensure_session_exists(&input.session_id).await?;
+    pub fn insert_tool_result(&self, input: NewToolResult) -> HamburResult<ToolResultRecord> {
+        self.ensure_session_exists(&input.session_id)?;
         let id = new_id("tool_result");
         let now = now_ms();
         self.connection
@@ -676,13 +676,13 @@ impl HamburDatabase {
                     now as i64,
                 ],
             )
-            .await
+            
             .map_err(database_error)?;
 
-        self.tool_result_by_id(&id).await
+        self.tool_result_by_id(&id)
     }
 
-    pub async fn upsert_file_record(&self, input: NewFileRecord) -> HamburResult<FileRecord> {
+    pub fn upsert_file_record(&self, input: NewFileRecord) -> HamburResult<FileRecord> {
         let id = if input.id.trim().is_empty() {
             new_id("file")
         } else {
@@ -691,7 +691,7 @@ impl HamburDatabase {
         let scope = normalize_file_scope(&input.scope)?;
         let session_id = input.session_id.trim().to_string();
         if scope == "session" {
-            self.ensure_session_exists(&session_id).await?;
+            self.ensure_session_exists(&session_id)?;
         }
         let relative_path = normalize_db_path(&input.relative_path, "relative_path")?;
         let sandbox_path = normalize_db_path(&input.sandbox_path, "sandbox_path")?;
@@ -738,18 +738,18 @@ impl HamburDatabase {
                     retention_policy,
                 ],
             )
-            .await
+            
             .map_err(database_error)?;
 
-        self.file_by_id(&id).await
+        self.file_by_id(&id)
     }
 
-    pub async fn create_pending_attachment(
+    pub fn create_pending_attachment(
         &self,
         input: NewAttachment,
     ) -> HamburResult<AttachmentRecord> {
-        self.ensure_session_exists(&input.session_id).await?;
-        self.file_by_id(&input.file_id).await?;
+        self.ensure_session_exists(&input.session_id)?;
+        self.file_by_id(&input.file_id)?;
         let id = if input.id.trim().is_empty() {
             new_id("att")
         } else {
@@ -816,25 +816,25 @@ impl HamburDatabase {
                     now as i64,
                 ],
             )
-            .await
+            
             .map_err(database_error)?;
-        self.attachment_by_id(&id).await
+        self.attachment_by_id(&id)
     }
 
-    pub async fn attach_pending_to_message(
+    pub fn attach_pending_to_message(
         &self,
         session_id: &str,
         message_id: &str,
         attachment_ids: &[String],
     ) -> HamburResult<Vec<AttachmentRecord>> {
-        self.ensure_session_exists(session_id).await?;
+        self.ensure_session_exists(session_id)?;
         if attachment_ids.is_empty() {
             return Ok(Vec::new());
         }
         let now = now_ms();
         let mut attached = Vec::new();
         for attachment_id in attachment_ids {
-            let attachment = self.attachment_by_id(attachment_id).await?;
+            let attachment = self.attachment_by_id(attachment_id)?;
             if attachment.session_id != session_id {
                 return Err(HamburError::InvalidCommand(format!(
                     "attachment does not belong to session: {attachment_id}"
@@ -854,20 +854,20 @@ impl HamburDatabase {
                      WHERE id = ?3",
                     params![message_id, now as i64, attachment_id.clone()],
                 )
-                .await
+                
                 .map_err(database_error)?;
-            attached.push(self.attachment_by_id(attachment_id).await?);
+            attached.push(self.attachment_by_id(attachment_id)?);
         }
         Ok(attached)
     }
 
-    pub async fn remove_pending_attachment(
+    pub fn remove_pending_attachment(
         &self,
         session_id: &str,
         attachment_id: &str,
     ) -> HamburResult<(AttachmentRecord, Option<FileCleanupJobRecord>)> {
-        self.ensure_session_exists(session_id).await?;
-        let attachment = self.attachment_by_id(attachment_id).await?;
+        self.ensure_session_exists(session_id)?;
+        let attachment = self.attachment_by_id(attachment_id)?;
         if attachment.session_id != session_id {
             return Err(HamburError::InvalidCommand(format!(
                 "attachment does not belong to session: {attachment_id}"
@@ -887,17 +887,17 @@ impl HamburDatabase {
                  WHERE id = ?2",
                 params![now as i64, attachment_id],
             )
-            .await
+            
             .map_err(database_error)?;
-        let removed = self.attachment_by_id(attachment_id).await?;
+        let removed = self.attachment_by_id(attachment_id)?;
         let cleanup = self
             .schedule_file_cleanup(&removed.file_id, "pending_attachment_removed")
-            .await
+            
             .ok();
         Ok((removed, cleanup))
     }
 
-    pub async fn cleanup_pending_attachments(
+    pub fn cleanup_pending_attachments(
         &self,
         older_than_ms: u64,
     ) -> HamburResult<Vec<FileCleanupJobRecord>> {
@@ -932,11 +932,11 @@ impl HamburDatabase {
                 ",
                 params![cutoff as i64],
             )
-            .await
+            
             .map_err(database_error)?;
 
         let mut expired = Vec::new();
-        while let Some(row) = rows.next().await.map_err(database_error)? {
+        while let Some(row) = rows.next().map_err(database_error)? {
             expired.push(attachment_from_row(&row)?);
         }
 
@@ -951,11 +951,11 @@ impl HamburDatabase {
                      WHERE id = ?2 AND status = 'pending'",
                     params![now as i64, attachment.id],
                 )
-                .await
+                
                 .map_err(database_error)?;
             if let Ok(job) = self
                 .schedule_file_cleanup(&attachment.file_id, "pending_attachment_expired")
-                .await
+                
             {
                 jobs.push(job);
             }
@@ -963,12 +963,12 @@ impl HamburDatabase {
         Ok(jobs)
     }
 
-    pub async fn schedule_file_cleanup(
+    pub fn schedule_file_cleanup(
         &self,
         file_id: &str,
         reason: &str,
     ) -> HamburResult<FileCleanupJobRecord> {
-        let file = self.file_by_id(file_id).await?;
+        let file = self.file_by_id(file_id)?;
         let id = new_id("cleanup");
         let now = now_ms();
         self.connection
@@ -993,12 +993,12 @@ impl HamburDatabase {
                     now as i64,
                 ],
             )
-            .await
+            
             .map_err(database_error)?;
-        self.file_cleanup_job_by_id(&id).await
+        self.file_cleanup_job_by_id(&id)
     }
 
-    pub async fn mark_file_cleanup_done(&self, job_id: &str) -> HamburResult<FileCleanupJobRecord> {
+    pub fn mark_file_cleanup_done(&self, job_id: &str) -> HamburResult<FileCleanupJobRecord> {
         let now = now_ms();
         let changed = self
             .connection
@@ -1009,22 +1009,22 @@ impl HamburDatabase {
                  WHERE id = ?2",
                 params![now as i64, job_id],
             )
-            .await
+            
             .map_err(database_error)?;
         if changed == 0 {
             return Err(HamburError::InvalidCommand(format!(
                 "file cleanup job not found: {job_id}"
             )));
         }
-        self.file_cleanup_job_by_id(job_id).await
+        self.file_cleanup_job_by_id(job_id)
     }
 
-    pub async fn upsert_timeline_item(
+    pub fn upsert_timeline_item(
         &self,
         session_id: &str,
         item: NewTimelineItem,
     ) -> HamburResult<TimelineItemSnapshot> {
-        self.ensure_session_exists(session_id).await?;
+        self.ensure_session_exists(session_id)?;
 
         let stable_key = item.stable_key;
         if stable_key.trim().is_empty() {
@@ -1079,21 +1079,21 @@ impl HamburDatabase {
                     now as i64
                 ],
             )
-            .await
+            
             .map_err(database_error)?;
-        self.touch_session(session_id, now).await?;
+        self.touch_session(session_id, now)?;
 
         self.timeline_item_by_stable_key(session_id, &stable_key)
-            .await
+            
     }
 
-    pub async fn upsert_message_block_payload(
+    pub fn upsert_message_block_payload(
         &self,
         session_id: &str,
         _turn_id: &str,
         input: NewMessageBlockPayload,
     ) -> HamburResult<MessageBlockPayloadRecord> {
-        self.ensure_session_exists(session_id).await?;
+        self.ensure_session_exists(session_id)?;
         if input.message_id.trim().is_empty() {
             return Err(HamburError::InvalidCommand(
                 "message block message_id must not be empty".to_string(),
@@ -1161,16 +1161,16 @@ impl HamburDatabase {
                     now as i64
                 ],
             )
-            .await
+            
             .map_err(database_error)?;
-        self.touch_session(session_id, now).await?;
+        self.touch_session(session_id, now)?;
 
         let record = self
             .message_block_by_stable_key(session_id, &stable_key)
-            .await?;
+            ?;
         let display_base = self
             .message_by_id(&record.message_id)
-            .await?
+            ?
             .map(|message| message.created_at_ms)
             .unwrap_or(record.created_at_ms);
         let (content_type, display_sequence, kind) = if record.block_type == "reasoning" {
@@ -1203,24 +1203,24 @@ impl HamburDatabase {
                 kind,
             },
         )
-        .await?;
+        ?;
         if record.block_type == "content" && record.committed {
             self.hide_timeline_item(session_id, &pending_markdown_stable_key(&record.message_id))
-                .await?;
+                ?;
         }
         Ok(record)
     }
 
-    pub async fn remove_pending_markdown_block(
+    pub fn remove_pending_markdown_block(
         &self,
         session_id: &str,
         message_id: &str,
     ) -> HamburResult<()> {
         self.hide_timeline_item(session_id, &pending_markdown_stable_key(message_id))
-            .await
+            
     }
 
-    pub(crate) async fn hide_timeline_item(
+    pub(crate) fn hide_timeline_item(
         &self,
         session_id: &str,
         stable_key: &str,
@@ -1238,12 +1238,12 @@ impl HamburDatabase {
                  WHERE session_id = ?1 AND stable_key = ?2",
                 params![session_id, stable_key, now as i64],
             )
-            .await
+            
             .map(|_| ())
             .map_err(database_error)
     }
-    pub async fn create_turn(&self, session_id: &str, status: &str) -> HamburResult<TurnRecord> {
-        self.ensure_session_exists(session_id).await?;
+    pub fn create_turn(&self, session_id: &str, status: &str) -> HamburResult<TurnRecord> {
+        self.ensure_session_exists(session_id)?;
 
         let id = new_id("turn");
         let now = now_ms();
@@ -1255,9 +1255,9 @@ impl HamburDatabase {
                  VALUES (?1, ?2, ?3, ?4, ?4, NULL)",
                 params![id.clone(), session_id, status.clone(), now as i64],
             )
-            .await
+            
             .map_err(database_error)?;
-        self.touch_session(session_id, now).await?;
+        self.touch_session(session_id, now)?;
 
         Ok(TurnRecord {
             id,
@@ -1277,13 +1277,13 @@ impl HamburDatabase {
         })
     }
 
-    pub async fn create_turn_with_route(
+    pub fn create_turn_with_route(
         &self,
         session_id: &str,
         status: &str,
         route: &ModelRouteSnapshot,
     ) -> HamburResult<TurnRecord> {
-        self.ensure_session_exists(session_id).await?;
+        self.ensure_session_exists(session_id)?;
 
         let id = new_id("turn");
         let now = now_ms();
@@ -1321,9 +1321,9 @@ impl HamburDatabase {
                     route.model_group_id.clone()
                 ],
             )
-            .await
+            
             .map_err(database_error)?;
-        self.touch_session(session_id, now).await?;
+        self.touch_session(session_id, now)?;
 
         Ok(TurnRecord {
             id,
@@ -1343,7 +1343,7 @@ impl HamburDatabase {
         })
     }
 
-    pub async fn update_turn_status(
+    pub fn update_turn_status(
         &self,
         turn_id: &str,
         status: &str,
@@ -1361,7 +1361,7 @@ impl HamburDatabase {
                  WHERE id = ?4",
                 params![status, now as i64, finished, turn_id],
             )
-            .await
+            
             .map_err(database_error)?;
 
         if changed == 0 {
@@ -1370,10 +1370,10 @@ impl HamburDatabase {
             )));
         }
 
-        self.turn_by_id(turn_id).await
+        self.turn_by_id(turn_id)
     }
 
-    pub async fn update_turn_route_snapshot(
+    pub fn update_turn_route_snapshot(
         &self,
         turn_id: &str,
         route: &ModelRouteSnapshot,
@@ -1402,7 +1402,7 @@ impl HamburDatabase {
                     turn_id,
                 ],
             )
-            .await
+            
             .map_err(database_error)?;
 
         if changed == 0 {
@@ -1410,10 +1410,10 @@ impl HamburDatabase {
                 "turn not found: {turn_id}"
             )));
         }
-        self.turn_by_id(turn_id).await
+        self.turn_by_id(turn_id)
     }
 
-    pub async fn fail_turn(
+    pub fn fail_turn(
         &self,
         turn_id: &str,
         status: &str,
@@ -1434,7 +1434,7 @@ impl HamburDatabase {
                  WHERE id = ?5",
                 params![status, now as i64, error_code, error_message, turn_id],
             )
-            .await
+            
             .map_err(database_error)?;
 
         if changed == 0 {
@@ -1443,45 +1443,45 @@ impl HamburDatabase {
             )));
         }
 
-        self.turn_by_id(turn_id).await
+        self.turn_by_id(turn_id)
     }
 
-    pub async fn mark_session_memory_reviewed(
+    pub fn mark_session_memory_reviewed(
         &self,
         session_id: &str,
         reviewed: bool,
     ) -> HamburResult<()> {
-        self.ensure_session_exists(session_id).await?;
+        self.ensure_session_exists(session_id)?;
         self.connection
             .execute(
                 "UPDATE sessions SET memory_reviewed = ?1 WHERE id = ?2 AND deleted_at_ms IS NULL",
                 params![reviewed, session_id],
             )
-            .await
+            
             .map(|_| ())
             .map_err(database_error)
     }
 
-    pub async fn mark_session_memory_dirty(&self, session_id: &str) -> HamburResult<()> {
-        self.ensure_session_exists(session_id).await?;
+    pub fn mark_session_memory_dirty(&self, session_id: &str) -> HamburResult<()> {
+        self.ensure_session_exists(session_id)?;
         self.connection
             .execute(
                 "UPDATE sessions SET memory_reviewed = 0 WHERE id = ?1 AND deleted_at_ms IS NULL",
                 params![session_id],
             )
-            .await
+            
             .map(|_| ())
             .map_err(database_error)
     }
 
-    pub async fn hide_visible_timeline_after_message(
+    pub fn hide_visible_timeline_after_message(
         &self,
         session_id: &str,
         message_id: &str,
         include_message: bool,
     ) -> HamburResult<()> {
-        self.ensure_session_exists(session_id).await?;
-        let message = self.message_snapshot(message_id).await?.ok_or_else(|| {
+        self.ensure_session_exists(session_id)?;
+        let message = self.message_snapshot(message_id)?.ok_or_else(|| {
             HamburError::InvalidCommand(format!("message not found: {message_id}"))
         })?;
         if message.session_id != session_id {
@@ -1501,10 +1501,10 @@ impl HamburDatabase {
                 .as_str(),
                 params![session_id, message.created_at_ms as i64],
             )
-            .await
+            
             .map_err(database_error)?;
         let mut message_ids = Vec::new();
-        while let Some(row) = rows.next().await.map_err(database_error)? {
+        while let Some(row) = rows.next().map_err(database_error)? {
             message_ids.push(row.get::<String>(0).map_err(database_error)?);
         }
         if message_ids.is_empty() {
@@ -1513,18 +1513,18 @@ impl HamburDatabase {
         let now = now_ms();
         for hidden_message_id in message_ids {
             self.hide_timeline_for_message_id(session_id, &hidden_message_id, now)
-                .await?;
+                ?;
         }
         Ok(())
     }
 
-    pub(crate) async fn hide_timeline_for_message_id(
+    pub(crate) fn hide_timeline_for_message_id(
         &self,
         session_id: &str,
         message_id: &str,
         now: u64,
     ) -> HamburResult<()> {
-        let message = self.message_snapshot(message_id).await?.ok_or_else(|| {
+        let message = self.message_snapshot(message_id)?.ok_or_else(|| {
             HamburError::InvalidCommand(format!("message not found: {message_id}"))
         })?;
         self.connection
@@ -1538,7 +1538,7 @@ impl HamburDatabase {
                    AND payload_ref = ?3",
                 params![now as i64, session_id, message_id],
             )
-            .await
+            
             .map_err(database_error)?;
         self.connection
             .execute(
@@ -1554,7 +1554,7 @@ impl HamburDatabase {
                    )",
                 params![now as i64, session_id, message_id],
             )
-            .await
+            
             .map_err(database_error)?;
         self.connection
             .execute(
@@ -1589,11 +1589,11 @@ impl HamburDatabase {
                     message.created_at_ms as i64
                 ],
             )
-            .await
+            
             .map_err(database_error)?;
         Ok(())
     }
-    pub async fn upsert_provider(&self, input: ProviderUpsert) -> HamburResult<ProviderRecord> {
+    pub fn upsert_provider(&self, input: ProviderUpsert) -> HamburResult<ProviderRecord> {
         let provider_id = normalize_provider_id(&input.id);
         let name = normalize_title(&input.name);
         let icon_name = input.icon_name.trim().chars().take(80).collect::<String>();
@@ -1631,13 +1631,13 @@ impl HamburDatabase {
                     now as i64
                 ],
             )
-            .await
+            
             .map_err(database_error)?;
 
-        self.provider_by_id(&provider_id).await
+        self.provider_by_id(&provider_id)
     }
 
-    pub async fn delete_provider(&self, provider_id: &str) -> HamburResult<()> {
+    pub fn delete_provider(&self, provider_id: &str) -> HamburResult<()> {
         let provider_id = provider_id.trim();
         if provider_id.is_empty() {
             return Err(HamburError::InvalidCommand(
@@ -1647,7 +1647,7 @@ impl HamburDatabase {
         let changed = self
             .connection
             .execute("DELETE FROM providers WHERE id = ?1", params![provider_id])
-            .await
+            
             .map_err(database_error)?;
         if changed == 0 {
             return Err(HamburError::ProviderUnavailable(format!(
@@ -1657,12 +1657,12 @@ impl HamburDatabase {
         Ok(())
     }
 
-    pub async fn replace_provider_models(
+    pub fn replace_provider_models(
         &self,
         provider_id: &str,
         models: Vec<ProviderModelUpsert>,
     ) -> HamburResult<Vec<ProviderModelRecord>> {
-        self.provider_by_id(provider_id).await?;
+        self.provider_by_id(provider_id)?;
         if models.is_empty() {
             return Err(HamburError::InvalidCommand(
                 "model refresh returned no usable models".to_string(),
@@ -1674,7 +1674,7 @@ impl HamburDatabase {
                 "DELETE FROM provider_models WHERE provider_id = ?1 AND (metadata_json NOT LIKE '%\"custom\":true%' AND metadata_json NOT LIKE '%\"custom\": true%')",
                 params![provider_id],
             )
-            .await
+            
             .map_err(database_error)?;
 
         let now = now_ms();
@@ -1738,42 +1738,42 @@ impl HamburDatabase {
                         now as i64
                     ],
                 )
-                .await
+                
                 .map_err(database_error)?;
         }
 
-        let saved = self.provider_models(provider_id).await?;
+        let saved = self.provider_models(provider_id)?;
         if let Some(first) = saved.first() {
             self.ensure_default_model_groups(provider_id, &first.model_id)
-                .await?;
+                ?;
         }
         Ok(saved)
     }
 
-    pub async fn delete_provider_model(
+    pub fn delete_provider_model(
         &self,
         provider_id: &str,
         model_id: &str,
     ) -> HamburResult<()> {
-        self.provider_by_id(provider_id).await?;
+        self.provider_by_id(provider_id)?;
         self.connection
             .execute(
                 "DELETE FROM provider_models WHERE provider_id = ?1 AND model_id = ?2",
                 params![provider_id, model_id],
             )
-            .await
+            
             .map_err(database_error)?;
         self.connection
             .execute(
                 "DELETE FROM model_group_members WHERE provider_id = ?1 AND model_id = ?2",
                 params![provider_id, model_id],
             )
-            .await
+            
             .map_err(database_error)?;
         Ok(())
     }
 
-    pub async fn upsert_provider_model_override(
+    pub fn upsert_provider_model_override(
         &self,
         input: ProviderModelOverride,
     ) -> HamburResult<ProviderModelRecord> {
@@ -1784,7 +1784,7 @@ impl HamburDatabase {
                 "provider_id and model_id must not be empty".to_string(),
             ));
         }
-        self.provider_by_id(&provider_id).await?;
+        self.provider_by_id(&provider_id)?;
         let display_name = if input.display_name.trim().is_empty() {
             model_id.clone()
         } else {
@@ -1840,13 +1840,13 @@ impl HamburDatabase {
                     now as i64
                 ],
             )
-            .await
+            
             .map_err(database_error)?;
 
-        self.provider_model_by_key(&provider_id, &model_id).await
+        self.provider_model_by_key(&provider_id, &model_id)
     }
 
-    pub async fn ensure_default_model_groups(
+    pub fn ensure_default_model_groups(
         &self,
         provider_id: &str,
         model_id: &str,
@@ -1868,7 +1868,7 @@ impl HamburDatabase {
                      ON CONFLICT(id) DO UPDATE SET updated_at_ms = excluded.updated_at_ms",
                     params![group_id, name, now as i64],
                 )
-                .await
+                
                 .map_err(database_error)?;
             self.connection
                 .execute(
@@ -1879,7 +1879,7 @@ impl HamburDatabase {
                         updated_at_ms = excluded.updated_at_ms",
                     params![default_key, group_id, now as i64],
                 )
-                .await
+                
                 .map_err(database_error)?;
         }
 
@@ -1891,18 +1891,18 @@ impl HamburDatabase {
                  ON CONFLICT(group_id, provider_id, model_id) DO UPDATE SET enabled = 1",
                 params![new_id("mgm"), provider_id, model_id],
             )
-            .await
+            
             .map_err(database_error)?;
         Ok(())
     }
 
-    pub async fn upsert_primary_chat_member(
+    pub fn upsert_primary_chat_member(
         &self,
         provider_id: &str,
         model_id: &str,
         position: u32,
     ) -> HamburResult<()> {
-        self.provider_by_id(provider_id).await?;
+        self.provider_by_id(provider_id)?;
         let now = now_ms();
         self.connection
             .execute(
@@ -1912,7 +1912,7 @@ impl HamburDatabase {
                  ON CONFLICT(id) DO UPDATE SET updated_at_ms = excluded.updated_at_ms",
                 params![now as i64],
             )
-            .await
+            
             .map_err(database_error)?;
         self.connection
             .execute(
@@ -1923,7 +1923,7 @@ impl HamburDatabase {
                     updated_at_ms = excluded.updated_at_ms",
                 params![now as i64],
             )
-            .await
+            
             .map_err(database_error)?;
         self.connection
             .execute(
@@ -1935,12 +1935,12 @@ impl HamburDatabase {
                     enabled = 1",
                 params![new_id("mgm"), provider_id, model_id, position as i64],
             )
-            .await
+            
             .map_err(database_error)?;
         Ok(())
     }
 
-    pub async fn upsert_model_group(
+    pub fn upsert_model_group(
         &self,
         group_id: &str,
         name: &str,
@@ -1970,12 +1970,12 @@ impl HamburDatabase {
                     now as i64
                 ],
             )
-            .await
+            
             .map_err(database_error)?;
-        self.model_group_by_id(&group_id).await
+        self.model_group_by_id(&group_id)
     }
 
-    pub async fn upsert_model_group_member(
+    pub fn upsert_model_group_member(
         &self,
         group_id: &str,
         provider_id: &str,
@@ -1983,8 +1983,8 @@ impl HamburDatabase {
         position: u32,
         enabled: bool,
     ) -> HamburResult<ModelGroupMemberRecord> {
-        self.model_group_by_id(group_id).await?;
-        self.provider_model_by_key(provider_id, model_id).await?;
+        self.model_group_by_id(group_id)?;
+        self.provider_model_by_key(provider_id, model_id)?;
         self.connection
             .execute(
                 "INSERT INTO model_group_members
@@ -2002,13 +2002,13 @@ impl HamburDatabase {
                     enabled
                 ],
             )
-            .await
+            
             .map_err(database_error)?;
         self.model_group_member_by_key(group_id, provider_id, model_id)
-            .await
+            
     }
 
-    pub async fn delete_model_group_member(
+    pub fn delete_model_group_member(
         &self,
         group_id: &str,
         provider_id: &str,
@@ -2021,18 +2021,18 @@ impl HamburDatabase {
                 "DELETE FROM model_group_members WHERE group_id = ?1 AND provider_id = ?2 AND model_id = ?3",
                 params![group_id, provider_id, model_id.trim()],
             )
-            .await
+            
             .map_err(database_error)?;
         Ok(())
     }
 
-    pub async fn set_default_model_group(
+    pub fn set_default_model_group(
         &self,
         key: &str,
         group_id: &str,
     ) -> HamburResult<DefaultModelGroupRecord> {
         let key = normalize_default_group_key(key)?;
-        self.model_group_by_id(group_id).await?;
+        self.model_group_by_id(group_id)?;
         let now = now_ms();
         self.connection
             .execute(
@@ -2043,7 +2043,7 @@ impl HamburDatabase {
                     updated_at_ms = excluded.updated_at_ms",
                 params![key.clone(), group_id, now as i64],
             )
-            .await
+            
             .map_err(database_error)?;
         Ok(DefaultModelGroupRecord {
             key,
@@ -2052,7 +2052,7 @@ impl HamburDatabase {
         })
     }
 
-    pub async fn upsert_app_setting(
+    pub fn upsert_app_setting(
         &self,
         key: &str,
         value: &str,
@@ -2069,7 +2069,7 @@ impl HamburDatabase {
                     updated_at_ms = excluded.updated_at_ms",
                 params![key.clone(), value.clone(), now as i64],
             )
-            .await
+            
             .map_err(database_error)?;
         Ok(AppSettingRecord {
             key,
@@ -2078,7 +2078,7 @@ impl HamburDatabase {
         })
     }
 
-    pub async fn upsert_model_catalog_cache(
+    pub fn upsert_model_catalog_cache(
         &self,
         key: &str,
         catalog_json: &str,
@@ -2094,7 +2094,7 @@ impl HamburDatabase {
                     synced_at_ms = excluded.synced_at_ms",
                 params![key.clone(), catalog_json, synced_at_ms as i64],
             )
-            .await
+            
             .map_err(database_error)?;
         Ok(ModelCatalogCacheRecord {
             key,
@@ -2103,33 +2103,33 @@ impl HamburDatabase {
         })
     }
 
-    pub async fn delete_model_group(&self, group_id: &str) -> HamburResult<()> {
+    pub fn delete_model_group(&self, group_id: &str) -> HamburResult<()> {
         let group_id = normalize_setting_id(group_id, "grp");
         self.connection
             .execute(
                 "DELETE FROM default_model_groups WHERE group_id = ?1",
                 params![group_id.clone()],
             )
-            .await
+            
             .map_err(database_error)?;
         self.connection
             .execute("DELETE FROM model_groups WHERE id = ?1", params![group_id])
-            .await
+            
             .map_err(database_error)?;
         Ok(())
     }
 
-    pub async fn delete_app_setting(&self, key: &str) -> HamburResult<()> {
+    pub fn delete_app_setting(&self, key: &str) -> HamburResult<()> {
         let key = normalize_app_setting_key(key)?;
         self.connection
             .execute("DELETE FROM app_settings WHERE key = ?1", params![key])
-            .await
+            
             .map_err(database_error)?;
         Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn insert_config_audit(
+    pub fn insert_config_audit(
         &self,
         command_id: &str,
         actor: &str,
@@ -2172,12 +2172,12 @@ impl HamburDatabase {
                     record.created_at_ms as i64
                 ],
             )
-            .await
+            
             .map_err(database_error)?;
         Ok(record)
     }
 
-    pub(crate) async fn migrate(&self) -> HamburResult<()> {
+    pub(crate) fn migrate(&self) -> HamburResult<()> {
         self.connection
             .execute_batch(
                 "
@@ -2612,83 +2612,83 @@ impl HamburDatabase {
                     ON config_audit(created_at_ms DESC, id DESC);
                 ",
             )
-            .await
+            
             .map_err(database_error)?;
 
         self.add_column_if_missing("sessions", "pinned_at_ms", "INTEGER NOT NULL DEFAULT 0")
-            .await?;
+            ?;
         self.add_column_if_missing("messages", "turn_id", "TEXT NOT NULL DEFAULT ''")
-            .await?;
+            ?;
         self.add_column_if_missing("messages", "status", "TEXT NOT NULL DEFAULT 'completed'")
-            .await?;
+            ?;
         self.add_column_if_missing("messages", "reasoning_content", "TEXT NOT NULL DEFAULT ''")
-            .await?;
+            ?;
         self.add_column_if_missing(
             "messages",
             "provider_id_snapshot",
             "TEXT NOT NULL DEFAULT ''",
         )
-        .await?;
+        ?;
         self.add_column_if_missing(
             "messages",
             "provider_name_snapshot",
             "TEXT NOT NULL DEFAULT ''",
         )
-        .await?;
+        ?;
         self.add_column_if_missing("messages", "provider_protocol", "TEXT NOT NULL DEFAULT ''")
-            .await?;
+            ?;
         self.add_column_if_missing("messages", "model_id_snapshot", "TEXT NOT NULL DEFAULT ''")
-            .await?;
+            ?;
         self.add_column_if_missing(
             "messages",
             "model_name_snapshot",
             "TEXT NOT NULL DEFAULT ''",
         )
-        .await?;
+        ?;
         self.add_column_if_missing("messages", "model_group_id", "TEXT NOT NULL DEFAULT ''")
-            .await?;
+            ?;
         self.add_column_if_missing("messages", "finish_reason", "TEXT NOT NULL DEFAULT ''")
-            .await?;
+            ?;
         self.add_column_if_missing(
             "messages",
             "native_finish_reason",
             "TEXT NOT NULL DEFAULT ''",
         )
-        .await?;
+        ?;
         self.add_column_if_missing("messages", "tool_call_id", "TEXT NOT NULL DEFAULT ''")
-            .await?;
+            ?;
         self.add_column_if_missing("messages", "tool_name", "TEXT NOT NULL DEFAULT ''")
-            .await?;
+            ?;
         self.add_column_if_missing("messages", "tool_title", "TEXT NOT NULL DEFAULT ''")
-            .await?;
+            ?;
         self.add_column_if_missing("messages", "prompt_prefix", "TEXT NOT NULL DEFAULT ''")
-            .await?;
+            ?;
         self.add_column_if_missing("timeline_items", "visible", "INTEGER NOT NULL DEFAULT 1")
-            .await?;
+            ?;
         self.add_column_if_missing("turns", "selected_provider_id", "TEXT NOT NULL DEFAULT ''")
-            .await?;
+            ?;
         self.add_column_if_missing(
             "turns",
             "selected_provider_name",
             "TEXT NOT NULL DEFAULT ''",
         )
-        .await?;
+        ?;
         self.add_column_if_missing("turns", "provider_protocol", "TEXT NOT NULL DEFAULT ''")
-            .await?;
+            ?;
         self.add_column_if_missing("turns", "selected_model_id", "TEXT NOT NULL DEFAULT ''")
-            .await?;
+            ?;
         self.add_column_if_missing("turns", "selected_model_name", "TEXT NOT NULL DEFAULT ''")
-            .await?;
+            ?;
         self.add_column_if_missing("turns", "model_group_id", "TEXT NOT NULL DEFAULT ''")
-            .await?;
+            ?;
         self.add_column_if_missing("turns", "error_code", "TEXT NOT NULL DEFAULT ''")
-            .await?;
+            ?;
         self.add_column_if_missing("turns", "error_message", "TEXT NOT NULL DEFAULT ''")
-            .await?;
+            ?;
         self.add_column_if_missing("sessions", "memory_reviewed", "INTEGER NOT NULL DEFAULT 0")
-            .await?;
+            ?;
         self.add_column_if_missing("sessions", "purpose", "TEXT NOT NULL DEFAULT 'chat'")
-            .await?;
+            ?;
         self.connection
             .execute(
                 "UPDATE sessions
@@ -2696,7 +2696,7 @@ impl HamburDatabase {
                  WHERE purpose = 'chat' AND title LIKE 'Delegate:%'",
                 params![],
             )
-            .await
+            
             .map_err(database_error)?;
         self.connection
             .execute(
@@ -2707,14 +2707,14 @@ impl HamburDatabase {
                    )",
                 params![],
             )
-            .await
+            
             .map_err(database_error)?;
         self.add_column_if_missing("tool_calls", "call_index", "INTEGER NOT NULL DEFAULT 0")
-            .await?;
+            ?;
 
         Ok(())
     }
-    pub(crate) async fn add_column_if_missing(
+    pub(crate) fn add_column_if_missing(
         &self,
         table: &str,
         column: &str,
@@ -2724,9 +2724,9 @@ impl HamburDatabase {
         let mut rows = self
             .connection
             .query(pragma.as_str(), params![])
-            .await
+            
             .map_err(database_error)?;
-        while let Some(row) = rows.next().await.map_err(database_error)? {
+        while let Some(row) = rows.next().map_err(database_error)? {
             let name = row.get::<String>(1).map_err(database_error)?;
             if name == column {
                 return Ok(());
@@ -2736,12 +2736,12 @@ impl HamburDatabase {
         let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {definition}");
         self.connection
             .execute(sql.as_str(), params![])
-            .await
+            
             .map(|_| ())
             .map_err(database_error)
     }
-    pub(crate) async fn ensure_session_exists(&self, session_id: &str) -> HamburResult<()> {
-        if self.session_exists(session_id).await? {
+    pub(crate) fn ensure_session_exists(&self, session_id: &str) -> HamburResult<()> {
+        if self.session_exists(session_id)? {
             Ok(())
         } else {
             Err(HamburError::InvalidCommand(format!(
@@ -2749,7 +2749,7 @@ impl HamburDatabase {
             )))
         }
     }
-    pub(crate) async fn touch_session(&self, session_id: &str, now: u64) -> HamburResult<()> {
+    pub(crate) fn touch_session(&self, session_id: &str, now: u64) -> HamburResult<()> {
         self.connection
             .execute(
                 "UPDATE sessions
@@ -2758,11 +2758,11 @@ impl HamburDatabase {
                  WHERE id = ?2 AND deleted_at_ms IS NULL",
                 params![now as i64, session_id],
             )
-            .await
+            
             .map_err(database_error)?;
         Ok(())
     }
-    pub(crate) async fn set_active_session(&self, session_id: Option<&str>) -> HamburResult<()> {
+    pub(crate) fn set_active_session(&self, session_id: Option<&str>) -> HamburResult<()> {
         let now = now_ms();
         match session_id {
             Some(session_id) => self
@@ -2775,7 +2775,7 @@ impl HamburDatabase {
                         updated_at_ms = excluded.updated_at_ms",
                     params![session_id, now as i64],
                 )
-                .await
+                
                 .map(|_| ())
                 .map_err(database_error),
             None => self
@@ -2784,7 +2784,7 @@ impl HamburDatabase {
                     "DELETE FROM app_state WHERE key = 'active_session_id'",
                     params![],
                 )
-                .await
+                
                 .map(|_| ())
                 .map_err(database_error),
         }

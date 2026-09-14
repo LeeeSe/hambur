@@ -3,26 +3,26 @@ use std::collections::HashMap;
 use crate::*;
 
 impl HamburDatabase {
-    pub async fn bootstrap_snapshot(&self) -> HamburResult<AppSnapshot> {
-        self.snapshot_for_selected(None).await
+    pub fn bootstrap_snapshot(&self) -> HamburResult<AppSnapshot> {
+        self.snapshot_for_selected(None)
     }
 
-    pub async fn open_session(&self, session_id: &str) -> HamburResult<AppSnapshot> {
-        if !self.chat_session_exists(session_id).await? {
+    pub fn open_session(&self, session_id: &str) -> HamburResult<AppSnapshot> {
+        if !self.chat_session_exists(session_id)? {
             return Err(HamburError::InvalidCommand(format!(
                 "session not found: {session_id}"
             )));
         }
 
-        self.set_active_session(Some(session_id)).await?;
-        self.snapshot_for_selected(Some(session_id)).await
+        self.set_active_session(Some(session_id))?;
+        self.snapshot_for_selected(Some(session_id))
     }
 
-    pub async fn pending_attachments_for_session(
+    pub fn pending_attachments_for_session(
         &self,
         session_id: &str,
     ) -> HamburResult<Vec<AttachmentRecord>> {
-        self.ensure_session_exists(session_id).await?;
+        self.ensure_session_exists(session_id)?;
         let mut rows = self
             .connection
             .query(
@@ -53,17 +53,17 @@ impl HamburDatabase {
                 ",
                 params![session_id],
             )
-            .await
+            
             .map_err(database_error)?;
 
         let mut attachments = Vec::new();
-        while let Some(row) = rows.next().await.map_err(database_error)? {
+        while let Some(row) = rows.next().map_err(database_error)? {
             attachments.push(attachment_from_row(&row)?);
         }
         Ok(attachments)
     }
 
-    pub async fn pending_file_cleanup_jobs(
+    pub fn pending_file_cleanup_jobs(
         &self,
         limit: u32,
     ) -> HamburResult<Vec<FileCleanupJobRecord>> {
@@ -80,21 +80,21 @@ impl HamburDatabase {
                 ",
                 params![limit as i64],
             )
-            .await
+            
             .map_err(database_error)?;
         let mut jobs = Vec::new();
-        while let Some(row) = rows.next().await.map_err(database_error)? {
+        while let Some(row) = rows.next().map_err(database_error)? {
             jobs.push(file_cleanup_job_from_row(&row)?);
         }
         Ok(jobs)
     }
 
-    pub async fn resolve_file_by_sandbox_path(
+    pub fn resolve_file_by_sandbox_path(
         &self,
         session_id: &str,
         sandbox_path: &str,
     ) -> HamburResult<FileRecord> {
-        self.ensure_session_exists(session_id).await?;
+        self.ensure_session_exists(session_id)?;
         let mut rows = self
             .connection
             .query(
@@ -118,9 +118,9 @@ impl HamburDatabase {
                 ",
                 params![sandbox_path, session_id],
             )
-            .await
+            
             .map_err(database_error)?;
-        let Some(row) = rows.next().await.map_err(database_error)? else {
+        let Some(row) = rows.next().map_err(database_error)? else {
             return Err(HamburError::InvalidCommand(format!(
                 "file not found for sandbox path: {sandbox_path}"
             )));
@@ -128,7 +128,7 @@ impl HamburDatabase {
         file_from_row(&row)
     }
 
-    pub(crate) async fn message_block_by_stable_key(
+    pub(crate) fn message_block_by_stable_key(
         &self,
         session_id: &str,
         stable_key: &str,
@@ -157,17 +157,17 @@ impl HamburDatabase {
                 ",
                 params![session_id, stable_key],
             )
-            .await
+            
             .map_err(database_error)?;
 
-        let Some(row) = rows.next().await.map_err(database_error)? else {
+        let Some(row) = rows.next().map_err(database_error)? else {
             return Err(HamburError::Internal(format!(
                 "markdown block not found after upsert: {stable_key}"
             )));
         };
         message_block_from_row(&row)
     }
-    pub(crate) async fn message_blocks_for_payload_refs(
+    pub(crate) fn message_blocks_for_payload_refs(
         &self,
         session_id: &str,
         payload_refs: &[String],
@@ -201,29 +201,29 @@ impl HamburDatabase {
                     ",
                     params![session_id, payload_ref],
                 )
-                .await
+                
                 .map_err(database_error)?;
-            if let Some(row) = rows.next().await.map_err(database_error)? {
+            if let Some(row) = rows.next().map_err(database_error)? {
                 blocks.push(message_block_from_row(&row)?);
             }
         }
         Ok(blocks)
     }
-    pub async fn session_snapshot(&self, session_id: &str) -> HamburResult<AppSnapshot> {
-        self.ensure_session_exists(session_id).await?;
-        self.snapshot_for_selected(Some(session_id)).await
+    pub fn session_snapshot(&self, session_id: &str) -> HamburResult<AppSnapshot> {
+        self.ensure_session_exists(session_id)?;
+        self.snapshot_for_selected(Some(session_id))
     }
 
-    pub async fn session_list(&self, limit: u32, offset: u32) -> HamburResult<Vec<SessionSummary>> {
-        self.list_sessions_page(limit, offset).await
+    pub fn session_list(&self, limit: u32, offset: u32) -> HamburResult<Vec<SessionSummary>> {
+        self.list_sessions_page(limit, offset)
     }
 
-    pub async fn session_summary(&self, session_id: &str) -> HamburResult<SessionSummary> {
-        self.ensure_session_exists(session_id).await?;
-        self.session_summary_by_id(session_id).await
+    pub fn session_summary(&self, session_id: &str) -> HamburResult<SessionSummary> {
+        self.ensure_session_exists(session_id)?;
+        self.session_summary_by_id(session_id)
     }
 
-    pub async fn unreviewed_sessions(&self, limit: u32) -> HamburResult<Vec<SessionSummary>> {
+    pub fn unreviewed_sessions(&self, limit: u32) -> HamburResult<Vec<SessionSummary>> {
         let limit = clamp_limit(limit, 1, 100);
         let mut rows = self
             .connection
@@ -257,21 +257,21 @@ impl HamburDatabase {
                 ",
                 params![limit as i64],
             )
-            .await
+            
             .map_err(database_error)?;
 
         let mut sessions = Vec::new();
-        while let Some(row) = rows.next().await.map_err(database_error)? {
+        while let Some(row) = rows.next().map_err(database_error)? {
             sessions.push(session_summary_from_row(&row)?);
         }
         Ok(sessions)
     }
 
-    pub async fn session_review_record(
+    pub fn session_review_record(
         &self,
         session_id: &str,
     ) -> HamburResult<SessionReviewRecord> {
-        let summary = self.session_summary(session_id).await?;
+        let summary = self.session_summary(session_id)?;
         Ok(SessionReviewRecord {
             id: summary.id.clone(),
             title: summary.title,
@@ -279,35 +279,35 @@ impl HamburDatabase {
             created_at_ms: summary.created_at_ms,
             updated_at_ms: summary.updated_at_ms,
             memory_reviewed: summary.memory_reviewed,
-            messages: self.messages_for_session(session_id).await?,
-            trace_spans: self.trace_spans_for_session(session_id).await?,
+            messages: self.messages_for_session(session_id)?,
+            trace_spans: self.trace_spans_for_session(session_id)?,
         })
     }
 
-    pub async fn timeline_page(
+    pub fn timeline_page(
         &self,
         session_id: &str,
         before_cursor: u64,
         limit: u32,
     ) -> HamburResult<TimelinePageData> {
-        self.ensure_session_exists(session_id).await?;
+        self.ensure_session_exists(session_id)?;
         let mut page = self
             .timeline_items_page(session_id, before_cursor, limit)
-            .await?;
+            ?;
         let payload_refs = message_block_payload_refs(&page.items);
         page.message_block_payloads = self
             .message_blocks_for_payload_refs(session_id, &payload_refs)
-            .await?;
+            ?;
         Ok(page)
     }
 
-    pub async fn visible_chat_transcript_before_message(
+    pub fn visible_chat_transcript_before_message(
         &self,
         session_id: &str,
         message_id: &str,
     ) -> HamburResult<Vec<ChatTranscriptEntry>> {
-        self.ensure_session_exists(session_id).await?;
-        let boundary = self.message_snapshot(message_id).await?.ok_or_else(|| {
+        self.ensure_session_exists(session_id)?;
+        let boundary = self.message_snapshot(message_id)?.ok_or_else(|| {
             HamburError::InvalidCommand(format!("message not found: {message_id}"))
         })?;
         if boundary.session_id != session_id {
@@ -415,15 +415,15 @@ impl HamburDatabase {
                     boundary.id.clone()
                 ],
             )
-            .await
+            
             .map_err(database_error)?;
 
         let mut entries = Vec::new();
-        while let Some(row) = rows.next().await.map_err(database_error)? {
+        while let Some(row) = rows.next().map_err(database_error)? {
             let mut message = message_from_row(&row)?;
-            message.attachments = self.attachments_for_message(&message.id).await?;
+            message.attachments = self.attachments_for_message(&message.id)?;
             let tool_calls = if message.role == "assistant" {
-                self.tool_calls_for_assistant_message(&message.id).await?
+                self.tool_calls_for_assistant_message(&message.id)?
             } else {
                 Vec::new()
             };
@@ -435,26 +435,26 @@ impl HamburDatabase {
         Ok(entries)
     }
 
-    pub async fn message_snapshot(&self, message_id: &str) -> HamburResult<Option<MessageRecord>> {
+    pub fn message_snapshot(&self, message_id: &str) -> HamburResult<Option<MessageRecord>> {
         if message_id.trim().is_empty() {
             return Err(HamburError::InvalidCommand(
                 "message_id must not be empty".to_string(),
             ));
         }
-        let Some(mut message) = self.message_by_id(message_id).await? else {
+        let Some(mut message) = self.message_by_id(message_id)? else {
             return Ok(None);
         };
-        message.attachments = self.attachments_for_message(message_id).await?;
+        message.attachments = self.attachments_for_message(message_id)?;
         Ok(Some(message))
     }
 
-    pub async fn source_user_message_for(
+    pub fn source_user_message_for(
         &self,
         session_id: &str,
         message_id: &str,
     ) -> HamburResult<MessageRecord> {
-        self.ensure_session_exists(session_id).await?;
-        let source = self.message_snapshot(message_id).await?.ok_or_else(|| {
+        self.ensure_session_exists(session_id)?;
+        let source = self.message_snapshot(message_id)?.ok_or_else(|| {
             HamburError::InvalidCommand(format!("message not found: {message_id}"))
         })?;
 
@@ -502,10 +502,10 @@ impl HamburDatabase {
                 ",
                 params![session_id, source.created_at_ms as i64],
             )
-            .await
+            
             .map_err(database_error)?;
 
-        let Some(row) = rows.next().await.map_err(database_error)? else {
+        let Some(row) = rows.next().map_err(database_error)? else {
             return Err(HamburError::InvalidCommand(format!(
                 "source user message not found for: {message_id}"
             )));
@@ -514,14 +514,14 @@ impl HamburDatabase {
         message_from_row(&row)
     }
 
-    pub async fn search_sessions(
+    pub fn search_sessions(
         &self,
         query: &str,
         limit: u32,
     ) -> HamburResult<Vec<SessionSummary>> {
         let query = query.trim();
         if query.is_empty() {
-            return self.list_sessions_page(limit, 0).await;
+            return self.list_sessions_page(limit, 0);
         }
 
         let limit = clamp_limit(limit, 1, 100);
@@ -558,18 +558,18 @@ impl HamburDatabase {
                 ",
                 params![pattern, limit as i64],
             )
-            .await
+            
             .map_err(database_error)?;
 
         let mut sessions = Vec::new();
-        while let Some(row) = rows.next().await.map_err(database_error)? {
+        while let Some(row) = rows.next().map_err(database_error)? {
             sessions.push(session_summary_from_row(&row)?);
         }
 
         Ok(sessions)
     }
 
-    pub async fn provider_by_id(&self, provider_id: &str) -> HamburResult<ProviderRecord> {
+    pub fn provider_by_id(&self, provider_id: &str) -> HamburResult<ProviderRecord> {
         let mut rows = self
             .connection
             .query(
@@ -581,10 +581,10 @@ impl HamburDatabase {
                 ",
                 params![provider_id],
             )
-            .await
+            
             .map_err(database_error)?;
 
-        let Some(row) = rows.next().await.map_err(database_error)? else {
+        let Some(row) = rows.next().map_err(database_error)? else {
             return Err(HamburError::ProviderUnavailable(format!(
                 "provider not found: {provider_id}"
             )));
@@ -592,7 +592,7 @@ impl HamburDatabase {
         provider_record_from_row(&row)
     }
 
-    pub async fn provider_model_by_key(
+    pub fn provider_model_by_key(
         &self,
         provider_id: &str,
         model_id: &str,
@@ -622,10 +622,10 @@ impl HamburDatabase {
                 ",
                 params![provider_id, model_id],
             )
-            .await
+            
             .map_err(database_error)?;
 
-        let Some(row) = rows.next().await.map_err(database_error)? else {
+        let Some(row) = rows.next().map_err(database_error)? else {
             return Err(HamburError::ModelUnavailable(format!(
                 "provider model not found: {provider_id}/{model_id}"
             )));
@@ -633,7 +633,7 @@ impl HamburDatabase {
         provider_model_from_row(&row)
     }
 
-    pub async fn provider_models(
+    pub fn provider_models(
         &self,
         provider_id: &str,
     ) -> HamburResult<Vec<ProviderModelRecord>> {
@@ -662,37 +662,37 @@ impl HamburDatabase {
                 ",
                 params![provider_id],
             )
-            .await
+            
             .map_err(database_error)?;
 
         let mut models = Vec::new();
-        while let Some(row) = rows.next().await.map_err(database_error)? {
+        while let Some(row) = rows.next().map_err(database_error)? {
             models.push(provider_model_from_row(&row)?);
         }
         Ok(models)
     }
 
-    pub async fn settings_snapshot(&self) -> HamburResult<SettingsSnapshot> {
+    pub fn settings_snapshot(&self) -> HamburResult<SettingsSnapshot> {
         Ok(SettingsSnapshot {
-            providers: self.public_providers().await?,
-            provider_models: self.all_provider_models().await?,
-            model_groups: self.model_groups().await?,
-            model_group_members: self.model_group_members().await?,
-            default_model_groups: self.default_model_groups().await?,
-            settings: self.app_settings().await?,
-            config_audits: self.config_audits(40).await?,
+            providers: self.public_providers()?,
+            provider_models: self.all_provider_models()?,
+            model_groups: self.model_groups()?,
+            model_group_members: self.model_group_members()?,
+            default_model_groups: self.default_model_groups()?,
+            settings: self.app_settings()?,
+            config_audits: self.config_audits(40)?,
         })
     }
 
-    pub async fn primary_chat_route(&self) -> HamburResult<Vec<ModelRouteSnapshot>> {
-        self.default_model_group_route("primary").await
+    pub fn primary_chat_route(&self) -> HamburResult<Vec<ModelRouteSnapshot>> {
+        self.default_model_group_route("primary")
     }
 
-    pub async fn memory_review_route(&self) -> HamburResult<Vec<ModelRouteSnapshot>> {
-        self.default_model_group_route("secondary").await
+    pub fn memory_review_route(&self) -> HamburResult<Vec<ModelRouteSnapshot>> {
+        self.default_model_group_route("secondary")
     }
 
-    pub(crate) async fn default_model_group_route(
+    pub(crate) fn default_model_group_route(
         &self,
         default_key: &str,
     ) -> HamburResult<Vec<ModelRouteSnapshot>> {
@@ -734,21 +734,21 @@ impl HamburDatabase {
                 ",
                 params![default_key],
             )
-            .await
+            
             .map_err(database_error)?;
 
         let mut targets = Vec::new();
-        while let Some(row) = rows.next().await.map_err(database_error)? {
+        while let Some(row) = rows.next().map_err(database_error)? {
             targets.push(model_route_from_row(&row)?);
         }
 
         if targets.is_empty() {
-            let fallback = self.first_enabled_model_route().await?;
+            let fallback = self.first_enabled_model_route()?;
             targets.extend(fallback);
         }
         Ok(targets)
     }
-    pub(crate) async fn first_enabled_model_route(&self) -> HamburResult<Vec<ModelRouteSnapshot>> {
+    pub(crate) fn first_enabled_model_route(&self) -> HamburResult<Vec<ModelRouteSnapshot>> {
         let mut rows = self
             .connection
             .query(
@@ -782,27 +782,27 @@ impl HamburDatabase {
                 ",
                 params![],
             )
-            .await
+            
             .map_err(database_error)?;
 
-        let Some(row) = rows.next().await.map_err(database_error)? else {
+        let Some(row) = rows.next().map_err(database_error)? else {
             return Err(HamburError::ProviderUnavailable(
                 "no enabled provider model is configured".to_string(),
             ));
         };
         Ok(vec![model_route_from_row(&row)?])
     }
-    pub(crate) async fn snapshot_for_selected(
+    pub(crate) fn snapshot_for_selected(
         &self,
         requested_session_id: Option<&str>,
     ) -> HamburResult<AppSnapshot> {
-        let sessions = self.list_sessions().await?;
-        let active_session_id = self.active_session_id().await?;
+        let sessions = self.list_sessions()?;
+        let active_session_id = self.active_session_id()?;
         let selected_session_id = match requested_session_id {
             Some(session_id) if sessions.iter().any(|session| session.id == session_id) => {
                 session_id.to_string()
             }
-            Some(session_id) if self.session_exists(session_id).await? => session_id.to_string(),
+            Some(session_id) if self.session_exists(session_id)? => session_id.to_string(),
             _ if active_session_id.as_ref().is_some_and(|session_id| {
                 sessions.iter().any(|session| session.id == *session_id)
             }) =>
@@ -818,20 +818,20 @@ impl HamburDatabase {
             Vec::new()
         } else {
             self.timeline_items_for_session(&selected_session_id)
-                .await?
+                ?
         };
         let message_block_payloads = if selected_session_id.is_empty() {
             Vec::new()
         } else {
             let payload_refs = message_block_payload_refs(&timeline_items);
             self.message_blocks_for_payload_refs(&selected_session_id, &payload_refs)
-                .await?
+                ?
         };
         let pending_attachments = if selected_session_id.is_empty() {
             Vec::new()
         } else {
             self.pending_attachments_for_session(&selected_session_id)
-                .await?
+                ?
         };
 
         Ok(AppSnapshot {
@@ -842,10 +842,10 @@ impl HamburDatabase {
             pending_attachments,
         })
     }
-    pub(crate) async fn list_sessions(&self) -> HamburResult<Vec<SessionSummary>> {
-        self.list_sessions_page(100, 0).await
+    pub(crate) fn list_sessions(&self) -> HamburResult<Vec<SessionSummary>> {
+        self.list_sessions_page(100, 0)
     }
-    pub(crate) async fn list_sessions_page(
+    pub(crate) fn list_sessions_page(
         &self,
         limit: u32,
         offset: u32,
@@ -882,17 +882,17 @@ impl HamburDatabase {
                 ",
                 params![limit as i64, offset as i64],
             )
-            .await
+            
             .map_err(database_error)?;
 
         let mut sessions = Vec::new();
-        while let Some(row) = rows.next().await.map_err(database_error)? {
+        while let Some(row) = rows.next().map_err(database_error)? {
             sessions.push(session_summary_from_row(&row)?);
         }
 
         Ok(sessions)
     }
-    pub(crate) async fn timeline_items_for_session(
+    pub(crate) fn timeline_items_for_session(
         &self,
         session_id: &str,
     ) -> HamburResult<Vec<TimelineItemSnapshot>> {
@@ -922,11 +922,11 @@ impl HamburDatabase {
                 ",
                 params![session_id],
             )
-            .await
+            
             .map_err(database_error)?;
 
         let mut items = Vec::new();
-        while let Some(row) = rows.next().await.map_err(database_error)? {
+        while let Some(row) = rows.next().map_err(database_error)? {
             items.push(TimelineItemSnapshot {
                 id: row.get::<String>(0).map_err(database_error)?,
                 stable_key: row.get::<String>(1).map_err(database_error)?,
@@ -945,10 +945,10 @@ impl HamburDatabase {
             });
         }
 
-        self.hydrate_timeline_attachments(&mut items).await?;
+        self.hydrate_timeline_attachments(&mut items)?;
         Ok(items)
     }
-    pub(crate) async fn timeline_items_page(
+    pub(crate) fn timeline_items_page(
         &self,
         session_id: &str,
         before_cursor: u64,
@@ -983,7 +983,7 @@ impl HamburDatabase {
                     ",
                     params![session_id, fetch_limit as i64],
                 )
-                .await
+                
                 .map_err(database_error)?
         } else {
             self.connection
@@ -1014,12 +1014,12 @@ impl HamburDatabase {
                     ",
                     params![session_id, before_cursor as i64, fetch_limit as i64],
                 )
-                .await
+                
                 .map_err(database_error)?
         };
 
         let mut items = Vec::new();
-        while let Some(row) = rows.next().await.map_err(database_error)? {
+        while let Some(row) = rows.next().map_err(database_error)? {
             items.push(timeline_item_from_row(&row)?);
         }
 
@@ -1036,7 +1036,7 @@ impl HamburDatabase {
         } else {
             0
         };
-        self.hydrate_timeline_attachments(&mut items).await?;
+        self.hydrate_timeline_attachments(&mut items)?;
 
         Ok(TimelinePageData {
             items,
@@ -1045,31 +1045,31 @@ impl HamburDatabase {
             has_more,
         })
     }
-    pub(crate) async fn session_exists(&self, session_id: &str) -> HamburResult<bool> {
+    pub(crate) fn session_exists(&self, session_id: &str) -> HamburResult<bool> {
         let mut rows = self
             .connection
             .query(
                 "SELECT id FROM sessions WHERE id = ?1 AND deleted_at_ms IS NULL LIMIT 1",
                 params![session_id],
             )
-            .await
+            
             .map_err(database_error)?;
 
-        Ok(rows.next().await.map_err(database_error)?.is_some())
+        Ok(rows.next().map_err(database_error)?.is_some())
     }
-    pub(crate) async fn chat_session_exists(&self, session_id: &str) -> HamburResult<bool> {
+    pub(crate) fn chat_session_exists(&self, session_id: &str) -> HamburResult<bool> {
         let mut rows = self
             .connection
             .query(
                 "SELECT id FROM sessions WHERE id = ?1 AND purpose = 'chat' AND deleted_at_ms IS NULL LIMIT 1",
                 params![session_id],
             )
-            .await
+            
             .map_err(database_error)?;
 
-        Ok(rows.next().await.map_err(database_error)?.is_some())
+        Ok(rows.next().map_err(database_error)?.is_some())
     }
-    pub(crate) async fn session_summary_by_id(
+    pub(crate) fn session_summary_by_id(
         &self,
         session_id: &str,
     ) -> HamburResult<SessionSummary> {
@@ -1102,10 +1102,10 @@ impl HamburDatabase {
                 ",
                 params![session_id],
             )
-            .await
+            
             .map_err(database_error)?;
 
-        let Some(row) = rows.next().await.map_err(database_error)? else {
+        let Some(row) = rows.next().map_err(database_error)? else {
             return Err(HamburError::InvalidCommand(format!(
                 "session not found: {session_id}"
             )));
@@ -1113,17 +1113,17 @@ impl HamburDatabase {
 
         session_summary_from_row(&row)
     }
-    pub(crate) async fn active_session_id(&self) -> HamburResult<Option<String>> {
+    pub(crate) fn active_session_id(&self) -> HamburResult<Option<String>> {
         let mut rows = self
             .connection
             .query(
                 "SELECT value FROM app_state WHERE key = 'active_session_id' LIMIT 1",
                 params![],
             )
-            .await
+            
             .map_err(database_error)?;
 
-        let Some(row) = rows.next().await.map_err(database_error)? else {
+        let Some(row) = rows.next().map_err(database_error)? else {
             return Ok(None);
         };
         let value = row.get::<String>(0).map_err(database_error)?;
@@ -1133,7 +1133,7 @@ impl HamburDatabase {
             Ok(Some(value))
         }
     }
-    pub(crate) async fn timeline_item_by_stable_key(
+    pub(crate) fn timeline_item_by_stable_key(
         &self,
         session_id: &str,
         stable_key: &str,
@@ -1164,10 +1164,10 @@ impl HamburDatabase {
                 ",
                 params![session_id, stable_key],
             )
-            .await
+            
             .map_err(database_error)?;
 
-        let Some(row) = rows.next().await.map_err(database_error)? else {
+        let Some(row) = rows.next().map_err(database_error)? else {
             return Err(HamburError::Internal(format!(
                 "timeline item not found after upsert: {stable_key}"
             )));
@@ -1175,10 +1175,10 @@ impl HamburDatabase {
 
         let mut item = timeline_item_from_row(&row)?;
         self.hydrate_timeline_attachments(std::slice::from_mut(&mut item))
-            .await?;
+            ?;
         Ok(item)
     }
-    pub(crate) async fn message_by_id(
+    pub(crate) fn message_by_id(
         &self,
         message_id: &str,
     ) -> HamburResult<Option<MessageRecord>> {
@@ -1214,16 +1214,16 @@ impl HamburDatabase {
                 ",
                 params![message_id],
             )
-            .await
+            
             .map_err(database_error)?;
 
-        let Some(row) = rows.next().await.map_err(database_error)? else {
+        let Some(row) = rows.next().map_err(database_error)? else {
             return Ok(None);
         };
 
         Ok(Some(message_from_row(&row)?))
     }
-    pub async fn messages_for_session(&self, session_id: &str) -> HamburResult<Vec<MessageRecord>> {
+    pub fn messages_for_session(&self, session_id: &str) -> HamburResult<Vec<MessageRecord>> {
         let mut rows = self
             .connection
             .query(
@@ -1256,18 +1256,18 @@ impl HamburDatabase {
                 ",
                 params![session_id],
             )
-            .await
+            
             .map_err(database_error)?;
 
         let mut messages = Vec::new();
-        while let Some(row) = rows.next().await.map_err(database_error)? {
+        while let Some(row) = rows.next().map_err(database_error)? {
             let mut message = message_from_row(&row)?;
-            message.attachments = self.attachments_for_message(&message.id).await?;
+            message.attachments = self.attachments_for_message(&message.id)?;
             messages.push(message);
         }
         Ok(messages)
     }
-    pub(crate) async fn turn_by_id(&self, turn_id: &str) -> HamburResult<TurnRecord> {
+    pub(crate) fn turn_by_id(&self, turn_id: &str) -> HamburResult<TurnRecord> {
         let mut rows = self
             .connection
             .query(
@@ -1293,10 +1293,10 @@ impl HamburDatabase {
                 ",
                 params![turn_id],
             )
-            .await
+            
             .map_err(database_error)?;
 
-        let Some(row) = rows.next().await.map_err(database_error)? else {
+        let Some(row) = rows.next().map_err(database_error)? else {
             return Err(HamburError::InvalidCommand(format!(
                 "turn not found: {turn_id}"
             )));
@@ -1323,7 +1323,7 @@ impl HamburDatabase {
             error_message: row.get::<String>(13).map_err(database_error)?,
         })
     }
-    pub(crate) async fn trace_span_by_id(&self, trace_id: &str) -> HamburResult<TraceSpanRecord> {
+    pub(crate) fn trace_span_by_id(&self, trace_id: &str) -> HamburResult<TraceSpanRecord> {
         let mut rows = self
             .connection
             .query(
@@ -1347,17 +1347,17 @@ impl HamburDatabase {
                 ",
                 params![trace_id],
             )
-            .await
+            
             .map_err(database_error)?;
 
-        let Some(row) = rows.next().await.map_err(database_error)? else {
+        let Some(row) = rows.next().map_err(database_error)? else {
             return Err(HamburError::InvalidCommand(format!(
                 "trace span not found: {trace_id}"
             )));
         };
         trace_span_from_row(&row)
     }
-    pub(crate) async fn trace_spans_for_session(
+    pub(crate) fn trace_spans_for_session(
         &self,
         session_id: &str,
     ) -> HamburResult<Vec<TraceSpanRecord>> {
@@ -1384,16 +1384,16 @@ impl HamburDatabase {
                 ",
                 params![session_id],
             )
-            .await
+            
             .map_err(database_error)?;
 
         let mut traces = Vec::new();
-        while let Some(row) = rows.next().await.map_err(database_error)? {
+        while let Some(row) = rows.next().map_err(database_error)? {
             traces.push(trace_span_from_row(&row)?);
         }
         Ok(traces)
     }
-    pub(crate) async fn tool_call_by_id(&self, tool_call_id: &str) -> HamburResult<ToolCallRecord> {
+    pub(crate) fn tool_call_by_id(&self, tool_call_id: &str) -> HamburResult<ToolCallRecord> {
         let mut rows = self
             .connection
             .query(
@@ -1421,17 +1421,17 @@ impl HamburDatabase {
                 ",
                 params![tool_call_id],
             )
-            .await
+            
             .map_err(database_error)?;
 
-        let Some(row) = rows.next().await.map_err(database_error)? else {
+        let Some(row) = rows.next().map_err(database_error)? else {
             return Err(HamburError::InvalidCommand(format!(
                 "tool call not found: {tool_call_id}"
             )));
         };
         tool_call_from_row(&row)
     }
-    pub(crate) async fn tool_calls_for_assistant_message(
+    pub(crate) fn tool_calls_for_assistant_message(
         &self,
         assistant_message_id: &str,
     ) -> HamburResult<Vec<ToolCallRecord>> {
@@ -1462,16 +1462,16 @@ impl HamburDatabase {
                 ",
                 params![assistant_message_id],
             )
-            .await
+            
             .map_err(database_error)?;
 
         let mut calls = Vec::new();
-        while let Some(row) = rows.next().await.map_err(database_error)? {
+        while let Some(row) = rows.next().map_err(database_error)? {
             calls.push(tool_call_from_row(&row)?);
         }
         Ok(calls)
     }
-    pub(crate) async fn tool_result_by_id(
+    pub(crate) fn tool_result_by_id(
         &self,
         result_id: &str,
     ) -> HamburResult<ToolResultRecord> {
@@ -1501,17 +1501,17 @@ impl HamburDatabase {
                 ",
                 params![result_id],
             )
-            .await
+            
             .map_err(database_error)?;
 
-        let Some(row) = rows.next().await.map_err(database_error)? else {
+        let Some(row) = rows.next().map_err(database_error)? else {
             return Err(HamburError::InvalidCommand(format!(
                 "tool result not found: {result_id}"
             )));
         };
         tool_result_from_row(&row)
     }
-    pub async fn file_by_id(&self, file_id: &str) -> HamburResult<FileRecord> {
+    pub fn file_by_id(&self, file_id: &str) -> HamburResult<FileRecord> {
         let mut rows = self
             .connection
             .query(
@@ -1534,9 +1534,9 @@ impl HamburDatabase {
                 ",
                 params![file_id],
             )
-            .await
+            
             .map_err(database_error)?;
-        let Some(row) = rows.next().await.map_err(database_error)? else {
+        let Some(row) = rows.next().map_err(database_error)? else {
             return Err(HamburError::InvalidCommand(format!(
                 "file not found: {file_id}"
             )));
@@ -1544,7 +1544,7 @@ impl HamburDatabase {
         file_from_row(&row)
     }
 
-    pub async fn attachment_by_id(&self, attachment_id: &str) -> HamburResult<AttachmentRecord> {
+    pub fn attachment_by_id(&self, attachment_id: &str) -> HamburResult<AttachmentRecord> {
         let mut rows = self
             .connection
             .query(
@@ -1573,9 +1573,9 @@ impl HamburDatabase {
                 ",
                 params![attachment_id],
             )
-            .await
+            
             .map_err(database_error)?;
-        let Some(row) = rows.next().await.map_err(database_error)? else {
+        let Some(row) = rows.next().map_err(database_error)? else {
             return Err(HamburError::InvalidCommand(format!(
                 "attachment not found: {attachment_id}"
             )));
@@ -1583,7 +1583,7 @@ impl HamburDatabase {
         attachment_from_row(&row)
     }
 
-    pub async fn attachments_for_message(
+    pub fn attachments_for_message(
         &self,
         message_id: &str,
     ) -> HamburResult<Vec<AttachmentRecord>> {
@@ -1619,16 +1619,16 @@ impl HamburDatabase {
                 ",
                 params![message_id],
             )
-            .await
+            
             .map_err(database_error)?;
         let mut attachments = Vec::new();
-        while let Some(row) = rows.next().await.map_err(database_error)? {
+        while let Some(row) = rows.next().map_err(database_error)? {
             attachments.push(attachment_from_row(&row)?);
         }
         Ok(attachments)
     }
 
-    async fn hydrate_timeline_attachments(
+    fn hydrate_timeline_attachments(
         &self,
         items: &mut [TimelineItemSnapshot],
     ) -> HamburResult<()> {
@@ -1680,11 +1680,11 @@ impl HamburDatabase {
         let mut rows = self
             .connection
             .query(&sql, params)
-            .await
+            
             .map_err(database_error)?;
 
         let mut attachments_by_message_id: HashMap<String, Vec<AttachmentRecord>> = HashMap::new();
-        while let Some(row) = rows.next().await.map_err(database_error)? {
+        while let Some(row) = rows.next().map_err(database_error)? {
             let attachment = attachment_from_row(&row)?;
             attachments_by_message_id
                 .entry(attachment.message_id.clone())
@@ -1701,7 +1701,7 @@ impl HamburDatabase {
         Ok(())
     }
 
-    pub(crate) async fn file_cleanup_job_by_id(
+    pub(crate) fn file_cleanup_job_by_id(
         &self,
         job_id: &str,
     ) -> HamburResult<FileCleanupJobRecord> {
@@ -1716,16 +1716,16 @@ impl HamburDatabase {
                 ",
                 params![job_id],
             )
-            .await
+            
             .map_err(database_error)?;
-        let Some(row) = rows.next().await.map_err(database_error)? else {
+        let Some(row) = rows.next().map_err(database_error)? else {
             return Err(HamburError::InvalidCommand(format!(
                 "file cleanup job not found: {job_id}"
             )));
         };
         file_cleanup_job_from_row(&row)
     }
-    pub(crate) async fn public_providers(&self) -> HamburResult<Vec<PublicProviderRecord>> {
+    pub(crate) fn public_providers(&self) -> HamburResult<Vec<PublicProviderRecord>> {
         let mut rows = self
             .connection
             .query(
@@ -1736,15 +1736,15 @@ impl HamburDatabase {
                 ",
                 params![],
             )
-            .await
+            
             .map_err(database_error)?;
         let mut providers = Vec::new();
-        while let Some(row) = rows.next().await.map_err(database_error)? {
+        while let Some(row) = rows.next().map_err(database_error)? {
             providers.push(public_provider_from_row(&row)?);
         }
         Ok(providers)
     }
-    pub(crate) async fn all_provider_models(&self) -> HamburResult<Vec<ProviderModelRecord>> {
+    pub(crate) fn all_provider_models(&self) -> HamburResult<Vec<ProviderModelRecord>> {
         let mut rows = self
             .connection
             .query(
@@ -1769,15 +1769,15 @@ impl HamburDatabase {
                 ",
                 params![],
             )
-            .await
+            
             .map_err(database_error)?;
         let mut models = Vec::new();
-        while let Some(row) = rows.next().await.map_err(database_error)? {
+        while let Some(row) = rows.next().map_err(database_error)? {
             models.push(provider_model_from_row(&row)?);
         }
         Ok(models)
     }
-    pub(crate) async fn model_groups(&self) -> HamburResult<Vec<ModelGroupRecord>> {
+    pub(crate) fn model_groups(&self) -> HamburResult<Vec<ModelGroupRecord>> {
         let mut rows = self
             .connection
             .query(
@@ -1788,15 +1788,15 @@ impl HamburDatabase {
                 ",
                 params![],
             )
-            .await
+            
             .map_err(database_error)?;
         let mut groups = Vec::new();
-        while let Some(row) = rows.next().await.map_err(database_error)? {
+        while let Some(row) = rows.next().map_err(database_error)? {
             groups.push(model_group_from_row(&row)?);
         }
         Ok(groups)
     }
-    pub(crate) async fn model_group_by_id(&self, group_id: &str) -> HamburResult<ModelGroupRecord> {
+    pub(crate) fn model_group_by_id(&self, group_id: &str) -> HamburResult<ModelGroupRecord> {
         let mut rows = self
             .connection
             .query(
@@ -1808,16 +1808,16 @@ impl HamburDatabase {
                 ",
                 params![group_id],
             )
-            .await
+            
             .map_err(database_error)?;
-        let Some(row) = rows.next().await.map_err(database_error)? else {
+        let Some(row) = rows.next().map_err(database_error)? else {
             return Err(HamburError::ModelUnavailable(format!(
                 "model group not found: {group_id}"
             )));
         };
         model_group_from_row(&row)
     }
-    pub(crate) async fn model_group_members(&self) -> HamburResult<Vec<ModelGroupMemberRecord>> {
+    pub(crate) fn model_group_members(&self) -> HamburResult<Vec<ModelGroupMemberRecord>> {
         let mut rows = self
             .connection
             .query(
@@ -1838,15 +1838,15 @@ impl HamburDatabase {
                 ",
                 params![],
             )
-            .await
+            
             .map_err(database_error)?;
         let mut members = Vec::new();
-        while let Some(row) = rows.next().await.map_err(database_error)? {
+        while let Some(row) = rows.next().map_err(database_error)? {
             members.push(model_group_member_from_row(&row)?);
         }
         Ok(members)
     }
-    pub(crate) async fn model_group_member_by_key(
+    pub(crate) fn model_group_member_by_key(
         &self,
         group_id: &str,
         provider_id: &str,
@@ -1873,16 +1873,16 @@ impl HamburDatabase {
                 ",
                 params![group_id, provider_id, model_id],
             )
-            .await
+            
             .map_err(database_error)?;
-        let Some(row) = rows.next().await.map_err(database_error)? else {
+        let Some(row) = rows.next().map_err(database_error)? else {
             return Err(HamburError::ModelUnavailable(format!(
                 "model group member not found: {group_id}/{provider_id}/{model_id}"
             )));
         };
         model_group_member_from_row(&row)
     }
-    pub(crate) async fn default_model_groups(&self) -> HamburResult<Vec<DefaultModelGroupRecord>> {
+    pub(crate) fn default_model_groups(&self) -> HamburResult<Vec<DefaultModelGroupRecord>> {
         let mut rows = self
             .connection
             .query(
@@ -1893,10 +1893,10 @@ impl HamburDatabase {
                 ",
                 params![],
             )
-            .await
+            
             .map_err(database_error)?;
         let mut defaults = Vec::new();
-        while let Some(row) = rows.next().await.map_err(database_error)? {
+        while let Some(row) = rows.next().map_err(database_error)? {
             defaults.push(DefaultModelGroupRecord {
                 key: row.get::<String>(0).map_err(database_error)?,
                 group_id: row.get::<String>(1).map_err(database_error)?,
@@ -1905,7 +1905,7 @@ impl HamburDatabase {
         }
         Ok(defaults)
     }
-    pub(crate) async fn app_settings(&self) -> HamburResult<Vec<AppSettingRecord>> {
+    pub(crate) fn app_settings(&self) -> HamburResult<Vec<AppSettingRecord>> {
         let mut rows = self
             .connection
             .query(
@@ -1916,10 +1916,10 @@ impl HamburDatabase {
                 ",
                 params![],
             )
-            .await
+            
             .map_err(database_error)?;
         let mut settings = Vec::new();
-        while let Some(row) = rows.next().await.map_err(database_error)? {
+        while let Some(row) = rows.next().map_err(database_error)? {
             settings.push(AppSettingRecord {
                 key: row.get::<String>(0).map_err(database_error)?,
                 value: row.get::<String>(1).map_err(database_error)?,
@@ -1929,7 +1929,7 @@ impl HamburDatabase {
         Ok(settings)
     }
 
-    pub async fn model_catalog_cache(
+    pub fn model_catalog_cache(
         &self,
         key: &str,
     ) -> HamburResult<Option<ModelCatalogCacheRecord>> {
@@ -1944,9 +1944,9 @@ impl HamburDatabase {
                 ",
                 params![key],
             )
-            .await
+            
             .map_err(database_error)?;
-        let Some(row) = rows.next().await.map_err(database_error)? else {
+        let Some(row) = rows.next().map_err(database_error)? else {
             return Ok(None);
         };
         Ok(Some(ModelCatalogCacheRecord {
@@ -1956,7 +1956,7 @@ impl HamburDatabase {
         }))
     }
 
-    pub(crate) async fn config_audits(&self, limit: u32) -> HamburResult<Vec<ConfigAuditRecord>> {
+    pub(crate) fn config_audits(&self, limit: u32) -> HamburResult<Vec<ConfigAuditRecord>> {
         let limit = clamp_limit(limit, 1, 100);
         let mut rows = self
             .connection
@@ -1979,10 +1979,10 @@ impl HamburDatabase {
                 ",
                 params![limit as i64],
             )
-            .await
+            
             .map_err(database_error)?;
         let mut audits = Vec::new();
-        while let Some(row) = rows.next().await.map_err(database_error)? {
+        while let Some(row) = rows.next().map_err(database_error)? {
             audits.push(config_audit_from_row(&row)?);
         }
         Ok(audits)

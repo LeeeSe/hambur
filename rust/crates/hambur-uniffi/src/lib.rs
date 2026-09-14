@@ -10,7 +10,7 @@ use hambur_markdown::{
     MarkdownBlockNode, MarkdownInlineNode, MarkdownRenderUpdate, MarkdownTableRow,
 };
 use hambur_runtime::{
-    AppBootstrap, PlatformRequest, RuntimeCommand, RuntimeCommandAck, RuntimeEngine, RuntimeEvent,
+    AppBootstrap, PlatformRequest, RuntimeCommand, RuntimeCommandAck, RuntimeEngine, RuntimeEvent, RuntimeEventKind, RuntimeEventPayload,
     RuntimeFileResolution, RuntimeMemoryFileDetail, RuntimeMemoryFileSummary,
     RuntimeMessageSnapshot, RuntimeRootfsStatus, RuntimeSearchSnapshot, RuntimeSessionListSnapshot,
     RuntimeSessionSnapshot, RuntimeSettingsSnapshot, RuntimeSkillDetail, RuntimeSkillSummary,
@@ -57,14 +57,55 @@ pub struct BackendEvent {
     pub schema_version: u32,
     pub sequence: u64,
     pub created_at_ms: u64,
-    pub kind: String,
+    pub kind: BackendEventKind,
     pub session_id: String,
     pub turn_id: String,
-    pub snapshot: AppSnapshotDTO,
-    pub markdown_render_update: MarkdownRenderUpdateDTO,
-    pub platform_request: PlatformRequestDTO,
+    pub payload: BackendEventPayload,
     pub error_code: String,
     pub message: String,
+}
+
+/// Typed per-event data. Structural events carry a snapshot; streaming deltas carry only the delta.
+pub enum BackendEventPayload {
+    None,
+    Snapshot { snapshot: AppSnapshotDTO },
+    Delta { message_id: String, delta: String },
+    Markdown { update: MarkdownRenderUpdateDTO },
+    Attachments { attachments: Vec<AttachmentDTO> },
+    PlatformRequest { request: PlatformRequestDTO },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendEventKind {
+    RuntimeReady,
+    RuntimeClosed,
+    RuntimeError,
+    SessionCreated,
+    SessionOpened,
+    SessionDeleted,
+    SessionRenamed,
+    SessionPinnedChanged,
+    ModelsUpdated,
+    SettingsChanged,
+    AttachmentImported,
+    PendingAttachmentRemoved,
+    PendingAttachmentsCleaned,
+    TurnStarted,
+    TurnStateChanged,
+    TurnFinished,
+    TurnFailed,
+    TurnCancelled,
+    MessageUpserted,
+    AssistantMessageStarted,
+    AssistantMessageFinished,
+    AssistantReasoningDelta,
+    MarkdownRenderUpdate,
+    ToolCallStarted,
+    ToolCallDelta,
+    ToolCallFinished,
+    ToolCallFailed,
+    PlatformRequest,
+    PlatformRequestTimedOut,
 }
 
 pub struct PlatformRequestDTO {
@@ -613,14 +654,69 @@ impl From<RuntimeEvent> for BackendEvent {
             schema_version: value.schema_version,
             sequence: value.sequence,
             created_at_ms: value.created_at_ms,
-            kind: value.kind.as_str().to_string(),
+            kind: value.kind.into(),
             session_id: value.session_id,
             turn_id: value.turn_id,
-            snapshot: value.snapshot.into(),
-            markdown_render_update: value.markdown_render_update.into(),
-            platform_request: value.platform_request.into(),
+            payload: value.payload.into(),
             error_code: value.error_code,
             message: value.message,
+        }
+    }
+}
+
+impl From<RuntimeEventPayload> for BackendEventPayload {
+    fn from(value: RuntimeEventPayload) -> Self {
+        match value {
+            RuntimeEventPayload::None => Self::None,
+            RuntimeEventPayload::Snapshot { snapshot } => Self::Snapshot {
+                snapshot: snapshot.into(),
+            },
+            RuntimeEventPayload::Delta { message_id, delta } => Self::Delta { message_id, delta },
+            RuntimeEventPayload::Markdown { update } => Self::Markdown {
+                update: update.into(),
+            },
+            RuntimeEventPayload::Attachments { attachments } => Self::Attachments {
+                attachments: attachments.into_iter().map(AttachmentDTO::from).collect(),
+            },
+            RuntimeEventPayload::PlatformRequest { request } => Self::PlatformRequest {
+                request: request.into(),
+            },
+        }
+    }
+}
+
+impl From<RuntimeEventKind> for BackendEventKind {
+    fn from(value: RuntimeEventKind) -> Self {
+        match value {
+            RuntimeEventKind::RuntimeReady => Self::RuntimeReady,
+            RuntimeEventKind::RuntimeClosed => Self::RuntimeClosed,
+            RuntimeEventKind::RuntimeError => Self::RuntimeError,
+            RuntimeEventKind::SessionCreated => Self::SessionCreated,
+            RuntimeEventKind::SessionOpened => Self::SessionOpened,
+            RuntimeEventKind::SessionDeleted => Self::SessionDeleted,
+            RuntimeEventKind::SessionRenamed => Self::SessionRenamed,
+            RuntimeEventKind::SessionPinnedChanged => Self::SessionPinnedChanged,
+            RuntimeEventKind::ModelsUpdated => Self::ModelsUpdated,
+            RuntimeEventKind::SettingsChanged => Self::SettingsChanged,
+            RuntimeEventKind::AttachmentImported => Self::AttachmentImported,
+            RuntimeEventKind::PendingAttachmentRemoved => Self::PendingAttachmentRemoved,
+            RuntimeEventKind::PendingAttachmentsCleaned => Self::PendingAttachmentsCleaned,
+            RuntimeEventKind::TurnStarted => Self::TurnStarted,
+            RuntimeEventKind::TurnStateChanged => Self::TurnStateChanged,
+            RuntimeEventKind::TurnFinished => Self::TurnFinished,
+            RuntimeEventKind::TurnFailed => Self::TurnFailed,
+            RuntimeEventKind::TurnCancelled => Self::TurnCancelled,
+            RuntimeEventKind::MessageUpserted => Self::MessageUpserted,
+            RuntimeEventKind::AssistantMessageStarted => Self::AssistantMessageStarted,
+            RuntimeEventKind::AssistantMessageFinished => Self::AssistantMessageFinished,
+            RuntimeEventKind::AssistantReasoningDelta => Self::AssistantReasoningDelta,
+            RuntimeEventKind::MarkdownRenderUpdate => Self::MarkdownRenderUpdate,
+            RuntimeEventKind::ToolCallStarted => Self::ToolCallStarted,
+            RuntimeEventKind::ToolCallDelta => Self::ToolCallDelta,
+            RuntimeEventKind::ToolCallFinished => Self::ToolCallFinished,
+            RuntimeEventKind::ToolCallFailed => Self::ToolCallFailed,
+            RuntimeEventKind::PlatformRequest => Self::PlatformRequest,
+            RuntimeEventKind::PlatformRequestTimedOut => Self::PlatformRequestTimedOut,
         }
     }
 }

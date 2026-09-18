@@ -196,6 +196,7 @@ dependencies {
     implementation("androidx.compose.material3:material3:1.4.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
     implementation("io.coil-kt.coil3:coil-compose:3.3.0")
+    implementation("io.coil-kt.coil3:coil-network-okhttp:3.3.0")
     implementation("com.composables:icons-lucide-android:1.1.0")
     implementation("net.java.dev.jna:jna:5.17.0@aar")
 

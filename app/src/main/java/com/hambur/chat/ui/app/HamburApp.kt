@@ -1,9 +1,12 @@
 package com.hambur.chat.ui.app
 
+import android.content.Intent
+import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
@@ -11,13 +14,18 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.zIndex
 import com.hambur.chat.platform.AndroidPlatformAdapter
 import com.hambur.chat.reducer.HamburUiState
 import com.hambur.chat.reducer.HamburUiStore
 import com.hambur.chat.ui.browser.SharedBrowserScreen
 import com.hambur.chat.ui.chat.HamburChatScreen
+import com.hambur.chat.ui.components.HamburImageZoomSandbox
+import com.hambur.chat.ui.components.HamburZoomImageState
 import com.hambur.chat.ui.preview.HamburFilePreviewScreen
 import com.hambur.chat.ui.settings.AppearanceSettingsScreen
 import com.hambur.chat.ui.settings.FeatureUnavailableScreen
@@ -85,6 +93,7 @@ fun HamburApp(
     }
     val state by store.state.collectAsState()
     val backStack = remember { mutableStateListOf<HamburScreen>(HamburScreen.Chat) }
+    var activeZoomImage by remember { mutableStateOf<HamburZoomImageState?>(null) }
 
     DisposableEffect(store) {
         onDispose { store.shutdown() }
@@ -108,6 +117,36 @@ fun HamburApp(
         BackHandler(onBack = goBack)
     }
 
+    val context = LocalContext.current
+    val isImageTarget: (String) -> Boolean = remember {
+        { path ->
+            val clean = path.substringBefore('?').lowercase()
+            val imageExtensions = listOf(".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg", ".heic", ".heif", ".ico")
+            imageExtensions.any { clean.endsWith(it) }
+        }
+    }
+
+    val openTarget: (String) -> Unit = remember(context) {
+        { target ->
+            val isWeb = target.startsWith("http://", ignoreCase = true) || target.startsWith("https://", ignoreCase = true)
+            val isWebImage = isWeb && isImageTarget(target)
+            if (isImageTarget(target)) {
+                val cleanName = target.substringBefore('?').substringAfterLast('/').ifBlank { "图片预览" }
+                activeZoomImage = HamburZoomImageState(
+                    model = target,
+                    title = cleanName,
+                )
+            } else if (isWeb && !isWebImage) {
+                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(target)).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                runCatching { context.startActivity(intent) }
+            } else {
+                navigate(HamburScreen.FilePreview(target))
+            }
+        }
+    }
+
     HamburTheme(state = state) {
         Surface(
             modifier = Modifier.fillMaxSize(),
@@ -124,7 +163,14 @@ fun HamburApp(
                         store = store,
                         onOpenSettings = { navigate(HamburScreen.Settings) },
                         onOpenBrowser = { navigate(HamburScreen.Browser) },
-                        onOpenFile = { navigate(HamburScreen.FilePreview(it)) },
+                        onOpenFile = openTarget,
+                        onOpenImage = { destination, alt ->
+                            val cleanName = alt.ifBlank { destination.substringBefore('?').substringAfterLast('/') }
+                            activeZoomImage = HamburZoomImageState(
+                                model = destination,
+                                title = cleanName,
+                            )
+                        },
                         onPickImage = { onPicked ->
                             onPickImage { displayName, mimeType, byteSize, uri, sourcePath ->
                                 onPicked(displayName, mimeType, byteSize, uri, sourcePath)
@@ -278,7 +324,25 @@ fun HamburApp(
                         state = state,
                         store = store,
                         onBack = goBack,
-                        onOpenFile = { navigate(HamburScreen.FilePreview(it)) },
+                        onOpenFile = openTarget,
+                        onOpenZoomImage = { zoomState ->
+                            activeZoomImage = zoomState
+                        },
+                    )
+                }
+
+                activeZoomImage?.let { zoomState ->
+                    HamburImageZoomSandbox(
+                        state = zoomState,
+                        onResolveHostPath = { path ->
+                            store.resolveSandboxHostPath(state.selectedSessionId, path)
+                        },
+                        onDismiss = {
+                            activeZoomImage = null
+                        },
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .zIndex(999f),
                     )
                 }
             }

@@ -20,7 +20,21 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
+import androidx.compose.foundation.ComposeFoundationFlags
+import androidx.compose.foundation.ExperimentalFoundationApi
+import coil3.ImageLoader
+import coil3.SingletonImageLoader
+import coil3.network.okhttp.OkHttpNetworkFetcherFactory
+import okhttp3.OkHttpClient
+import java.util.concurrent.TimeUnit
+
+@OptIn(ExperimentalFoundationApi::class)
 class MainActivity : ComponentActivity() {
+    companion object {
+        init {
+            ComposeFoundationFlags.isNewContextMenuEnabled = false
+        }
+    }
     private var pendingPickedAttachment: ((String, String, ULong, String, String) -> Unit)? = null
     private val imagePicker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         handlePickedAttachment(uri)
@@ -71,6 +85,29 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+
+        SingletonImageLoader.setSafe { context ->
+            val okHttpClient = OkHttpClient.Builder()
+                .connectTimeout(15, TimeUnit.SECONDS)
+                .readTimeout(20, TimeUnit.SECONDS)
+                .addInterceptor { chain ->
+                    val request = chain.request().newBuilder()
+                        .header(
+                            "User-Agent",
+                            "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36",
+                        )
+                        .build()
+                    chain.proceed(request)
+                }
+                .build()
+
+            ImageLoader.Builder(context)
+                .components {
+                    add(OkHttpNetworkFetcherFactory(callFactory = { okHttpClient }))
+                }
+                .build()
+        }
+
         val platformAdapter = AndroidPlatformAdapter(
             appContext = applicationContext,
             permissionRequester = { permissions -> requestPermissionsInternal(permissions) },

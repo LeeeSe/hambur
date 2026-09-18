@@ -3,6 +3,8 @@
     <style name="Theme.Hambur" parent="android:style/Theme.Material.Light.NoActionBar">
         <item name="android:windowLightStatusBar">true</item>
         <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:colorBackgroundFloating">#FFFFFF</item>
+        <item name="android:colorAccent">#3F8CFF</item>
     </style>
 </resources>
 

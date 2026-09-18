@@ -44,6 +44,15 @@ Android 37.0 (API 37.0)
 ### 5. CMake (C/C++ 构建工具)
 •  3.22.1
 
+### 6. 设备部署与安装规范 (Deployment Memory)
+
+• **小更新（日常改动、小修复、特性调整）**：通过 adb 编译并安装 **debug** 包到连接的手机：
+  - Windows: `.\gradlew.bat :app:installDebug` 或 `build-install.bat`
+  - Linux/macOS: `./build-install.sh :app:installDebug`
+• **大更新（大版本发布、重大架构升级、完整里程碑）**：通过 adb 编译并安装 **release** 包到连接的手机：
+  - Windows: `.\gradlew.bat :app:installRelease`
+  - Linux/macOS: `./build-install.sh :app:installRelease`
+
 
 Markdown Streaming / Parsing / Rendering Architecture
 

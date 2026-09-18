@@ -753,67 +753,75 @@ class AndroidPlatformAdapter(
         val lm = appContext.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
             ?: return JSONObject().put("status", "Unavailable").put("message", "LocationManager unavailable")
 
-        var bestLocation: Location? = null
-        val providers = listOf(
-            LocationManager.GPS_PROVIDER,
-            LocationManager.NETWORK_PROVIDER,
-            LocationManager.PASSIVE_PROVIDER
-        )
+        val providers = mutableListOf<String>()
+        if (runCatching { lm.isProviderEnabled(LocationManager.FUSED_PROVIDER) }.getOrDefault(false)) {
+            providers.add(LocationManager.FUSED_PROVIDER)
+        }
+        if (runCatching { lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER) }.getOrDefault(false)) {
+            providers.add(LocationManager.NETWORK_PROVIDER)
+        }
+        if (runCatching { lm.isProviderEnabled(LocationManager.GPS_PROVIDER) }.getOrDefault(false)) {
+            providers.add(LocationManager.GPS_PROVIDER)
+        }
+        if (providers.isEmpty()) {
+            providers.addAll(listOf(LocationManager.NETWORK_PROVIDER, LocationManager.GPS_PROVIDER))
+        }
+
+        var freshLocation: Location? = null
         for (provider in providers) {
             try {
-                if (lm.isProviderEnabled(provider)) {
-                    val loc = lm.getLastKnownLocation(provider)
-                    if (loc != null && (bestLocation == null || loc.time > bestLocation.time)) {
-                        bestLocation = loc
+                val loc = runCatching {
+                    withTimeoutOrNull(6000L) {
+                        suspendCancellableCoroutine<Location?> { cont ->
+                            val cancelSignal = android.os.CancellationSignal()
+                            cont.invokeOnCancellation { cancelSignal.cancel() }
+                            lm.getCurrentLocation(
+                                provider,
+                                cancelSignal,
+                                ContextCompat.getMainExecutor(appContext)
+                            ) { resultLoc ->
+                                if (cont.isActive) cont.resume(resultLoc)
+                            }
+                        }
                     }
+                }.getOrNull()
+                if (loc != null) {
+                    freshLocation = loc
+                    break
                 }
             } catch (_: SecurityException) {
             }
         }
 
-        if (bestLocation == null) {
-            for (provider in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)) {
-                try {
-                    if (lm.isProviderEnabled(provider)) {
-                        val freshLoc = runCatching {
-                            withTimeoutOrNull(5000L) {
-                                suspendCancellableCoroutine<Location?> { cont ->
-                                    val cancelSignal = android.os.CancellationSignal()
-                                    cont.invokeOnCancellation { cancelSignal.cancel() }
-                                    lm.getCurrentLocation(
-                                        provider,
-                                        cancelSignal,
-                                        ContextCompat.getMainExecutor(appContext)
-                                    ) { loc ->
-                                        if (cont.isActive) cont.resume(loc)
-                                    }
-                                }
-                            }
-                        }.getOrNull()
-                        if (freshLoc != null) {
-                            bestLocation = freshLoc
-                            break
-                        }
-                    }
-                } catch (_: SecurityException) {
-                }
-            }
-        }
-
-        if (bestLocation != null) {
+        if (freshLocation != null) {
+            val (gcjLat, gcjLon) = CoordinateTransform.wgs84ToGcj02(
+                freshLocation.latitude,
+                freshLocation.longitude
+            )
+            val isMock = runCatching { freshLocation.isMock }.getOrDefault(false)
             return JSONObject()
                 .put("status", "Success")
-                .put("latitude", bestLocation.latitude)
-                .put("longitude", bestLocation.longitude)
-                .put("altitude", if (bestLocation.hasAltitude()) bestLocation.altitude else null)
-                .put("accuracy", if (bestLocation.hasAccuracy()) bestLocation.accuracy else null)
-                .put("provider", bestLocation.provider)
-                .put("timestamp", bestLocation.time)
+                .put("coordinate_system", "WGS-84")
+                .put("latitude", freshLocation.latitude)
+                .put("longitude", freshLocation.longitude)
+                .put(
+                    "gcj02",
+                    JSONObject()
+                        .put("latitude", gcjLat)
+                        .put("longitude", gcjLon)
+                )
+                .put("altitude", if (freshLocation.hasAltitude()) freshLocation.altitude else JSONObject.NULL)
+                .put("accuracy", if (freshLocation.hasAccuracy()) freshLocation.accuracy else JSONObject.NULL)
+                .put("speed", if (freshLocation.hasSpeed()) freshLocation.speed else JSONObject.NULL)
+                .put("bearing", if (freshLocation.hasBearing()) freshLocation.bearing else JSONObject.NULL)
+                .put("provider", freshLocation.provider)
+                .put("timestamp", freshLocation.time)
+                .put("is_mock", isMock)
         }
 
         return JSONObject()
             .put("status", "LocationUnavailable")
-            .put("message", "No recent location cached; please ensure GPS/location services are enabled on the device.")
+            .put("message", "Failed to acquire current location; please ensure GPS/location services are enabled on the device.")
     }
 
     private fun getBattery(): JSONObject {
@@ -1027,3 +1035,46 @@ private fun java.io.InputStream.readBytes(maxBytes: Int): ByteArray {
     }
     return output.toByteArray()
 }
+
+internal object CoordinateTransform {
+    private const val A = 6378245.0
+    private const val EE = 0.00669342162296594323
+
+    fun outOfChina(lat: Double, lon: Double): Boolean {
+        if (lon < 72.004 || lon > 137.8347) return true
+        if (lat < 0.8293 || lat > 55.8271) return true
+        return false
+    }
+
+    private fun transformLat(x: Double, y: Double): Double {
+        var ret = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * Math.sqrt(Math.abs(x))
+        ret += (20.0 * Math.sin(6.0 * x * Math.PI) + 20.0 * Math.sin(2.0 * x * Math.PI)) * 2.0 / 3.0
+        ret += (20.0 * Math.sin(y * Math.PI) + 40.0 * Math.sin(y / 3.0 * Math.PI)) * 2.0 / 3.0
+        ret += (160.0 * Math.sin(y / 12.0 * Math.PI) + 320.0 * Math.sin(y * Math.PI / 30.0)) * 2.0 / 3.0
+        return ret
+    }
+
+    private fun transformLon(x: Double, y: Double): Double {
+        var ret = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * Math.sqrt(Math.abs(x))
+        ret += (20.0 * Math.sin(6.0 * x * Math.PI) + 20.0 * Math.sin(2.0 * x * Math.PI)) * 2.0 / 3.0
+        ret += (20.0 * Math.sin(x * Math.PI) + 40.0 * Math.sin(x / 3.0 * Math.PI)) * 2.0 / 3.0
+        ret += (150.0 * Math.sin(x / 12.0 * Math.PI) + 300.0 * Math.sin(x / 30.0 * Math.PI)) * 2.0 / 3.0
+        return ret
+    }
+
+    fun wgs84ToGcj02(lat: Double, lon: Double): Pair<Double, Double> {
+        if (outOfChina(lat, lon)) {
+            return Pair(lat, lon)
+        }
+        val dLat = transformLat(lon - 105.0, lat - 35.0)
+        val dLon = transformLon(lon - 105.0, lat - 35.0)
+        val radLat = lat / 180.0 * Math.PI
+        var magic = Math.sin(radLat)
+        magic = 1.0 - EE * magic * magic
+        val sqrtMagic = Math.sqrt(magic)
+        val mgLat = lat + (dLat * 180.0) / ((A * (1.0 - EE)) / (magic * sqrtMagic) * Math.PI)
+        val mgLon = lon + (dLon * 180.0) / (A / sqrtMagic * Math.cos(radLat) * Math.PI)
+        return Pair(mgLat, mgLon)
+    }
+}
+

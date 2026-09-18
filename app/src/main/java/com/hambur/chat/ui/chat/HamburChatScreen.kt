@@ -17,6 +17,7 @@ import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.snap
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.ComposeFoundationFlags
 import androidx.compose.foundation.Image as ComposeImage
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -70,17 +71,23 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.derivedStateOf
@@ -136,10 +143,17 @@ import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.platform.LocalTextToolbar
+import androidx.compose.ui.platform.TextToolbar
+import androidx.compose.ui.platform.TextToolbarStatus
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupPositionProvider
 import androidx.compose.ui.window.PopupProperties
 import coil3.compose.AsyncImage
+import coil3.compose.SubcomposeAsyncImage
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.ui.graphics.vector.ImageVector
 import com.composables.icons.lucide.Bot
@@ -183,7 +197,10 @@ import android.content.Context
 import android.net.Uri
 import android.os.Build
 import android.util.Log
+import android.view.ActionMode
 import android.view.HapticFeedbackConstants
+import android.view.Menu
+import android.view.MenuItem
 import android.view.View
 import android.widget.Toast
 import com.hambur.chat.R
@@ -229,6 +246,7 @@ fun HamburChatScreen(
     onOpenSettings: () -> Unit,
     onOpenBrowser: () -> Unit,
     onOpenFile: (String) -> Unit,
+    onOpenImage: ((String, String) -> Unit)? = null,
     onPickImage: (((String, String, ULong, String, String) -> Unit) -> Unit) = {},
     onPickFile: (((String, String, ULong, String, String) -> Unit) -> Unit) = {},
 ) {
@@ -545,6 +563,7 @@ fun HamburChatScreen(
                             state = visibleState,
                             store = store,
                             onOpenFile = onOpenFile,
+                            onOpenImage = onOpenImage,
                             onEditMessage = { message ->
                                 editingMessageId = message.id
                                 draftMessage = message.contentText
@@ -1073,6 +1092,7 @@ private fun ChatTimeline(
     state: HamburUiState,
     store: HamburUiStore,
     onOpenFile: (String) -> Unit,
+    onOpenImage: ((String, String) -> Unit)? = null,
     onEditMessage: (UiMessageSnapshot) -> Unit,
     onSelectText: (String) -> Unit,
     bottomPadding: Dp,
@@ -1237,6 +1257,7 @@ private fun ChatTimeline(
                                 item = timelineItem,
                                 message = message,
                                 onOpenFile = onOpenFile,
+                                onOpenImage = onOpenImage,
                                 onSelectText = onSelectText,
                                 onRetryMessage = {
                                     message?.let {
@@ -1245,6 +1266,9 @@ private fun ChatTimeline(
                                 },
                                 onEditMessage = { message?.let(onEditMessage) },
                                 thinkingDisplayMode = thinkingDisplayMode,
+                                onResolveHostPath = { path ->
+                                    store.resolveSandboxHostPath(sessionId, path)
+                                },
                                 modifier = Modifier.padding(top = topPadding),
                             )
                         }
@@ -1289,6 +1313,7 @@ private fun ChatTimeline(
                         markdownStyle = markdownStyle,
                         markdownCache = markdownCache,
                         onOpenFile = onOpenFile,
+                        onOpenImage = onOpenImage,
                         onRegenerate = {
                             store.regenerateMessage(state.selectedSessionId, item.messageId)
                         },
@@ -1367,31 +1392,316 @@ private fun EmptyChatState(
     }
 }
 
+@Immutable
+private data class HamburFloatingToolbarState(
+    val rect: Rect,
+    val onCopy: (() -> Unit)?,
+    val onSelectAll: (() -> Unit)?,
+)
+
+private class FloatingToolbarPositionProvider(
+    private val contentRect: Rect,
+    private val density: Density,
+) : PopupPositionProvider {
+    override fun calculatePosition(
+        anchorBounds: IntRect,
+        windowSize: IntSize,
+        layoutDirection: LayoutDirection,
+        popupContentSize: IntSize,
+    ): IntOffset {
+        val marginPx = with(density) { 12.dp.toPx() }.toInt()
+        val gapPx = with(density) { 8.dp.toPx() }.toInt()
+
+        val selectionCenterX = (contentRect.left + contentRect.right) / 2f
+        var localX = (selectionCenterX - popupContentSize.width / 2f).toInt()
+
+        val screenX = anchorBounds.left + localX
+        if (screenX < marginPx) {
+            localX = marginPx - anchorBounds.left
+        } else if (screenX + popupContentSize.width > windowSize.width - marginPx) {
+            localX = windowSize.width - marginPx - anchorBounds.left - popupContentSize.width
+        }
+
+        val localTopY = contentRect.top.toInt() - popupContentSize.height - gapPx
+        val localBottomY = contentRect.bottom.toInt() + gapPx
+
+        var localY = if (anchorBounds.top + localTopY >= marginPx) localTopY else localBottomY
+        if (anchorBounds.top + localY < marginPx) {
+            localY = marginPx - anchorBounds.top
+        } else if (anchorBounds.top + localY + popupContentSize.height > windowSize.height - marginPx) {
+            localY = windowSize.height - marginPx - anchorBounds.top - popupContentSize.height
+        }
+
+        return IntOffset(localX, localY)
+    }
+}
+
+@Composable
+private fun HorizontalToolbarActionItem(
+    icon: ImageVector,
+    label: String,
+    onClick: () -> Unit,
+) {
+    val isDark = MaterialTheme.colorScheme.background.luminance() <= 0.5f
+    val contentColor = if (isDark) Color(0xFFF2F2F7) else Color(0xFF1C1C1E)
+    Row(
+        modifier = Modifier
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = 9.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = contentColor,
+            modifier = Modifier.size(15.dp),
+        )
+        Spacer(modifier = Modifier.width(6.dp))
+        Text(
+            text = label,
+            color = contentColor,
+            style = MaterialTheme.typography.bodyMedium.copy(
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Medium,
+            ),
+            maxLines = 1,
+        )
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun SelectTextDialog(
     text: String,
     onDismiss: () -> Unit,
 ) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Select text") },
-        text = {
-            SelectionContainer {
-                Text(
-                    text = text,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = 360.dp)
-                        .verticalScroll(rememberScrollState()),
+    SideEffect {
+        ComposeFoundationFlags.isNewContextMenuEnabled = false
+    }
+
+    val context = LocalContext.current
+    val density = LocalDensity.current
+    val isDark = MaterialTheme.colorScheme.background.luminance() <= 0.5f
+    val popupBgColor = if (isDark) Color(0xFF2C2C2E) else Color.White
+    val popupBorderColor = if (isDark) Color.White.copy(alpha = 0.08f) else Color(0xFFE5E5EA)
+    val dividerColor = if (isDark) Color(0xFF3E3E40) else Color(0xFFE5E5EA)
+
+    var toolbarState by remember { mutableStateOf<HamburFloatingToolbarState?>(null) }
+
+    val customTextToolbar = remember {
+        object : TextToolbar {
+            override var status: TextToolbarStatus = TextToolbarStatus.Hidden
+                private set
+
+            override fun showMenu(
+                rect: Rect,
+                onCopyRequested: (() -> Unit)?,
+                onPasteRequested: (() -> Unit)?,
+                onCutRequested: (() -> Unit)?,
+                onSelectAllRequested: (() -> Unit)?,
+            ) {
+                status = TextToolbarStatus.Shown
+                toolbarState = HamburFloatingToolbarState(
+                    rect = rect,
+                    onCopy = onCopyRequested,
+                    onSelectAll = onSelectAllRequested,
                 )
             }
-        },
-        confirmButton = {
-            TextButton(onClick = onDismiss) {
-                Text("Done")
+
+            override fun hide() {
+                status = TextToolbarStatus.Hidden
+                toolbarState = null
             }
-        },
-    )
+        }
+    }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(
+            usePlatformDefaultWidth = false,
+        ),
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    onClick = onDismiss,
+                ),
+            contentAlignment = Alignment.Center,
+        ) {
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth(0.92f)
+                    .fillMaxHeight(0.75f)
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = {},
+                    ),
+                shape = RoundedCornerShape(20.dp),
+                color = MaterialTheme.colorScheme.surface,
+                border = BorderStroke(0.5.dp, MaterialTheme.colorScheme.outlineVariant),
+                shadowElevation = 8.dp,
+            ) {
+                Column(
+                    modifier = Modifier.fillMaxSize(),
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 20.dp, vertical = 16.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = "选择文本",
+                            style = MaterialTheme.typography.titleMedium.copy(
+                                fontWeight = FontWeight.SemiBold,
+                            ),
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                        IconButton(
+                            onClick = onDismiss,
+                            modifier = Modifier.size(32.dp),
+                        ) {
+                            Icon(
+                                imageVector = Lucide.X,
+                                contentDescription = "关闭",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(20.dp),
+                            )
+                        }
+                    }
+
+                    HorizontalDivider(
+                        thickness = 0.5.dp,
+                        color = MaterialTheme.colorScheme.outlineVariant,
+                    )
+
+                    CompositionLocalProvider(
+                        LocalTextToolbar provides customTextToolbar,
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxWidth()
+                                .verticalScroll(rememberScrollState())
+                                .padding(horizontal = 20.dp, vertical = 16.dp),
+                        ) {
+                            SelectionContainer {
+                                Text(
+                                    text = text,
+                                    style = MaterialTheme.typography.bodyLarge.copy(
+                                        lineHeight = 24.sp,
+                                        color = MaterialTheme.colorScheme.onSurface,
+                                    ),
+                                    modifier = Modifier.fillMaxWidth(),
+                                )
+                            }
+
+                            if (toolbarState != null) {
+                                Popup(
+                                    popupPositionProvider = FloatingToolbarPositionProvider(
+                                        contentRect = toolbarState!!.rect,
+                                        density = density,
+                                    ),
+                                    onDismissRequest = { customTextToolbar.hide() },
+                                    properties = PopupProperties(focusable = false),
+                                ) {
+                                    Card(
+                                        shape = RoundedCornerShape(16.dp),
+                                        colors = CardDefaults.cardColors(containerColor = popupBgColor),
+                                        modifier = Modifier.border(0.5.dp, popupBorderColor, RoundedCornerShape(16.dp)),
+                                        elevation = CardDefaults.cardElevation(defaultElevation = 8.dp),
+                                    ) {
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp),
+                                        ) {
+                                            HorizontalToolbarActionItem(
+                                                icon = Lucide.Copy,
+                                                label = "复制",
+                                                onClick = {
+                                                    toolbarState?.onCopy?.invoke()
+                                                    Toast.makeText(context, "已复制", Toast.LENGTH_SHORT).show()
+                                                    customTextToolbar.hide()
+                                                },
+                                            )
+                                            if (toolbarState?.onSelectAll != null) {
+                                                Box(
+                                                    modifier = Modifier
+                                                        .width(0.5.dp)
+                                                        .height(18.dp)
+                                                        .background(dividerColor),
+                                                )
+                                                HorizontalToolbarActionItem(
+                                                    icon = Lucide.Check,
+                                                    label = "全选",
+                                                    onClick = {
+                                                        toolbarState?.onSelectAll?.invoke()
+                                                    },
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    HorizontalDivider(
+                        thickness = 0.5.dp,
+                        color = MaterialTheme.colorScheme.outlineVariant,
+                    )
+
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        OutlinedButton(
+                            onClick = {
+                                copyTextToClipboard(context = context, text = text)
+                            },
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(42.dp),
+                            shape = RoundedCornerShape(12.dp),
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                            colors = ButtonDefaults.outlinedButtonColors(
+                                contentColor = MaterialTheme.colorScheme.onSurface,
+                            ),
+                        ) {
+                            Icon(
+                                imageVector = Lucide.Copy,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp),
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("复制全文", fontSize = 14.sp)
+                        }
+
+                        Button(
+                            onClick = onDismiss,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(42.dp),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = MaterialTheme.colorScheme.primary,
+                                contentColor = MaterialTheme.colorScheme.onPrimary,
+                            ),
+                        ) {
+                            Text("完成", fontSize = 14.sp)
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 @Composable
@@ -1399,29 +1709,49 @@ private fun MessageTimelineItem(
     item: UiTimelineItem,
     message: UiMessageSnapshot?,
     onOpenFile: (String) -> Unit,
+    onOpenImage: ((String, String) -> Unit)? = null,
     onSelectText: (String) -> Unit,
     onRetryMessage: () -> Unit,
     onEditMessage: () -> Unit,
     thinkingDisplayMode: String,
+    onResolveHostPath: ((String) -> String)? = null,
     modifier: Modifier = Modifier,
 ) {
     val role = message?.role ?: item.kind
     val isUser = role == "user"
     val context = LocalContext.current
-    val messageText = message?.contentText?.ifBlank { item.smallSummary }
-        ?: item.smallSummary.ifBlank { "Loading message..." }
     val attachments = message?.attachments ?: item.attachments
+    val (imageAttachments, fileAttachments) = remember(attachments) {
+        attachments.partition { isImageAttachment(it) }
+    }
+
+    val rawContentText = message?.contentText.orEmpty()
+    val displayText = when {
+        rawContentText.isNotBlank() -> rawContentText
+        attachments.isEmpty() -> item.smallSummary.ifBlank { "Loading message..." }
+        else -> ""
+    }
+
+    val hasOnlyImages = imageAttachments.isNotEmpty() && fileAttachments.isEmpty() && displayText.isBlank()
+    val bubbleHorizontalPadding = if (hasOnlyImages) 8.dp else 16.dp
+    val bubbleVerticalPadding = if (hasOnlyImages) 8.dp else 12.dp
 
     Box(
         modifier = modifier.fillMaxWidth(),
         contentAlignment = Alignment.CenterEnd,
     ) {
         MessageLongPressMenuBox(
-            enabled = isUser && message != null && messageText.isNotBlank(),
+            enabled = isUser && (displayText.isNotBlank() || attachments.isNotEmpty()),
             onCopy = {
-                copyTextToClipboard(context = context, text = messageText)
+                if (displayText.isNotBlank()) {
+                    copyTextToClipboard(context = context, text = displayText)
+                }
             },
-            onSelectText = { onSelectText(messageText) },
+            onSelectText = {
+                if (displayText.isNotBlank()) {
+                    onSelectText(displayText)
+                }
+            },
             onRetry = onRetryMessage,
             onEdit = onEditMessage,
         ) {
@@ -1431,7 +1761,10 @@ private fun MessageTimelineItem(
                 color = MaterialTheme.colorScheme.primaryContainer,
             ) {
                 Column(
-                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 13.dp),
+                    modifier = Modifier.padding(
+                        horizontal = bubbleHorizontalPadding,
+                        vertical = bubbleVerticalPadding,
+                    ),
                 ) {
                     if (!message?.reasoningContent.isNullOrBlank()) {
                         ExecutionProcessBlock(
@@ -1449,24 +1782,198 @@ private fun MessageTimelineItem(
                                 .padding(bottom = 8.dp),
                         )
                     }
-                    if (attachments.isNotEmpty()) {
-                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                            attachments.forEach { attachment ->
+                    if (imageAttachments.isNotEmpty()) {
+                        UserMessageImageGrid(
+                            images = imageAttachments,
+                            onOpenFile = { attachment ->
+                                val target = resolveAttachmentOpenTarget(attachment, onResolveHostPath)
+                                if (onOpenImage != null) {
+                                    onOpenImage(target, attachment.displayName)
+                                } else {
+                                    onOpenFile(target)
+                                }
+                            },
+                            onResolveHostPath = onResolveHostPath,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(bottom = if (displayText.isNotBlank() || fileAttachments.isNotEmpty()) 8.dp else 0.dp),
+                        )
+                    }
+                    if (fileAttachments.isNotEmpty()) {
+                        Column(
+                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(bottom = if (displayText.isNotBlank()) 8.dp else 0.dp),
+                        ) {
+                            fileAttachments.forEach { attachment ->
                                 MessageAttachmentRow(
                                     attachment = attachment,
-                                    onOpen = { onOpenFile(attachment.sandboxPath) },
+                                    onOpen = {
+                                        val target = resolveAttachmentOpenTarget(attachment, onResolveHostPath)
+                                        onOpenFile(target)
+                                    },
                                 )
                             }
                         }
                     }
-                    Text(
-                        text = messageText,
-                        style = MaterialTheme.typography.bodyLarge,
-                    )
+                    if (displayText.isNotBlank()) {
+                        Text(
+                            text = displayText,
+                            style = MaterialTheme.typography.bodyLarge,
+                        )
+                    }
                 }
             }
         }
     }
+}
+
+@Composable
+private fun UserMessageImageGrid(
+    images: List<UiPendingAttachment>,
+    onOpenFile: (UiPendingAttachment) -> Unit,
+    onResolveHostPath: ((String) -> String)? = null,
+    modifier: Modifier = Modifier,
+) {
+    val isDark = MaterialTheme.colorScheme.background.luminance() <= 0.5f
+    val mediaBorderColor = if (isDark) Color.White.copy(alpha = 0.12f) else Color.Black.copy(alpha = 0.08f)
+    val cardShape = RoundedCornerShape(14.dp)
+    val tileBackground = if (isDark) Color(0xFF2C2C2E) else Color(0xFFEDEDF2)
+
+    if (images.size == 1) {
+        val attachment = images[0]
+        val model = remember(attachment) { resolveAttachmentImageModel(attachment, onResolveHostPath) }
+        Box(
+            modifier = modifier
+                .fillMaxWidth()
+                .clip(cardShape)
+                .border(0.5.dp, mediaBorderColor, cardShape)
+                .background(tileBackground)
+                .clickable { onOpenFile(attachment) },
+            contentAlignment = Alignment.Center,
+        ) {
+            SubcomposeAsyncImage(
+                model = model,
+                contentDescription = attachment.displayName,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 240.dp)
+                    .clip(cardShape),
+                loading = {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(140.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(20.dp),
+                            strokeWidth = 2.dp,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                    }
+                },
+            )
+        }
+    } else {
+        Column(
+            modifier = modifier.fillMaxWidth(),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            images.chunked(2).forEach { rowImages ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    rowImages.forEach { attachment ->
+                        val model = remember(attachment) { resolveAttachmentImageModel(attachment, onResolveHostPath) }
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(120.dp)
+                                .clip(cardShape)
+                                .border(0.5.dp, mediaBorderColor, cardShape)
+                                .background(tileBackground)
+                                .clickable { onOpenFile(attachment) },
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            SubcomposeAsyncImage(
+                                model = model,
+                                contentDescription = attachment.displayName,
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .clip(cardShape),
+                                loading = {
+                                    Box(
+                                        modifier = Modifier.fillMaxSize(),
+                                        contentAlignment = Alignment.Center,
+                                    ) {
+                                        CircularProgressIndicator(
+                                            modifier = Modifier.size(16.dp),
+                                            strokeWidth = 2.dp,
+                                            color = MaterialTheme.colorScheme.primary,
+                                        )
+                                    }
+                                },
+                            )
+                        }
+                    }
+                    if (rowImages.size == 1) {
+                        Spacer(modifier = Modifier.weight(1f))
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun isImageAttachment(attachment: UiPendingAttachment): Boolean {
+    if (attachment.mimeType.startsWith("image/", ignoreCase = true)) return true
+    if (attachment.kind.equals("image", ignoreCase = true)) return true
+    val ext = listOf(".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg", ".heic", ".heif")
+    val cleanUri = attachment.originalUri.substringBefore('?').lowercase()
+    val cleanPath = attachment.sandboxPath.substringBefore('?').lowercase()
+    val cleanName = attachment.displayName.substringBefore('?').lowercase()
+    return ext.any { cleanUri.endsWith(it) || cleanPath.endsWith(it) || cleanName.endsWith(it) }
+}
+
+private fun resolveAttachmentImageModel(
+    attachment: UiPendingAttachment,
+    onResolveHostPath: ((String) -> String)? = null,
+): Any? {
+    val hostPath = if (attachment.sandboxPath.isNotBlank()) {
+        onResolveHostPath?.invoke(attachment.sandboxPath).orEmpty()
+    } else ""
+    val hostFile = if (hostPath.isNotBlank()) File(hostPath) else null
+    return when {
+        hostFile?.exists() == true -> hostFile
+        attachment.originalUri.startsWith("content://") -> Uri.parse(attachment.originalUri)
+        attachment.originalUri.startsWith("file://") -> Uri.parse(attachment.originalUri)
+        attachment.originalUri.isNotBlank() && File(attachment.originalUri).exists() -> File(attachment.originalUri)
+        attachment.sandboxPath.startsWith("/") && File(attachment.sandboxPath).exists() -> File(attachment.sandboxPath)
+        attachment.originalUri.isNotBlank() -> attachment.originalUri
+        attachment.sandboxPath.isNotBlank() -> attachment.sandboxPath
+        else -> null
+    }
+}
+
+private fun resolveAttachmentOpenTarget(
+    attachment: UiPendingAttachment,
+    onResolveHostPath: ((String) -> String)? = null,
+): String {
+    val hostPath = if (attachment.sandboxPath.isNotBlank()) {
+        onResolveHostPath?.invoke(attachment.sandboxPath).orEmpty()
+    } else ""
+    if (hostPath.isNotBlank() && File(hostPath).exists()) {
+        return hostPath
+    }
+    if (attachment.originalUri.isNotBlank()) {
+        return attachment.originalUri
+    }
+    return attachment.sandboxPath
 }
 
 @Composable
@@ -1895,6 +2402,7 @@ private fun AssistantMarkdownBlockTimelineItem(
     markdownStyle: MarkdownStyle,
     markdownCache: MarkdownRenderCache,
     onOpenFile: (String) -> Unit,
+    onOpenImage: ((String, String) -> Unit)? = null,
     onRegenerate: () -> Unit,
     onSelectText: (String) -> Unit,
     onResolveHostPath: ((String) -> String)? = null,
@@ -1928,6 +2436,7 @@ private fun AssistantMarkdownBlockTimelineItem(
                 renderCache = markdownCache,
                 onOpenDestination = onOpenFile,
                 onResolveHostPath = onResolveHostPath,
+                onOpenImage = onOpenImage,
             )
         }
     }
@@ -2159,9 +2668,9 @@ private fun MessageAttachmentRow(
 ) {
     Surface(
         onClick = onOpen,
-        shape = RoundedCornerShape(8.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant,
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+        shape = RoundedCornerShape(12.dp),
+        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.85f),
+        border = BorderStroke(0.5.dp, MaterialTheme.colorScheme.outlineVariant),
         modifier = Modifier.fillMaxWidth(),
     ) {
         Row(
@@ -2170,8 +2679,9 @@ private fun MessageAttachmentRow(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             Icon(
-                imageVector = if (attachment.mimeType.startsWith("image/")) Lucide.Image else Lucide.FileText,
+                imageVector = if (isImageAttachment(attachment)) Lucide.Image else Lucide.FileText,
                 contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
                 modifier = Modifier.size(18.dp),
             )
             Column(modifier = Modifier.weight(1f)) {

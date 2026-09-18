@@ -26,3 +26,6 @@ rust/target/
 # OS metadata
 .DS_Store
 Thumbs.db
+
+# SQLite test files
+*.db

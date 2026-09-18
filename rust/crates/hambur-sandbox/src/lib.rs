@@ -1231,7 +1231,7 @@ impl SandboxService {
         command: &str,
         cwd: &str,
         emit_ready_marker: bool,
-        timeout_ms: u64,
+        _timeout_ms: u64,
     ) -> HamburResult<(
         String,
         Vec<String>,
@@ -1244,27 +1244,6 @@ impl SandboxService {
             ""
         };
         self.prepare_chroot_mounts(session_id)?;
-        let run_cmd = if timeout_ms > 0 {
-            let timeout_secs = ((timeout_ms + 999) / 1000).max(1);
-            format!(
-                "/bin/busybox setsid /bin/sh -c {} &\n\
-                 CPID=$!\n\
-                 (\n\
-                     /bin/busybox sleep {}\n\
-                     kill -KILL -$CPID 2>/dev/null\n\
-                     /bin/busybox pkill -KILL -s $CPID 2>/dev/null\n\
-                 ) &\n\
-                 WPID=$!\n\
-                 wait $CPID 2>/dev/null\n\
-                 STATUS=$?\n\
-                 kill -KILL $WPID 2>/dev/null\n\
-                 exit $STATUS",
-                shell_quote(command),
-                timeout_secs
-            )
-        } else {
-            command.to_string()
-        };
         let inner_script = format!(
             "export HOME=/root\n\
              export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\
@@ -1274,7 +1253,7 @@ impl SandboxService {
              {}",
             marker_line,
             shell_quote(cwd),
-            run_cmd
+            command
         );
         let script = format!(
             "set +e\n\
@@ -1298,7 +1277,7 @@ impl SandboxService {
         command: &str,
         cwd: &str,
         emit_ready_marker: bool,
-        timeout_ms: u64,
+        _timeout_ms: u64,
     ) -> HamburResult<(
         String,
         Vec<String>,
@@ -1316,27 +1295,6 @@ impl SandboxService {
         } else {
             ""
         };
-        let run_cmd = if timeout_ms > 0 {
-            let timeout_secs = ((timeout_ms + 999) / 1000).max(1);
-            format!(
-                "/bin/busybox setsid /bin/sh -c {} &\n\
-                 CPID=$!\n\
-                 (\n\
-                     /bin/busybox sleep {}\n\
-                     kill -KILL -$CPID 2>/dev/null\n\
-                     /bin/busybox pkill -KILL -s $CPID 2>/dev/null\n\
-                 ) &\n\
-                 WPID=$!\n\
-                 wait $CPID 2>/dev/null\n\
-                 STATUS=$?\n\
-                 kill -KILL $WPID 2>/dev/null\n\
-                 exit $STATUS",
-                shell_quote(command),
-                timeout_secs
-            )
-        } else {
-            command.to_string()
-        };
         let inner_script = format!(
             "export HOME=/root\n\
              export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\
@@ -1346,7 +1304,7 @@ impl SandboxService {
              {}",
             marker_line,
             shell_quote(cwd),
-            run_cmd
+            command
         );
         let mut args = vec![
             "-0".to_string(),

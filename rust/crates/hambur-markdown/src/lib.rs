@@ -300,23 +300,37 @@ fn hambur_file_block(
 
     let inline = &inlines[0];
     let destination = inline.destination.trim();
-    if !is_hambur_file_destination(destination) {
+
+    let dest_clean = destination.split('?').next().unwrap_or("").to_ascii_lowercase();
+    let has_image_ext = [".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg", ".heic", ".heif", ".ico"]
+        .iter()
+        .any(|ext| dest_clean.ends_with(ext));
+    let has_video_ext = [".mp4", ".webm", ".mkv", ".mov", ".avi", ".flv", ".m4v", ".3gp"]
+        .iter()
+        .any(|ext| dest_clean.ends_with(ext));
+    let has_audio_ext = [".mp3", ".m4a", ".aac", ".wav", ".ogg", ".flac", ".opus", ".wma"]
+        .iter()
+        .any(|ext| dest_clean.ends_with(ext));
+    let has_non_media_ext = [
+        ".txt", ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+        ".csv", ".tsv", ".json", ".xml", ".yaml", ".yml", ".zip", ".tar",
+        ".gz", ".7z", ".rar", ".rs", ".py", ".js", ".ts", ".java", ".kt",
+        ".c", ".cpp", ".h", ".hpp", ".go", ".sh", ".bat", ".cmd", ".ps1",
+        ".log", ".md", ".markdown", ".html", ".htm", ".css"
+    ]
+    .iter()
+    .any(|ext| dest_clean.ends_with(ext));
+
+    if inline.kind != "Image"
+        && !is_hambur_file_destination(destination)
+        && !has_image_ext
+        && !has_video_ext
+        && !has_audio_ext
+    {
         return None;
     }
 
-    let dest_clean = destination.split('?').next().unwrap_or("").to_ascii_lowercase();
-    let has_image_ext = [".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg"]
-        .iter()
-        .any(|ext| dest_clean.ends_with(ext));
-    let has_video_ext = [".mp4", ".webm", ".mkv", ".mov", ".avi"]
-        .iter()
-        .any(|ext| dest_clean.ends_with(ext));
-    let has_audio_ext = [".mp3", ".m4a", ".aac", ".wav", ".ogg", ".flac"]
-        .iter()
-        .any(|ext| dest_clean.ends_with(ext));
-
-    let file_kind = if inline.kind == "Image"
-        || destination.starts_with("hambur://image")
+    let file_kind = if destination.starts_with("hambur://image")
         || destination.starts_with("hambur://media/image")
         || has_image_ext
     {
@@ -331,6 +345,10 @@ fn hambur_file_block(
         || has_audio_ext
     {
         "audio"
+    } else if has_non_media_ext || is_hambur_file_destination(destination) {
+        "file"
+    } else if inline.kind == "Image" {
+        "image"
     } else {
         "file"
     };
@@ -711,5 +729,65 @@ mod tests {
                 ],
             }]
         );
+    }
+
+    #[test]
+    fn renders_standalone_web_image_as_file_block() {
+        let markdown = "![Cute Cat](https://example.com/cat.png)";
+        let nodes = render_markdown_to_nodes("msg_1", markdown);
+        assert_eq!(nodes.len(), 1);
+        let node = &nodes[0];
+        assert_eq!(node.node_kind, "HamburFileBlock");
+        assert_eq!(node.file_kind, "image");
+        assert_eq!(node.path, "https://example.com/cat.png");
+        assert_eq!(node.text, "Cute Cat");
+    }
+
+    #[test]
+    fn renders_standalone_web_image_link_as_file_block() {
+        let markdown = "[Cute Cat](https://example.com/cat.png)";
+        let nodes = render_markdown_to_nodes("msg_2", markdown);
+        assert_eq!(nodes.len(), 1);
+        let node = &nodes[0];
+        assert_eq!(node.node_kind, "HamburFileBlock");
+        assert_eq!(node.file_kind, "image");
+        assert_eq!(node.path, "https://example.com/cat.png");
+        assert_eq!(node.text, "Cute Cat");
+    }
+
+    #[test]
+    fn renders_standalone_text_file_as_file_not_image() {
+        let markdown = "![hello.txt](/var/hambur/workspace/hello.txt)";
+        let nodes = render_markdown_to_nodes("msg_3", markdown);
+        assert_eq!(nodes.len(), 1);
+        let node = &nodes[0];
+        assert_eq!(node.node_kind, "HamburFileBlock");
+        assert_eq!(node.file_kind, "file");
+        assert_eq!(node.path, "/var/hambur/workspace/hello.txt");
+        assert_eq!(node.text, "hello.txt");
+    }
+
+    #[test]
+    fn renders_standalone_pdf_file_as_file_not_image() {
+        let markdown = "![report.pdf](/var/hambur/workspace/report.pdf)";
+        let nodes = render_markdown_to_nodes("msg_4", markdown);
+        assert_eq!(nodes.len(), 1);
+        let node = &nodes[0];
+        assert_eq!(node.node_kind, "HamburFileBlock");
+        assert_eq!(node.file_kind, "file");
+        assert_eq!(node.path, "/var/hambur/workspace/report.pdf");
+        assert_eq!(node.text, "report.pdf");
+    }
+
+    #[test]
+    fn renders_extensionless_web_avatar_as_image() {
+        let markdown = "![Avatar](https://images.unsplash.com/photo-12345?w=500)";
+        let nodes = render_markdown_to_nodes("msg_5", markdown);
+        assert_eq!(nodes.len(), 1);
+        let node = &nodes[0];
+        assert_eq!(node.node_kind, "HamburFileBlock");
+        assert_eq!(node.file_kind, "image");
+        assert_eq!(node.path, "https://images.unsplash.com/photo-12345?w=500");
+        assert_eq!(node.text, "Avatar");
     }
 }

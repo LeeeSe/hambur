@@ -8,6 +8,7 @@ import android.widget.VideoView
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -52,12 +53,14 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import coil3.compose.AsyncImage
+import coil3.compose.SubcomposeAsyncImage
 import com.composables.icons.lucide.FileText
 import com.composables.icons.lucide.Lucide
 import com.hambur.chat.reducer.HamburUiState
 import com.hambur.chat.reducer.HamburUiStore
 import com.hambur.chat.ui.components.HamburSection
 import com.hambur.chat.ui.components.HamburTopBar
+import com.hambur.chat.ui.components.HamburZoomImageState
 import com.hambur.chat.ui.markdown.MarkdownBlock
 import com.hambur.chat.ui.markdown.rememberMarkdownRenderCache
 import com.hambur.chat.ui.markdown.rememberMarkdownStyle
@@ -72,7 +75,9 @@ private const val TextPreviewMaxBytes = 512 * 1024
 
 private data class ResolvedPreviewFile(
     val originalPath: String,
-    val file: File,
+    val file: File? = null,
+    val uri: Uri? = null,
+    val webUrl: String? = null,
     val displayName: String,
     val kind: PreviewFileKind,
     val sizeLabel: String,
@@ -106,6 +111,7 @@ fun HamburFilePreviewScreen(
     store: HamburUiStore,
     onBack: () -> Unit,
     onOpenFile: (String) -> Unit,
+    onOpenZoomImage: ((HamburZoomImageState) -> Unit)? = null,
 ) {
     val resolved = remember(path, state.selectedSessionId) {
         val cleanPath = when {
@@ -153,12 +159,12 @@ fun HamburFilePreviewScreen(
                 message = path.ifBlank { "No file selected" },
                 modifier = Modifier.fillMaxSize(),
             )
-            !resolved.file.exists() -> FilePreviewMessage(
+            resolved.file != null && !resolved.file.exists() -> FilePreviewMessage(
                 title = "File not found",
                 message = resolved.file.absolutePath,
                 modifier = Modifier.fillMaxSize(),
             )
-            !resolved.file.isFile -> FilePreviewMessage(
+            resolved.file != null && !resolved.file.isFile -> FilePreviewMessage(
                 title = "Unsupported target",
                 message = "${resolved.file.absolutePath} is not a regular file.",
                 modifier = Modifier.fillMaxSize(),
@@ -168,6 +174,7 @@ fun HamburFilePreviewScreen(
                 state = state,
                 store = store,
                 onOpenFile = onOpenFile,
+                onOpenZoomImage = onOpenZoomImage,
             )
         }
     }
@@ -179,9 +186,13 @@ private fun FilePreviewBody(
     state: HamburUiState,
     store: HamburUiStore,
     onOpenFile: (String) -> Unit,
+    onOpenZoomImage: ((HamburZoomImageState) -> Unit)? = null,
 ) {
     when (resolved.kind) {
-        PreviewFileKind.Image -> ImagePreview(resolved)
+        PreviewFileKind.Image -> ImagePreview(
+            resolved = resolved,
+            onOpenZoomImage = onOpenZoomImage,
+        )
         PreviewFileKind.Audio -> AudioPreview(resolved)
         PreviewFileKind.Video -> VideoPreview(resolved)
         PreviewFileKind.Markdown -> MarkdownFilePreview(
@@ -189,6 +200,7 @@ private fun FilePreviewBody(
             state = state,
             store = store,
             onOpenFile = onOpenFile,
+            onOpenZoomImage = onOpenZoomImage,
         )
         PreviewFileKind.Text -> TextFilePreview(resolved)
         PreviewFileKind.Pdf -> PdfPreview(resolved)
@@ -197,7 +209,17 @@ private fun FilePreviewBody(
 }
 
 @Composable
-private fun ImagePreview(resolved: ResolvedPreviewFile) {
+private fun ImagePreview(
+    resolved: ResolvedPreviewFile,
+    onOpenZoomImage: ((HamburZoomImageState) -> Unit)? = null,
+) {
+    val model: Any? = when {
+        resolved.webUrl != null -> resolved.webUrl
+        resolved.uri != null -> resolved.uri
+        resolved.file != null -> resolved.file
+        else -> resolved.originalPath
+    }
+    val cardShape = RoundedCornerShape(14.dp)
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -205,14 +227,66 @@ private fun ImagePreview(resolved: ResolvedPreviewFile) {
             .padding(16.dp),
         contentAlignment = Alignment.TopCenter,
     ) {
-        AsyncImage(
-            model = resolved.file,
+        SubcomposeAsyncImage(
+            model = model,
             contentDescription = resolved.displayName,
             modifier = Modifier
                 .fillMaxWidth()
-                .clip(RoundedCornerShape(8.dp))
-                .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(8.dp)),
+                .clip(cardShape)
+                .border(0.5.dp, MaterialTheme.colorScheme.outlineVariant, cardShape)
+                .clickable {
+                    val m = model ?: resolved.originalPath
+                    onOpenZoomImage?.invoke(
+                        HamburZoomImageState(
+                            model = m,
+                            title = resolved.displayName,
+                        )
+                    )
+                },
             contentScale = ContentScale.FillWidth,
+            loading = {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(240.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(28.dp),
+                        strokeWidth = 2.5.dp,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+            },
+            error = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(32.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Icon(
+                        imageVector = Lucide.FileText,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                        modifier = Modifier.size(32.dp),
+                    )
+                    Text(
+                        text = "图片加载失败",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                        text = resolved.webUrl ?: resolved.originalPath,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                        textAlign = TextAlign.Center,
+                    )
+                }
+            },
         )
     }
 }
@@ -228,6 +302,7 @@ private fun AudioPreview(resolved: ResolvedPreviewFile) {
 
 @Composable
 private fun VideoPreview(resolved: ResolvedPreviewFile) {
+    val file = resolved.file ?: return
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -246,7 +321,7 @@ private fun VideoPreview(resolved: ResolvedPreviewFile) {
                 modifier = Modifier.fillMaxSize(),
                 factory = { context ->
                     VideoView(context).apply {
-                        setVideoURI(Uri.fromFile(resolved.file))
+                        setVideoURI(Uri.fromFile(file))
                         setOnPreparedListener { player ->
                             player.isLooping = false
                             start()
@@ -266,12 +341,14 @@ private fun MarkdownFilePreview(
     state: HamburUiState,
     store: HamburUiStore,
     onOpenFile: (String) -> Unit,
+    onOpenZoomImage: ((HamburZoomImageState) -> Unit)? = null,
 ) {
-    val preview by produceState<Result<TextPreview>?>(initialValue = null, resolved.file) {
-        value = runCatching { readTextPreview(resolved.file) }
+    val file = resolved.file ?: return
+    val preview by produceState<Result<TextPreview>?>(initialValue = null, file) {
+        value = runCatching { readTextPreview(file) }
     }
-    val messageId = remember(resolved.file.absolutePath, resolved.file.lastModified()) {
-        "file-preview:${resolved.file.absolutePath.hashCode()}:${resolved.file.lastModified()}"
+    val messageId = remember(file.absolutePath, file.lastModified()) {
+        "file-preview:${file.absolutePath.hashCode()}:${file.lastModified()}"
     }
     val markdownStyle = rememberMarkdownStyle()
     val markdownCache = rememberMarkdownRenderCache()
@@ -301,7 +378,7 @@ private fun MarkdownFilePreview(
         preview == null -> LoadingPreview()
         preview?.isFailure == true -> FilePreviewMessage(
             title = "Read failed",
-            message = preview?.exceptionOrNull()?.message ?: resolved.file.absolutePath,
+            message = preview?.exceptionOrNull()?.message ?: file.absolutePath,
             modifier = Modifier.fillMaxSize(),
         )
         blocks.isEmpty() -> LoadingPreview()
@@ -319,6 +396,14 @@ private fun MarkdownFilePreview(
                     onResolveHostPath = { path ->
                         store.resolveSandboxHostPath(state.selectedSessionId, path)
                     },
+                    onOpenImage = { destination, alt ->
+                        onOpenZoomImage?.invoke(
+                            HamburZoomImageState(
+                                model = destination,
+                                title = alt,
+                            )
+                        )
+                    },
                 )
             }
         }
@@ -327,15 +412,16 @@ private fun MarkdownFilePreview(
 
 @Composable
 private fun TextFilePreview(resolved: ResolvedPreviewFile) {
-    val preview by produceState<Result<TextPreview>?>(initialValue = null, resolved.file) {
-        value = runCatching { readTextPreview(resolved.file) }
+    val file = resolved.file ?: return
+    val preview by produceState<Result<TextPreview>?>(initialValue = null, file) {
+        value = runCatching { readTextPreview(file) }
     }
 
     when {
         preview == null -> LoadingPreview()
         preview?.isFailure == true -> FilePreviewMessage(
             title = "Read failed",
-            message = preview?.exceptionOrNull()?.message ?: resolved.file.absolutePath,
+            message = preview?.exceptionOrNull()?.message ?: file.absolutePath,
             modifier = Modifier.fillMaxSize(),
         )
         else -> {
@@ -362,20 +448,21 @@ private fun TextFilePreview(resolved: ResolvedPreviewFile) {
 
 @Composable
 private fun PdfPreview(resolved: ResolvedPreviewFile) {
-    val pageCount by produceState<Result<Int>?>(initialValue = null, resolved.file) {
-        value = runCatching { readPdfPageCount(resolved.file) }
+    val file = resolved.file ?: return
+    val pageCount by produceState<Result<Int>?>(initialValue = null, file) {
+        value = runCatching { readPdfPageCount(file) }
     }
 
     when {
         pageCount == null -> LoadingPreview()
         pageCount?.isFailure == true -> FilePreviewMessage(
             title = "PDF read failed",
-            message = pageCount?.exceptionOrNull()?.message ?: resolved.file.absolutePath,
+            message = pageCount?.exceptionOrNull()?.message ?: file.absolutePath,
             modifier = Modifier.fillMaxSize(),
         )
         pageCount!!.getOrThrow() <= 0 -> FilePreviewMessage(
             title = "Empty PDF",
-            message = resolved.file.absolutePath,
+            message = file.absolutePath,
             modifier = Modifier.fillMaxSize(),
         )
         else -> BoxWithConstraints(
@@ -399,7 +486,7 @@ private fun PdfPreview(resolved: ResolvedPreviewFile) {
             ) {
                 items((0 until pageCount!!.getOrThrow()).toList()) { pageIndex ->
                     PdfPage(
-                        file = resolved.file,
+                        file = file,
                         pageIndex = pageIndex,
                         targetWidthPx = targetWidthPx,
                     )
@@ -498,7 +585,7 @@ private fun MediaInfoPreview(
 @Composable
 private fun FileMetadataSection(resolved: ResolvedPreviewFile) {
     HamburSection(title = "File") {
-        MetadataRow(label = "Path", value = resolved.file.absolutePath)
+        MetadataRow(label = "Path", value = resolved.file?.absolutePath ?: resolved.originalPath)
         MetadataRow(label = "Size", value = resolved.sizeLabel)
         MetadataRow(label = "Kind", value = resolved.kind.name)
     }
@@ -570,6 +657,34 @@ private fun FilePreviewMessage(
 
 private fun resolvePreviewFile(path: String, sandboxHostPath: String = ""): ResolvedPreviewFile? {
     if (path.isBlank()) return null
+    if (path.startsWith("http://", ignoreCase = true) || path.startsWith("https://", ignoreCase = true)) {
+        val cleanUrl = path.substringBefore('?')
+        val fileName = cleanUrl.substringAfterLast('/').ifBlank { "web_file" }
+        val ext = fileName.substringAfterLast('.', "").lowercase()
+        val isImage = ext in setOf("png", "jpg", "jpeg", "webp", "gif", "bmp", "heic", "heif", "svg", "ico") ||
+            cleanUrl.contains("image", ignoreCase = true)
+        return ResolvedPreviewFile(
+            originalPath = path,
+            file = null,
+            uri = null,
+            webUrl = path,
+            displayName = fileName,
+            kind = if (isImage) PreviewFileKind.Image else PreviewFileKind.Other,
+            sizeLabel = if (isImage) "网络图片" else "网络文件",
+        )
+    }
+    if (path.startsWith("content://", ignoreCase = true)) {
+        val parsedUri = Uri.parse(path)
+        return ResolvedPreviewFile(
+            originalPath = path,
+            file = null,
+            uri = parsedUri,
+            webUrl = null,
+            displayName = "图片",
+            kind = PreviewFileKind.Image,
+            sizeLabel = "本地图片",
+        )
+    }
     val normalized = when {
         path.startsWith("file://") -> Uri.parse(path).path.orEmpty()
         path.startsWith("hambur://") -> {
@@ -584,7 +699,7 @@ private fun resolvePreviewFile(path: String, sandboxHostPath: String = ""): Reso
     val file = File(targetPath)
     val extension = file.extension.lowercase()
     val kind = when {
-        extension in setOf("png", "jpg", "jpeg", "webp", "gif", "bmp", "heic", "heif") -> PreviewFileKind.Image
+        extension in setOf("png", "jpg", "jpeg", "webp", "gif", "bmp", "heic", "heif", "svg") -> PreviewFileKind.Image
         extension in setOf("mp3", "m4a", "aac", "wav", "ogg", "flac") -> PreviewFileKind.Audio
         extension in setOf("mp4", "webm", "mov", "mkv", "avi") -> PreviewFileKind.Video
         extension in setOf("md", "markdown", "mdown") -> PreviewFileKind.Markdown

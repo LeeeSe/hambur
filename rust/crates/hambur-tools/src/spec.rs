@@ -674,7 +674,7 @@ impl ToolRegistry {
         ))?;
         registry.register(ToolSpec::new(
             ToolKind::AndroidCli,
-            "Access native Android system and hardware capabilities on-demand without background daemons. Actions: get_location (GPS and network coordinates), get_battery (percentage, charging status, temperature), get_device_info (hardware model, brand, Android version, network connectivity), clipboard_get (read system clipboard text), clipboard_set (write text to system clipboard), vibrate (haptic vibration feedback), send_notification (post system status bar notification), torch (turn flashlight on/off).",
+            "Access native Android system and hardware capabilities on-demand without background daemons. Actions: get_location (GPS/network coordinates; returns standard WGS-84 and converted GCJ-02 coordinates for Chinese map services like Gaode, plus altitude, speed, bearing, accuracy), get_battery (percentage, charging status, temperature), get_device_info (hardware model, brand, Android version, network connectivity), clipboard_get (read system clipboard text), clipboard_set (write text to system clipboard), vibrate (haptic vibration feedback), send_notification (post system status bar notification), torch (turn flashlight on/off).",
             object_schema(json!({
                 "type": "object",
                 "properties": {

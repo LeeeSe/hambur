@@ -8,19 +8,31 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.height
 import androidx.compose.ui.layout.ContentScale
 import coil3.compose.AsyncImage
+import coil3.compose.SubcomposeAsyncImage
 import java.io.File
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Icon
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.text.style.TextOverflow
+import com.composables.icons.lucide.FileText
+import com.composables.icons.lucide.Lucide
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.Stable
@@ -195,6 +207,7 @@ fun MarkdownBlock(
     renderCache: MarkdownRenderCache? = null,
     onOpenDestination: (String) -> Unit = {},
     onResolveHostPath: ((String) -> String)? = null,
+    onOpenImage: ((String, String) -> Unit)? = null,
 ) {
     val markdownStyle = style ?: rememberMarkdownStyle()
     SideEffect {
@@ -213,14 +226,27 @@ fun MarkdownBlock(
             onOpenDestination = onOpenDestination,
             modifier = modifier.fillMaxWidth(),
         )
-        "Paragraph" -> MarkdownInlineText(
-            node = node,
-            textStyle = markdownStyle.paragraphTextStyle,
-            markdownStyle = markdownStyle,
-            renderCache = renderCache,
-            onOpenDestination = onOpenDestination,
-            modifier = modifier.fillMaxWidth(),
-        )
+        "Paragraph" -> {
+            if (node.inlines.any { it.kind == "Image" && isLikelyImageDestination(it.destination) }) {
+                MarkdownParagraphWithImages(
+                    node = node,
+                    markdownStyle = markdownStyle,
+                    onOpenDestination = onOpenDestination,
+                    onResolveHostPath = onResolveHostPath,
+                    onOpenImage = onOpenImage,
+                    modifier = modifier.fillMaxWidth(),
+                )
+            } else {
+                MarkdownInlineText(
+                    node = node,
+                    textStyle = markdownStyle.paragraphTextStyle,
+                    markdownStyle = markdownStyle,
+                    renderCache = renderCache,
+                    onOpenDestination = onOpenDestination,
+                    modifier = modifier.fillMaxWidth(),
+                )
+            }
+        }
         "CodeBlock" -> MarkdownCodeBlock(
             node = node,
             markdownStyle = markdownStyle,
@@ -241,6 +267,7 @@ fun MarkdownBlock(
             markdownStyle = markdownStyle,
             onOpenDestination = onOpenDestination,
             onResolveHostPath = onResolveHostPath,
+            onOpenImage = onOpenImage,
             modifier = modifier,
         )
         "HtmlBlock", "MathBlock" -> MarkdownPlainBlock(
@@ -803,83 +830,345 @@ private fun traceShortId(id: String): String {
 }
 
 @Composable
+fun MarkdownImageItem(
+    destination: String,
+    alt: String,
+    markdownStyle: MarkdownStyle,
+    onOpenDestination: (String) -> Unit,
+    onResolveHostPath: ((String) -> String)? = null,
+    onOpenImage: ((String, String) -> Unit)? = null,
+    modifier: Modifier = Modifier,
+) {
+    val cleanPath = when {
+        destination.startsWith("hambur://") -> destination.removePrefix("hambur://")
+        destination.startsWith("hambur:") -> destination.removePrefix("hambur:")
+        else -> destination
+    }
+    val hostPath = remember(destination, onResolveHostPath) {
+        if (cleanPath.startsWith("/") && File(cleanPath).exists()) {
+            cleanPath
+        } else {
+            onResolveHostPath?.invoke(destination).orEmpty()
+        }
+    }
+    val imageModel: Any? = remember(destination, hostPath) {
+        when {
+            destination.startsWith("http://") || destination.startsWith("https://") -> destination
+            destination.startsWith("content://") -> Uri.parse(destination)
+            destination.startsWith("file://") -> Uri.parse(destination)
+            hostPath.isNotBlank() && File(hostPath).exists() -> File(hostPath)
+            cleanPath.isNotBlank() && File(cleanPath).exists() -> File(cleanPath)
+            else -> destination
+        }
+    }
+
+    val isDark = MaterialTheme.colorScheme.background.luminance() <= 0.5f
+    val mediaBorderColor = if (isDark) Color.White.copy(alpha = 0.12f) else Color.Black.copy(alpha = 0.08f)
+    val cardShape = RoundedCornerShape(14.dp)
+
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(cardShape)
+            .clickable {
+                if (onOpenImage != null) {
+                    onOpenImage(destination, alt)
+                } else {
+                    onOpenDestination(destination)
+                }
+            },
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(cardShape)
+                .border(0.5.dp, mediaBorderColor, cardShape)
+                .background(markdownStyle.codeBlockColor),
+            contentAlignment = Alignment.Center,
+        ) {
+            SubcomposeAsyncImage(
+                model = imageModel,
+                contentDescription = alt.ifBlank { destination },
+                contentScale = ContentScale.FillWidth,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(cardShape),
+                loading = {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(180.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(24.dp),
+                            strokeWidth = 2.dp,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                    }
+                },
+                error = {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Icon(
+                            imageVector = Lucide.FileText,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                            modifier = Modifier.size(24.dp),
+                        )
+                        Text(
+                            text = "图片加载失败",
+                            style = markdownStyle.smallTextStyle,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Text(
+                            text = destination,
+                            style = markdownStyle.labelTextStyle,
+                            color = markdownStyle.onSurfaceVariantColor.copy(alpha = 0.6f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                },
+            )
+        }
+        val cleanAlt = alt.trim()
+        val showCaption = cleanAlt.isNotBlank() &&
+            cleanAlt != destination &&
+            !cleanAlt.startsWith("http://", ignoreCase = true) &&
+            !cleanAlt.startsWith("https://", ignoreCase = true) &&
+            !cleanAlt.startsWith("file://", ignoreCase = true)
+        if (showCaption) {
+            Text(
+                text = cleanAlt,
+                style = markdownStyle.smallTextStyle,
+                color = markdownStyle.onSurfaceVariantColor,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(top = 6.dp, start = 8.dp, end = 8.dp),
+            )
+        }
+    }
+}
+
+private fun isLikelyImageDestination(destination: String): Boolean {
+    val clean = destination.substringBefore('?').lowercase()
+    val imageExts = listOf(".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg", ".heic", ".heif", ".ico")
+    if (imageExts.any { clean.endsWith(it) }) return true
+    if (destination.startsWith("hambur://image") || destination.startsWith("hambur://media/image")) return true
+
+    val nonImageExts = listOf(
+        ".txt", ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+        ".csv", ".tsv", ".json", ".xml", ".yaml", ".yml", ".zip", ".tar",
+        ".gz", ".7z", ".rar", ".rs", ".py", ".js", ".ts", ".java", ".kt",
+        ".c", ".cpp", ".h", ".hpp", ".go", ".sh", ".bat", ".cmd", ".ps1",
+        ".log", ".md", ".markdown", ".html", ".htm", ".css", ".mp3", ".wav",
+        ".m4a", ".mp4", ".mov", ".webm", ".mkv"
+    )
+    if (nonImageExts.any { clean.endsWith(it) }) return false
+
+    if (destination.startsWith("/") || destination.startsWith("file://") || destination.startsWith("hambur://")) {
+        return false
+    }
+
+    return destination.startsWith("http://") || destination.startsWith("https://") || destination.startsWith("content://")
+}
+
+private sealed interface ParagraphSegment {
+    data class TextRun(val inlines: List<MarkdownInlineNodeDto>) : ParagraphSegment
+    data class ImageItem(val inline: MarkdownInlineNodeDto) : ParagraphSegment
+}
+
+@Composable
+private fun MarkdownParagraphWithImages(
+    node: MarkdownBlockNodeDto,
+    markdownStyle: MarkdownStyle,
+    onOpenDestination: (String) -> Unit,
+    onResolveHostPath: ((String) -> String)? = null,
+    onOpenImage: ((String, String) -> Unit)? = null,
+    modifier: Modifier = Modifier,
+) {
+    val segments = remember(node.inlines) {
+        val result = mutableListOf<ParagraphSegment>()
+        val currentTextRun = mutableListOf<MarkdownInlineNodeDto>()
+
+        for (inline in node.inlines) {
+            if (inline.kind == "Image" && isLikelyImageDestination(inline.destination)) {
+                if (currentTextRun.isNotEmpty()) {
+                    result.add(ParagraphSegment.TextRun(currentTextRun.toList()))
+                    currentTextRun.clear()
+                }
+                result.add(ParagraphSegment.ImageItem(inline))
+            } else {
+                currentTextRun.add(inline)
+            }
+        }
+        if (currentTextRun.isNotEmpty()) {
+            result.add(ParagraphSegment.TextRun(currentTextRun.toList()))
+        }
+        result
+    }
+
+    Column(
+        modifier = modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        segments.forEach { segment ->
+            when (segment) {
+                is ParagraphSegment.ImageItem -> {
+                    MarkdownImageItem(
+                        destination = segment.inline.destination,
+                        alt = segment.inline.alt,
+                        markdownStyle = markdownStyle,
+                        onOpenDestination = onOpenDestination,
+                        onResolveHostPath = onResolveHostPath,
+                        onOpenImage = onOpenImage,
+                    )
+                }
+                is ParagraphSegment.TextRun -> {
+                    MarkdownInlinesText(
+                        inlines = segment.inlines,
+                        textStyle = markdownStyle.paragraphTextStyle,
+                        markdownStyle = markdownStyle,
+                        onOpenDestination = onOpenDestination,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MarkdownInlinesText(
+    inlines: List<MarkdownInlineNodeDto>,
+    textStyle: TextStyle,
+    markdownStyle: MarkdownStyle,
+    onOpenDestination: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val annotated = remember(inlines, markdownStyle.styleVersion, markdownStyle.visualFingerprint()) {
+        buildAnnotatedString {
+            appendInlineNodes(
+                inlines = inlines,
+                linkColor = markdownStyle.linkColor,
+                inlineCodeBackground = markdownStyle.inlineCodeBackground,
+            )
+        }
+    }
+    var layoutResult by remember(annotated) { mutableStateOf<TextLayoutResult?>(null) }
+
+    Text(
+        text = annotated,
+        style = textStyle,
+        onTextLayout = { layoutResult = it },
+        modifier = modifier.pointerInput(annotated, onOpenDestination) {
+            detectTapGestures { position ->
+                val offset = layoutResult?.getOffsetForPosition(position) ?: return@detectTapGestures
+                val destination = annotated
+                    .getStringAnnotations(DestinationAnnotation, offset, offset)
+                    .firstOrNull()
+                    ?.item
+                    .orEmpty()
+                if (destination.isNotBlank()) {
+                    onOpenDestination(destination)
+                }
+            }
+        },
+    )
+}
+
+@Composable
 private fun MarkdownFileBlock(
     node: MarkdownBlockNodeDto,
     markdownStyle: MarkdownStyle,
     onOpenDestination: (String) -> Unit,
     onResolveHostPath: ((String) -> String)? = null,
+    onOpenImage: ((String, String) -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
+    val isImage = remember(node.fileKind, node.path) {
+        val clean = node.path.substringBefore('?').lowercase()
+        val hasImageExt = listOf(".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg", ".heic", ".heif", ".ico")
+            .any { clean.endsWith(it) }
+        val hasNonImageExt = listOf(
+            ".txt", ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+            ".csv", ".tsv", ".json", ".xml", ".yaml", ".yml", ".zip", ".tar",
+            ".gz", ".7z", ".rar", ".rs", ".py", ".js", ".ts", ".java", ".kt",
+            ".c", ".cpp", ".h", ".hpp", ".go", ".sh", ".bat", ".cmd", ".ps1",
+            ".log", ".md", ".markdown", ".html", ".htm", ".css", ".mp3", ".wav",
+            ".m4a", ".mp4", ".mov", ".webm", ".mkv"
+        ).any { clean.endsWith(it) }
+
+        if (hasNonImageExt) {
+            false
+        } else if (hasImageExt) {
+            true
+        } else {
+            node.fileKind.equals("image", ignoreCase = true) && isLikelyImageDestination(node.path)
+        }
+    }
+
+    if (isImage) {
+        MarkdownImageItem(
+            destination = node.path,
+            alt = node.text,
+            markdownStyle = markdownStyle,
+            onOpenDestination = onOpenDestination,
+            onResolveHostPath = onResolveHostPath,
+            onOpenImage = onOpenImage,
+            modifier = modifier,
+        )
+        return
+    }
+
     val clickableModifier = if (node.path.isNotBlank()) {
         Modifier.clickable { onOpenDestination(node.path) }
     } else {
         Modifier
     }
 
-    val cleanPath = when {
-        node.path.startsWith("hambur://") -> node.path.removePrefix("hambur://")
-        node.path.startsWith("hambur:") -> node.path.removePrefix("hambur:")
-        else -> node.path
-    }
-    val hostPath = remember(node.path, onResolveHostPath) {
-        if (cleanPath.startsWith("/") && File(cleanPath).exists()) {
-            cleanPath
-        } else {
-            onResolveHostPath?.invoke(node.path).orEmpty()
-        }
-    }
-    val imageFile = remember(hostPath) {
-        if (hostPath.isNotBlank()) File(hostPath) else null
-    }
-    val isImage = remember(node.fileKind, node.path) {
-        node.fileKind.equals("image", ignoreCase = true) ||
-            listOf(".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg").any {
-                node.path.substringBefore('?').endsWith(it, ignoreCase = true)
-            }
-    }
-    val imageModel: Any? = remember(node.path, hostPath, imageFile) {
-        when {
-            node.path.startsWith("http://") || node.path.startsWith("https://") -> node.path
-            node.path.startsWith("content://") -> Uri.parse(node.path)
-            imageFile?.exists() == true -> imageFile
-            else -> null
-        }
-    }
-
     Surface(
         modifier = modifier
             .fillMaxWidth()
             .then(clickableModifier),
-        shape = RoundedCornerShape(markdownStyle.cornerRadius),
+        shape = RoundedCornerShape(14.dp),
         color = markdownStyle.blockSurfaceColor,
-        border = BorderStroke(1.dp, markdownStyle.outlineColor),
+        border = BorderStroke(0.5.dp, markdownStyle.outlineColor),
     ) {
-        Column(
-            modifier = Modifier.padding(markdownStyle.blockPadding),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
+        Row(
+            modifier = Modifier.padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            if (isImage && imageModel != null) {
-                AsyncImage(
-                    model = imageModel,
-                    contentDescription = node.text.ifBlank { node.path },
-                    contentScale = ContentScale.Fit,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(markdownStyle.cornerRadius)),
-                )
-            }
+            Icon(
+                imageVector = Lucide.FileText,
+                contentDescription = null,
+                modifier = Modifier.size(24.dp),
+                tint = MaterialTheme.colorScheme.primary,
+            )
             Column(
-                verticalArrangement = Arrangement.spacedBy(4.dp),
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
             ) {
                 Text(
-                    text = node.text.ifBlank { node.fileKind.ifBlank { "file" } },
+                    text = node.text.ifBlank { node.path.substringAfterLast('/').ifBlank { node.fileKind.ifBlank { "file" } } },
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                 )
                 Text(
                     text = node.path,
                     style = markdownStyle.smallTextStyle,
                     color = markdownStyle.onSurfaceVariantColor,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                 )
             }
         }

@@ -1390,8 +1390,11 @@ pub(crate) fn provider_stream_source(
     if !memory_system_prompt.trim().is_empty() {
         system_blocks.push(memory_system_prompt.to_string());
     }
-    if search_enabled {
-        let has_web_tools = tools_json.contains("\"web_search\"") || tools_json.contains("\"browser_use\"");
+    let is_official_deepseek = hambur_llm::is_official_deepseek_url(&route.base_url);
+    if search_enabled || is_official_deepseek {
+        let has_web_tools = tools_json.contains("\"web_search\"")
+            || tools_json.contains("\"browser_use\"")
+            || is_official_deepseek;
         if has_web_tools {
             system_blocks.push(
                 "Web assistance is enabled for this turn. Use available web search or browser tools when current external information is needed."
@@ -1414,7 +1417,7 @@ pub(crate) fn provider_stream_source(
         },
         max_output_tokens: route.output_limit,
         temperature: Some(0.7),
-        tools_json: if route.supports_tool_call {
+        tools_json: if route.supports_tool_call || is_official_deepseek {
             tools_json.to_string()
         } else {
             String::new()
@@ -1496,13 +1499,12 @@ pub(crate) fn openai_non_stream_request(
     target: &ProviderTarget,
     api_key: &str,
 ) -> HamburResult<hambur_llm::HttpRequestSpec> {
-    let mut spec = match target.provider.protocol.as_str() {
-        OPENAI_RESPONSES_PROTOCOL => {
-            ResponsesApiAdapter::build_stream_request(request, target, api_key)?
-        }
-        _ => {
-            OpenAiCompatibleAdapter::build_stream_request(request, target, api_key)?
-        }
+    let use_responses_api = target.provider.protocol == OPENAI_RESPONSES_PROTOCOL
+        || target.provider.is_official_deepseek();
+    let mut spec = if use_responses_api {
+        ResponsesApiAdapter::build_stream_request(request, target, api_key)?
+    } else {
+        OpenAiCompatibleAdapter::build_stream_request(request, target, api_key)?
     };
     let mut body: Value = serde_json::from_str(&spec.body_json)
         .map_err(|error| HamburError::InvalidCommand(format!("invalid request body: {error}")))?;

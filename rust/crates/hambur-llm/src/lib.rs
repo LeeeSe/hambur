@@ -17,6 +17,27 @@ pub struct ProviderConfig {
     pub enabled: bool,
 }
 
+pub fn is_official_deepseek_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    let stripped = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed);
+    let host = stripped
+        .split(&['/', ':', '?', '#'][..])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    host == "api.deepseek.com" || host == "deepseek.com" || host.ends_with(".deepseek.com")
+}
+
+impl ProviderConfig {
+    pub fn is_official_deepseek(&self) -> bool {
+        is_official_deepseek_url(&self.base_url)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelCapabilities {
     pub supports_tool_call: bool,
@@ -657,7 +678,7 @@ impl ResponsesApiAdapter {
         target: &ProviderTarget,
         api_key: &str,
     ) -> HamburResult<HttpRequestSpec> {
-        if target.provider.protocol != OPENAI_RESPONSES_PROTOCOL {
+        if target.provider.protocol != OPENAI_RESPONSES_PROTOCOL && !target.provider.is_official_deepseek() {
             return Err(HamburError::ProviderUnavailable(format!(
                 "unsupported provider protocol: {}",
                 target.provider.protocol
@@ -775,29 +796,51 @@ impl ResponsesApiAdapter {
         }
 
         let tools_json = request.tools_json.trim();
+        let is_official_deepseek = target.provider.is_official_deepseek();
+        let mut responses_tools = Vec::new();
+
         if !tools_json.is_empty() {
             let tools: Value = serde_json::from_str(tools_json).map_err(|error| {
                 HamburError::InvalidCommand(format!("invalid Responses API tools JSON: {error}"))
             })?;
             if let Some(items) = tools.as_array() {
-                if !items.is_empty() {
-                    let mut responses_tools = Vec::new();
-                    for item in items {
-                        if let Some(function) = item.get("function") {
+                for item in items {
+                    if let Some(function) = item.get("function") {
+                        let name = function.get("name").and_then(Value::as_str).unwrap_or_default();
+                        if is_official_deepseek && name == "web_search" {
+                            responses_tools.push(json!({ "type": "web_search" }));
+                        } else {
                             let mut tool = json!({ "type": "function" });
                             if let Some(name) = function.get("name") { tool["name"] = name.clone(); }
                             if let Some(desc) = function.get("description") { tool["description"] = desc.clone(); }
                             if let Some(params) = function.get("parameters") { tool["parameters"] = params.clone(); }
                             if let Some(strict) = function.get("strict") { tool["strict"] = strict.clone(); }
                             responses_tools.push(tool);
+                        }
+                    } else {
+                        let tool_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+                        if is_official_deepseek && tool_type == "web_search" {
+                            responses_tools.push(json!({ "type": "web_search" }));
                         } else {
                             responses_tools.push(item.clone());
                         }
                     }
-                    body["tools"] = Value::Array(responses_tools);
-                    body["tool_choice"] = json!("auto");
                 }
             }
+        }
+
+        if is_official_deepseek {
+            let has_web_search = responses_tools.iter().any(|t| {
+                t.get("type").and_then(Value::as_str) == Some("web_search")
+            });
+            if !has_web_search {
+                responses_tools.push(json!({ "type": "web_search" }));
+            }
+        }
+
+        if !responses_tools.is_empty() {
+            body["tools"] = Value::Array(responses_tools);
+            body["tool_choice"] = json!("auto");
         }
 
         if request.max_output_tokens > 0 {
@@ -824,6 +867,14 @@ impl ResponsesApiAdapter {
         }
         if base_url.ends_with("/responses") {
             base_url = base_url.trim_end_matches("/responses").trim_end_matches('/').to_string();
+        }
+        if target.provider.is_official_deepseek() {
+            if base_url.ends_with("/v1") {
+                base_url = base_url.trim_end_matches("/v1").trim_end_matches('/').to_string();
+            }
+            if base_url.ends_with("/beta") {
+                base_url = base_url.trim_end_matches("/beta").trim_end_matches('/').to_string();
+            }
         }
         let url = if base_url == "https://api.openai.com" {
             "https://api.openai.com/v1/responses".to_string()
@@ -920,6 +971,25 @@ impl ResponsesApiAdapter {
                     events.push(ProviderStreamEvent::ReasoningDelta(delta.to_string()));
                 }
             }
+            "response.web_search_call.in_progress" => {}
+            "response.web_search_call.searching" => {
+                let query = value
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .or_else(|| value.get("item").and_then(|i| i.get("query")).and_then(Value::as_str))
+                    .unwrap_or_default();
+                if !query.is_empty() {
+                    events.push(ProviderStreamEvent::ReasoningDelta(format!(
+                        "\n🔍 正在联网搜索：{}\n",
+                        query
+                    )));
+                } else {
+                    events.push(ProviderStreamEvent::ReasoningDelta(
+                        "\n🔍 正在联网搜索...\n".to_string(),
+                    ));
+                }
+            }
+            "response.web_search_call.completed" => {}
             "response.output_item.added" => {
                 if let Some(item) = value.get("item") {
                     let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
@@ -951,6 +1021,18 @@ impl ResponsesApiAdapter {
                                 name: name.to_string(),
                                 arguments_delta: String::new(),
                             });
+                        }
+                    } else if item_type == "web_search_call" {
+                        let query = item
+                            .get("query")
+                            .or_else(|| item.get("action").and_then(|a| a.get("query")))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        if !query.is_empty() {
+                            events.push(ProviderStreamEvent::ReasoningDelta(format!(
+                                "\n🔍 正在联网搜索：{}\n",
+                                query
+                            )));
                         }
                     }
                 }
@@ -1502,5 +1584,143 @@ mod tests {
             finish_reason: "stop".to_string(),
             native_finish_reason: "completed".to_string(),
         }]);
+    }
+
+    #[test]
+    fn test_is_official_deepseek() {
+        let make_provider = |url: &str| ProviderConfig {
+            base_url: url.to_string(),
+            ..Default::default()
+        };
+
+        assert!(make_provider("https://api.deepseek.com").is_official_deepseek());
+        assert!(make_provider("https://api.deepseek.com/").is_official_deepseek());
+        assert!(make_provider("https://api.deepseek.com/v1").is_official_deepseek());
+        assert!(make_provider("https://api.deepseek.com:443/beta").is_official_deepseek());
+        assert!(make_provider("http://deepseek.com").is_official_deepseek());
+        assert!(make_provider("https://chat.deepseek.com").is_official_deepseek());
+
+        // Non-official providers
+        assert!(!make_provider("https://api.siliconflow.cn/v1").is_official_deepseek());
+        assert!(!make_provider("https://openrouter.ai/api/v1").is_official_deepseek());
+        assert!(!make_provider("https://notdeepseek.com").is_official_deepseek());
+        assert!(!make_provider("https://deepseek.com.attacker.com").is_official_deepseek());
+        assert!(!make_provider("https://api.openai.com/v1").is_official_deepseek());
+        assert!(!make_provider("").is_official_deepseek());
+    }
+
+    #[test]
+    fn test_official_deepseek_responses_api_web_search_injection() {
+        let deepseek_provider = ProviderConfig {
+            id: "deepseek".to_string(),
+            name: "DeepSeek".to_string(),
+            protocol: OPENAI_RESPONSES_PROTOCOL.to_string(),
+            base_url: "https://api.deepseek.com".to_string(),
+            secret_ref: "secret_deepseek".to_string(),
+            enabled: true,
+        };
+        let deepseek_target = ProviderTarget {
+            provider: deepseek_provider,
+            model: ProviderModel {
+                provider_id: "deepseek".to_string(),
+                model_id: "deepseek-chat".to_string(),
+                display_name: "DeepSeek-V3".to_string(),
+                capabilities: ModelCapabilities {
+                    supports_tool_call: true,
+                    supports_reasoning: false,
+                    ..Default::default()
+                },
+                metadata_json: "{}".to_string(),
+            },
+            model_group_id: "default".to_string(),
+            model_group_name: "Default".to_string(),
+            position: 0,
+        };
+
+        // Case 1: tools_json has function web_search -> converted to {"type": "web_search"}
+        let request_with_web_search = ModelRequest {
+            system_blocks: vec![],
+            messages: vec![ModelMessage {
+                role: "user".to_string(),
+                content: "Latest news today?".to_string(),
+                ..Default::default()
+            }],
+            tools_json: r#"[
+                {"type":"function","function":{"name":"web_search","description":"Search","parameters":{"type":"object"}}},
+                {"type":"function","function":{"name":"read_file","description":"Read","parameters":{"type":"object"}}}
+            ]"#.to_string(),
+            ..Default::default()
+        };
+
+        let spec = ResponsesApiAdapter::build_stream_request(&request_with_web_search, &deepseek_target, "sk-ds-key")
+            .expect("build request");
+        let body: Value = serde_json::from_str(&spec.body_json).expect("valid json");
+        let tools = body["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0], json!({ "type": "web_search" }));
+        assert_eq!(tools[1]["type"], "function");
+        assert_eq!(tools[1]["name"], "read_file");
+
+        // Case 2: tools_json is empty -> official deepseek still gets {"type": "web_search"}
+        let request_empty_tools = ModelRequest {
+            system_blocks: vec![],
+            messages: vec![ModelMessage {
+                role: "user".to_string(),
+                content: "Who won the game yesterday?".to_string(),
+                ..Default::default()
+            }],
+            tools_json: String::new(),
+            ..Default::default()
+        };
+        let spec2 = ResponsesApiAdapter::build_stream_request(&request_empty_tools, &deepseek_target, "sk-ds-key")
+            .expect("build request");
+        let body2: Value = serde_json::from_str(&spec2.body_json).expect("valid json");
+        let tools2 = body2["tools"].as_array().expect("tools array");
+        assert_eq!(tools2.len(), 1);
+        assert_eq!(tools2[0], json!({ "type": "web_search" }));
+
+        // Case 3: Non-official provider should NOT convert or inject web_search
+        let mut non_official_target = deepseek_target.clone();
+        non_official_target.provider.base_url = "https://api.siliconflow.cn/v1".to_string();
+        let spec3 = ResponsesApiAdapter::build_stream_request(&request_with_web_search, &non_official_target, "sk-sf-key")
+            .expect("build request");
+        let body3: Value = serde_json::from_str(&spec3.body_json).expect("valid json");
+        let tools3 = body3["tools"].as_array().expect("tools array");
+        assert_eq!(tools3.len(), 2);
+        assert_eq!(tools3[0]["type"], "function");
+        assert_eq!(tools3[0]["name"], "web_search");
+    }
+
+    #[test]
+    fn test_responses_api_parse_web_search_stream_events() {
+        // response.web_search_call.searching
+        let payload_searching = StreamPayload {
+            data: r#"{"type":"response.web_search_call.searching","query":"Rust 2024 features"}"#.to_string(),
+            event_name: "response.web_search_call.searching".to_string(),
+            event_id: "ws_1".to_string(),
+            raw_frame_meta: String::new(),
+        };
+        let events = ResponsesApiAdapter::parse_stream_payload(&payload_searching).expect("parse search");
+        assert_eq!(events, vec![ProviderStreamEvent::ReasoningDelta("\n🔍 正在联网搜索：Rust 2024 features\n".to_string())]);
+
+        // response.output_item.added with web_search_call
+        let payload_item_added = StreamPayload {
+            data: r#"{"type":"response.output_item.added","item":{"id":"ws_item_1","type":"web_search_call","query":"DeepSeek responses API"}}"#.to_string(),
+            event_name: "response.output_item.added".to_string(),
+            event_id: "ws_2".to_string(),
+            raw_frame_meta: String::new(),
+        };
+        let events_added = ResponsesApiAdapter::parse_stream_payload(&payload_item_added).expect("parse item added");
+        assert_eq!(events_added, vec![ProviderStreamEvent::ReasoningDelta("\n🔍 正在联网搜索：DeepSeek responses API\n".to_string())]);
+
+        // response.output_item.done with web_search_call must NOT emit ToolCallDone
+        let payload_item_done = StreamPayload {
+            data: r#"{"type":"response.output_item.done","item":{"id":"ws_item_1","type":"web_search_call","status":"completed"}}"#.to_string(),
+            event_name: "response.output_item.done".to_string(),
+            event_id: "ws_3".to_string(),
+            raw_frame_meta: String::new(),
+        };
+        let events_done = ResponsesApiAdapter::parse_stream_payload(&payload_item_done).expect("parse item done");
+        assert!(events_done.is_empty(), "web_search_call output_item.done should not emit any ToolCallDone");
     }
 }

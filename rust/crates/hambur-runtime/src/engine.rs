@@ -577,6 +577,13 @@ impl RuntimeEngine {
         match stream_source {
             RouteStreamSource::Scripted { chunks, .. } => {
                 for chunk in chunks {
+                    let effective_protocol = if route.provider_protocol == OPENAI_RESPONSES_PROTOCOL
+                        || hambur_llm::is_official_deepseek_url(&route.base_url)
+                    {
+                        OPENAI_RESPONSES_PROTOCOL
+                    } else {
+                        route.provider_protocol.as_str()
+                    };
                     if let Some(result) = self
                         .clone()
                         .process_stream_chunk(
@@ -586,7 +593,7 @@ impl RuntimeEngine {
                             &assistant_message_id,
                             &cancel,
                             &chunk,
-                            &route.provider_protocol,
+                            effective_protocol,
                             true,
                         )
                         .await
@@ -610,13 +617,12 @@ impl RuntimeEngine {
                     }
                 };
                 let target = provider_target_from_route(route.clone());
-                let spec_result = match target.provider.protocol.as_str() {
-                    OPENAI_RESPONSES_PROTOCOL => {
-                        ResponsesApiAdapter::build_stream_request(&request, &target, &api_key)
-                    }
-                    _ => {
-                        OpenAiCompatibleAdapter::build_stream_request(&request, &target, &api_key)
-                    }
+                let use_responses_api = target.provider.protocol == OPENAI_RESPONSES_PROTOCOL
+                    || target.provider.is_official_deepseek();
+                let spec_result = if use_responses_api {
+                    ResponsesApiAdapter::build_stream_request(&request, &target, &api_key)
+                } else {
+                    OpenAiCompatibleAdapter::build_stream_request(&request, &target, &api_key)
                 };
                 let spec = match spec_result {
                     Ok(spec) => spec,
@@ -692,6 +698,13 @@ impl RuntimeEngine {
                     let Some(chunk) = chunk else {
                         break;
                     };
+                    let effective_protocol = if route.provider_protocol == OPENAI_RESPONSES_PROTOCOL
+                        || hambur_llm::is_official_deepseek_url(&route.base_url)
+                    {
+                        OPENAI_RESPONSES_PROTOCOL
+                    } else {
+                        route.provider_protocol.as_str()
+                    };
                     if let Some(result) = self
                         .clone()
                         .process_stream_chunk(
@@ -701,7 +714,7 @@ impl RuntimeEngine {
                             &assistant_message_id,
                             &cancel,
                             chunk.as_ref(),
-                            &route.provider_protocol,
+                            effective_protocol,
                             false,
                         )
                         .await

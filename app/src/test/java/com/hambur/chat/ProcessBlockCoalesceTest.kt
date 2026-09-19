@@ -480,4 +480,100 @@ class ProcessBlockCoalesceTest {
         assertEquals("Initial thought and further elaboration", (pbAfter.steps[0] as ProcessStep.Reasoning).text)
         assertEquals("tool_a", (pbAfter.steps[1] as ProcessStep.ToolCall).toolName)
     }
+
+    @Test
+    fun interleavedReasoningAndMarkdownCreateMultipleProcessBlocksSeparatedByContent() {
+        val user = UiTimelineItem(
+            id = "u1", stableKey = "u1", contentType = "user_message", versionSequence = 1UL,
+            payloadRef = "u1", smallSummary = "Plan and execute", kind = "UserMessage", displaySequence = 100UL,
+        )
+        // Segment 1: Reasoning 1 -> Markdown 1
+        val r1 = UiTimelineItem(
+            id = "r1", stableKey = "msg1:reasoning", contentType = "assistant_reasoning_block", versionSequence = 1UL,
+            payloadRef = "r1-node", smallSummary = "Initial planning", kind = "AssistantReasoningBlock", displaySequence = 101UL,
+        )
+        val ans1 = UiTimelineItem(
+            id = "ans1", stableKey = "msg1:md:0", contentType = "assistant_markdown_block", versionSequence = 1UL,
+            payloadRef = "ans1-node", smallSummary = "Here is the preliminary plan.", kind = "AssistantMarkdownBlock", displaySequence = 102UL,
+        )
+
+        // Segment 2: Tool 1 -> Reasoning 2 -> Markdown 2
+        val t1 = UiTimelineItem(
+            id = "t1", stableKey = "trace-1", contentType = "trace", versionSequence = 1UL,
+            payloadRef = "t1-ref", smallSummary = "fetch_data", kind = "ToolTrace",
+            traceTitle = "Fetching data", traceContent = "data: ok", traceStatus = "completed",
+            toolName = "fetch_data", displaySequence = 105UL,
+        )
+        val r2 = UiTimelineItem(
+            id = "r2", stableKey = "msg2:reasoning", contentType = "assistant_reasoning_block", versionSequence = 1UL,
+            payloadRef = "r2-node", smallSummary = "Analyzing data", kind = "AssistantReasoningBlock", displaySequence = 106UL,
+        )
+        val ans2 = UiTimelineItem(
+            id = "ans2", stableKey = "msg2:md:0", contentType = "assistant_markdown_block", versionSequence = 1UL,
+            payloadRef = "ans2-node", smallSummary = "Here is the final result.", kind = "AssistantMarkdownBlock", displaySequence = 110UL,
+        )
+
+        val nodes = mapOf(
+            "r1-node" to createNode("msg1", "Initial planning"),
+            "ans1-node" to createNode("msg1", "Here is the preliminary plan."),
+            "r2-node" to createNode("msg2", "Analyzing data"),
+            "ans2-node" to createNode("msg2", "Here is the final result."),
+        )
+        val messages = mapOf(
+            "u1" to UiMessageSnapshot(
+                id = "u1", sessionId = "s1", role = "user", contentText = "Plan and execute",
+                reasoningContent = "", status = "completed", turnId = "t1",
+                providerName = "", modelName = "", finishReason = "", nativeFinishReason = "", versionSequence = 1UL,
+            ),
+            "msg1" to UiMessageSnapshot(
+                id = "msg1", sessionId = "s1", role = "assistant", contentText = "Here is the preliminary plan.",
+                reasoningContent = "Initial planning", status = "completed", turnId = "t1",
+                providerName = "", modelName = "", finishReason = "", nativeFinishReason = "", versionSequence = 1UL,
+            ),
+            "msg2" to UiMessageSnapshot(
+                id = "msg2", sessionId = "s1", role = "assistant", contentText = "Here is the final result.",
+                reasoningContent = "Analyzing data", status = "completed", turnId = "t1",
+                providerName = "", modelName = "", finishReason = "", nativeFinishReason = "", versionSequence = 1UL,
+            ),
+        )
+
+        val displayItems = listOf(user, r1, ans1, t1, r2, ans2).toChatDisplayItems(nodes, messages)
+
+        // Verify total and sequence of items:
+        // [User, ProcessBlock 1, MarkdownBlock 1, ProcessBlock 2, MarkdownBlock 2, AssistantActions]
+        assertEquals(6, displayItems.size)
+        assertTrue(displayItems[0] is ChatDisplayItem.Timeline)
+        assertTrue(displayItems[1] is ChatDisplayItem.AssistantProcessBlock)
+        assertTrue(displayItems[2] is ChatDisplayItem.AssistantMarkdownBlock)
+        assertTrue(displayItems[3] is ChatDisplayItem.AssistantProcessBlock)
+        assertTrue(displayItems[4] is ChatDisplayItem.AssistantMarkdownBlock)
+        assertTrue(displayItems[5] is ChatDisplayItem.AssistantActions)
+
+        val processBlocks = displayItems.filterIsInstance<ChatDisplayItem.AssistantProcessBlock>()
+        assertEquals(2, processBlocks.size)
+
+        // First process block before Markdown 1: contains only r1
+        val pb1 = processBlocks[0]
+        assertEquals(1, pb1.steps.size)
+        assertTrue(pb1.steps[0] is ProcessStep.Reasoning)
+        assertEquals("Initial planning", (pb1.steps[0] as ProcessStep.Reasoning).text)
+
+        // Second process block after Markdown 1: contains t1 and r2
+        val pb2 = processBlocks[1]
+        assertEquals(2, pb2.steps.size)
+        assertTrue(pb2.steps[0] is ProcessStep.ToolCall)
+        assertEquals("fetch_data", (pb2.steps[0] as ProcessStep.ToolCall).toolName)
+        assertTrue(pb2.steps[1] is ProcessStep.Reasoning)
+        assertEquals("Analyzing data", (pb2.steps[1] as ProcessStep.Reasoning).text)
+
+        // Verify markdowns
+        val markdownBlocks = displayItems.filterIsInstance<ChatDisplayItem.AssistantMarkdownBlock>()
+        assertEquals(2, markdownBlocks.size)
+        assertEquals("Here is the preliminary plan.", markdownBlocks[0].assistantText)
+        assertEquals("Here is the final result.", markdownBlocks[1].assistantText)
+
+        // Single actions row retained at the bottom of the turn
+        val actions = displayItems.filterIsInstance<ChatDisplayItem.AssistantActions>()
+        assertEquals(1, actions.size)
+    }
 }

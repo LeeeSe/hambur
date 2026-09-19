@@ -1268,9 +1268,25 @@ private fun ChatTimeline(
                 is ChatDisplayItem.AssistantProcessBlock -> {
                     val activeTurnId = state.activeTurnIds[sessionId].orEmpty()
                     val blockTurnId = if (item.turnId.isNotBlank()) item.turnId else state.messagesById[item.messageId]?.turnId.orEmpty()
-                    val isGenerating = activeTurnId.isNotBlank() && (blockTurnId == activeTurnId || (blockTurnId.isBlank() && index >= displayItems.size - 2))
-                    val durationSec = state.turnDurationSeconds[blockTurnId]
-                        ?: if (item.estimatedDurationSeconds > 0) item.estimatedDurationSeconds else null
+                    val hasMarkdownAfterInTurn = displayItems.subList(index + 1, displayItems.size).any {
+                        if (it !is ChatDisplayItem.AssistantMarkdownBlock) return@any false
+                        val mdTurnId = state.messagesById[it.messageId]?.turnId.orEmpty()
+                        blockTurnId.isBlank() || mdTurnId == blockTurnId
+                    }
+                    val isLastProcessInTurn = displayItems.subList(index + 1, displayItems.size).none {
+                        if (it !is ChatDisplayItem.AssistantProcessBlock) return@none false
+                        val otherTurnId = if (it.turnId.isNotBlank()) it.turnId else state.messagesById[it.messageId]?.turnId.orEmpty()
+                        blockTurnId.isBlank() || otherTurnId == blockTurnId
+                    }
+                    val isGenerating = activeTurnId.isNotBlank() &&
+                        (blockTurnId == activeTurnId || (blockTurnId.isBlank() && index >= displayItems.size - 2)) &&
+                        !hasMarkdownAfterInTurn &&
+                        isLastProcessInTurn
+                    val durationSec = if (item.estimatedDurationSeconds > 0) {
+                        item.estimatedDurationSeconds
+                    } else {
+                        state.turnDurationSeconds[blockTurnId]
+                    }
                     ExecutionProcessBlock(
                         steps = item.steps,
                         isGenerating = isGenerating,
@@ -3264,6 +3280,7 @@ internal fun List<UiTimelineItem>.toChatDisplayItems(
     var groupProcessMessageId = ""
     var currentTurnId = ""
     var lastUserMessageIndex = -1
+    var lastRemovedAction: ChatDisplayItem.AssistantActions? = null
 
     fun flushMarkdownGroup() {
         if (groupMarkdownItems.isNotEmpty() && groupMarkdownNodes.isNotEmpty()) {
@@ -3312,9 +3329,10 @@ internal fun List<UiTimelineItem>.toChatDisplayItems(
                 0
             }
 
+            val lastMarkdownIndex = displayItems.indexOfLast { it is ChatDisplayItem.AssistantMarkdownBlock }
             val existingProcessIndex = displayItems.indexOfLast { it is ChatDisplayItem.AssistantProcessBlock }
             val sortedSteps = groupProcessSteps.sortedBy { it.displaySequence }
-            if (existingProcessIndex > lastUserMessageIndex) {
+            if (existingProcessIndex > lastUserMessageIndex && existingProcessIndex > lastMarkdownIndex) {
                 val existing = displayItems[existingProcessIndex] as ChatDisplayItem.AssistantProcessBlock
                 val mergedSteps = existing.steps.mergeWith(sortedSteps)
                 val newDuration = maxOf(existing.estimatedDurationSeconds, estimatedDuration)
@@ -3329,6 +3347,9 @@ internal fun List<UiTimelineItem>.toChatDisplayItems(
                     estimatedDurationSeconds = newDuration,
                 )
             } else {
+                if (displayItems.lastOrNull() is ChatDisplayItem.AssistantActions) {
+                    lastRemovedAction = displayItems.removeAt(displayItems.lastIndex) as ChatDisplayItem.AssistantActions
+                }
                 displayItems += ChatDisplayItem.AssistantProcessBlock(
                     messageId = groupProcessMessageId,
                     turnId = resolvedTurnId,
@@ -3446,10 +3467,17 @@ internal fun List<UiTimelineItem>.toChatDisplayItems(
     flushMarkdownGroup()
 
     val lastActionIndex = displayItems.indexOfLast { it is ChatDisplayItem.AssistantActions }
-    if (lastActionIndex < 0) return displayItems
-    return displayItems.filterIndexed { index, item ->
-        item !is ChatDisplayItem.AssistantActions || index == lastActionIndex
+    val resultItems = if (lastActionIndex >= 0) {
+        displayItems.filterIndexed { index, item ->
+            item !is ChatDisplayItem.AssistantActions || index == lastActionIndex
+        }.toMutableList()
+    } else {
+        displayItems.toMutableList()
     }
+    if (resultItems.none { it is ChatDisplayItem.AssistantActions } && lastRemovedAction != null) {
+        resultItems.add(lastRemovedAction)
+    }
+    return resultItems
 }
 
 private fun ChatDisplayItem.topSpacingAfter(previous: ChatDisplayItem?): Dp {
@@ -3461,6 +3489,9 @@ private fun ChatDisplayItem.topSpacingAfter(previous: ChatDisplayItem?): Dp {
 
         this is ChatDisplayItem.AssistantMarkdownBlock &&
                 previous is ChatDisplayItem.AssistantProcessBlock -> 8.dp
+
+        this is ChatDisplayItem.AssistantProcessBlock &&
+                previous is ChatDisplayItem.AssistantMarkdownBlock -> 12.dp
 
         this is ChatDisplayItem.AssistantActions &&
                 previous is ChatDisplayItem.AssistantMarkdownBlock &&

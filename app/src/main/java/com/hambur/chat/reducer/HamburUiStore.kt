@@ -1926,22 +1926,37 @@ private fun HamburUiState.reduce(event: BackendEvent): HamburUiState {
         val lastUserMessageIndex = nextTimelineItems.indexOfLast {
             it.contentType == "user_message" || it.kind == "UserMessage"
         }
+        val pendingMarkdownItem = nextTimelineItems
+            .filterIndexed { index, item -> item.contentType == "assistant_pending_block" && index > lastUserMessageIndex }
+            .lastOrNull()
+        val targetMsgId = pendingMarkdownItem?.stableKey
+            ?.removeSuffix(":pending")
+            ?.removePrefix("md:pending:")
+            ?.ifBlank { "stream-${event.turnId}" }
+            ?: "stream-${event.turnId}"
+
+        val lastReasoningIndex = nextTimelineItems.indexOfLast {
+            it.isAssistantReasoningBlock()
+        }
+        val lastCommittedMarkdownIndex = nextTimelineItems.indexOfLast {
+            it.contentType == "assistant_markdown_block" || it.kind == "AssistantMarkdownBlock"
+        }
+        val hasInterveningMarkdown = lastCommittedMarkdownIndex > lastReasoningIndex
+
+        val baseReasoningKey = "$targetMsgId:reasoning"
+        val reasoningKey = if (hasInterveningMarkdown) {
+            "$baseReasoningKey:$lastCommittedMarkdownIndex"
+        } else {
+            baseReasoningKey
+        }
+
         val existingReasoningItem = nextTimelineItems
             .filterIndexed { index, item -> item.isAssistantReasoningBlock() && index > lastUserMessageIndex }
-            .lastOrNull()
+            .lastOrNull { it.stableKey == reasoningKey }
 
         val reasoningItem = if (existingReasoningItem != null) {
             existingReasoningItem
         } else {
-            val pendingMarkdownItem = nextTimelineItems
-                .filterIndexed { index, item -> item.contentType == "assistant_pending_block" && index > lastUserMessageIndex }
-                .lastOrNull()
-            val targetMsgId = pendingMarkdownItem?.stableKey
-                ?.removeSuffix(":pending")
-                ?.removePrefix("md:pending:")
-                ?.ifBlank { "stream-${event.turnId}" }
-                ?: "stream-${event.turnId}"
-            val reasoningKey = "$targetMsgId:reasoning"
             val displaySeq = if ((pendingMarkdownItem?.displaySequence ?: 0UL) > 1UL) {
                 pendingMarkdownItem!!.displaySequence - 1UL
             } else {

@@ -13,7 +13,12 @@ val rustDir = rootProject.layout.projectDirectory.dir("rust")
 val uniffiUdl = rustDir.file("crates/hambur-uniffi/src/hambur_uniffi.udl")
 val uniffiConfig = rustDir.file("crates/hambur-uniffi/uniffi.toml")
 val generatedUniffiDir = layout.buildDirectory.dir("generated/source/uniffi/kotlin")
-val generatedJniLibsDir = layout.buildDirectory.dir("generated/rustJniLibs")
+// debug / release 必须各自独占一个输出目录。
+// 两个 Rust 任务的输入完全相同,共用一个目录时 Gradle 无法区分它们:
+// 跑完 assembleRelease 后 buildRustDebug 会被判为 UP-TO-DATE,
+// 于是 debug APK 里嵌进 release 版 .so(实测体积从 48.9MB 掉到 42.2MB),反之亦然。
+val generatedJniLibsDebugDir = layout.buildDirectory.dir("generated/rustJniLibs/debug")
+val generatedJniLibsReleaseDir = layout.buildDirectory.dir("generated/rustJniLibs/release")
 val uniffiBindgenRoot = layout.buildDirectory.dir("uniffi-bindgen")
 val uniffiBindgenBin = uniffiBindgenRoot.map { it.file("bin/uniffi-bindgen").asFile }
 val localPropertiesFile = rootProject.layout.projectDirectory.file("local.properties").asFile
@@ -32,6 +37,11 @@ val androidSdkDir = providers.environmentVariable("ANDROID_HOME")
     )
 val androidNdkHome = androidSdkDir.map { sdkDir ->
     File(sdkDir, "ndk/$androidNdkVersion").absolutePath
+}
+// Rust 源码才是真正的输入。若直接用 inputs.dir(rustDir),cargo 每轮写进 target/ 都会
+// 让任务失效,且每次构建都要对 GB 级产物目录做指纹计算。
+val rustSourceInputs = fileTree(rustDir.asFile) {
+    exclude("target/**")
 }
 
 android {
@@ -55,7 +65,13 @@ android {
         getByName("main") {
             kotlin.srcDir(generatedUniffiDir.get().asFile)
             jniLibs.srcDir("src/main/jniLibs")
-            jniLibs.srcDir(generatedJniLibsDir.get().asFile)
+            // 注意: 生成的 Rust 库不再挂在 main 上,否则两个变体会同时包含两份 .so。
+        }
+        getByName("debug") {
+            jniLibs.srcDir(generatedJniLibsDebugDir.get().asFile)
+        }
+        getByName("release") {
+            jniLibs.srcDir(generatedJniLibsReleaseDir.get().asFile)
         }
     }
 
@@ -135,8 +151,8 @@ tasks.register<Exec>("generateUniFfiKotlinBindings") {
 
 tasks.register<Exec>("buildRustDebug") {
     description = "Builds the Rust UniFFI cdylib for Android debug packaging."
-    inputs.dir(rustDir)
-    outputs.dir(generatedJniLibsDir)
+    inputs.files(rustSourceInputs)
+    outputs.dir(generatedJniLibsDebugDir)
     workingDir = rustDir.asFile
     environment("ANDROID_HOME", androidSdkDir.get())
     environment("ANDROID_NDK_HOME", androidNdkHome.get())
@@ -146,7 +162,7 @@ tasks.register<Exec>("buildRustDebug") {
         "-t",
         "arm64-v8a",
         "-o",
-        generatedJniLibsDir.get().asFile.absolutePath,
+        generatedJniLibsDebugDir.get().asFile.absolutePath,
         "build",
         "-p",
         "hambur-uniffi"
@@ -155,8 +171,8 @@ tasks.register<Exec>("buildRustDebug") {
 
 tasks.register<Exec>("buildRustRelease") {
     description = "Builds the Rust UniFFI cdylib for Android release packaging."
-    inputs.dir(rustDir)
-    outputs.dir(generatedJniLibsDir)
+    inputs.files(rustSourceInputs)
+    outputs.dir(generatedJniLibsReleaseDir)
     workingDir = rustDir.asFile
     environment("ANDROID_HOME", androidSdkDir.get())
     environment("ANDROID_NDK_HOME", androidNdkHome.get())
@@ -166,7 +182,7 @@ tasks.register<Exec>("buildRustRelease") {
         "-t",
         "arm64-v8a",
         "-o",
-        generatedJniLibsDir.get().asFile.absolutePath,
+        generatedJniLibsReleaseDir.get().asFile.absolutePath,
         "build",
         "-p",
         "hambur-uniffi",
@@ -178,13 +194,14 @@ tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach 
     dependsOn("generateUniFfiKotlinBindings")
 }
 
-val isRelease = gradle.startParameter.taskNames.any { it.contains("Release", ignoreCase = true) }
-tasks.named("preBuild") {
-    if (isRelease) {
-        dependsOn("buildRustRelease")
-    } else {
-        dependsOn("buildRustDebug")
-    }
+// 按构建类型分别挂钩,取代原先"用命令行任务名里是否含 Release 来猜"的做法:
+// 那个启发式在 `assembleDebug assembleRelease` 或 `build` 这类同时构建两个变体的
+// 调用下只会挂上一个任务,另一个变体就会打包出缺失或错误 flavor 的 .so。
+tasks.matching { it.name == "preDebugBuild" }.configureEach {
+    dependsOn("buildRustDebug")
+}
+tasks.matching { it.name == "preReleaseBuild" }.configureEach {
+    dependsOn("buildRustRelease")
 }
 
 dependencies {

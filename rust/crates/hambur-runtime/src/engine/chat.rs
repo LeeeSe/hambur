@@ -1112,14 +1112,20 @@ fn openai_request_thinking_trace(
         .get("reasoning_effort")
         .map(serde_json::Value::to_string)
         .unwrap_or_else(|| "null".to_string());
+    // Responses API requests carry the toggle inside `reasoning.effort`.
+    let reasoning = body
+        .get("reasoning")
+        .map(serde_json::Value::to_string)
+        .unwrap_or_else(|| "null".to_string());
     format!(
-        "ThinkingToggle rust request session={} model={} supports_reasoning={} reasoning_mode={:?} thinking={} reasoning_effort={}",
+        "ThinkingToggle rust request session={} model={} supports_reasoning={} reasoning_mode={:?} thinking={} reasoning_effort={} reasoning={}",
         request.session_id,
         route.model_id,
         route.supports_reasoning,
         request.reasoning_mode,
         thinking,
         reasoning_effort,
+        reasoning,
     )
 }
 

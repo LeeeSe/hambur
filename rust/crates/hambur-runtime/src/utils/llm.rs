@@ -314,6 +314,11 @@ pub(crate) fn provider_stream_source(
             );
         }
     }
+    // The official DeepSeek API enables thinking mode by default and exposes an
+    // explicit on/off switch, so the deep-thinking toggle must work even when the
+    // cached model capability is unknown.
+    let supports_thinking_toggle =
+        route.supports_reasoning || hambur_llm::is_official_deepseek_url(&route.base_url);
     RouteStreamSource::Provider(ModelRequest {
         request_id: new_id("llm_req"),
         session_id: session_id.to_string(),
@@ -322,7 +327,7 @@ pub(crate) fn provider_stream_source(
         stream: true,
         system_blocks,
         messages,
-        reasoning_mode: if route.supports_reasoning && deep_thinking_enabled {
+        reasoning_mode: if supports_thinking_toggle && deep_thinking_enabled {
             ReasoningMode::Enabled
         } else {
             ReasoningMode::Disabled
@@ -730,4 +735,48 @@ pub(crate) async fn reqwest_text_url(url: &str, timeout_secs: u64) -> HamburResu
         .text()
         .await
         .map_err(|error| HamburError::ProviderUnavailable(format!("NetworkError: {error}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_thinking_toggle_for_official_deepseek_without_capability() {
+        let route = |base_url: &str, supports_reasoning: bool| hambur_db::ModelRouteSnapshot {
+            provider_id: "provider".to_string(),
+            provider_protocol: hambur_llm::OPENAI_RESPONSES_PROTOCOL.to_string(),
+            base_url: base_url.to_string(),
+            model_id: "deepseek-flash".to_string(),
+            supports_reasoning,
+            ..Default::default()
+        };
+        let build = |route: &hambur_db::ModelRouteSnapshot, deep_thinking_enabled: bool| {
+            let source = provider_stream_source(
+                "sess",
+                "turn",
+                Vec::new(),
+                route,
+                "",
+                "",
+                "",
+                deep_thinking_enabled,
+                false,
+            );
+            match source {
+                RouteStreamSource::Provider(request) => request.reasoning_mode,
+                RouteStreamSource::Scripted { .. } => panic!("expected provider source"),
+            }
+        };
+
+        // Official DeepSeek defaults to thinking on, so the toggle must work even
+        // when the cached model capability has not been refreshed yet.
+        let deepseek = route("https://api.deepseek.com", false);
+        assert_eq!(build(&deepseek, true), hambur_llm::ReasoningMode::Enabled);
+        assert_eq!(build(&deepseek, false), hambur_llm::ReasoningMode::Disabled);
+
+        // Other providers still require the capability flag.
+        let generic = route("https://api.example.com/v1", false);
+        assert_eq!(build(&generic, true), hambur_llm::ReasoningMode::Disabled);
+    }
 }

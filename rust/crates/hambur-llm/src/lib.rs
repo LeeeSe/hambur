@@ -851,14 +851,21 @@ impl ResponsesApiAdapter {
         {
             body["temperature"] = json!(temperature);
         }
-        if target.model.capabilities.supports_reasoning {
-            body["reasoning"] = json!({
-                "effort": if request.reasoning_mode == ReasoningMode::Enabled {
-                    "high"
-                } else {
-                    "low"
+        // Responses API providers keep thinking enabled by default, so the
+        // thinking toggle has to be sent explicitly, including the disabled
+        // case. DeepSeek's Responses API maps `effort: "none"` to thinking mode
+        // off, while other providers reject `none` on legacy reasoning models;
+        // for those we omit `reasoning` and let the provider default apply.
+        if target.model.capabilities.supports_reasoning || is_official_deepseek {
+            match request.reasoning_mode {
+                ReasoningMode::Enabled => {
+                    body["reasoning"] = json!({ "effort": "high" });
                 }
-            });
+                ReasoningMode::Disabled if is_official_deepseek => {
+                    body["reasoning"] = json!({ "effort": "none" });
+                }
+                ReasoningMode::Disabled => {}
+            }
         }
 
         let mut base_url = target.provider.base_url.trim().trim_end_matches('/').to_string();
@@ -1584,6 +1591,79 @@ mod tests {
             finish_reason: "stop".to_string(),
             native_finish_reason: "completed".to_string(),
         }]);
+    }
+
+    #[test]
+    fn test_responses_api_reasoning_toggle() {
+        let make_target =
+            |base_url: &str, model_id: &str, supports_reasoning: bool| ProviderTarget {
+                provider: ProviderConfig {
+                    id: "provider".to_string(),
+                    name: "Provider".to_string(),
+                    protocol: OPENAI_RESPONSES_PROTOCOL.to_string(),
+                    base_url: base_url.to_string(),
+                    secret_ref: "secret".to_string(),
+                    enabled: true,
+                },
+                model: ProviderModel {
+                    provider_id: "provider".to_string(),
+                    model_id: model_id.to_string(),
+                    display_name: model_id.to_string(),
+                    capabilities: ModelCapabilities {
+                        supports_tool_call: true,
+                        supports_reasoning,
+                        ..Default::default()
+                    },
+                    metadata_json: "{}".to_string(),
+                },
+                model_group_id: "default".to_string(),
+                model_group_name: "Default".to_string(),
+                position: 0,
+            };
+        let make_request = |reasoning_mode: ReasoningMode| ModelRequest {
+            messages: vec![ModelMessage {
+                role: "user".to_string(),
+                content: "Hello!".to_string(),
+                ..Default::default()
+            }],
+            reasoning_mode,
+            ..Default::default()
+        };
+        let build = |target: &ProviderTarget, reasoning_mode: ReasoningMode| {
+            let spec = ResponsesApiAdapter::build_stream_request(
+                &make_request(reasoning_mode),
+                target,
+                "sk-test-key",
+            )
+            .expect("build request");
+            serde_json::from_str::<Value>(&spec.body_json).expect("valid json body")
+        };
+
+        // Official DeepSeek enables thinking by default, so both states must be
+        // sent explicitly even when the cached capability is unknown (false).
+        let deepseek = make_target("https://api.deepseek.com", "deepseek-flash", false);
+        let disabled = build(&deepseek, ReasoningMode::Disabled);
+        assert_eq!(disabled["reasoning"]["effort"], "none");
+        let enabled = build(&deepseek, ReasoningMode::Enabled);
+        assert_eq!(enabled["reasoning"]["effort"], "high");
+
+        // Other Responses API providers keep reasoning off by omitting the field
+        // (legacy OpenAI reasoning models reject `effort: none`).
+        let openai = make_target("https://api.openai.com/v1", "gpt-5.1", true);
+        let disabled = build(&openai, ReasoningMode::Disabled);
+        assert!(
+            disabled.get("reasoning").is_none(),
+            "generic Responses providers must not force a reasoning effort when thinking is off"
+        );
+        let enabled = build(&openai, ReasoningMode::Enabled);
+        assert_eq!(enabled["reasoning"]["effort"], "high");
+
+        // Models without reasoning support never receive a reasoning request.
+        let plain = make_target("https://api.example.com/v1", "plain-model", false);
+        for mode in [ReasoningMode::Enabled, ReasoningMode::Disabled] {
+            let body = build(&plain, mode);
+            assert!(body.get("reasoning").is_none());
+        }
     }
 
     #[test]

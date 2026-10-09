@@ -488,8 +488,12 @@ impl OpenAiCompatibleAdapter {
             target.model.model_id,
             target.model.capabilities.supports_reasoning,
             request.reasoning_mode,
-            body.get("thinking").map(Value::to_string).unwrap_or_else(|| "null".to_string()),
-            body.get("reasoning_effort").map(Value::to_string).unwrap_or_else(|| "null".to_string()),
+            body.get("thinking")
+                .map(Value::to_string)
+                .unwrap_or_else(|| "null".to_string()),
+            body.get("reasoning_effort")
+                .map(Value::to_string)
+                .unwrap_or_else(|| "null".to_string()),
         );
 
         Ok(HttpRequestSpec {
@@ -545,7 +549,9 @@ impl OpenAiCompatibleAdapter {
                 .or_else(|| item.get("supports_vision"))
                 .or_else(|| item.get("supportsVision"))
                 .and_then(Value::as_bool)
-                .unwrap_or_else(|| model_modalities_include_image(item) || model_id_implies_image_input(model_id));
+                .unwrap_or_else(|| {
+                    model_modalities_include_image(item) || model_id_implies_image_input(model_id)
+                });
             capabilities.supports_structured_output = item
                 .get("supports_structured_output")
                 .and_then(Value::as_bool)
@@ -678,7 +684,9 @@ impl ResponsesApiAdapter {
         target: &ProviderTarget,
         api_key: &str,
     ) -> HamburResult<HttpRequestSpec> {
-        if target.provider.protocol != OPENAI_RESPONSES_PROTOCOL && !target.provider.is_official_deepseek() {
+        if target.provider.protocol != OPENAI_RESPONSES_PROTOCOL
+            && !target.provider.is_official_deepseek()
+        {
             return Err(HamburError::ProviderUnavailable(format!(
                 "unsupported provider protocol: {}",
                 target.provider.protocol
@@ -718,7 +726,8 @@ impl ResponsesApiAdapter {
                             }));
                         }
                         for img in &message.images {
-                            let data_url = format!("data:{};base64,{}", img.mime_type, img.data_base64);
+                            let data_url =
+                                format!("data:{};base64,{}", img.mime_type, img.data_base64);
                             let mut img_part = json!({
                                 "type": "input_image",
                                 "image_url": data_url,
@@ -744,13 +753,21 @@ impl ResponsesApiAdapter {
                         }));
                     }
                     if !message.tool_calls_json.trim().is_empty() {
-                        if let Ok(tool_calls) = serde_json::from_str::<Value>(message.tool_calls_json.trim()) {
+                        if let Ok(tool_calls) =
+                            serde_json::from_str::<Value>(message.tool_calls_json.trim())
+                        {
                             if let Some(items) = tool_calls.as_array() {
                                 for item in items {
-                                    let call_id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+                                    let call_id =
+                                        item.get("id").and_then(Value::as_str).unwrap_or_default();
                                     let function = item.get("function").unwrap_or(&Value::Null);
-                                    let name = function.get("name").and_then(Value::as_str).unwrap_or_default();
-                                    let arguments = if let Some(s) = function.get("arguments").and_then(Value::as_str) {
+                                    let name = function
+                                        .get("name")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default();
+                                    let arguments = if let Some(s) =
+                                        function.get("arguments").and_then(Value::as_str)
+                                    {
                                         s.to_string()
                                     } else if let Some(obj) = function.get("arguments") {
                                         obj.to_string()
@@ -806,35 +823,28 @@ impl ResponsesApiAdapter {
             if let Some(items) = tools.as_array() {
                 for item in items {
                     if let Some(function) = item.get("function") {
-                        let name = function.get("name").and_then(Value::as_str).unwrap_or_default();
-                        if is_official_deepseek && name == "web_search" {
-                            responses_tools.push(json!({ "type": "web_search" }));
-                        } else {
-                            let mut tool = json!({ "type": "function" });
-                            if let Some(name) = function.get("name") { tool["name"] = name.clone(); }
-                            if let Some(desc) = function.get("description") { tool["description"] = desc.clone(); }
-                            if let Some(params) = function.get("parameters") { tool["parameters"] = params.clone(); }
-                            if let Some(strict) = function.get("strict") { tool["strict"] = strict.clone(); }
-                            responses_tools.push(tool);
+                        // `web_search` stays a function tool on every route, including
+                        // official DeepSeek: the runtime owns the search, so the model must
+                        // see a tool it can actually call. Rewriting it into the provider's
+                        // native `{"type":"web_search"}` server tool hid it from the model.
+                        let mut tool = json!({ "type": "function" });
+                        if let Some(name) = function.get("name") {
+                            tool["name"] = name.clone();
                         }
+                        if let Some(desc) = function.get("description") {
+                            tool["description"] = desc.clone();
+                        }
+                        if let Some(params) = function.get("parameters") {
+                            tool["parameters"] = params.clone();
+                        }
+                        if let Some(strict) = function.get("strict") {
+                            tool["strict"] = strict.clone();
+                        }
+                        responses_tools.push(tool);
                     } else {
-                        let tool_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
-                        if is_official_deepseek && tool_type == "web_search" {
-                            responses_tools.push(json!({ "type": "web_search" }));
-                        } else {
-                            responses_tools.push(item.clone());
-                        }
+                        responses_tools.push(item.clone());
                     }
                 }
-            }
-        }
-
-        if is_official_deepseek {
-            let has_web_search = responses_tools.iter().any(|t| {
-                t.get("type").and_then(Value::as_str) == Some("web_search")
-            });
-            if !has_web_search {
-                responses_tools.push(json!({ "type": "web_search" }));
             }
         }
 
@@ -868,19 +878,36 @@ impl ResponsesApiAdapter {
             }
         }
 
-        let mut base_url = target.provider.base_url.trim().trim_end_matches('/').to_string();
+        let mut base_url = target
+            .provider
+            .base_url
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
         if base_url.ends_with("/chat/completions") {
-            base_url = base_url.trim_end_matches("/chat/completions").trim_end_matches('/').to_string();
+            base_url = base_url
+                .trim_end_matches("/chat/completions")
+                .trim_end_matches('/')
+                .to_string();
         }
         if base_url.ends_with("/responses") {
-            base_url = base_url.trim_end_matches("/responses").trim_end_matches('/').to_string();
+            base_url = base_url
+                .trim_end_matches("/responses")
+                .trim_end_matches('/')
+                .to_string();
         }
         if target.provider.is_official_deepseek() {
             if base_url.ends_with("/v1") {
-                base_url = base_url.trim_end_matches("/v1").trim_end_matches('/').to_string();
+                base_url = base_url
+                    .trim_end_matches("/v1")
+                    .trim_end_matches('/')
+                    .to_string();
             }
             if base_url.ends_with("/beta") {
-                base_url = base_url.trim_end_matches("/beta").trim_end_matches('/').to_string();
+                base_url = base_url
+                    .trim_end_matches("/beta")
+                    .trim_end_matches('/')
+                    .to_string();
             }
         }
         let url = if base_url == "https://api.openai.com" {
@@ -943,7 +970,10 @@ impl ResponsesApiAdapter {
         let event_type = if !payload.event_name.trim().is_empty() {
             payload.event_name.trim()
         } else {
-            value.get("type").and_then(Value::as_str).unwrap_or_default()
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
         };
 
         let mut events = Vec::new();
@@ -955,9 +985,19 @@ impl ResponsesApiAdapter {
                 let delta = value
                     .get("delta")
                     .and_then(Value::as_str)
-                    .or_else(|| value.get("delta").and_then(|d| d.get("text")).and_then(Value::as_str))
+                    .or_else(|| {
+                        value
+                            .get("delta")
+                            .and_then(|d| d.get("text"))
+                            .and_then(Value::as_str)
+                    })
                     .or_else(|| value.get("text").and_then(Value::as_str))
-                    .or_else(|| value.get("part").and_then(|p| p.get("text")).and_then(Value::as_str))
+                    .or_else(|| {
+                        value
+                            .get("part")
+                            .and_then(|p| p.get("text"))
+                            .and_then(Value::as_str)
+                    })
                     .unwrap_or_default();
                 if !delta.is_empty() {
                     events.push(ProviderStreamEvent::ContentDelta(delta.to_string()));
@@ -970,7 +1010,12 @@ impl ResponsesApiAdapter {
                 let delta = value
                     .get("delta")
                     .and_then(Value::as_str)
-                    .or_else(|| value.get("delta").and_then(|d| d.get("text")).and_then(Value::as_str))
+                    .or_else(|| {
+                        value
+                            .get("delta")
+                            .and_then(|d| d.get("text"))
+                            .and_then(Value::as_str)
+                    })
                     .or_else(|| value.get("text").and_then(Value::as_str))
                     .or_else(|| value.get("summary").and_then(Value::as_str))
                     .unwrap_or_default();
@@ -983,7 +1028,12 @@ impl ResponsesApiAdapter {
                 let query = value
                     .get("query")
                     .and_then(Value::as_str)
-                    .or_else(|| value.get("item").and_then(|i| i.get("query")).and_then(Value::as_str))
+                    .or_else(|| {
+                        value
+                            .get("item")
+                            .and_then(|i| i.get("query"))
+                            .and_then(Value::as_str)
+                    })
                     .unwrap_or_default();
                 if !query.is_empty() {
                     events.push(ProviderStreamEvent::ReasoningDelta(format!(
@@ -1001,9 +1051,16 @@ impl ResponsesApiAdapter {
                 if let Some(item) = value.get("item") {
                     let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
                     if item_type == "function_call" {
-                        let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or_default();
+                        let call_id = item
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
                         let item_id = item.get("id").and_then(Value::as_str).unwrap_or_default();
-                        let id = if !call_id.is_empty() { call_id } else { item_id };
+                        let id = if !call_id.is_empty() {
+                            call_id
+                        } else {
+                            item_id
+                        };
                         let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
                         let index = value
                             .get("output_index")
@@ -1013,8 +1070,12 @@ impl ResponsesApiAdapter {
                             .and_then(Value::as_u64)
                             .and_then(|v| u32::try_from(v).ok())
                             .unwrap_or_default();
-                        let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or_default();
-                        if !arguments.is_empty() && serde_json::from_str::<Value>(arguments).is_ok() {
+                        let arguments = item
+                            .get("arguments")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        if !arguments.is_empty() && serde_json::from_str::<Value>(arguments).is_ok()
+                        {
                             events.push(ProviderStreamEvent::ToolCallDone {
                                 index,
                                 id: id.to_string(),
@@ -1045,10 +1106,23 @@ impl ResponsesApiAdapter {
                 }
             }
             "response.function_call_arguments.delta" => {
-                let call_id = value.get("call_id").and_then(Value::as_str).unwrap_or_default();
-                let item_id = value.get("item_id").and_then(Value::as_str).unwrap_or_default();
-                let id = if !call_id.is_empty() { call_id } else { item_id };
-                let delta = value.get("delta").and_then(Value::as_str).unwrap_or_default();
+                let call_id = value
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let item_id = value
+                    .get("item_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let id = if !call_id.is_empty() {
+                    call_id
+                } else {
+                    item_id
+                };
+                let delta = value
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
                 let index = value
                     .get("output_index")
                     .or_else(|| value.get("index"))
@@ -1065,10 +1139,23 @@ impl ResponsesApiAdapter {
                 }
             }
             "response.function_call_arguments.done" => {
-                let call_id = value.get("call_id").and_then(Value::as_str).unwrap_or_default();
-                let item_id = value.get("item_id").and_then(Value::as_str).unwrap_or_default();
-                let id = if !call_id.is_empty() { call_id } else { item_id };
-                let arguments = value.get("arguments").and_then(Value::as_str).unwrap_or_default();
+                let call_id = value
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let item_id = value
+                    .get("item_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let id = if !call_id.is_empty() {
+                    call_id
+                } else {
+                    item_id
+                };
+                let arguments = value
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
                 let index = value
                     .get("output_index")
                     .or_else(|| value.get("index"))
@@ -1094,11 +1181,21 @@ impl ResponsesApiAdapter {
                         .and_then(|v| u32::try_from(v).ok())
                         .unwrap_or_default();
                     if item_type == "function_call" {
-                        let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or_default();
+                        let call_id = item
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
                         let item_id = item.get("id").and_then(Value::as_str).unwrap_or_default();
-                        let id = if !call_id.is_empty() { call_id } else { item_id };
+                        let id = if !call_id.is_empty() {
+                            call_id
+                        } else {
+                            item_id
+                        };
                         let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
-                        let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or_default();
+                        let arguments = item
+                            .get("arguments")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
                         events.push(ProviderStreamEvent::ToolCallDone {
                             index,
                             id: id.to_string(),
@@ -1117,8 +1214,14 @@ impl ResponsesApiAdapter {
                 });
                 let (code, message) = if let Some(err) = error {
                     (
-                        err.get("code").and_then(Value::as_str).unwrap_or("ProviderError").to_string(),
-                        err.get("message").and_then(Value::as_str).unwrap_or("response failed").to_string(),
+                        err.get("code")
+                            .and_then(Value::as_str)
+                            .unwrap_or("ProviderError")
+                            .to_string(),
+                        err.get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("response failed")
+                            .to_string(),
                     )
                 } else {
                     ("ProviderError".to_string(), "response failed".to_string())
@@ -1137,8 +1240,14 @@ impl ResponsesApiAdapter {
                         .and_then(|sd| sd.get("error"));
                     let (code, message) = if let Some(err) = error {
                         (
-                            err.get("code").and_then(Value::as_str).unwrap_or("ProviderError").to_string(),
-                            err.get("message").and_then(Value::as_str).unwrap_or("response failed").to_string(),
+                            err.get("code")
+                                .and_then(Value::as_str)
+                                .unwrap_or("ProviderError")
+                                .to_string(),
+                            err.get("message")
+                                .and_then(Value::as_str)
+                                .unwrap_or("response failed")
+                                .to_string(),
                         )
                     } else {
                         ("ProviderError".to_string(), "response failed".to_string())
@@ -1294,18 +1403,34 @@ impl ToolCallAccumulator {
                 id,
                 name,
                 arguments_delta,
-            } => (*index, id.as_str(), name.as_str(), Some(arguments_delta.as_str()), None),
+            } => (
+                *index,
+                id.as_str(),
+                name.as_str(),
+                Some(arguments_delta.as_str()),
+                None,
+            ),
             ProviderStreamEvent::ToolCallDone {
                 index,
                 id,
                 name,
                 arguments_json,
-            } => (*index, id.as_str(), name.as_str(), None, Some(arguments_json.as_str())),
+            } => (
+                *index,
+                id.as_str(),
+                name.as_str(),
+                None,
+                Some(arguments_json.as_str()),
+            ),
             _ => return Vec::new(),
         };
 
         let call = if !id.is_empty() {
-            if let Some((_, c)) = self.calls.iter_mut().find(|(_, c)| c.id == id || (!c.item_id.is_empty() && c.item_id == id)) {
+            if let Some((_, c)) = self
+                .calls
+                .iter_mut()
+                .find(|(_, c)| c.id == id || (!c.item_id.is_empty() && c.item_id == id))
+            {
                 c
             } else {
                 self.calls.entry(index).or_default()
@@ -1320,7 +1445,8 @@ impl ToolCallAccumulator {
                 if call.id.is_empty() {
                     call.id = id.to_string();
                 }
-            } else if id.starts_with("call_") || call.id.is_empty() || call.id.starts_with("item_") {
+            } else if id.starts_with("call_") || call.id.is_empty() || call.id.starts_with("item_")
+            {
                 call.id = id.to_string();
             }
         }
@@ -1331,7 +1457,10 @@ impl ToolCallAccumulator {
             call.arguments.push_str(delta);
         }
         if let Some(done) = done_json {
-            if !done.is_empty() && (call.arguments.is_empty() || serde_json::from_str::<Value>(&call.arguments).is_err()) {
+            if !done.is_empty()
+                && (call.arguments.is_empty()
+                    || serde_json::from_str::<Value>(&call.arguments).is_err())
+            {
                 call.arguments = done.to_string();
             }
         }
@@ -1501,8 +1630,12 @@ mod tests {
             event_id: "0".to_string(),
             raw_frame_meta: String::new(),
         };
-        let events0 = ResponsesApiAdapter::parse_stream_payload(&payload0).expect("parse output text delta");
-        assert_eq!(events0, vec![ProviderStreamEvent::ContentDelta("Hi!".to_string())]);
+        let events0 =
+            ResponsesApiAdapter::parse_stream_payload(&payload0).expect("parse output text delta");
+        assert_eq!(
+            events0,
+            vec![ProviderStreamEvent::ContentDelta("Hi!".to_string())]
+        );
 
         // Text delta (fallback event)
         let payload1 = StreamPayload {
@@ -1511,8 +1644,12 @@ mod tests {
             event_id: "1".to_string(),
             raw_frame_meta: String::new(),
         };
-        let events1 = ResponsesApiAdapter::parse_stream_payload(&payload1).expect("parse text delta");
-        assert_eq!(events1, vec![ProviderStreamEvent::ContentDelta("Hello world".to_string())]);
+        let events1 =
+            ResponsesApiAdapter::parse_stream_payload(&payload1).expect("parse text delta");
+        assert_eq!(
+            events1,
+            vec![ProviderStreamEvent::ContentDelta("Hello world".to_string())]
+        );
 
         // Reasoning delta
         let payload_reasoning = StreamPayload {
@@ -1521,8 +1658,14 @@ mod tests {
             event_id: "1r".to_string(),
             raw_frame_meta: String::new(),
         };
-        let events_r = ResponsesApiAdapter::parse_stream_payload(&payload_reasoning).expect("parse reasoning delta");
-        assert_eq!(events_r, vec![ProviderStreamEvent::ReasoningDelta("Thinking...".to_string())]);
+        let events_r = ResponsesApiAdapter::parse_stream_payload(&payload_reasoning)
+            .expect("parse reasoning delta");
+        assert_eq!(
+            events_r,
+            vec![ProviderStreamEvent::ReasoningDelta(
+                "Thinking...".to_string()
+            )]
+        );
 
         // Function call item added (with top-level output_index)
         let payload2 = StreamPayload {
@@ -1531,13 +1674,17 @@ mod tests {
             event_id: "2".to_string(),
             raw_frame_meta: String::new(),
         };
-        let events2 = ResponsesApiAdapter::parse_stream_payload(&payload2).expect("parse call added");
-        assert_eq!(events2, vec![ProviderStreamEvent::ToolCallDelta {
-            index: 1,
-            id: "call_999".to_string(),
-            name: "view_image".to_string(),
-            arguments_delta: String::new(),
-        }]);
+        let events2 =
+            ResponsesApiAdapter::parse_stream_payload(&payload2).expect("parse call added");
+        assert_eq!(
+            events2,
+            vec![ProviderStreamEvent::ToolCallDelta {
+                index: 1,
+                id: "call_999".to_string(),
+                name: "view_image".to_string(),
+                arguments_delta: String::new(),
+            }]
+        );
 
         // Function call arguments delta
         let payload3 = StreamPayload {
@@ -1546,13 +1693,17 @@ mod tests {
             event_id: "3".to_string(),
             raw_frame_meta: String::new(),
         };
-        let events3 = ResponsesApiAdapter::parse_stream_payload(&payload3).expect("parse args delta");
-        assert_eq!(events3, vec![ProviderStreamEvent::ToolCallDelta {
-            index: 1,
-            id: "call_999".to_string(),
-            name: String::new(),
-            arguments_delta: "{\"path\":\"foo.png\"}".to_string(),
-        }]);
+        let events3 =
+            ResponsesApiAdapter::parse_stream_payload(&payload3).expect("parse args delta");
+        assert_eq!(
+            events3,
+            vec![ProviderStreamEvent::ToolCallDelta {
+                index: 1,
+                id: "call_999".to_string(),
+                name: String::new(),
+                arguments_delta: "{\"path\":\"foo.png\"}".to_string(),
+            }]
+        );
 
         // Accumulator should complete the call
         let mut acc = ToolCallAccumulator::default();
@@ -1571,13 +1722,17 @@ mod tests {
             event_id: "4".to_string(),
             raw_frame_meta: String::new(),
         };
-        let events_done = ResponsesApiAdapter::parse_stream_payload(&payload_done).expect("parse item done");
-        assert_eq!(events_done, vec![ProviderStreamEvent::ToolCallDone {
-            index: 1,
-            id: "call_999".to_string(),
-            name: "view_image".to_string(),
-            arguments_json: "{\"path\":\"foo.png\"}".to_string(),
-        }]);
+        let events_done =
+            ResponsesApiAdapter::parse_stream_payload(&payload_done).expect("parse item done");
+        assert_eq!(
+            events_done,
+            vec![ProviderStreamEvent::ToolCallDone {
+                index: 1,
+                id: "call_999".to_string(),
+                name: "view_image".to_string(),
+                arguments_json: "{\"path\":\"foo.png\"}".to_string(),
+            }]
+        );
 
         // Response done
         let payload4 = StreamPayload {
@@ -1587,10 +1742,13 @@ mod tests {
             raw_frame_meta: String::new(),
         };
         let events4 = ResponsesApiAdapter::parse_stream_payload(&payload4).expect("parse done");
-        assert_eq!(events4, vec![ProviderStreamEvent::Finish {
-            finish_reason: "stop".to_string(),
-            native_finish_reason: "completed".to_string(),
-        }]);
+        assert_eq!(
+            events4,
+            vec![ProviderStreamEvent::Finish {
+                finish_reason: "stop".to_string(),
+                native_finish_reason: "completed".to_string(),
+            }]
+        );
     }
 
     #[test]
@@ -1690,7 +1848,7 @@ mod tests {
     }
 
     #[test]
-    fn test_official_deepseek_responses_api_web_search_injection() {
+    fn test_web_search_stays_a_callable_function_tool_on_every_route() {
         let deepseek_provider = ProviderConfig {
             id: "deepseek".to_string(),
             name: "DeepSeek".to_string(),
@@ -1717,7 +1875,9 @@ mod tests {
             position: 0,
         };
 
-        // Case 1: tools_json has function web_search -> converted to {"type": "web_search"}
+        // The runtime owns web search, so the model must always receive a function tool it
+        // can call — the provider's native server tool is an implementation detail of the
+        // search provider, not something the model-facing tool list may hide.
         let request_with_web_search = ModelRequest {
             system_blocks: vec![],
             messages: vec![ModelMessage {
@@ -1732,16 +1892,23 @@ mod tests {
             ..Default::default()
         };
 
-        let spec = ResponsesApiAdapter::build_stream_request(&request_with_web_search, &deepseek_target, "sk-ds-key")
-            .expect("build request");
+        let spec = ResponsesApiAdapter::build_stream_request(
+            &request_with_web_search,
+            &deepseek_target,
+            "sk-ds-key",
+        )
+        .expect("build request");
         let body: Value = serde_json::from_str(&spec.body_json).expect("valid json");
         let tools = body["tools"].as_array().expect("tools array");
         assert_eq!(tools.len(), 2);
-        assert_eq!(tools[0], json!({ "type": "web_search" }));
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], "web_search");
+        assert_eq!(tools[0]["parameters"], json!({"type": "object"}));
         assert_eq!(tools[1]["type"], "function");
         assert_eq!(tools[1]["name"], "read_file");
 
-        // Case 2: tools_json is empty -> official deepseek still gets {"type": "web_search"}
+        // No tool list means no tools: never invent a native search tool the model would
+        // silently gain (and that the runtime could not account for).
         let request_empty_tools = ModelRequest {
             system_blocks: vec![],
             messages: vec![ModelMessage {
@@ -1752,18 +1919,27 @@ mod tests {
             tools_json: String::new(),
             ..Default::default()
         };
-        let spec2 = ResponsesApiAdapter::build_stream_request(&request_empty_tools, &deepseek_target, "sk-ds-key")
-            .expect("build request");
+        let spec2 = ResponsesApiAdapter::build_stream_request(
+            &request_empty_tools,
+            &deepseek_target,
+            "sk-ds-key",
+        )
+        .expect("build request");
         let body2: Value = serde_json::from_str(&spec2.body_json).expect("valid json");
-        let tools2 = body2["tools"].as_array().expect("tools array");
-        assert_eq!(tools2.len(), 1);
-        assert_eq!(tools2[0], json!({ "type": "web_search" }));
+        assert!(
+            body2.get("tools").is_none(),
+            "no tools must stay no tools: {body2}"
+        );
 
-        // Case 3: Non-official provider should NOT convert or inject web_search
+        // A non-official provider behaves identically.
         let mut non_official_target = deepseek_target.clone();
         non_official_target.provider.base_url = "https://api.siliconflow.cn/v1".to_string();
-        let spec3 = ResponsesApiAdapter::build_stream_request(&request_with_web_search, &non_official_target, "sk-sf-key")
-            .expect("build request");
+        let spec3 = ResponsesApiAdapter::build_stream_request(
+            &request_with_web_search,
+            &non_official_target,
+            "sk-sf-key",
+        )
+        .expect("build request");
         let body3: Value = serde_json::from_str(&spec3.body_json).expect("valid json");
         let tools3 = body3["tools"].as_array().expect("tools array");
         assert_eq!(tools3.len(), 2);
@@ -1775,13 +1951,20 @@ mod tests {
     fn test_responses_api_parse_web_search_stream_events() {
         // response.web_search_call.searching
         let payload_searching = StreamPayload {
-            data: r#"{"type":"response.web_search_call.searching","query":"Rust 2024 features"}"#.to_string(),
+            data: r#"{"type":"response.web_search_call.searching","query":"Rust 2024 features"}"#
+                .to_string(),
             event_name: "response.web_search_call.searching".to_string(),
             event_id: "ws_1".to_string(),
             raw_frame_meta: String::new(),
         };
-        let events = ResponsesApiAdapter::parse_stream_payload(&payload_searching).expect("parse search");
-        assert_eq!(events, vec![ProviderStreamEvent::ReasoningDelta("\n🔍 正在联网搜索：Rust 2024 features\n".to_string())]);
+        let events =
+            ResponsesApiAdapter::parse_stream_payload(&payload_searching).expect("parse search");
+        assert_eq!(
+            events,
+            vec![ProviderStreamEvent::ReasoningDelta(
+                "\n🔍 正在联网搜索：Rust 2024 features\n".to_string()
+            )]
+        );
 
         // response.output_item.added with web_search_call
         let payload_item_added = StreamPayload {
@@ -1790,8 +1973,14 @@ mod tests {
             event_id: "ws_2".to_string(),
             raw_frame_meta: String::new(),
         };
-        let events_added = ResponsesApiAdapter::parse_stream_payload(&payload_item_added).expect("parse item added");
-        assert_eq!(events_added, vec![ProviderStreamEvent::ReasoningDelta("\n🔍 正在联网搜索：DeepSeek responses API\n".to_string())]);
+        let events_added = ResponsesApiAdapter::parse_stream_payload(&payload_item_added)
+            .expect("parse item added");
+        assert_eq!(
+            events_added,
+            vec![ProviderStreamEvent::ReasoningDelta(
+                "\n🔍 正在联网搜索：DeepSeek responses API\n".to_string()
+            )]
+        );
 
         // response.output_item.done with web_search_call must NOT emit ToolCallDone
         let payload_item_done = StreamPayload {
@@ -1800,7 +1989,11 @@ mod tests {
             event_id: "ws_3".to_string(),
             raw_frame_meta: String::new(),
         };
-        let events_done = ResponsesApiAdapter::parse_stream_payload(&payload_item_done).expect("parse item done");
-        assert!(events_done.is_empty(), "web_search_call output_item.done should not emit any ToolCallDone");
+        let events_done =
+            ResponsesApiAdapter::parse_stream_payload(&payload_item_done).expect("parse item done");
+        assert!(
+            events_done.is_empty(),
+            "web_search_call output_item.done should not emit any ToolCallDone"
+        );
     }
 }

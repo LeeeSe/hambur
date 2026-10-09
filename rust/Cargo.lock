@@ -583,6 +583,7 @@ dependencies = [
  "hambur-markdown",
  "hambur-sandbox",
  "hambur-tools",
+ "hambur-web",
  "regex",
  "reqwest",
  "serde_json",
@@ -623,6 +624,16 @@ dependencies = [
  "hambur-runtime",
  "serde_json",
  "uniffi",
+]
+
+[[package]]
+name = "hambur-web"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

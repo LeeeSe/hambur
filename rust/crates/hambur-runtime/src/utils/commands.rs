@@ -145,6 +145,9 @@ pub(crate) fn validate_command(command: &RuntimeCommand) -> HamburResult<()> {
             }
             Ok(())
         }
+        // An empty payload is the explicit "clear the persona" encoding: the runtime stores
+        // an empty `persona` setting, which reads back as no persona.
+        "UpdatePersona" => Ok(()),
         "UpdateToolSettings"
         | "UpdateSkills"
         | "UpdateMemoryProjections"
@@ -153,7 +156,6 @@ pub(crate) fn validate_command(command: &RuntimeCommand) -> HamburResult<()> {
         | "UpdateAppearance"
         | "UpdateLogs"
         | "UpdateTokenUsage"
-        | "UpdatePersona"
         | "UpdateEnvironmentVariables"
         | "UpdateAppSetting"
         | "UpdateBrowserToolSettings"

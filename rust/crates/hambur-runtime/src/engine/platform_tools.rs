@@ -71,13 +71,11 @@ impl RuntimeEngine {
                     payload_json
                 };
                 if !is_error {
-                    match self
-                        .materialize_browser_artifacts(
-                            session_id,
-                            &invocation.tool_call_id,
-                            &content,
-                        )
-                    {
+                    match self.materialize_browser_artifacts(
+                        session_id,
+                        &invocation.tool_call_id,
+                        &content,
+                    ) {
                         Ok(materialized) => {
                             content = materialized;
                         }
@@ -115,12 +113,12 @@ impl RuntimeEngine {
                 self.tools
                     .normalize_raw_with_session(raw, Some(&invocation.session_id))
                     .unwrap_or_else(|error| {
-                    ToolResult::failed(
-                        &invocation.tool_call_id,
-                        &invocation.name,
-                        error.to_string(),
-                    )
-                })
+                        ToolResult::failed(
+                            &invocation.tool_call_id,
+                            &invocation.name,
+                            error.to_string(),
+                        )
+                    })
             }
             _ => {
                 let _ = self
@@ -128,7 +126,7 @@ impl RuntimeEngine {
                     .lock()
                     .ok()
                     .and_then(|mut requests| requests.remove(&request_id));
-                                let _ = self.emit_failure(
+                let _ = self.emit_failure(
                     RuntimeEventKind::PlatformRequestTimedOut,
                     session_id.to_string(),
                     turn_id.to_string(),
@@ -163,8 +161,8 @@ impl RuntimeEngine {
         }
 
         let request_id = new_id("platform_req");
-        let timeout_ms = argument_seconds_or_ms(arguments, "timeout", "timeout_ms", 20_000)
-            .clamp(1_000, 60_000);
+        let timeout_ms =
+            argument_seconds_or_ms(arguments, "timeout", "timeout_ms", 20_000).clamp(1_000, 60_000);
         let request = PlatformRequest {
             request_id: request_id.clone(),
             session_id: session_id.to_string(),
@@ -250,7 +248,7 @@ impl RuntimeEngine {
                     .lock()
                     .ok()
                     .and_then(|mut requests| requests.remove(&request_id));
-                                let _ = self.emit_failure(
+                let _ = self.emit_failure(
                     RuntimeEventKind::PlatformRequestTimedOut,
                     session_id.to_string(),
                     turn_id.to_string(),
@@ -276,26 +274,27 @@ impl RuntimeEngine {
         };
         if value.get("downloaded").and_then(Value::as_bool) == Some(true) {
             if let Some(sandbox_path) = value.get("sandboxPath").and_then(Value::as_str) {
-                if let Ok(resolved) = self.sandbox.resolve(session_id, sandbox_path, SandboxAccess::Read) {
+                if let Ok(resolved) =
+                    self.sandbox
+                        .resolve(session_id, sandbox_path, SandboxAccess::Read)
+                {
                     if let Ok(meta) = fs::metadata(&resolved.host_path) {
                         let mime_type = value
                             .get("mimeType")
                             .and_then(Value::as_str)
                             .unwrap_or_else(|| detect_mime_type(&resolved.host_path));
                         let file_id = new_id("file");
-                        let _ = self
-                            .database
-                            .upsert_file_record(NewFileRecord {
-                                id: file_id.clone(),
-                                scope: "session".to_string(),
-                                session_id: session_id.to_string(),
-                                relative_path: resolved.relative_path.clone(),
-                                sandbox_path: resolved.sandbox_path.clone(),
-                                mime_type: mime_type.to_string(),
-                                byte_size: meta.len(),
-                                sha256: String::new(),
-                                retention_policy: "delete_with_session".to_string(),
-                            });
+                        let _ = self.database.upsert_file_record(NewFileRecord {
+                            id: file_id.clone(),
+                            scope: "session".to_string(),
+                            session_id: session_id.to_string(),
+                            relative_path: resolved.relative_path.clone(),
+                            sandbox_path: resolved.sandbox_path.clone(),
+                            mime_type: mime_type.to_string(),
+                            byte_size: meta.len(),
+                            sha256: String::new(),
+                            retention_policy: "delete_with_session".to_string(),
+                        });
                         if let Some(object) = value.as_object_mut() {
                             object.insert("fileId".to_string(), json!(file_id));
                             object.insert(
@@ -333,18 +332,17 @@ impl RuntimeEngine {
         let reserved = self.filestore.reserve_cache_image(session_id, extension)?;
         fs::write(&reserved.host_path, &bytes)
             .map_err(|error| HamburError::Internal(format!("write browser artifact: {error}")))?;
-        self.database
-            .upsert_file_record(NewFileRecord {
-                id: reserved.file_id.clone(),
-                scope: "session".to_string(),
-                session_id: session_id.to_string(),
-                relative_path: reserved.relative_path.clone(),
-                sandbox_path: reserved.sandbox_path.clone(),
-                mime_type: mime_type.clone(),
-                byte_size: bytes.len() as u64,
-                sha256: String::new(),
-                retention_policy: "delete_with_session".to_string(),
-            })?;
+        self.database.upsert_file_record(NewFileRecord {
+            id: reserved.file_id.clone(),
+            scope: "session".to_string(),
+            session_id: session_id.to_string(),
+            relative_path: reserved.relative_path.clone(),
+            sandbox_path: reserved.sandbox_path.clone(),
+            mime_type: mime_type.clone(),
+            byte_size: bytes.len() as u64,
+            sha256: String::new(),
+            retention_policy: "delete_with_session".to_string(),
+        })?;
         if let Some(object) = value.as_object_mut() {
             object.remove("base64");
             object.insert("fileId".to_string(), json!(reserved.file_id));
@@ -354,56 +352,5 @@ impl RuntimeEngine {
             object.insert("materialized".to_string(), json!(true));
         }
         Ok(value.to_string())
-    }
-
-    pub(crate) fn resolve_web_tool_result(
-        &self,
-        invocation: &ToolInvocation,
-        arguments: &Value,
-    ) -> ToolResult {
-        if let Err(error) = self
-            .tools
-            .schemas()
-            .validate_arguments(&invocation.name, arguments)
-        {
-            return ToolResult::failed(
-                &invocation.tool_call_id,
-                &invocation.name,
-                error.to_string(),
-            );
-        }
-
-        let raw = match invocation.name.as_str() {
-            "web_search" => RawToolOutput {
-                tool_call_id: invocation.tool_call_id.clone(),
-                tool_name: invocation.name.clone(),
-                is_error: true,
-                content: "web_search requires a configured search provider".to_string(),
-                summary: "Web search provider unavailable".to_string(),
-                trust_level: "untrusted".to_string(),
-                command_or_url: arguments.to_string(),
-                status: "ProviderUnavailable".to_string(),
-            },
-            _ => RawToolOutput {
-                tool_call_id: invocation.tool_call_id.clone(),
-                tool_name: invocation.name.clone(),
-                is_error: true,
-                content: format!("unknown web tool: {}", invocation.name),
-                summary: "Unknown web tool".to_string(),
-                trust_level: "trusted".to_string(),
-                command_or_url: arguments.to_string(),
-                status: "InvalidCommand".to_string(),
-            },
-        };
-
-        self.tools
-            .normalize_raw_with_session(raw, Some(&invocation.session_id))
-            .unwrap_or_else(|error| {
-            ToolResult::failed(
-                &invocation.tool_call_id,
-                &invocation.name,
-                error.to_string(),
-            )
-        })
     }
 }

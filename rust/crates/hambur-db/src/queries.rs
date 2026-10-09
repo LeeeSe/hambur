@@ -53,7 +53,6 @@ impl HamburDatabase {
                 ",
                 params![session_id],
             )
-            
             .map_err(database_error)?;
 
         let mut attachments = Vec::new();
@@ -63,10 +62,7 @@ impl HamburDatabase {
         Ok(attachments)
     }
 
-    pub fn pending_file_cleanup_jobs(
-        &self,
-        limit: u32,
-    ) -> HamburResult<Vec<FileCleanupJobRecord>> {
+    pub fn pending_file_cleanup_jobs(&self, limit: u32) -> HamburResult<Vec<FileCleanupJobRecord>> {
         let limit = clamp_limit(limit, 1, 100);
         let mut rows = self
             .connection
@@ -118,7 +114,6 @@ impl HamburDatabase {
                 ",
                 params![sandbox_path, session_id],
             )
-            
             .map_err(database_error)?;
         let Some(row) = rows.next().map_err(database_error)? else {
             return Err(HamburError::InvalidCommand(format!(
@@ -157,7 +152,6 @@ impl HamburDatabase {
                 ",
                 params![session_id, stable_key],
             )
-            
             .map_err(database_error)?;
 
         let Some(row) = rows.next().map_err(database_error)? else {
@@ -201,7 +195,6 @@ impl HamburDatabase {
                     ",
                     params![session_id, payload_ref],
                 )
-                
                 .map_err(database_error)?;
             if let Some(row) = rows.next().map_err(database_error)? {
                 blocks.push(message_block_from_row(&row)?);
@@ -257,7 +250,6 @@ impl HamburDatabase {
                 ",
                 params![limit as i64],
             )
-            
             .map_err(database_error)?;
 
         let mut sessions = Vec::new();
@@ -267,10 +259,7 @@ impl HamburDatabase {
         Ok(sessions)
     }
 
-    pub fn session_review_record(
-        &self,
-        session_id: &str,
-    ) -> HamburResult<SessionReviewRecord> {
+    pub fn session_review_record(&self, session_id: &str) -> HamburResult<SessionReviewRecord> {
         let summary = self.session_summary(session_id)?;
         Ok(SessionReviewRecord {
             id: summary.id.clone(),
@@ -291,13 +280,10 @@ impl HamburDatabase {
         limit: u32,
     ) -> HamburResult<TimelinePageData> {
         self.ensure_session_exists(session_id)?;
-        let mut page = self
-            .timeline_items_page(session_id, before_cursor, limit)
-            ?;
+        let mut page = self.timeline_items_page(session_id, before_cursor, limit)?;
         let payload_refs = message_block_payload_refs(&page.items);
-        page.message_block_payloads = self
-            .message_blocks_for_payload_refs(session_id, &payload_refs)
-            ?;
+        page.message_block_payloads =
+            self.message_blocks_for_payload_refs(session_id, &payload_refs)?;
         Ok(page)
     }
 
@@ -415,7 +401,6 @@ impl HamburDatabase {
                     boundary.id.clone()
                 ],
             )
-            
             .map_err(database_error)?;
 
         let mut entries = Vec::new();
@@ -502,7 +487,6 @@ impl HamburDatabase {
                 ",
                 params![session_id, source.created_at_ms as i64],
             )
-            
             .map_err(database_error)?;
 
         let Some(row) = rows.next().map_err(database_error)? else {
@@ -514,11 +498,7 @@ impl HamburDatabase {
         message_from_row(&row)
     }
 
-    pub fn search_sessions(
-        &self,
-        query: &str,
-        limit: u32,
-    ) -> HamburResult<Vec<SessionSummary>> {
+    pub fn search_sessions(&self, query: &str, limit: u32) -> HamburResult<Vec<SessionSummary>> {
         let query = query.trim();
         if query.is_empty() {
             return self.list_sessions_page(limit, 0);
@@ -558,7 +538,6 @@ impl HamburDatabase {
                 ",
                 params![pattern, limit as i64],
             )
-            
             .map_err(database_error)?;
 
         let mut sessions = Vec::new();
@@ -622,7 +601,6 @@ impl HamburDatabase {
                 ",
                 params![provider_id, model_id],
             )
-            
             .map_err(database_error)?;
 
         let Some(row) = rows.next().map_err(database_error)? else {
@@ -633,10 +611,7 @@ impl HamburDatabase {
         provider_model_from_row(&row)
     }
 
-    pub fn provider_models(
-        &self,
-        provider_id: &str,
-    ) -> HamburResult<Vec<ProviderModelRecord>> {
+    pub fn provider_models(&self, provider_id: &str) -> HamburResult<Vec<ProviderModelRecord>> {
         let mut rows = self
             .connection
             .query(
@@ -662,7 +637,6 @@ impl HamburDatabase {
                 ",
                 params![provider_id],
             )
-            
             .map_err(database_error)?;
 
         let mut models = Vec::new();
@@ -734,7 +708,6 @@ impl HamburDatabase {
                 ",
                 params![default_key],
             )
-            
             .map_err(database_error)?;
 
         let mut targets = Vec::new();
@@ -782,7 +755,6 @@ impl HamburDatabase {
                 ",
                 params![],
             )
-            
             .map_err(database_error)?;
 
         let Some(row) = rows.next().map_err(database_error)? else {
@@ -817,21 +789,18 @@ impl HamburDatabase {
         let timeline_items = if selected_session_id.is_empty() {
             Vec::new()
         } else {
-            self.timeline_items_for_session(&selected_session_id)
-                ?
+            self.timeline_items_for_session(&selected_session_id)?
         };
         let message_block_payloads = if selected_session_id.is_empty() {
             Vec::new()
         } else {
             let payload_refs = message_block_payload_refs(&timeline_items);
-            self.message_blocks_for_payload_refs(&selected_session_id, &payload_refs)
-                ?
+            self.message_blocks_for_payload_refs(&selected_session_id, &payload_refs)?
         };
         let pending_attachments = if selected_session_id.is_empty() {
             Vec::new()
         } else {
-            self.pending_attachments_for_session(&selected_session_id)
-                ?
+            self.pending_attachments_for_session(&selected_session_id)?
         };
 
         Ok(AppSnapshot {
@@ -882,7 +851,6 @@ impl HamburDatabase {
                 ",
                 params![limit as i64, offset as i64],
             )
-            
             .map_err(database_error)?;
 
         let mut sessions = Vec::new();
@@ -913,7 +881,8 @@ impl HamburDatabase {
                     COALESCE(ts.content, ''),
                     COALESCE(ts.status, ''),
                     COALESCE(ts.tool_call_id, ''),
-                    COALESCE(tc.name, '')
+                    COALESCE(tc.name, ''),
+                    COALESCE(tc.arguments_json, '')
                 FROM timeline_items ti
                 LEFT JOIN trace_spans ts ON ti.content_type = 'trace' AND ts.id = ti.payload_ref
                 LEFT JOIN tool_calls tc ON tc.id = ts.tool_call_id
@@ -922,7 +891,6 @@ impl HamburDatabase {
                 ",
                 params![session_id],
             )
-            
             .map_err(database_error)?;
 
         let mut items = Vec::new();
@@ -941,6 +909,7 @@ impl HamburDatabase {
                 trace_status: row.get::<String>(10).map_err(database_error)?,
                 tool_call_id: row.get::<String>(11).map_err(database_error)?,
                 tool_name: row.get::<String>(12).map_err(database_error)?,
+                trace_arguments: row.get::<String>(13).map_err(database_error)?,
                 attachments: Vec::new(),
             });
         }
@@ -973,7 +942,8 @@ impl HamburDatabase {
                         COALESCE(ts.content, ''),
                         COALESCE(ts.status, ''),
                         COALESCE(ts.tool_call_id, ''),
-                        COALESCE(tc.name, '')
+                        COALESCE(tc.name, ''),
+                        COALESCE(tc.arguments_json, '')
                     FROM timeline_items ti
                     LEFT JOIN trace_spans ts ON ti.content_type = 'trace' AND ts.id = ti.payload_ref
                     LEFT JOIN tool_calls tc ON tc.id = ts.tool_call_id
@@ -983,7 +953,6 @@ impl HamburDatabase {
                     ",
                     params![session_id, fetch_limit as i64],
                 )
-                
                 .map_err(database_error)?
         } else {
             self.connection
@@ -1002,7 +971,8 @@ impl HamburDatabase {
                         COALESCE(ts.content, ''),
                         COALESCE(ts.status, ''),
                         COALESCE(ts.tool_call_id, ''),
-                        COALESCE(tc.name, '')
+                        COALESCE(tc.name, ''),
+                        COALESCE(tc.arguments_json, '')
                     FROM timeline_items ti
                     LEFT JOIN trace_spans ts ON ti.content_type = 'trace' AND ts.id = ti.payload_ref
                     LEFT JOIN tool_calls tc ON tc.id = ts.tool_call_id
@@ -1014,7 +984,6 @@ impl HamburDatabase {
                     ",
                     params![session_id, before_cursor as i64, fetch_limit as i64],
                 )
-                
                 .map_err(database_error)?
         };
 
@@ -1052,7 +1021,6 @@ impl HamburDatabase {
                 "SELECT id FROM sessions WHERE id = ?1 AND deleted_at_ms IS NULL LIMIT 1",
                 params![session_id],
             )
-            
             .map_err(database_error)?;
 
         Ok(rows.next().map_err(database_error)?.is_some())
@@ -1069,10 +1037,7 @@ impl HamburDatabase {
 
         Ok(rows.next().map_err(database_error)?.is_some())
     }
-    pub(crate) fn session_summary_by_id(
-        &self,
-        session_id: &str,
-    ) -> HamburResult<SessionSummary> {
+    pub(crate) fn session_summary_by_id(&self, session_id: &str) -> HamburResult<SessionSummary> {
         let mut rows = self
             .connection
             .query(
@@ -1102,7 +1067,6 @@ impl HamburDatabase {
                 ",
                 params![session_id],
             )
-            
             .map_err(database_error)?;
 
         let Some(row) = rows.next().map_err(database_error)? else {
@@ -1120,7 +1084,6 @@ impl HamburDatabase {
                 "SELECT value FROM app_state WHERE key = 'active_session_id' LIMIT 1",
                 params![],
             )
-            
             .map_err(database_error)?;
 
         let Some(row) = rows.next().map_err(database_error)? else {
@@ -1155,7 +1118,8 @@ impl HamburDatabase {
                     COALESCE(ts.content, ''),
                     COALESCE(ts.status, ''),
                     COALESCE(ts.tool_call_id, ''),
-                    COALESCE(tc.name, '')
+                    COALESCE(tc.name, ''),
+                    COALESCE(tc.arguments_json, '')
                 FROM timeline_items ti
                 LEFT JOIN trace_spans ts ON ti.content_type = 'trace' AND ts.id = ti.payload_ref
                 LEFT JOIN tool_calls tc ON tc.id = ts.tool_call_id
@@ -1164,7 +1128,6 @@ impl HamburDatabase {
                 ",
                 params![session_id, stable_key],
             )
-            
             .map_err(database_error)?;
 
         let Some(row) = rows.next().map_err(database_error)? else {
@@ -1174,14 +1137,10 @@ impl HamburDatabase {
         };
 
         let mut item = timeline_item_from_row(&row)?;
-        self.hydrate_timeline_attachments(std::slice::from_mut(&mut item))
-            ?;
+        self.hydrate_timeline_attachments(std::slice::from_mut(&mut item))?;
         Ok(item)
     }
-    pub(crate) fn message_by_id(
-        &self,
-        message_id: &str,
-    ) -> HamburResult<Option<MessageRecord>> {
+    pub(crate) fn message_by_id(&self, message_id: &str) -> HamburResult<Option<MessageRecord>> {
         let mut rows = self
             .connection
             .query(
@@ -1214,7 +1173,6 @@ impl HamburDatabase {
                 ",
                 params![message_id],
             )
-            
             .map_err(database_error)?;
 
         let Some(row) = rows.next().map_err(database_error)? else {
@@ -1256,7 +1214,6 @@ impl HamburDatabase {
                 ",
                 params![session_id],
             )
-            
             .map_err(database_error)?;
 
         let mut messages = Vec::new();
@@ -1293,7 +1250,6 @@ impl HamburDatabase {
                 ",
                 params![turn_id],
             )
-            
             .map_err(database_error)?;
 
         let Some(row) = rows.next().map_err(database_error)? else {
@@ -1347,7 +1303,6 @@ impl HamburDatabase {
                 ",
                 params![trace_id],
             )
-            
             .map_err(database_error)?;
 
         let Some(row) = rows.next().map_err(database_error)? else {
@@ -1384,7 +1339,6 @@ impl HamburDatabase {
                 ",
                 params![session_id],
             )
-            
             .map_err(database_error)?;
 
         let mut traces = Vec::new();
@@ -1421,7 +1375,6 @@ impl HamburDatabase {
                 ",
                 params![tool_call_id],
             )
-            
             .map_err(database_error)?;
 
         let Some(row) = rows.next().map_err(database_error)? else {
@@ -1462,7 +1415,6 @@ impl HamburDatabase {
                 ",
                 params![assistant_message_id],
             )
-            
             .map_err(database_error)?;
 
         let mut calls = Vec::new();
@@ -1471,10 +1423,7 @@ impl HamburDatabase {
         }
         Ok(calls)
     }
-    pub(crate) fn tool_result_by_id(
-        &self,
-        result_id: &str,
-    ) -> HamburResult<ToolResultRecord> {
+    pub(crate) fn tool_result_by_id(&self, result_id: &str) -> HamburResult<ToolResultRecord> {
         let mut rows = self
             .connection
             .query(
@@ -1501,7 +1450,6 @@ impl HamburDatabase {
                 ",
                 params![result_id],
             )
-            
             .map_err(database_error)?;
 
         let Some(row) = rows.next().map_err(database_error)? else {
@@ -1534,7 +1482,6 @@ impl HamburDatabase {
                 ",
                 params![file_id],
             )
-            
             .map_err(database_error)?;
         let Some(row) = rows.next().map_err(database_error)? else {
             return Err(HamburError::InvalidCommand(format!(
@@ -1573,7 +1520,6 @@ impl HamburDatabase {
                 ",
                 params![attachment_id],
             )
-            
             .map_err(database_error)?;
         let Some(row) = rows.next().map_err(database_error)? else {
             return Err(HamburError::InvalidCommand(format!(
@@ -1583,10 +1529,7 @@ impl HamburDatabase {
         attachment_from_row(&row)
     }
 
-    pub fn attachments_for_message(
-        &self,
-        message_id: &str,
-    ) -> HamburResult<Vec<AttachmentRecord>> {
+    pub fn attachments_for_message(&self, message_id: &str) -> HamburResult<Vec<AttachmentRecord>> {
         if message_id.trim().is_empty() {
             return Ok(Vec::new());
         }
@@ -1619,7 +1562,6 @@ impl HamburDatabase {
                 ",
                 params![message_id],
             )
-            
             .map_err(database_error)?;
         let mut attachments = Vec::new();
         while let Some(row) = rows.next().map_err(database_error)? {
@@ -1628,10 +1570,7 @@ impl HamburDatabase {
         Ok(attachments)
     }
 
-    fn hydrate_timeline_attachments(
-        &self,
-        items: &mut [TimelineItemSnapshot],
-    ) -> HamburResult<()> {
+    fn hydrate_timeline_attachments(&self, items: &mut [TimelineItemSnapshot]) -> HamburResult<()> {
         let message_ids = items
             .iter()
             .filter(|item| {
@@ -1680,7 +1619,6 @@ impl HamburDatabase {
         let mut rows = self
             .connection
             .query(&sql, params)
-            
             .map_err(database_error)?;
 
         let mut attachments_by_message_id: HashMap<String, Vec<AttachmentRecord>> = HashMap::new();
@@ -1769,7 +1707,6 @@ impl HamburDatabase {
                 ",
                 params![],
             )
-            
             .map_err(database_error)?;
         let mut models = Vec::new();
         while let Some(row) = rows.next().map_err(database_error)? {
@@ -1788,7 +1725,6 @@ impl HamburDatabase {
                 ",
                 params![],
             )
-            
             .map_err(database_error)?;
         let mut groups = Vec::new();
         while let Some(row) = rows.next().map_err(database_error)? {
@@ -1808,7 +1744,6 @@ impl HamburDatabase {
                 ",
                 params![group_id],
             )
-            
             .map_err(database_error)?;
         let Some(row) = rows.next().map_err(database_error)? else {
             return Err(HamburError::ModelUnavailable(format!(
@@ -1893,7 +1828,6 @@ impl HamburDatabase {
                 ",
                 params![],
             )
-            
             .map_err(database_error)?;
         let mut defaults = Vec::new();
         while let Some(row) = rows.next().map_err(database_error)? {
@@ -1905,6 +1839,28 @@ impl HamburDatabase {
         }
         Ok(defaults)
     }
+    /// Single setting lookup. The runtime reads this on every model request, so it
+    /// must not pull the whole settings snapshot (providers, models, audits, ...).
+    pub fn app_setting(&self, key: &str) -> HamburResult<Option<String>> {
+        let mut rows = self
+            .connection
+            .query(
+                "
+                SELECT value
+                FROM app_settings
+                WHERE key = ?1
+                LIMIT 1
+                ",
+                params![key],
+            )
+            .map_err(database_error)?;
+
+        let Some(row) = rows.next().map_err(database_error)? else {
+            return Ok(None);
+        };
+        Ok(Some(row.get::<String>(0).map_err(database_error)?))
+    }
+
     pub(crate) fn app_settings(&self) -> HamburResult<Vec<AppSettingRecord>> {
         let mut rows = self
             .connection
@@ -1916,7 +1872,6 @@ impl HamburDatabase {
                 ",
                 params![],
             )
-            
             .map_err(database_error)?;
         let mut settings = Vec::new();
         while let Some(row) = rows.next().map_err(database_error)? {
@@ -1929,10 +1884,7 @@ impl HamburDatabase {
         Ok(settings)
     }
 
-    pub fn model_catalog_cache(
-        &self,
-        key: &str,
-    ) -> HamburResult<Option<ModelCatalogCacheRecord>> {
+    pub fn model_catalog_cache(&self, key: &str) -> HamburResult<Option<ModelCatalogCacheRecord>> {
         let mut rows = self
             .connection
             .query(
@@ -1944,7 +1896,6 @@ impl HamburDatabase {
                 ",
                 params![key],
             )
-            
             .map_err(database_error)?;
         let Some(row) = rows.next().map_err(database_error)? else {
             return Ok(None);
@@ -1979,7 +1930,6 @@ impl HamburDatabase {
                 ",
                 params![limit as i64],
             )
-            
             .map_err(database_error)?;
         let mut audits = Vec::new();
         while let Some(row) = rows.next().map_err(database_error)? {

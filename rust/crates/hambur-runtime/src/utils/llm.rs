@@ -186,6 +186,7 @@ pub(crate) fn stream_source_for_command(
     tools_json: &str,
     skills_index_prompt: &str,
     memory_system_prompt: &str,
+    persona_system_prompt: &str,
     deep_thinking_enabled: bool,
     search_enabled: bool,
 ) -> RouteStreamSource {
@@ -197,6 +198,7 @@ pub(crate) fn stream_source_for_command(
         tools_json,
         skills_index_prompt,
         memory_system_prompt,
+        persona_system_prompt,
         deep_thinking_enabled,
         search_enabled,
     );
@@ -291,14 +293,23 @@ pub(crate) fn provider_stream_source(
     tools_json: &str,
     skills_index_prompt: &str,
     memory_system_prompt: &str,
+    persona_system_prompt: &str,
     deep_thinking_enabled: bool,
     search_enabled: bool,
 ) -> RouteStreamSource {
-    let mut system_blocks = vec![
-        "You are Hambur, a concise assistant.".to_string(),
-        HAMBUR_FILE_LINK_SYSTEM_PROMPT.to_string(),
-        HAMBUR_CONFIG_SYSTEM_PROMPT.to_string(),
-    ];
+    let mut system_blocks = vec!["You are Hambur, a concise assistant.".to_string()];
+    // The persona sits right behind the default identity line: it is the user's
+    // replacement for that style, while the operational blocks below still apply.
+    if !persona_system_prompt.trim().is_empty() {
+        system_blocks.push(persona_system_prompt.to_string());
+    }
+    system_blocks.push(HAMBUR_FILE_LINK_SYSTEM_PROMPT.to_string());
+    system_blocks.push(HAMBUR_CONFIG_SYSTEM_PROMPT.to_string());
+    // `compile_kinds` serialises an empty selection as `[]`: non-empty, but no tools are
+    // offered, so the title contract must not be injected for it.
+    if route.supports_tool_call && !matches!(tools_json.trim(), "" | "[]") {
+        system_blocks.push(HAMBUR_TOOL_TITLE_SYSTEM_PROMPT.to_string());
+    }
     if !skills_index_prompt.trim().is_empty() {
         system_blocks.push(skills_index_prompt.to_string());
     }
@@ -306,7 +317,8 @@ pub(crate) fn provider_stream_source(
         system_blocks.push(memory_system_prompt.to_string());
     }
     if search_enabled {
-        let has_web_tools = tools_json.contains("\"web_search\"") || tools_json.contains("\"browser_use\"");
+        let has_web_tools =
+            tools_json.contains("\"web_search\"") || tools_json.contains("\"browser_use\"");
         if has_web_tools {
             system_blocks.push(
                 "Web assistance is enabled for this turn. Use available web search or browser tools when current external information is needed."
@@ -420,9 +432,7 @@ pub(crate) fn openai_non_stream_request(
         OPENAI_RESPONSES_PROTOCOL => {
             ResponsesApiAdapter::build_stream_request(request, target, api_key)?
         }
-        _ => {
-            OpenAiCompatibleAdapter::build_stream_request(request, target, api_key)?
-        }
+        _ => OpenAiCompatibleAdapter::build_stream_request(request, target, api_key)?,
     };
     let mut body: Value = serde_json::from_str(&spec.body_json)
         .map_err(|error| HamburError::InvalidCommand(format!("invalid request body: {error}")))?;
@@ -760,6 +770,7 @@ mod tests {
                 "",
                 "",
                 "",
+                "",
                 deep_thinking_enabled,
                 false,
             );
@@ -778,5 +789,100 @@ mod tests {
         // Other providers still require the capability flag.
         let generic = route("https://api.example.com/v1", false);
         assert_eq!(build(&generic, true), hambur_llm::ReasoningMode::Disabled);
+    }
+
+    #[test]
+    fn test_persona_block_is_injected_after_the_default_identity() {
+        let route = hambur_db::ModelRouteSnapshot {
+            provider_id: "provider".to_string(),
+            provider_protocol: hambur_llm::OPENAI_COMPATIBLE_PROTOCOL.to_string(),
+            base_url: "https://api.example.com/v1".to_string(),
+            model_id: "model".to_string(),
+            ..Default::default()
+        };
+        let build_blocks = |persona: &str| {
+            let source = provider_stream_source(
+                "sess",
+                "turn",
+                Vec::new(),
+                &route,
+                "",
+                "",
+                "",
+                persona,
+                false,
+                false,
+            );
+            match source {
+                RouteStreamSource::Provider(request) => request.system_blocks,
+                RouteStreamSource::Scripted { .. } => panic!("expected provider source"),
+            }
+        };
+
+        let persona = format_persona_system_prompt("You are a pirate captain.");
+        let blocks = build_blocks(&persona);
+        assert_eq!(blocks[0], "You are Hambur, a concise assistant.");
+        assert!(blocks[1].contains("You are a pirate captain."));
+        assert!(blocks[2].contains("Hambur can render local file links"));
+
+        // No persona configured: the block must disappear entirely and leave the
+        // default identity, the file-link prompt, and the config prompt in place.
+        let blocks = build_blocks("");
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0], "You are Hambur, a concise assistant.");
+    }
+
+    #[test]
+    fn test_tool_title_guidance_is_only_sent_when_tools_are_offered() {
+        let route = hambur_db::ModelRouteSnapshot {
+            provider_id: "provider".to_string(),
+            provider_protocol: hambur_llm::OPENAI_COMPATIBLE_PROTOCOL.to_string(),
+            base_url: "https://api.example.com/v1".to_string(),
+            model_id: "model".to_string(),
+            supports_tool_call: true,
+            ..Default::default()
+        };
+        let build_blocks = |tools_json: &str| {
+            let source = provider_stream_source(
+                "sess",
+                "turn",
+                Vec::new(),
+                &route,
+                tools_json,
+                "",
+                "",
+                "",
+                false,
+                false,
+            );
+            match source {
+                RouteStreamSource::Provider(request) => request.system_blocks,
+                RouteStreamSource::Scripted { .. } => panic!("expected provider source"),
+            }
+        };
+
+        let blocks = build_blocks("[{\"type\":\"function\"}]");
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block.contains(HAMBUR_TOOL_TITLE_SYSTEM_PROMPT)),
+            "tools are offered, so the model must be told what the call description is for"
+        );
+
+        // Without tools there is nothing to describe; the block would only waste tokens.
+        let blocks = build_blocks("");
+        assert!(
+            !blocks
+                .iter()
+                .any(|block| block.contains(HAMBUR_TOOL_TITLE_SYSTEM_PROMPT))
+        );
+
+        // The compiled empty selection is `[]`, not `""`, and must behave the same way.
+        let blocks = build_blocks("[]");
+        assert!(
+            !blocks
+                .iter()
+                .any(|block| block.contains(HAMBUR_TOOL_TITLE_SYSTEM_PROMPT))
+        );
     }
 }

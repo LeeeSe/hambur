@@ -1,10 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!--
+      这个 XML 主题只负责「Compose 首帧之前」的那一小段时间：窗口底色、系统栏图标明暗、
+      浮动控件底色。真正的界面配色在 HamburTheme（Compose）里。
+      暗色版本见 values-night/styles.xml。
+    -->
     <style name="Theme.Hambur" parent="android:style/Theme.Material.Light.NoActionBar">
         <item name="android:windowLightStatusBar">true</item>
         <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:windowBackground">@color/app_window_background</item>
         <item name="android:colorBackgroundFloating">#FFFFFF</item>
         <item name="android:colorAccent">#3F8CFF</item>
     </style>
 </resources>
-

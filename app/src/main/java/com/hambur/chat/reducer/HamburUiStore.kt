@@ -68,6 +68,8 @@ data class UiTimelineItem(
     val kind: String,
     val traceTitle: String = "",
     val traceContent: String = "",
+    /** Raw tool-call arguments; unlike [traceContent] this survives the tool finishing. */
+    val traceArguments: String = "",
     val traceStatus: String = "",
     val toolCallId: String = "",
     val toolName: String = "",
@@ -478,6 +480,23 @@ class HamburUiStore(
         }
     }
 
+    // Web 搜索的密钥（DeepSeek / Exa）只进 Android Secret Store，不写进设置 JSON。
+    // 空值或非法 ref 直接忽略；返回是否写入成功，调用方据此决定是否提示成功 / 更新引用。
+    fun saveWebSearchSecret(secretRef: String, apiKey: String): Boolean {
+        val ref = secretRef.trim()
+        if (!ref.startsWith("android-secret://") || apiKey.isBlank()) return false
+        return runCatching {
+            platformAdapter.saveSecret(ref, apiKey)
+        }.onFailure { error ->
+            _state.update {
+                it.copy(
+                    latestEventKind = "SecretStoreFailed",
+                    footer = error.message ?: "Secret store failed",
+                )
+            }
+        }.isSuccess
+    }
+
     fun deleteProvider(providerId: String, approved: Boolean) {
         if (providerId.isBlank() || !approved) return
         val payload = """{"approvalToken":"approve:delete-provider"}"""
@@ -656,6 +675,11 @@ class HamburUiStore(
     }
 
     fun saveAppSetting(key: String, value: String, approved: Boolean = false) {
+        // web 工具的配置是自由形状 JSON，走通用 UpdateAppSetting 通道（键名在 chunk 里）。
+        if (key == "web_search_settings" || key == "web_fetch_settings") {
+            saveRawAppSetting(key, value, approved)
+            return
+        }
         val commandKind = when (key) {
             "tool_settings" -> "UpdateToolSettings"
             "skills" -> "UpdateSkills"
@@ -692,6 +716,24 @@ class HamburUiStore(
                     chunk = key,
                     content = value,
                     payloadJson = payload,
+                ),
+            )
+        }
+    }
+
+    // 人设 (SOUL.md) 存在 persona 设置键里，由后端在每轮对话的 system prompt 里注入。
+    // UpdatePersona 的取值约定是"payload_json 就是设置值"；空 payload 是后端约定的
+    // "清除人设"编码，所以清空输入框时直接送空串。
+    fun savePersona(text: String) {
+        val persona = text.trim()
+        // 后端用 UTF-8 字节数限制长度（normalize_json_or_text_setting 的 value.len()）。
+        if (persona.toByteArray(Charsets.UTF_8).size > PERSONA_BYTE_LIMIT) return
+        runCommand {
+            runtime.dispatch(
+                backendCommand(
+                    kind = "UpdatePersona",
+                    idempotencyKey = "persona:update:${nextCommandOrdinal()}",
+                    payloadJson = persona,
                 ),
             )
         }
@@ -1774,7 +1816,8 @@ private fun HamburUiState.applySettingsSnapshot(snapshot: SettingsSnapshotDto): 
     )
 }
 
-private fun HamburUiState.reduce(event: BackendEvent): HamburUiState {
+// internal 而非 private：单元测试要按真实事件序列驱动 reducer，验证流式时间线。
+internal fun HamburUiState.reduce(event: BackendEvent): HamburUiState {
     if (event.eventId in appliedEventIds || event.sequence <= lastAppliedSequence) {
         return this
     }
@@ -2236,6 +2279,7 @@ private fun List<TimelineItemDto>.toUiTimelineItems(): List<UiTimelineItem> {
             kind = it.kind,
             traceTitle = it.traceTitle,
             traceContent = it.traceContent,
+            traceArguments = it.traceArguments,
             traceStatus = it.traceStatus,
             toolCallId = it.toolCallId,
             toolName = it.toolName,
@@ -2575,3 +2619,8 @@ const val THINKING_BLOCK_DISPLAY_MODE_KEY = "thinkingBlockDisplayMode"
 const val THINKING_BLOCK_DISPLAY_AUTO_EXPAND = "auto_expand"
 const val THINKING_BLOCK_DISPLAY_COLLAPSED = "collapsed"
 const val THINKING_BLOCK_DISPLAY_AUTO_COLLAPSE = "auto_collapse"
+
+// persona 设置键与后端 normalize_json_or_text_setting 的长度上限保持一致。
+// 上限单位是 UTF-8 字节（后端用 Rust String::len()），不是 UTF-16 code unit。
+const val PERSONA_SETTING_KEY = "persona"
+const val PERSONA_BYTE_LIMIT = 8000

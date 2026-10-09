@@ -1909,6 +1909,23 @@ errorCode
 errorMessage
 ```
 
+### Tool Call Description
+
+Every model-facing tool schema injects a required `title` string argument
+(`with_tool_call_title` in `hambur-tools/src/spec.rs`). The model writes one
+short sentence, in the user's language, describing what that specific call is
+doing right now, for example `安装调试包到手机`.
+
+`ToolKind::display_title` uses that description as the call's `displayTitle`;
+only when it is missing, blank, or malformed does it fall back to the derived
+per-tool title (`Run terminal command`, `Search web: ...`). The description
+flows to `tool_calls.display_title` and `trace_spans.title`, and the chat UI
+shows it as the first line of the process step, with the concrete
+command/URL/path rendered as a muted second line.
+
+`title` is reserved for this description. Tool-specific parameter names must
+not reuse it (for example `android_cli` uses `notification_title`).
+
 #### tool_results
 
 ```text
@@ -2116,6 +2133,39 @@ maxFetchBytes = 250000..10000000
 autoCloseMinutes = 0..240
 acceptThirdPartyCookies = false when acceptCookies = false
 ```
+
+#### web_search_settings
+
+```text
+provider          // auto | deepseek-official | exa | off
+endpoint          // Anthropic-compatible Messages base for the DeepSeek provider
+model             // model used only for the auxiliary search turn
+apiVersion
+maxTokens         // 256..32000
+maxUses           // 1..20 native web_search uses per request
+maxResults        // 1..25 sources kept per query
+maxQueries        // 1..8 queries accepted in one call
+apiKeyRef         // credential reference; empty reuses the official DeepSeek provider
+exaEndpoint
+exaApiKeyRef
+exaSnippetChars   // 120..8000
+```
+
+#### web_fetch_settings
+
+```text
+enabled            // false hides web_fetch and rejects calls to it
+maxBytes           // 8192..16777216 decoded body bytes kept
+timeoutMs          // 1000..120000
+maxRedirects       // 0..10
+allowPrivateHosts  // false blocks loopback and private ranges
+maxChars           // 1000..400000 markdown handed to the model
+```
+
+Both keys must hold a JSON object; Rust rejects anything else before database
+write. The runtime re-parses the stored value, applies the defaults above for
+absent fields, and clamps every value again, so a hand-edited setting can never
+widen a bound.
 
 #### model_catalog_cache
 
@@ -3326,12 +3376,35 @@ It must not load entire long sessions into LLM context.
 
 ### Web Tools
 
-`web_fetch` must support up to 5 URLs per call.
+`web_search` takes 1-4 queries and returns citeable sources (title, URL,
+snippet, date) merged round-robin across queries and deduplicated by URL; full
+page text is a separate `web_fetch` call, never an implicit second fetch inside
+search.
 
-`web_search` must return search results with title, URL, snippet, and fetched
-content when available.
+`web_fetch` takes one `url` or up to 5 `urls`, fetched concurrently, and returns
+each page as Markdown. Redirects are followed manually, one hop at a time, and
+every hop is re-screened like a fresh request.
 
-Search and fetch provider credentials must not be hardcoded.
+The web capability is a provider seam, mirroring the `ctx.web` seam of DeepSeek
+Harness: a configured provider id wins, otherwise exactly one usable provider
+must exist, otherwise the call fails with `WEB_PROVIDER_AMBIGUOUS`.
+
+Providers shipped by the Rust backend:
+
+```text
+search: deepseek-official  Anthropic-compatible Messages call with the native
+                           web_search_20250305 server tool; snippets come from
+                           text-block citations joined by URL
+search: exa                POST /search on the Exa API; snippets come from the
+                           per-result page text
+fetch:  http               anonymous public HTTP(S); refuses non-public
+                           addresses unless allowPrivateHosts is set
+```
+
+Search and fetch provider credentials must not be hardcoded. They live in the
+Android Secret Store and are referenced from settings by `android-secret://…`
+refs; `web_search_settings.apiKeyRef` empty reuses the configured official
+DeepSeek provider credential first, then `$DEEPSEEK_API_KEY`.
 
 External web content must be untrusted.
 
@@ -4060,6 +4133,7 @@ hambur/
       hambur-llm/
       hambur-markdown/
       hambur-tools/
+      hambur-web/
       hambur-sandbox/
       hambur-filestore/
       hambur-platform/
@@ -4096,6 +4170,7 @@ rust/
     hambur-llm/
     hambur-markdown/
     hambur-tools/
+    hambur-web/
     hambur-sandbox/
     hambur-filestore/
     hambur-platform/
@@ -4125,6 +4200,11 @@ hambur-markdown:
 
 hambur-tools:
   tool registry, scheduler, result normalizer, built-in tool implementations
+
+hambur-web:
+  web capability seam (provider registry, selection, maxResults bound), search
+  providers (deepseek-official, exa), the anonymous public HTTP fetch provider,
+  HTML to Markdown conversion, and the web_search/web_fetch renderers
 
 hambur-sandbox:
   rootfs, process execution, path policy, virtual paths

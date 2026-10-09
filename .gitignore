@@ -18,6 +18,9 @@ app/src/main/jniLibs/
 !app/src/main/jniLibs/arm64-v8a/libproot.so
 rust/target/
 
+# Local cargo configuration (machine-specific linkers/toolchains) stays out of VCS.
+rust/.cargo/
+
 # IDEs and Editors
 .idea/
 *.iml

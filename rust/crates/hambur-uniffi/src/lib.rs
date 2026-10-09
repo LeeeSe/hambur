@@ -10,11 +10,11 @@ use hambur_markdown::{
     MarkdownBlockNode, MarkdownInlineNode, MarkdownRenderUpdate, MarkdownTableRow,
 };
 use hambur_runtime::{
-    AppBootstrap, PlatformRequest, RuntimeCommand, RuntimeCommandAck, RuntimeEngine, RuntimeEvent, RuntimeEventKind, RuntimeEventPayload,
-    RuntimeFileResolution, RuntimeMemoryFileDetail, RuntimeMemoryFileSummary,
-    RuntimeMessageSnapshot, RuntimeRootfsStatus, RuntimeSearchSnapshot, RuntimeSessionListSnapshot,
-    RuntimeSessionSnapshot, RuntimeSettingsSnapshot, RuntimeSkillDetail, RuntimeSkillSummary,
-    RuntimeTimelinePage,
+    AppBootstrap, PlatformRequest, RuntimeCommand, RuntimeCommandAck, RuntimeEngine, RuntimeEvent,
+    RuntimeEventKind, RuntimeEventPayload, RuntimeFileResolution, RuntimeMemoryFileDetail,
+    RuntimeMemoryFileSummary, RuntimeMessageSnapshot, RuntimeRootfsStatus, RuntimeSearchSnapshot,
+    RuntimeSessionListSnapshot, RuntimeSessionSnapshot, RuntimeSettingsSnapshot,
+    RuntimeSkillDetail, RuntimeSkillSummary, RuntimeTimelinePage,
 };
 
 uniffi::include_scaffolding!("hambur_uniffi");
@@ -186,6 +186,7 @@ pub struct TimelineItemDTO {
     pub trace_status: String,
     pub tool_call_id: String,
     pub tool_name: String,
+    pub trace_arguments: String,
     pub attachments: Vec<AttachmentDTO>,
 }
 
@@ -1098,6 +1099,7 @@ impl From<TimelineItemSnapshot> for TimelineItemDTO {
             trace_status: value.trace_status,
             tool_call_id: value.tool_call_id,
             tool_name: value.tool_name,
+            trace_arguments: value.trace_arguments,
             attachments: value
                 .attachments
                 .into_iter()

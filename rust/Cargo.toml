@@ -11,6 +11,7 @@ members = [
     "crates/hambur-filestore",
     "crates/hambur-platform",
     "crates/hambur-config",
+    "crates/hambur-web",
 ]
 resolver = "3"
 
@@ -30,6 +31,7 @@ hambur-sandbox = { path = "crates/hambur-sandbox" }
 hambur-filestore = { path = "crates/hambur-filestore" }
 hambur-platform = { path = "crates/hambur-platform" }
 hambur-config = { path = "crates/hambur-config" }
+hambur-web = { path = "crates/hambur-web" }
 
 tokio = { version = "1.49.0", features = ["rt-multi-thread", "sync", "time"] }
 uuid = { version = "1.19.0", features = ["v4"] }

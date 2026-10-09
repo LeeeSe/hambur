@@ -3,15 +3,13 @@ package com.hambur.chat.ui.chat
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.snap
@@ -54,6 +52,7 @@ import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
@@ -95,12 +94,15 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.toMutableStateList
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -131,6 +133,7 @@ import androidx.compose.ui.platform.LocalView
 import kotlin.math.abs
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -232,11 +235,21 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
 import java.util.UUID
 
 private const val SESSION_OPEN_DELAY_MS = 50L
+
+/**
+ * 会话列表左右内边距。左右取同一个值，助手内容和用户气泡因此是对称的：
+ * 助手内容左缘离屏幕 20dp，用户气泡右缘同样离屏幕 20dp。
+ */
+private val CHAT_CONTENT_HORIZONTAL_PADDING = 20.dp
+
+/** 用户气泡内的左右内边距（纯文本消息）。 */
+private val USER_BUBBLE_TEXT_PADDING = 16.dp
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -1233,9 +1246,9 @@ private fun ChatTimeline(
             )
         },
         contentPadding = PaddingValues(
-            start = 14.dp,
+            start = CHAT_CONTENT_HORIZONTAL_PADDING,
             top = 12.dp,
-            end = 14.dp,
+            end = CHAT_CONTENT_HORIZONTAL_PADDING,
             bottom = bottomPadding,
         ),
         verticalArrangement = Arrangement.spacedBy(0.dp),
@@ -1387,7 +1400,7 @@ private fun EmptyChatState(
                 .padding(horizontal = tokens.emptyStateHorizontalPadding),
         ) {
             ComposeImage(
-                painter = painterResource(id = R.drawable.hambur_empty_icon_vector),
+                painter = painterResource(id = R.drawable.hambur_cat_mark),
                 contentDescription = null,
                 contentScale = ContentScale.Fit,
                 colorFilter = ColorFilter.tint(MaterialTheme.colorScheme.onBackground),
@@ -1749,7 +1762,7 @@ private fun MessageTimelineItem(
     }
 
     val hasOnlyImages = imageAttachments.isNotEmpty() && fileAttachments.isEmpty() && displayText.isBlank()
-    val bubbleHorizontalPadding = if (hasOnlyImages) 8.dp else 16.dp
+    val bubbleHorizontalPadding = if (hasOnlyImages) 8.dp else USER_BUBBLE_TEXT_PADDING
     val bubbleVerticalPadding = if (hasOnlyImages) 8.dp else 12.dp
 
     Box(
@@ -1796,6 +1809,8 @@ private fun MessageTimelineItem(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .padding(bottom = 8.dp),
+                            // 这个思考块画在用户气泡里，标记圆底必须跟气泡同色。
+                            markerBackground = MaterialTheme.colorScheme.primaryContainer,
                         )
                     }
                     if (imageAttachments.isNotEmpty()) {
@@ -2113,13 +2128,45 @@ private fun ExecutionProcessBlock(
     durationSeconds: Int?,
     displayMode: String,
     modifier: Modifier = Modifier,
+    markerBackground: Color = MaterialTheme.colorScheme.background,
 ) {
     if (steps.isEmpty()) return
+
+    // 时间流左列几何（对齐 DeepSeek 时间流事件的观感）：
+    // 轨道线画在 railCenterX，与标记同轴；标记圆心 railMarkerCenterY 要把行的上下
+    // padding 算进去（drawBehind 的坐标系含 padding）。三者必须对齐，否则线会从图标
+    // 边缘穿过去。
+    val railIconSize = 13.dp
+    val railColumnWidth = railIconSize // 标记列宽度=图标宽度，图标左缘才能与标题首字对齐
+    val railMarkerTextGap = 8.dp // 标记列与文字列之间的间隔
+    val railStartPadding = 0.dp // 左列起点=块左边距，与标题文字同起点
+    val railMarkerBoxHeight = 24.dp // 跟随 stepTextStyle 的行高，标记才与首行文字同轴
+    val railMarkerClearance = 8.5.dp // 标记可见边缘到轨道线的统一留白（DeepSeek 约 8~9dp）
+    val railDotDiameter = 6.5.dp
+    val railIconHaloDiameter = railIconSize + railMarkerClearance * 2
+    val railDotHaloDiameter = railDotDiameter + railMarkerClearance * 2
+    val railRowVerticalPadding = 10.dp
+    val railCenterX = railColumnWidth / 2
+    val railMarkerCenterY = railRowVerticalPadding + railMarkerBoxHeight / 2
+    // 发丝轨道线：DeepSeek 是 2px 实心 + 2px 抗锯齿，颜色约 #E3E3E3。
+    val railStrokeWidth = 1.dp
+    val railLineColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f)
+    val railDotColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f)
+    val railIconTint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.55f)
 
     var isExpanded by rememberSaveable {
         mutableStateOf(initialThinkingBlockExpanded(displayMode, isGenerating))
     }
     var manuallyToggled by rememberSaveable { mutableStateOf(false) }
+
+    // 工具事件的详情行（实际命令 / URL / 路径）默认折叠，点该行才展开。用 id 集合支持
+    // 多个事件同时展开；listSaver 让它能跨配置变更存活。
+    val expandedDetailIds = rememberSaveable(
+        saver = listSaver(
+            save = { it.toList() },
+            restore = { it.toMutableStateList() },
+        ),
+    ) { mutableStateListOf<String>() }
 
     LaunchedEffect(isGenerating, displayMode) {
         if (manuallyToggled) return@LaunchedEffect
@@ -2130,36 +2177,22 @@ private fun ExecutionProcessBlock(
         }
     }
 
-    val infiniteTransition = rememberInfiniteTransition(label = "process_pulse")
-    val alpha by infiniteTransition.animateFloat(
-        initialValue = 0.4f,
-        targetValue = 1.0f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(1000, easing = FastOutSlowInEasing),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "process_alpha"
-    )
-
     val rotationAngle by animateFloatAsState(
         targetValue = if (isExpanded) 90f else 0f,
         animationSpec = tween(durationMillis = 200, easing = FastOutSlowInEasing),
         label = "chevron_rotation"
     )
 
-    val outlineColor = MaterialTheme.colorScheme.outlineVariant
-    val contentColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.85f)
+    // 正文与标题颜色对齐 DeepSeek：深灰字 + 极浅的发丝轨道线，对比来自文字而不是线。
+    val headerTextColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.64f)
+    val contentColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.62f)
     val stepTextStyle = MaterialTheme.typography.bodyMedium.copy(
-        fontSize = 13.sp,
-        lineHeight = 20.sp,
+        fontSize = 14.sp,
+        lineHeight = 24.sp,
         fontWeight = FontWeight.Normal,
     )
 
-    val headerTitle = when {
-        isGenerating -> "正在思考..."
-        durationSeconds != null && durationSeconds > 0 -> "已思考（用时 $durationSeconds 秒）"
-        else -> "已思考"
-    }
+    val headerTitle = resolveProcessHeaderTitle(steps, isGenerating, durationSeconds)
 
     Column(
         modifier = modifier
@@ -2170,41 +2203,46 @@ private fun ExecutionProcessBlock(
             modifier = Modifier
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(8.dp))
-                .clickable {
-                    manuallyToggled = true
-                    isExpanded = !isExpanded
-                }
-                .padding(vertical = 6.dp, horizontal = 4.dp),
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    onClick = {
+                        manuallyToggled = true
+                        isExpanded = !isExpanded
+                    },
+                )
+                .padding(vertical = 6.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Icon(
-                imageVector = Lucide.Sparkles,
-                contentDescription = null,
-                tint = if (isGenerating) {
-                    MaterialTheme.colorScheme.primary.copy(alpha = alpha)
-                } else {
-                    MaterialTheme.colorScheme.primary.copy(alpha = 0.85f)
-                },
-                modifier = Modifier.size(15.dp)
-            )
+            // 标题文字直接落在块的左边距上，与正文首字对齐（DeepSeek 也是这样：
+            // 标题在块边距、步骤再往右缩进一层）。不设左侧内边距是为了这个对齐。
+            // weight(1f, fill = false)：短标题贴着文字收尾，chevron 紧跟其后；
+            // 长标题才占满整行并省略号收尾。
+            Crossfade(
+                targetState = headerTitle,
+                animationSpec = tween(durationMillis = 180, easing = FastOutSlowInEasing),
+                label = "process_header_title",
+                modifier = Modifier.weight(1f, fill = false),
+            ) { title ->
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.bodyMedium.copy(
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.Medium,
+                        lineHeight = 20.sp,
+                    ),
+                    color = headerTextColor,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
 
-            Spacer(modifier = Modifier.width(8.dp))
-
-            Text(
-                text = headerTitle,
-                style = MaterialTheme.typography.bodyMedium.copy(
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Medium,
-                    lineHeight = 18.sp,
-                ),
-                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.88f),
-                modifier = Modifier.weight(1f)
-            )
+            Spacer(modifier = Modifier.width(6.dp))
 
             Icon(
                 imageVector = Lucide.ChevronRight,
                 contentDescription = if (isExpanded) "收起" else "展开",
-                tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
+                tint = headerTextColor.copy(alpha = 0.6f),
                 modifier = Modifier
                     .size(15.dp)
                     .graphicsLayer(rotationZ = rotationAngle)
@@ -2215,7 +2253,7 @@ private fun ExecutionProcessBlock(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(start = 2.dp, top = 4.dp, bottom = 6.dp)
+                    .padding(start = railStartPadding, top = 4.dp, bottom = 6.dp)
             ) {
                 val totalSteps = steps.size
                 steps.forEachIndexed { index, step ->
@@ -2224,10 +2262,12 @@ private fun ExecutionProcessBlock(
                             .fillMaxWidth()
                             .drawBehind {
                                 if (totalSteps > 1) {
-                                    val railX = 9.dp.toPx()
-                                    val nodeY = 10.dp.toPx()
-                                    val strokeW = 1.2.dp.toPx()
-                                    val lineColor = outlineColor.copy(alpha = 0.35f)
+                                    // 轨道线必须与左列标记的中心重合；标记本身带不透明底色，
+                                    // 会把穿过去的那一段线遮住（见下方 marker Box）。
+                                    val railX = railCenterX.toPx()
+                                    val nodeY = railMarkerCenterY.toPx()
+                                    val strokeW = railStrokeWidth.toPx()
+                                    val lineColor = railLineColor
 
                                     if (index > 0) {
                                         drawLine(
@@ -2247,38 +2287,54 @@ private fun ExecutionProcessBlock(
                                     }
                                 }
                             }
-                            .padding(vertical = 3.dp),
+                            .padding(vertical = railRowVerticalPadding),
                         verticalAlignment = Alignment.Top,
                     ) {
                         Box(
                             modifier = Modifier
-                                .width(18.dp)
-                                .height(20.dp),
+                                .width(railColumnWidth)
+                                .height(railMarkerBoxHeight),
                             contentAlignment = Alignment.Center,
                         ) {
-                            when (step) {
-                                is ProcessStep.Reasoning -> {
-                                    Box(
-                                        modifier = Modifier
-                                            .size(5.dp)
-                                            .background(
-                                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.55f),
-                                                shape = CircleShape,
-                                            )
-                                    )
-                                }
-                                is ProcessStep.ToolCall -> {
-                                    Icon(
-                                        imageVector = toolIconFor(step.toolName),
-                                        contentDescription = null,
-                                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f),
-                                        modifier = Modifier.size(14.dp),
-                                    )
+                            // 标记坐在一块不透明圆底上：工具图标是描边图形，竖线直接穿过
+                            // 字形会明显"打架"，垫一层与容器同色的圆底即可把线段截断。
+                            // 圆底按"标记尺寸 + 统一留白"算，圆点与图标周围的断开量一致。
+                            // 圆底比标记格高，用 requiredSize 让它溢出（普通 size 会被父
+                            // 约束压扁）；溢出量在行的上下 padding 内，不会盖到相邻行。
+                            val markerHalo = when (step) {
+                                is ProcessStep.ToolCall -> railIconHaloDiameter
+                                is ProcessStep.Reasoning -> railDotHaloDiameter
+                            }
+                            Box(
+                                modifier = Modifier
+                                    .requiredSize(markerHalo)
+                                    .background(markerBackground, CircleShape),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                when (step) {
+                                    is ProcessStep.Reasoning -> {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(railDotDiameter)
+                                                .background(
+                                                    color = railDotColor,
+                                                    shape = CircleShape,
+                                                )
+                                        )
+                                    }
+                                    is ProcessStep.ToolCall -> {
+                                        Icon(
+                                            imageVector = toolIconFor(step.toolName),
+                                            contentDescription = null,
+                                            tint = railIconTint,
+                                            modifier = Modifier.size(railIconSize),
+                                        )
+                                    }
                                 }
                             }
                         }
 
-                        Spacer(modifier = Modifier.width(8.dp))
+                        Spacer(modifier = Modifier.width(railMarkerTextGap))
 
                         Column(
                             modifier = Modifier
@@ -2299,6 +2355,12 @@ private fun ExecutionProcessBlock(
                                         step = step,
                                         textStyle = stepTextStyle,
                                         contentColor = contentColor,
+                                        detailExpanded = step.id in expandedDetailIds,
+                                        onToggleDetail = {
+                                            if (!expandedDetailIds.remove(step.id)) {
+                                                expandedDetailIds.add(step.id)
+                                            }
+                                        },
                                     )
                                 }
                             }
@@ -2315,46 +2377,151 @@ private fun ProcessToolStepRow(
     step: ProcessStep.ToolCall,
     textStyle: TextStyle,
     contentColor: Color,
+    detailExpanded: Boolean,
+    onToggleDetail: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val displayTitle = formatToolStepTitle(step.toolName, step.title)
+    val detail = toolCallDetail(step.toolName, step.argumentsJson)
+        .takeIf { it.isNotBlank() && !displayTitle.contains(it) }
 
-    Row(
-        modifier = modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .then(
+                if (detail == null) {
+                    Modifier
+                } else {
+                    // 整行可点：展开/收起这一条事件的详情行。不要波纹反馈，时间流保持安静。
+                    Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null,
+                            onClick = onToggleDetail,
+                        )
+                },
+            ),
     ) {
-        Text(
-            text = displayTitle,
-            style = textStyle,
-            color = contentColor,
-            modifier = Modifier.weight(1f, fill = false),
-        )
-        if (step.status == "running") {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
             Text(
-                text = "(执行中...)",
-                style = textStyle.copy(
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Medium,
-                ),
-                color = MaterialTheme.colorScheme.primary,
+                text = displayTitle,
+                style = textStyle,
+                color = contentColor,
+                modifier = Modifier.weight(1f, fill = false),
             )
-        } else if (step.status == "failed" || step.status == "error") {
-            Text(
-                text = "(失败)",
-                style = textStyle.copy(
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Medium,
-                ),
-                color = MaterialTheme.colorScheme.error,
+            if (detail != null) {
+                Icon(
+                    imageVector = Lucide.ChevronRight,
+                    contentDescription = if (detailExpanded) "收起详情" else "展开详情",
+                    tint = contentColor.copy(alpha = 0.45f),
+                    modifier = Modifier
+                        .size(12.dp)
+                        .graphicsLayer(rotationZ = if (detailExpanded) 90f else 0f),
+                )
+            }
+            if (step.status == "running") {
+                Text(
+                    text = "(执行中...)",
+                    style = textStyle.copy(
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                    ),
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            } else if (step.status == "failed" || step.status == "error") {
+                Text(
+                    text = "(失败)",
+                    style = textStyle.copy(
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                    ),
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+        }
+        if (detail != null && detailExpanded) {
+            ToolCallDetailLine(
+                detail = detail,
+                fallbackStyle = textStyle,
+                modifier = Modifier.fillMaxWidth(),
             )
         }
     }
 }
 
+/// Muted second line under a tool call: the concrete command/URL/path/query the model is
+/// touching, so a described call ("安装依赖") still shows what actually ran.
+@Composable
+private fun ToolCallDetailLine(
+    detail: String,
+    fallbackStyle: TextStyle,
+    modifier: Modifier = Modifier,
+) {
+    Text(
+        text = detail,
+        style = fallbackStyle.copy(
+            fontSize = 11.5.sp,
+            lineHeight = 16.sp,
+            fontFamily = FontFamily.Monospace,
+        ),
+        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.78f),
+        maxLines = 2,
+        overflow = TextOverflow.Ellipsis,
+        modifier = modifier.padding(top = 2.dp),
+    )
+}
+
+/// Compiled once: `toolCallDetail` runs on every recomposition of a tool row.
+private val WHITESPACE_REGEX = Regex("\\s+")
+
+/// Best-effort extraction of the concrete target of a tool call from its raw arguments.
+/// Returns an empty string when there is nothing more specific than the title itself.
+internal fun toolCallDetail(toolName: String, argumentsJson: String): String {
+    if (argumentsJson.isBlank()) return ""
+    val args = runCatching { JSONObject(argumentsJson) }.getOrNull() ?: return ""
+    fun text(key: String): String = args.optString(key, "").trim()
+    fun firstOf(key: String): String {
+        val array = args.optJSONArray(key) ?: return ""
+        for (index in 0 until array.length()) {
+            val value = array.optString(index, "").trim()
+            if (value.isNotEmpty()) return value
+        }
+        return ""
+    }
+    fun joined(vararg parts: String): String =
+        parts.filter { it.isNotEmpty() }.joinToString(" ")
+
+    val detail = when (toolName.lowercase().trim()) {
+        "terminal" -> text("command")
+        "process" -> joined(text("action"), text("session_id"))
+        "read_file", "write_file", "patch", "view_image" -> text("path")
+        "search_files" -> joined(text("pattern"), text("path"))
+        "web_search" -> firstOf("queries").ifEmpty { text("query") }
+        "web_fetch" -> firstOf("urls").ifEmpty { text("url") }
+        "browser_use" -> joined(text("action"), text("url"), text("selector"))
+        "android_cli" -> text("action")
+        "session_search" -> text("query")
+        "skill_view" -> joined(text("name"), text("file_path"))
+        "skills_list" -> text("category")
+        "hambur_config" -> joined(text("action"), text("path"))
+        "memory" -> joined(text("action"), text("target"))
+        "delegate_task" -> text("goal").ifEmpty {
+            args.optJSONArray("tasks")?.optJSONObject(0)?.optString("goal", "").orEmpty().trim()
+        }
+        else -> ""
+    }
+    return detail.replace(WHITESPACE_REGEX, " ").take(200)
+}
+
 private fun toolIconFor(toolName: String): ImageVector {
     return when (toolName.lowercase().trim()) {
         "web_search", "search" -> Lucide.Search
+        "web_fetch", "fetch", "fetch_url" -> Lucide.FileText
         "browser_use", "browser", "browse" -> Lucide.Globe
         "terminal", "run_command", "bash", "sh", "android_cli" -> Lucide.Terminal
         "process" -> Lucide.Terminal
@@ -2375,6 +2542,8 @@ private fun formatToolStepTitle(toolName: String, rawTitle: String): String {
     return when {
         title.startsWith("Search web: ") -> "搜索网页: " + title.removePrefix("Search web: ")
         title == "Search web" -> "搜索网页"
+        title.startsWith("Fetch web page: ") -> "抓取网页: " + title.removePrefix("Fetch web page: ")
+        title == "Fetch web page" -> "抓取网页"
         title.startsWith("Search files: ") -> "搜索文件: " + title.removePrefix("Search files: ")
         title == "Search files" -> "搜索文件"
         title.startsWith("Browser: ") -> "浏览网页: " + title.removePrefix("Browser: ")
@@ -2396,6 +2565,7 @@ private fun formatToolStepTitle(toolName: String, rawTitle: String): String {
 private fun defaultToolTitle(toolName: String): String {
     return when (toolName.lowercase().trim()) {
         "web_search", "search" -> "搜索网页"
+        "web_fetch", "fetch", "fetch_url" -> "抓取网页"
         "browser_use", "browser" -> "浏览网页"
         "terminal", "run_command", "bash", "android_cli" -> "执行终端命令"
         "process" -> "控制进程"
@@ -2725,6 +2895,8 @@ private fun StandaloneToolTraceItem(
     modifier: Modifier = Modifier,
 ) {
     val displayTitle = formatToolStepTitle(item.toolName, item.traceTitle.ifBlank { item.smallSummary })
+    val detail = toolCallDetail(item.toolName, item.traceArguments)
+        .takeIf { it.isNotBlank() && !displayTitle.contains(it) }
     Row(
         modifier = modifier
             .fillMaxWidth()
@@ -2738,23 +2910,38 @@ private fun StandaloneToolTraceItem(
             tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f),
             modifier = Modifier.size(15.dp),
         )
-        Text(
-            text = displayTitle,
-            style = MaterialTheme.typography.bodyMedium.copy(
-                fontSize = 13.sp,
-                fontWeight = FontWeight.Normal,
-            ),
-            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.85f),
-            modifier = Modifier.weight(1f),
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
-        if (item.traceStatus == "running") {
-            Text(
-                text = "(执行中...)",
-                style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
-                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.85f),
-            )
+        Column(modifier = Modifier.weight(1f)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Text(
+                    text = displayTitle,
+                    style = MaterialTheme.typography.bodyMedium.copy(
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Normal,
+                    ),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.85f),
+                    modifier = Modifier.weight(1f),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (item.traceStatus == "running") {
+                    Text(
+                        text = "(执行中...)",
+                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
+                        color = MaterialTheme.colorScheme.primary.copy(alpha = 0.85f),
+                    )
+                }
+            }
+            if (detail != null) {
+                ToolCallDetailLine(
+                    detail = detail,
+                    fallbackStyle = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
         }
     }
 }
@@ -3699,7 +3886,7 @@ internal sealed interface ProcessStep {
         override val id: String,
         val toolName: String,
         val title: String,
-        val content: String = "",
+        val argumentsJson: String = "",
         val status: String = "",
         override val displaySequence: ULong = 0UL,
     ) : ProcessStep
@@ -3931,7 +4118,8 @@ internal fun List<UiTimelineItem>.toChatDisplayItems(
                 id = stepId,
                 toolName = item.toolName,
                 title = title,
-                content = item.traceContent,
+                // traceContent 在工具跑完后会被结果摘要覆盖，详情行要用参数原文。
+                argumentsJson = item.traceArguments,
                 status = item.traceStatus,
                 displaySequence = item.displaySequence,
             )
@@ -4036,6 +4224,34 @@ internal fun initialThinkingBlockExpanded(displayMode: String, isGenerating: Boo
         THINKING_BLOCK_DISPLAY_AUTO_COLLAPSE -> isGenerating
         else -> true
     }
+}
+
+/**
+ * Title of the collapsed "thinking" block.
+ *
+ * While the turn is running the header reports the latest activity instead of a constant
+ * "正在思考...": when the last step is a tool call it shows that call's description (the
+ * model-supplied `title`, falling back to the derived tool title), so a collapsed block
+ * still tells the user what the agent is doing right now. Once the turn settles the header
+ * goes back to the elapsed-time summary.
+ */
+internal fun resolveProcessHeaderTitle(
+    steps: List<ProcessStep>,
+    isGenerating: Boolean,
+    durationSeconds: Int?,
+): String {
+    if (!isGenerating) {
+        return if (durationSeconds != null && durationSeconds > 0) {
+            "已思考（用时 $durationSeconds 秒）"
+        } else {
+            "已思考"
+        }
+    }
+    val activeToolStep = steps.lastOrNull() as? ProcessStep.ToolCall ?: return "正在思考..."
+    if (activeToolStep.toolName.isBlank() && activeToolStep.title.isBlank()) {
+        return "正在思考..."
+    }
+    return formatToolStepTitle(activeToolStep.toolName, activeToolStep.title)
 }
 
 private fun HamburUiState.thinkingBlockDisplayMode(): String {

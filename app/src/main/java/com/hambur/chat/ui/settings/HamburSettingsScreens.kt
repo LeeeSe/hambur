@@ -47,10 +47,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.composables.icons.lucide.Brain
 import com.composables.icons.lucide.Database
+import com.composables.icons.lucide.Globe
 import com.composables.icons.lucide.HardDrive
 import com.composables.icons.lucide.KeyRound
 import com.composables.icons.lucide.Layers
@@ -61,6 +63,8 @@ import com.composables.icons.lucide.Wrench
 import com.hambur.chat.uniffi.BackendEventKind
 import com.hambur.chat.reducer.HamburUiState
 import com.hambur.chat.reducer.HamburUiStore
+import com.hambur.chat.reducer.PERSONA_BYTE_LIMIT
+import com.hambur.chat.reducer.PERSONA_SETTING_KEY
 import com.hambur.chat.reducer.THINKING_BLOCK_DISPLAY_AUTO_COLLAPSE
 import com.hambur.chat.reducer.THINKING_BLOCK_DISPLAY_AUTO_EXPAND
 import com.hambur.chat.reducer.THINKING_BLOCK_DISPLAY_COLLAPSED
@@ -169,6 +173,12 @@ fun HamburSettingsHomeScreen(
                         summary = "Inject variables into sandbox sessions",
                         onClick = onOpenEnvironmentVariables,
                     )
+                    SettingsNavigationRow(
+                        icon = Lucide.Brain,
+                        title = "Persona",
+                        summary = "SOUL.md text injected into the system prompt of every chat turn",
+                        onClick = onOpenPersona,
+                    )
                 }
             }
             item {
@@ -197,12 +207,6 @@ fun HamburSettingsHomeScreen(
                         title = "Token usage",
                         summary = "Usage accounting and provider billing summaries are not exposed yet",
                         onClick = onOpenTokenUsage,
-                    )
-                    SettingsNavigationRow(
-                        icon = Lucide.Brain,
-                        title = "Persona",
-                        summary = "SOUL.md/personality editing is not exposed by the new backend yet",
-                        onClick = onOpenPersona,
                     )
                 }
             }
@@ -1264,8 +1268,21 @@ fun ToolsListScreen(
     state: HamburUiState,
     onBack: () -> Unit,
     onOpenTool: (String) -> Unit,
+    onOpenWebTools: () -> Unit,
 ) {
     SettingsPage(title = "Tools", onBack = onBack) {
+        item {
+            HamburSection(title = "Web tools", subtitle = "Search provider, credentials, fetch limits") {
+                val search = state.webSearchSettings()
+                SettingsNavigationRow(
+                    icon = Lucide.Globe,
+                    title = "Web search & fetch",
+                    summary = "Provider: ${search.provider} · web_fetch: " +
+                        if (state.webFetchSettings().enabled) "on" else "off",
+                    onClick = onOpenWebTools,
+                )
+            }
+        }
         item {
             HamburSection(title = "Built-in tools") {
                 listOf(
@@ -1278,7 +1295,8 @@ fun ToolsListScreen(
                     "patch" to "Targeted find-and-replace edits in files.",
                     "search_files" to "Search file contents or find files by name.",
                     "hambur_config" to "Read and update Hambur app configuration.",
-                    "web_search" to "Search the web for information.",
+                    "web_search" to "Search the web for information. Returns titles, URLs and snippets; accepts 1-4 queries.",
+                    "web_fetch" to "Fetch one URL, or up to 5 URLs, and return them as Markdown.",
                     "browser_use" to "Control the shared Android WebView browser.",
                     "android_cli" to "Access native Android hardware and system features on demand.",
                     "session_search" to "Search past chat sessions stored locally.",
@@ -1581,6 +1599,107 @@ fun AppearanceSettingsScreen(
 }
 
 @Composable
+fun PersonaSettingsScreen(
+    state: HamburUiState,
+    store: HamburUiStore,
+    onBack: () -> Unit,
+) {
+    val savedPersona = state.settingValue(PERSONA_SETTING_KEY, "").trim()
+    var draft by rememberSaveable { mutableStateOf(savedPersona) }
+    var loadedPersona by rememberSaveable { mutableStateOf(savedPersona) }
+    var lastCommandSequence by rememberSaveable { mutableStateOf(0L) }
+    val context = LocalContext.current
+    val trimmedDraft = draft.trim()
+    // 后端按 UTF-8 字节数限长，Kotlin String.length 是 UTF-16 code unit，非 ASCII 会低估。
+    val draftBytes = trimmedDraft.toByteArray(Charsets.UTF_8).size
+    val dirty = trimmedDraft != loadedPersona
+    val tooLong = draftBytes > PERSONA_BYTE_LIMIT
+
+    // 后端值变了（保存成功，或 agent 通过 hambur_config 改了设置）就同步到编辑框，
+    // 但本地有未保存修改时不覆盖，避免把用户正在写的内容冲掉。
+    LaunchedEffect(savedPersona) {
+        if (trimmedDraft == loadedPersona) {
+            draft = savedPersona
+            loadedPersona = savedPersona
+        }
+    }
+
+    LaunchedEffect(state.lastAppliedSequence) {
+        if (lastCommandSequence > 0L && state.lastAppliedSequence.toLong() > lastCommandSequence) {
+            if (state.latestEventKind == BackendEventKind.SETTINGS_CHANGED.name) {
+                // 只把"已保存内容"对齐到刚提交的文本，编辑框保持用户输入不动：
+                // 设置快照刷新可能晚一拍到达，这里不依赖它，避免把草稿冲掉。
+                loadedPersona = trimmedDraft
+                Toast.makeText(context, "Persona saved", Toast.LENGTH_SHORT).show()
+                lastCommandSequence = 0L
+            } else if (state.runtimeStatus == "Error") {
+                Toast.makeText(context, "Save failed: ${state.footer}", Toast.LENGTH_LONG).show()
+                lastCommandSequence = 0L
+            }
+        }
+    }
+
+    SettingsPage(title = "Persona", subtitle = "SOUL.md", onBack = onBack) {
+        item {
+            HamburSection(
+                title = "SOUL.md",
+                subtitle = "Prepended to the system prompt of every chat turn",
+            ) {
+                OutlinedTextField(
+                    value = draft,
+                    onValueChange = { draft = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    minLines = 10,
+                    label = { Text("Persona") },
+                    placeholder = {
+                        Text("For example: You are a terse senior engineer. Answer in Chinese, prefer concrete steps, never pad with pleasantries.")
+                    },
+                    isError = tooLong,
+                )
+                SummaryLine(label = "Length (UTF-8 bytes)", value = "$draftBytes / $PERSONA_BYTE_LIMIT")
+                if (tooLong) {
+                    Text(
+                        text = "The backend rejects persona text longer than $PERSONA_BYTE_LIMIT UTF-8 bytes.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    SecondaryActionButton(
+                        text = "Reload",
+                        enabled = dirty,
+                        onClick = {
+                            draft = savedPersona
+                            loadedPersona = savedPersona
+                        },
+                    )
+                    SecondaryActionButton(
+                        text = "Save",
+                        enabled = dirty && !tooLong,
+                        onClick = {
+                            lastCommandSequence = state.lastAppliedSequence.toLong()
+                            Toast.makeText(context, "Saving persona...", Toast.LENGTH_SHORT).show()
+                            store.savePersona(draft)
+                        },
+                    )
+                }
+            }
+        }
+        item {
+            HamburSection(title = "How it applies") {
+                SummaryLine(label = "Stored as", value = PERSONA_SETTING_KEY)
+                SummaryLine(label = "Applied to", value = "Main chat and delegated subagents")
+                Text(
+                    text = "Clearing the text and saving removes the persona; the default assistant style applies again. Changes take effect from the next message.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+@Composable
 fun GenericJsonSettingsScreen(
     title: String,
     summary: String,
@@ -1646,6 +1765,38 @@ fun ToolSettingsScreen(
     var browserSettings by rememberSaveable {
         mutableStateOf(state.appSettings.firstOrNull { it.key == "browser_tool_settings" }?.value ?: DEFAULT_BROWSER_TOOL_SETTINGS_JSON)
     }
+    val webSearchStored = state.webSearchSettings()
+    val webFetchStored = state.webFetchSettings()
+    var webSearchProvider by rememberSaveable { mutableStateOf(webSearchStored.provider) }
+    var webSearchEndpoint by rememberSaveable { mutableStateOf(webSearchStored.endpoint) }
+    var webSearchModel by rememberSaveable { mutableStateOf(webSearchStored.model) }
+    var webSearchMaxResults by rememberSaveable { mutableStateOf(webSearchStored.maxResults.toString()) }
+    var webSearchMaxQueries by rememberSaveable { mutableStateOf(webSearchStored.maxQueries.toString()) }
+    var webSearchMaxUses by rememberSaveable { mutableStateOf(webSearchStored.maxUses.toString()) }
+    var webFetchEnabled by rememberSaveable { mutableStateOf(webFetchStored.enabled) }
+    var webFetchAllowPrivateHosts by rememberSaveable { mutableStateOf(webFetchStored.allowPrivateHosts) }
+    var webFetchMaxChars by rememberSaveable { mutableStateOf(webFetchStored.maxChars.toString()) }
+    var webSearchJson by rememberSaveable { mutableStateOf(state.settingValue("web_search_settings", DEFAULT_WEB_SEARCH_SETTINGS_JSON)) }
+    var webFetchJson by rememberSaveable { mutableStateOf(state.settingValue("web_fetch_settings", DEFAULT_WEB_FETCH_SETTINGS_JSON)) }
+    var deepseekSearchKey by remember { mutableStateOf("") }
+    var exaSearchKey by remember { mutableStateOf("") }
+    val context = LocalContext.current
+
+    // 表单值盖在已存配置上，未暴露的字段（apiVersion/maxTokens/apiKeyRef/Exa 等）原样回写。
+    val webSearchForm = webSearchStored.copy(
+        provider = webSearchProvider,
+        endpoint = webSearchEndpoint,
+        model = webSearchModel,
+        maxResults = webSearchMaxResults.trim().toIntOrNull() ?: webSearchStored.maxResults,
+        maxQueries = webSearchMaxQueries.trim().toIntOrNull() ?: webSearchStored.maxQueries,
+        maxUses = webSearchMaxUses.trim().toIntOrNull() ?: webSearchStored.maxUses,
+    )
+    val webFetchForm = webFetchStored.copy(
+        enabled = webFetchEnabled,
+        allowPrivateHosts = webFetchAllowPrivateHosts,
+        maxChars = webFetchMaxChars.trim().toIntOrNull() ?: webFetchStored.maxChars,
+    )
+
     SettingsPage(title = "Tools", onBack = onBack) {
         item {
             HamburSection(title = "Tool settings") {
@@ -1662,7 +1813,117 @@ fun ToolSettingsScreen(
             }
         }
         item {
+            HamburSection(title = "Web search", subtitle = "web_search_settings：Auto 在可用后端里挑一个，Off 直接关闭") {
+                ChoiceRow(
+                    title = "Provider",
+                    current = webSearchProvider,
+                    options = listOf(
+                        "auto" to "Auto",
+                        "deepseek-official" to "DeepSeek official",
+                        "exa" to "Exa",
+                        "off" to "Off",
+                    ),
+                    onSelect = { webSearchProvider = it },
+                )
+                OutlinedTextField(value = webSearchEndpoint, onValueChange = { webSearchEndpoint = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Endpoint") })
+                OutlinedTextField(value = webSearchModel, onValueChange = { webSearchModel = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Model") })
+                OutlinedTextField(value = webSearchMaxResults, onValueChange = { webSearchMaxResults = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Max results (1-25)") })
+                OutlinedTextField(value = webSearchMaxQueries, onValueChange = { webSearchMaxQueries = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Max queries (1-8)") })
+                OutlinedTextField(value = webSearchMaxUses, onValueChange = { webSearchMaxUses = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Max uses (1-20)") })
+                SecondaryActionButton(
+                    text = "Save web search settings",
+                    enabled = webSearchEndpoint.isNotBlank() && webSearchModel.isNotBlank(),
+                    onClick = {
+                        val json = webSearchForm.toJson()
+                        store.saveAppSetting("web_search_settings", json, false)
+                        webSearchJson = json
+                    },
+                )
+            }
+        }
+        item {
+            HamburSection(title = "Web search keys", subtitle = "密钥只写入 Android Secret Store，不会存进设置 JSON") {
+                OutlinedTextField(value = deepseekSearchKey, onValueChange = { deepseekSearchKey = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, visualTransformation = PasswordVisualTransformation(), label = { Text("DeepSeek API key ($WEB_SEARCH_DEEPSEEK_SECRET_REF)") })
+                SecondaryActionButton(
+                    text = "Save DeepSeek key",
+                    enabled = deepseekSearchKey.isNotBlank(),
+                    onClick = {
+                        if (store.saveWebSearchSecret(WEB_SEARCH_DEEPSEEK_SECRET_REF, deepseekSearchKey)) {
+                            // apiKeyRef 为空时说明还在复用官方 DeepSeek provider 的密钥，
+                            // 这时把引用指向刚写入的 Secret；用户手填过引用就不动它。
+                            if (webSearchStored.apiKeyRef.isBlank()) {
+                                val json = webSearchForm.copy(apiKeyRef = WEB_SEARCH_DEEPSEEK_SECRET_REF).toJson()
+                                store.saveAppSetting("web_search_settings", json, false)
+                                webSearchJson = json
+                            }
+                            deepseekSearchKey = ""
+                            Toast.makeText(context, "DeepSeek search key saved", Toast.LENGTH_SHORT).show()
+                        } else {
+                            Toast.makeText(context, "Failed to save DeepSeek search key", Toast.LENGTH_LONG).show()
+                        }
+                    },
+                )
+                OutlinedTextField(value = exaSearchKey, onValueChange = { exaSearchKey = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, visualTransformation = PasswordVisualTransformation(), label = { Text("Exa API key ($WEB_SEARCH_EXA_SECRET_REF)") })
+                SecondaryActionButton(
+                    text = "Save Exa key",
+                    enabled = exaSearchKey.isNotBlank(),
+                    onClick = {
+                        if (store.saveWebSearchSecret(WEB_SEARCH_EXA_SECRET_REF, exaSearchKey)) {
+                            exaSearchKey = ""
+                            Toast.makeText(context, "Exa search key saved", Toast.LENGTH_SHORT).show()
+                        } else {
+                            Toast.makeText(context, "Failed to save Exa search key", Toast.LENGTH_LONG).show()
+                        }
+                    },
+                )
+            }
+        }
+        item {
+            HamburSection(title = "Web fetch", subtitle = "web_fetch_settings：抓取单个 URL 并转成 Markdown") {
+                SettingsSwitchRow(
+                    title = "Enabled",
+                    summary = if (webFetchEnabled) "The model can call web_fetch." else "Hidden from the model; calls to it are rejected.",
+                    checked = webFetchEnabled,
+                    onCheckedChange = { webFetchEnabled = it },
+                )
+                SettingsSwitchRow(
+                    title = "Allow private hosts",
+                    summary = if (webFetchAllowPrivateHosts) "允许访问回环和内网地址（慎用）" else "只允许公网地址",
+                    checked = webFetchAllowPrivateHosts,
+                    onCheckedChange = { webFetchAllowPrivateHosts = it },
+                )
+                OutlinedTextField(value = webFetchMaxChars, onValueChange = { webFetchMaxChars = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Max chars (1000-400000)") })
+                SecondaryActionButton(
+                    text = "Save web fetch settings",
+                    onClick = {
+                        val json = webFetchForm.toJson()
+                        store.saveAppSetting("web_fetch_settings", json, false)
+                        webFetchJson = json
+                    },
+                )
+            }
+        }
+        item {
+            HamburSection(title = "Web tools raw JSON", subtitle = "兜底编辑入口：文本会原样写进对应的 app setting") {
+                OutlinedTextField(value = webSearchJson, onValueChange = { webSearchJson = it }, modifier = Modifier.fillMaxWidth(), minLines = 5, label = { Text("web_search_settings") })
+                SecondaryActionButton(
+                    text = "Save raw web search JSON",
+                    enabled = webSearchJson.isNotBlank(),
+                    onClick = { store.saveAppSetting("web_search_settings", webSearchJson, false) },
+                )
+                OutlinedTextField(value = webFetchJson, onValueChange = { webFetchJson = it }, modifier = Modifier.fillMaxWidth(), minLines = 5, label = { Text("web_fetch_settings") })
+                SecondaryActionButton(
+                    text = "Save raw web fetch JSON",
+                    enabled = webFetchJson.isNotBlank(),
+                    onClick = { store.saveAppSetting("web_fetch_settings", webFetchJson, false) },
+                )
+            }
+        }
+        item {
             CurrentSettingsSection(state = state, prefix = "tool")
+        }
+        item {
+            CurrentSettingsSection(state = state, prefix = "web")
         }
     }
 }
@@ -2044,20 +2305,6 @@ fun FeatureUnavailableScreen(
                             label = { Text("Provider filter") },
                         )
                     }
-                    "Persona" -> {
-                        OutlinedTextField(
-                            value = textValue,
-                            onValueChange = { textValue = it },
-                            modifier = Modifier.fillMaxWidth(),
-                            minLines = 10,
-                            label = { Text("SOUL.md") },
-                            placeholder = { Text("Persona text editor surface") },
-                        )
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            SecondaryActionButton(text = "Reload", enabled = false, onClick = {})
-                            SecondaryActionButton(text = "Save", enabled = false, onClick = {})
-                        }
-                    }
                     "Environment Variables" -> {
                         OutlinedTextField(
                             value = textValue,
@@ -2334,6 +2581,15 @@ private data class UiBrowserToolSettings(
 private const val DEFAULT_BROWSER_TOOL_SETTINGS_JSON =
     """{"acceptCookies":true,"acceptThirdPartyCookies":true,"maxFetchBytes":2000000,"autoCloseMinutes":15}"""
 
+private const val DEFAULT_WEB_SEARCH_SETTINGS_JSON =
+    """{"provider":"auto","endpoint":"https://api.deepseek.com/anthropic/v1","model":"deepseek-chat","apiVersion":"2023-06-01","maxTokens":4096,"maxUses":5,"maxResults":8,"maxQueries":4,"apiKeyRef":"","exaEndpoint":"https://api.exa.ai","exaApiKeyRef":"android-secret://web_search/exa","exaSnippetChars":1200}"""
+
+private const val DEFAULT_WEB_FETCH_SETTINGS_JSON =
+    """{"enabled":true,"maxBytes":2097152,"timeoutMs":20000,"maxRedirects":4,"allowPrivateHosts":false,"maxChars":48000}"""
+
+private const val WEB_SEARCH_DEEPSEEK_SECRET_REF = "android-secret://web_search/deepseek"
+private const val WEB_SEARCH_EXA_SECRET_REF = "android-secret://web_search/exa"
+
 private fun HamburUiState.settingValue(key: String, fallback: String): String {
     return appSettings.firstOrNull { it.key == key }?.value ?: fallback
 }
@@ -2346,6 +2602,132 @@ private fun HamburUiState.browserToolSettings(): UiBrowserToolSettings {
         maxFetchBytes = raw.jsonInt("maxFetchBytes", 2_000_000),
         autoCloseMinutes = raw.jsonInt("autoCloseMinutes", 15),
     ).normalized()
+}
+
+private fun HamburUiState.webSearchSettings(): UiWebSearchSettings {
+    return settingValue("web_search_settings", "").toUiWebSearchSettings()
+}
+
+private fun HamburUiState.webFetchSettings(): UiWebFetchSettings {
+    return settingValue("web_fetch_settings", "").toUiWebFetchSettings()
+}
+
+// 形状与 Rust 侧 WebSearchSettings 一一对应；缺失字段用默认值，保存时整体回写。
+private data class UiWebSearchSettings(
+    val provider: String = "auto",
+    val endpoint: String = "https://api.deepseek.com/anthropic/v1",
+    val model: String = "deepseek-chat",
+    val apiVersion: String = "2023-06-01",
+    val maxTokens: Int = 4096,
+    val maxUses: Int = 5,
+    val maxResults: Int = 8,
+    val maxQueries: Int = 4,
+    val apiKeyRef: String = "",
+    val exaEndpoint: String = "https://api.exa.ai",
+    val exaApiKeyRef: String = WEB_SEARCH_EXA_SECRET_REF,
+    val exaSnippetChars: Int = 1200,
+) {
+    fun normalized(): UiWebSearchSettings {
+        return copy(
+            provider = provider.trim().ifBlank { "auto" },
+            endpoint = endpoint.trim().ifBlank { "https://api.deepseek.com/anthropic/v1" },
+            model = model.trim().ifBlank { "deepseek-chat" },
+            apiVersion = apiVersion.trim().ifBlank { "2023-06-01" },
+            maxTokens = maxTokens.coerceIn(256, 32_000),
+            maxUses = maxUses.coerceIn(1, 20),
+            maxResults = maxResults.coerceIn(1, 25),
+            maxQueries = maxQueries.coerceIn(1, 8),
+            exaEndpoint = exaEndpoint.trim().ifBlank { "https://api.exa.ai" },
+            exaSnippetChars = exaSnippetChars.coerceIn(120, 8_000),
+        )
+    }
+
+    fun toJson(): String {
+        val normalized = normalized()
+        return JSONObject()
+            .put("provider", normalized.provider)
+            .put("endpoint", normalized.endpoint)
+            .put("model", normalized.model)
+            .put("apiVersion", normalized.apiVersion)
+            .put("maxTokens", normalized.maxTokens)
+            .put("maxUses", normalized.maxUses)
+            .put("maxResults", normalized.maxResults)
+            .put("maxQueries", normalized.maxQueries)
+            .put("apiKeyRef", normalized.apiKeyRef)
+            .put("exaEndpoint", normalized.exaEndpoint)
+            .put("exaApiKeyRef", normalized.exaApiKeyRef)
+            .put("exaSnippetChars", normalized.exaSnippetChars)
+            .toString()
+    }
+}
+
+private fun String.toUiWebSearchSettings(): UiWebSearchSettings {
+    if (isBlank()) return UiWebSearchSettings()
+    return runCatching {
+        val defaults = UiWebSearchSettings()
+        val root = JSONObject(this)
+        UiWebSearchSettings(
+            provider = root.optString("provider", defaults.provider),
+            endpoint = root.optString("endpoint", defaults.endpoint),
+            model = root.optString("model", defaults.model),
+            apiVersion = root.optString("apiVersion", defaults.apiVersion),
+            maxTokens = root.optInt("maxTokens", defaults.maxTokens),
+            maxUses = root.optInt("maxUses", defaults.maxUses),
+            maxResults = root.optInt("maxResults", defaults.maxResults),
+            maxQueries = root.optInt("maxQueries", defaults.maxQueries),
+            apiKeyRef = root.optString("apiKeyRef", defaults.apiKeyRef),
+            exaEndpoint = root.optString("exaEndpoint", defaults.exaEndpoint),
+            exaApiKeyRef = root.optString("exaApiKeyRef", defaults.exaApiKeyRef),
+            exaSnippetChars = root.optInt("exaSnippetChars", defaults.exaSnippetChars),
+        )
+    }.getOrDefault(UiWebSearchSettings()).normalized()
+}
+
+// 形状与 Rust 侧 WebFetchSettings 一一对应。
+private data class UiWebFetchSettings(
+    val enabled: Boolean = true,
+    val maxBytes: Int = 2_097_152,
+    val timeoutMs: Int = 20_000,
+    val maxRedirects: Int = 4,
+    val allowPrivateHosts: Boolean = false,
+    val maxChars: Int = 48_000,
+) {
+    fun normalized(): UiWebFetchSettings {
+        return copy(
+            maxBytes = maxBytes.coerceIn(8 * 1024, 16 * 1024 * 1024),
+            timeoutMs = timeoutMs.coerceIn(1_000, 120_000),
+            maxRedirects = maxRedirects.coerceIn(0, 10),
+            maxChars = maxChars.coerceIn(1_000, 400_000),
+        )
+    }
+
+    fun toJson(): String {
+        val normalized = normalized()
+        return JSONObject()
+            .put("enabled", normalized.enabled)
+            .put("maxBytes", normalized.maxBytes)
+            .put("timeoutMs", normalized.timeoutMs)
+            .put("maxRedirects", normalized.maxRedirects)
+            .put("allowPrivateHosts", normalized.allowPrivateHosts)
+            .put("maxChars", normalized.maxChars)
+            .toString()
+    }
+}
+
+private fun String.toUiWebFetchSettings(): UiWebFetchSettings {
+    if (isBlank()) return UiWebFetchSettings()
+    return runCatching {
+        val defaults = UiWebFetchSettings()
+        val root = JSONObject(this)
+        UiWebFetchSettings(
+            enabled = root.optBoolean("enabled", defaults.enabled),
+            maxBytes = root.optInt("maxBytes", defaults.maxBytes),
+            timeoutMs = root.optInt("timeoutMs", defaults.timeoutMs),
+            maxRedirects = root.optInt("maxRedirects", defaults.maxRedirects),
+            allowPrivateHosts = root.optBoolean("allowPrivateHosts", defaults.allowPrivateHosts),
+            maxChars = root.optInt("maxChars", defaults.maxChars),
+        )
+    }.getOrDefault(UiWebFetchSettings()).normalized()
 }
 
 private fun String.jsonBool(key: String, fallback: Boolean): Boolean {

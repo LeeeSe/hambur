@@ -1,6 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  自适应启动图标：猫头前景 + 纯色底，两者都随系统明暗对调（见 values*/colors.xml）。
+    明主题 -> 黑猫 / 白底
+    暗主题 -> 白猫 / 黑底
+
+  这里刻意不放 <monochrome> 层：那一层是给 Android 13+「主题图标」用的，系统会按壁纸
+  取色重新着色，跟"只要黑白"的要求冲突。不放它，图标就稳定保持黑白。
+-->
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
     <background android:drawable="@color/ic_launcher_background" />
     <foreground android:drawable="@drawable/ic_launcher_foreground" />
 </adaptive-icon>
-

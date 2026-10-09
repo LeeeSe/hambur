@@ -1,7 +1,6 @@
 use crate::*;
 
 impl RuntimeEngine {
-
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn execute_tool_batch_and_continue(
         &self,
@@ -31,19 +30,18 @@ impl RuntimeEngine {
         if let Some(update) =
             self.append_stream_markdown(session_id, assistant_message_id, "", true)
         {
-            let _ = self
-                .emit_markdown_persisted(session_id.to_string(), turn_id.to_string(), update);
+            let _ =
+                self.emit_markdown_persisted(session_id.to_string(), turn_id.to_string(), update);
         }
 
-        self.database
-            .update_message_stream_result(
-                assistant_message_id,
-                content,
-                reasoning,
-                "requires_tool",
-                &finish_reason.if_blank("tool_calls".to_string()),
-                &native_finish_reason.if_blank("tool_calls".to_string()),
-            )?;
+        self.database.update_message_stream_result(
+            assistant_message_id,
+            content,
+            reasoning,
+            "requires_tool",
+            &finish_reason.if_blank("tool_calls".to_string()),
+            &native_finish_reason.if_blank("tool_calls".to_string()),
+        )?;
         self.persist_reasoning_block_for_timeline(
             session_id,
             turn_id,
@@ -78,33 +76,30 @@ impl RuntimeEngine {
                 call.name,
                 call.arguments_json,
             )?;
-            self.database
-                .insert_tool_call(NewToolCall {
-                    id: invocation.tool_call_id.clone(),
-                    session_id: session_id.to_string(),
-                    turn_id: turn_id.to_string(),
-                    assistant_message_id: assistant_message_id.to_string(),
-                    name: invocation.name.clone(),
-                    arguments_json: invocation.arguments_json.clone(),
-                    display_title: invocation.display_title.clone(),
-                    status: "running".to_string(),
-                    requires_approval: invocation.requires_approval,
-                    call_index: invocation.index,
-                })?;
-            let trace = self
-                .database
-                .insert_trace_span(NewTraceSpan {
-                    session_id: session_id.to_string(),
-                    turn_id: turn_id.to_string(),
-                    kind: "tool".to_string(),
-                    title: invocation.display_title.clone(),
-                    content: invocation.arguments_json.clone(),
-                    status: "running".to_string(),
-                    tool_call_id: invocation.tool_call_id.clone(),
-                    payload_json: invocation.arguments_json.clone(),
-                    visible: true,
-                    ..Default::default()
-                })?;
+            self.database.insert_tool_call(NewToolCall {
+                id: invocation.tool_call_id.clone(),
+                session_id: session_id.to_string(),
+                turn_id: turn_id.to_string(),
+                assistant_message_id: assistant_message_id.to_string(),
+                name: invocation.name.clone(),
+                arguments_json: invocation.arguments_json.clone(),
+                display_title: invocation.display_title.clone(),
+                status: "running".to_string(),
+                requires_approval: invocation.requires_approval,
+                call_index: invocation.index,
+            })?;
+            let trace = self.database.insert_trace_span(NewTraceSpan {
+                session_id: session_id.to_string(),
+                turn_id: turn_id.to_string(),
+                kind: "tool".to_string(),
+                title: invocation.display_title.clone(),
+                content: invocation.arguments_json.clone(),
+                status: "running".to_string(),
+                tool_call_id: invocation.tool_call_id.clone(),
+                payload_json: invocation.arguments_json.clone(),
+                visible: true,
+                ..Default::default()
+            })?;
             trace_ids.insert(invocation.tool_call_id.clone(), trace.id);
             let snapshot = self
                 .database
@@ -146,55 +141,50 @@ impl RuntimeEngine {
         let mut tool_result_messages = Vec::new();
         let mut context_stubs = Vec::new();
         for record in &records {
-            let tool_message = self
-                .database
-                .insert_tool_result_message(
-                    session_id,
-                    turn_id,
-                    &record.invocation.tool_call_id,
-                    &record.invocation.name,
-                    &record.result.context_stub,
-                    route,
-                )?;
-            let result = self
-                .database
-                .insert_tool_result(NewToolResult {
-                    session_id: session_id.to_string(),
-                    turn_id: turn_id.to_string(),
-                    tool_call_id: record.invocation.tool_call_id.clone(),
-                    message_id: tool_message.id,
-                    is_error: record.result.is_error,
-                    content_json: record.result.content_json.clone(),
-                    summary: record.result.summary.clone(),
-                    artifacts_json: record.result.artifacts_json.clone(),
-                    trust_level: record.result.trust_level.clone(),
-                    truncated: record.result.truncated,
-                    offloaded_file_id: record.result.offloaded_file_id.clone(),
-                    offloaded_path: record.result.offloaded_path.clone(),
-                    context_stub: record.result.context_stub.clone(),
-                })?;
+            let tool_message = self.database.insert_tool_result_message(
+                session_id,
+                turn_id,
+                &record.invocation.tool_call_id,
+                &record.invocation.name,
+                &record.result.context_stub,
+                route,
+            )?;
+            let result = self.database.insert_tool_result(NewToolResult {
+                session_id: session_id.to_string(),
+                turn_id: turn_id.to_string(),
+                tool_call_id: record.invocation.tool_call_id.clone(),
+                message_id: tool_message.id,
+                is_error: record.result.is_error,
+                content_json: record.result.content_json.clone(),
+                summary: record.result.summary.clone(),
+                artifacts_json: record.result.artifacts_json.clone(),
+                trust_level: record.result.trust_level.clone(),
+                truncated: record.result.truncated,
+                offloaded_file_id: record.result.offloaded_file_id.clone(),
+                offloaded_path: record.result.offloaded_path.clone(),
+                context_stub: record.result.context_stub.clone(),
+            })?;
             let status = if record.result.is_error {
                 "failed"
             } else {
                 "completed"
             };
-            self.database
-                .update_tool_call_status(
-                    &record.invocation.tool_call_id,
-                    status,
-                    &result.id,
-                    if record.result.is_error {
-                        "ToolError"
-                    } else {
-                        ""
-                    },
-                    if record.result.is_error {
-                        &record.result.summary
-                    } else {
-                        ""
-                    },
-                    true,
-                )?;
+            self.database.update_tool_call_status(
+                &record.invocation.tool_call_id,
+                status,
+                &result.id,
+                if record.result.is_error {
+                    "ToolError"
+                } else {
+                    ""
+                },
+                if record.result.is_error {
+                    &record.result.summary
+                } else {
+                    ""
+                },
+                true,
+            )?;
             self.update_latest_tool_trace(
                 trace_ids
                     .get(&record.invocation.tool_call_id)
@@ -267,17 +257,15 @@ impl RuntimeEngine {
             .iter()
             .any(|stub| stub.contains("ImagePart(fileId="))
         {
-            let _synthetic = self
-                .database
-                .insert_message_with_route(
-                    session_id,
-                    "user",
-                    &format_synthetic_view_image_message(&context_stubs),
-                    "",
-                    "completed",
-                    turn_id,
-                    &continuation_route,
-                )?;
+            let _synthetic = self.database.insert_message_with_route(
+                session_id,
+                "user",
+                &format_synthetic_view_image_message(&context_stubs),
+                "",
+                "completed",
+                turn_id,
+                &continuation_route,
+            )?;
         }
 
         let mut continuation_images = Vec::new();
@@ -331,20 +319,23 @@ impl RuntimeEngine {
             });
         }
 
-        let continuation_message = self
-            .database
-            .insert_message_with_route(
-                session_id,
-                "assistant",
-                "",
-                "",
-                "streaming",
-                turn_id,
-                &continuation_route,
-            )?;
-        let engine = self.self_ref.lock().ok().and_then(|value| value.upgrade()).ok_or_else(|| {
-            HamburError::Internal("runtime self reference unavailable".to_string())
-        })?;
+        let continuation_message = self.database.insert_message_with_route(
+            session_id,
+            "assistant",
+            "",
+            "",
+            "streaming",
+            turn_id,
+            &continuation_route,
+        )?;
+        let engine = self
+            .self_ref
+            .lock()
+            .ok()
+            .and_then(|value| value.upgrade())
+            .ok_or_else(|| {
+                HamburError::Internal("runtime self reference unavailable".to_string())
+            })?;
         engine.insert_initial_pending_markdown_block(
             session_id,
             turn_id,
@@ -371,10 +362,7 @@ impl RuntimeEngine {
         }))
     }
 
-    pub(crate) fn execute_memory_review_tool(
-        &self,
-        invocation: ToolInvocation,
-    ) -> ToolResult {
+    pub(crate) fn execute_memory_review_tool(&self, invocation: ToolInvocation) -> ToolResult {
         if invocation.name != "memory" {
             return ToolResult::failed(
                 &invocation.tool_call_id,
@@ -435,10 +423,9 @@ impl RuntimeEngine {
             .count();
         for invocation in invocations {
             if disabled_tools.contains(invocation.name.as_str()) {
-                records.push(failed_record(
-                    invocation,
-                    |invocation| format!("tool is disabled: {}", invocation.name),
-                ));
+                records.push(failed_record(invocation, |invocation| {
+                    format!("tool is disabled: {}", invocation.name)
+                }));
                 continue;
             }
             let Some(kind) = invocation.kind else {
@@ -446,7 +433,8 @@ impl RuntimeEngine {
                 builtin.push(invocation);
                 continue;
             };
-            if kind == ToolKind::DelegateTask && delegate_task_count > MAX_DELEGATE_TASKS_PER_BATCH {
+            if kind == ToolKind::DelegateTask && delegate_task_count > MAX_DELEGATE_TASKS_PER_BATCH
+            {
                 records.push(failed_record(invocation, |_| {
                     "delegate batch limit exceeded".to_string()
                 }));
@@ -508,18 +496,14 @@ impl RuntimeEngine {
         arguments: &Value,
     ) -> ToolResult {
         match kind {
-            ToolKind::ViewImage => {
-                self.resolve_view_image_result(
-                    ctx.session_id,
-                    ctx.route,
-                    ctx.route_candidates,
-                    invocation,
-                    arguments,
-                )
-            }
-            ToolKind::SessionSearch => {
-                self.resolve_session_search_result(invocation, arguments)
-            }
+            ToolKind::ViewImage => self.resolve_view_image_result(
+                ctx.session_id,
+                ctx.route,
+                ctx.route_candidates,
+                invocation,
+                arguments,
+            ),
+            ToolKind::SessionSearch => self.resolve_session_search_result(invocation, arguments),
             ToolKind::Terminal | ToolKind::Process => {
                 self.resolve_sandbox_tool_result(invocation, arguments)
             }
@@ -529,9 +513,7 @@ impl RuntimeEngine {
             ToolKind::Memory | ToolKind::SkillsList | ToolKind::SkillView => {
                 self.resolve_knowledge_tool_result(invocation, arguments)
             }
-            ToolKind::HamburConfig => {
-                self.resolve_hambur_config_tool_result(invocation, arguments)
-            }
+            ToolKind::HamburConfig => self.resolve_hambur_config_tool_result(invocation, arguments),
             ToolKind::BrowserUse => {
                 self.resolve_browser_tool_result(ctx.session_id, ctx.turn_id, invocation, arguments)
                     .await
@@ -545,7 +527,9 @@ impl RuntimeEngine {
                 )
                 .await
             }
-            ToolKind::WebSearch => self.resolve_web_tool_result(invocation, arguments),
+            ToolKind::WebSearch | ToolKind::WebFetch => {
+                self.resolve_web_tool_result(invocation, arguments).await
+            }
             ToolKind::DelegateTask | ToolKind::SubmitDelegateResult => {
                 self.resolve_delegate_result(
                     ctx.session_id,
@@ -573,8 +557,7 @@ impl RuntimeEngine {
         timeout_ms: u64,
     ) -> HamburResult<hambur_sandbox::SandboxExecResult> {
         let (tasks, enabled) = self.get_startup_tasks_and_enabled();
-        let settings_snap = self.database.settings_snapshot()
-            .unwrap_or_default();
+        let settings_snap = self.database.settings_snapshot().unwrap_or_default();
         let requested_backend = get_rootfs_backend(&settings_snap.settings);
         self.sandbox
             .ensure_initialized(&tasks, enabled, requested_backend)?;

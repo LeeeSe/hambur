@@ -91,11 +91,13 @@ impl RuntimeEngine {
             && command.chunk.trim().is_empty()
             && pending_attachments.is_empty();
         let setup = self.tokio.block_on(async {
-            let reusable_user_message = self
-                .prepare_visible_branch_for_command(&command, command_kind)?;
-            let turn = self
-                .database
-                .create_turn_with_route(&command.session_id, "StreamingAssistant", &route)?;
+            let reusable_user_message =
+                self.prepare_visible_branch_for_command(&command, command_kind)?;
+            let turn = self.database.create_turn_with_route(
+                &command.session_id,
+                "StreamingAssistant",
+                &route,
+            )?;
             let res = async {
                 let reuse_existing_user = can_reuse_source_user && reusable_user_message.is_some();
                 let user_message = if reuse_existing_user {
@@ -105,64 +107,63 @@ impl RuntimeEngine {
                         "[Current Time: {}]",
                         format_beijing_timestamp_with_weekday(now_ms())
                     );
-                    let user_message = self
-                        .database
-                        .insert_message_with_route_and_prefix(
-                            &command.session_id,
-                            "user",
-                            &visible_user_content,
-                            "",
-                            "completed",
-                            &turn.id,
-                            &route,
-                            &prompt_prefix,
-                        )?;
+                    let user_message = self.database.insert_message_with_route_and_prefix(
+                        &command.session_id,
+                        "user",
+                        &visible_user_content,
+                        "",
+                        "completed",
+                        &turn.id,
+                        &route,
+                        &prompt_prefix,
+                    )?;
                     let attachment_ids = pending_attachments
                         .iter()
                         .map(|attachment| attachment.id.clone())
                         .collect::<Vec<_>>();
-                    self.database
-                        .attach_pending_to_message(
-                            &command.session_id,
-                            &user_message.id,
-                            &attachment_ids,
-                        )?;
-                    self.database
-                        .upsert_timeline_item(
-                            &command.session_id,
-                            NewTimelineItem {
-                                stable_key: user_message.id.clone(),
-                                content_type: "user_message".to_string(),
-                                display_sequence: user_message.created_at_ms,
-                                payload_ref: user_message.id.clone(),
-                                small_summary: visible_user_content.chars().take(160).collect(),
-                                kind: if command_kind == "EditMessage" {
-                                    "EditedUserMessage".to_string()
-                                } else {
-                                    "UserMessage".to_string()
-                                },
+                    self.database.attach_pending_to_message(
+                        &command.session_id,
+                        &user_message.id,
+                        &attachment_ids,
+                    )?;
+                    self.database.upsert_timeline_item(
+                        &command.session_id,
+                        NewTimelineItem {
+                            stable_key: user_message.id.clone(),
+                            content_type: "user_message".to_string(),
+                            display_sequence: user_message.created_at_ms,
+                            payload_ref: user_message.id.clone(),
+                            small_summary: visible_user_content.chars().take(160).collect(),
+                            kind: if command_kind == "EditMessage" {
+                                "EditedUserMessage".to_string()
+                            } else {
+                                "UserMessage".to_string()
                             },
-                        )?;
+                        },
+                    )?;
                     self.maybe_title_session_from_first_user_message(
                         &command.session_id,
                         &visible_user_content,
                     )?;
                     user_message
                 };
-                let assistant_message = self
-                    .database
-                    .insert_message_with_route(
-                        &command.session_id,
-                        "assistant",
-                        "",
-                        "",
-                        "streaming",
-                        &turn.id,
-                        &route,
-                    )?;
-                let engine = self.self_ref.lock().ok().and_then(|value| value.upgrade()).ok_or_else(|| {
-                    HamburError::Internal("runtime self reference unavailable".to_string())
-                })?;
+                let assistant_message = self.database.insert_message_with_route(
+                    &command.session_id,
+                    "assistant",
+                    "",
+                    "",
+                    "streaming",
+                    &turn.id,
+                    &route,
+                )?;
+                let engine = self
+                    .self_ref
+                    .lock()
+                    .ok()
+                    .and_then(|value| value.upgrade())
+                    .ok_or_else(|| {
+                        HamburError::Internal("runtime self reference unavailable".to_string())
+                    })?;
                 engine.insert_initial_pending_markdown_block(
                     &command.session_id,
                     &turn.id,
@@ -173,20 +174,23 @@ impl RuntimeEngine {
                     &content,
                     &pending_attachments,
                 );
-                let chat_context = self
-                    .build_chat_context_messages(
-                        &command.session_id,
-                        &user_message,
-                        &pending_attachments,
-                        &route,
-                        true,
-                        &model_user_content,
-                    )?;
+                let chat_context = self.build_chat_context_messages(
+                    &command.session_id,
+                    &user_message,
+                    &pending_attachments,
+                    &route,
+                    true,
+                    &model_user_content,
+                )?;
                 let snapshot = self.database.session_snapshot(&command.session_id)?;
                 let disabled_tools = self.disabled_tool_names();
-                let tools_json = self.tools.schemas().compile_openai_tools_json_excluding(&disabled_tools);
+                let tools_json = self
+                    .tools
+                    .schemas()
+                    .compile_openai_tools_json_excluding(&disabled_tools);
                 let skills_index_prompt = self.build_skills_index_prompt();
                 let memory_system_prompt = self.build_memory_system_prompt();
+                let persona_system_prompt = self.build_persona_system_prompt();
                 Ok::<_, HamburError>((
                     turn.clone(),
                     user_message,
@@ -197,11 +201,15 @@ impl RuntimeEngine {
                     tools_json,
                     skills_index_prompt,
                     memory_system_prompt,
+                    persona_system_prompt,
                 ))
-            }.await;
+            }
+            .await;
 
             if let Err(ref e) = res {
-                let _ = self.database.fail_turn(&turn.id, "Failed", "SetupError", &e.to_string());
+                let _ = self
+                    .database
+                    .fail_turn(&turn.id, "Failed", "SetupError", &e.to_string());
             }
             res
         });
@@ -216,6 +224,7 @@ impl RuntimeEngine {
             tools_json,
             skills_index_prompt,
             memory_system_prompt,
+            persona_system_prompt,
         ) = match setup {
             Ok(value) => value,
             Err(error) => {
@@ -284,6 +293,7 @@ impl RuntimeEngine {
                     &tools_json,
                     &skills_index_prompt,
                     &memory_system_prompt,
+                    &persona_system_prompt,
                     send_options.deep_thinking_enabled,
                     send_options.search_enabled,
                 )

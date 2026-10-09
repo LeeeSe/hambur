@@ -184,6 +184,7 @@ dictionary TimelineItemDTO {
     string trace_status;
     string tool_call_id;
     string tool_name;
+    string trace_arguments;
     sequence<AttachmentDTO> attachments;
 };
 

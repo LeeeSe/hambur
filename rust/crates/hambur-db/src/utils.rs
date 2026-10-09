@@ -85,6 +85,8 @@ pub(crate) fn normalize_app_setting_key(value: &str) -> HamburResult<String> {
         "startup_tasks",
         "rootfs_settings",
         "browser_tool_settings",
+        "web_search_settings",
+        "web_fetch_settings",
         "appearance",
         "logs",
         "token_usage",
@@ -177,11 +179,9 @@ pub(crate) fn normalize_app_setting_value(key: &str, value: &str) -> HamburResul
             normalize_enum_setting(key, value, &["small", "default", "large", "extra_large"])
         }
         "startupChatMode" => normalize_enum_setting(key, value, &["new_chat", "last_chat"]),
-        "thinkingBlockDisplayMode" => normalize_enum_setting(
-            key,
-            value,
-            &["auto_expand", "collapsed", "auto_collapse"],
-        ),
+        "thinkingBlockDisplayMode" => {
+            normalize_enum_setting(key, value, &["auto_expand", "collapsed", "auto_collapse"])
+        }
         "rootfsBackend" => normalize_enum_setting(key, value, &["chroot", "proot"]),
         "webFetchBackend" => normalize_enum_setting(key, value, &["local", "tinyfish"]),
         "viewImageScaleMode" => normalize_enum_setting(key, value, &["original", "resize_fit"]),
@@ -192,6 +192,7 @@ pub(crate) fn normalize_app_setting_value(key: &str, value: &str) -> HamburResul
         | "startupTasksEnabled" => normalize_bool_setting(key, value),
         "lastSelectedSessionId" => Ok(value.chars().take(160).collect()),
         "browser_tool_settings" => normalize_browser_tool_settings(value),
+        "web_search_settings" | "web_fetch_settings" => normalize_web_settings(key, value),
         key if key.starts_with("skill_enabled:") => normalize_bool_setting(key, value),
         key if key.starts_with("tool_enabled:") => normalize_bool_setting(key, value),
         "tool_settings"
@@ -239,7 +240,7 @@ pub(crate) fn normalize_bool_setting(key: &str, value: &str) -> HamburResult<Str
 pub(crate) fn normalize_json_or_text_setting(value: &str) -> HamburResult<String> {
     if value.len() > 8000 {
         return Err(HamburError::InvalidCommand(
-            "setting value must be at most 8000 characters".to_string(),
+            "setting value must be at most 8000 UTF-8 bytes".to_string(),
         ));
     }
     if value.starts_with('{') || value.starts_with('[') {
@@ -248,6 +249,29 @@ pub(crate) fn normalize_json_or_text_setting(value: &str) -> HamburResult<String
         })?;
     }
     Ok(value.to_string())
+}
+
+/// Web tool settings are edited as JSON objects; the runtime re-parses them and clamps
+/// every value, so this layer only guarantees the stored value is an object it can read.
+pub(crate) fn normalize_web_settings(key: &str, value: &str) -> HamburResult<String> {
+    let parsed = serde_json::from_str::<serde_json::Value>(value).map_err(|error| {
+        HamburError::InvalidCommand(format!("{key} must be a JSON object: {error}"))
+    })?;
+    if !parsed.is_object() {
+        return Err(HamburError::InvalidCommand(format!(
+            "{key} must be a JSON object"
+        )));
+    }
+    if let Some(provider) = parsed.get("provider").and_then(serde_json::Value::as_str) {
+        const PROVIDERS: [&str; 4] = ["auto", "off", "deepseek-official", "exa"];
+        if !PROVIDERS.contains(&provider) {
+            return Err(HamburError::InvalidCommand(format!(
+                "{key} provider must be one of: {}",
+                PROVIDERS.join(", ")
+            )));
+        }
+    }
+    normalize_json_or_text_setting(value)
 }
 
 pub(crate) fn normalize_browser_tool_settings(value: &str) -> HamburResult<String> {
@@ -633,6 +657,7 @@ pub(crate) fn timeline_item_from_row(row: &Row) -> HamburResult<TimelineItemSnap
         trace_status: row.get::<String>(10).map_err(database_error)?,
         tool_call_id: row.get::<String>(11).map_err(database_error)?,
         tool_name: row.get::<String>(12).map_err(database_error)?,
+        trace_arguments: row.get::<String>(13).map_err(database_error)?,
         attachments: Vec::new(),
     })
 }
@@ -817,4 +842,38 @@ pub(crate) fn file_cleanup_job_from_row(row: &Row) -> HamburResult<FileCleanupJo
         created_at_ms: unsigned_ms(row.get::<i64>(6).map_err(database_error)?),
         updated_at_ms: unsigned_ms(row.get::<i64>(7).map_err(database_error)?),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_the_web_tool_setting_keys() {
+        for key in ["web_search_settings", "web_fetch_settings"] {
+            assert_eq!(normalize_app_setting_key(key).expect("key"), key);
+        }
+        assert!(normalize_app_setting_key("web_settings").is_err());
+    }
+
+    #[test]
+    fn web_settings_must_be_a_json_object_with_a_known_provider() {
+        let search = r#"{"provider":"exa","maxResults":5}"#;
+        assert_eq!(
+            normalize_app_setting_value("web_search_settings", search).expect("valid"),
+            search
+        );
+        assert_eq!(
+            normalize_app_setting_value("web_fetch_settings", r#"{"enabled":true}"#)
+                .expect("valid"),
+            r#"{"enabled":true}"#
+        );
+        assert!(normalize_app_setting_value("web_search_settings", "not json").is_err());
+        assert!(normalize_app_setting_value("web_search_settings", "[1,2]").is_err());
+        assert!(
+            normalize_app_setting_value("web_search_settings", r#"{"provider":"tavily"}"#).is_err()
+        );
+        // An absent provider is fine: the runtime applies the default.
+        assert!(normalize_app_setting_value("web_search_settings", r#"{"maxQueries":2}"#).is_ok());
+    }
 }

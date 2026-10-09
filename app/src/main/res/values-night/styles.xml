@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  暗主题版本的窗口主题（系统深色模式时自动选用）。
+  关键点是 windowBackground 换成 @color/app_window_background 的暗色值：不设的话它继承
+  Theme.Material.Light 的白色底，夜里冷启动会先闪一下白屏。
+  系统栏图标同时改成浅色（false = 深色背景配浅色图标）。
+-->
+<resources>
+    <style name="Theme.Hambur" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:windowBackground">@color/app_window_background</item>
+        <item name="android:colorBackgroundFloating">#111312</item>
+        <item name="android:colorAccent">#3F8CFF</item>
+    </style>
+</resources>

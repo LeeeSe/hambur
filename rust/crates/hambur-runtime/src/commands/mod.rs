@@ -99,9 +99,7 @@ impl RuntimeEngine {
             "UpdateProvider" => self.execute_update_provider(command),
             "DeleteProvider" => self.execute_delete_provider(command),
             "RefreshProviderModels" => self.execute_refresh_provider_models(command),
-            "DeleteProviderModel" | "DeleteModel" => {
-                self.execute_delete_provider_model(command)
-            }
+            "DeleteProviderModel" | "DeleteModel" => self.execute_delete_provider_model(command),
             "UpdateModelOverride" | "UpdateModelDetail" => {
                 self.execute_update_model_override(command)
             }

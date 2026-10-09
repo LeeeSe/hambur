@@ -1,5 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="ic_launcher_background">#134E4A</color>
-</resources>
+    <!-- 启动图标：明主题是黑猫白底，暗主题反过来（见 values-night/colors.xml）。 -->
+    <color name="ic_launcher_background">#FFFFFFFF</color>
+    <color name="ic_launcher_mark">#FF000000</color>
 
+    <!-- 冷启动首帧的窗口底色，与 HamburTheme 的 colorScheme.background 对齐：
+         明主题 #FFFFFF、暗主题 #111312。不跟着主题切的话，夜里打开会先闪一下白屏。 -->
+    <color name="app_window_background">#FFFFFFFF</color>
+</resources>

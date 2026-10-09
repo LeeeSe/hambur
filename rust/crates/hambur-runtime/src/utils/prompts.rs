@@ -15,6 +15,26 @@ Unified sandbox paths:
 pub(crate) const HAMBUR_CONFIG_SYSTEM_PROMPT: &str = r#"Use the `hambur_config` tool to inspect or change Hambur app settings, providers, models, model groups, default routing, startup tasks, tool options, network toggles, sandbox backend, and logging.
 Do not edit Android preference files or use terminal commands for Hambur app configuration. Start with `action=list_topics` or `action=topic_help` if you need to discover available config paths."#;
 
+pub(crate) const HAMBUR_TOOL_TITLE_SYSTEM_PROMPT: &str = r#"Every tool call takes a required `title` argument: one short sentence, in the same language the user is writing in, describing what that specific call is doing right now, for example "安装调试包到手机" or "在构建脚本里查找 Gradle 配置". The app shows this sentence to the user in place of the tool name while the call runs, so it must be concrete and specific to that call. Never repeat the tool name, never write a generic label like "执行工具", and never leave it empty."#;
+
+/// Upper bound of the user-defined persona that is injected into the system prompt.
+/// The `persona` app setting is already capped at 8000 UTF-8 bytes by the database layer;
+/// this is a defensive second cap for rows written before that rule existed.
+pub(crate) const PERSONA_CHAR_LIMIT: usize = 8000;
+
+/// Renders the user-defined persona (SOUL.md) as a system block. A blank or missing
+/// persona yields an empty string so the caller can skip the block entirely.
+pub(crate) fn format_persona_system_prompt(raw: &str) -> String {
+    let persona = raw.trim();
+    if persona.is_empty() {
+        return String::new();
+    }
+    let persona: String = persona.chars().take(PERSONA_CHAR_LIMIT).collect();
+    format!(
+        "PERSONA (SOUL.md). The user defined the following persona for you; adopt it as your identity, tone, and behavior, and let it override the default assistant style described above.\n\n{persona}"
+    )
+}
+
 pub(crate) fn format_beijing_timestamp_with_weekday(now_ms: u64) -> String {
     // Beijing Time is UTC+8: add 8 hours (8 * 3600 seconds = 28,800 seconds)
     let beijing_secs = (now_ms / 1000).saturating_add(8 * 3600);
@@ -45,7 +65,9 @@ pub(crate) fn format_beijing_timestamp_with_weekday(now_ms: u64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
 
-    format!("{y:04}-{m:02}-{d:02} {hour:02}:{minute:02}:{second:02} (UTC+8 / 北京时间), {weekday_en} ({weekday_zh})")
+    format!(
+        "{y:04}-{m:02}-{d:02} {hour:02}:{minute:02}:{second:02} (UTC+8 / 北京时间), {weekday_en} ({weekday_zh})"
+    )
 }
 
 pub(crate) fn format_user_content_with_prefix(
@@ -163,6 +185,24 @@ pub(crate) fn delegate_task_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_persona_prompt_skips_blank_settings() {
+        assert!(format_persona_system_prompt("").is_empty());
+        assert!(format_persona_system_prompt("   \n\t ").is_empty());
+    }
+
+    #[test]
+    fn test_persona_prompt_trims_and_caps_the_text() {
+        let prompt = format_persona_system_prompt("  You are a pirate.  ");
+        assert!(prompt.contains("PERSONA (SOUL.md)"));
+        assert!(prompt.ends_with("You are a pirate."));
+
+        // The cap must cut on a char boundary, never mid-codepoint.
+        let long = "字".repeat(PERSONA_CHAR_LIMIT + 50);
+        let prompt = format_persona_system_prompt(&long);
+        assert_eq!(prompt.matches('字').count(), PERSONA_CHAR_LIMIT);
+    }
 
     #[test]
     fn test_format_beijing_timestamp_with_weekday() {

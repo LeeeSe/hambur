@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  暗主题（系统处于深色模式时自动生效）。
+  图标与冷启动窗口底色都在这里对调，保证夜里打开 App 不会先闪一下白屏。
+-->
+<resources>
+    <color name="ic_launcher_background">#FF000000</color>
+    <color name="ic_launcher_mark">#FFFFFFFF</color>
+
+    <!-- 用 HamburTheme 暗色方案的 background(#111312)，而不是纯黑，
+         这样冷启动首帧和 Compose 画出来的第一帧颜色一致，不会二次跳色。 -->
+    <color name="app_window_background">#FF111312</color>
+</resources>

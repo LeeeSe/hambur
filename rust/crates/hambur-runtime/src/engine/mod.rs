@@ -7,11 +7,13 @@ mod events;
 mod markdown;
 mod memory;
 mod model_catalog;
+mod persona;
 mod platform_tools;
 mod process_tools;
 mod sandbox_tools;
 mod skills;
 mod vision_tool;
+mod web_tools;
 
 impl RuntimeEngine {
     pub fn create(bootstrap: AppBootstrap) -> HamburResult<Arc<Self>> {
@@ -120,7 +122,12 @@ impl RuntimeEngine {
             }
         }
 
-                let _ = self.emit_plain(RuntimeEventKind::RuntimeClosed, String::new(), String::new(), "");
+        let _ = self.emit_plain(
+            RuntimeEventKind::RuntimeClosed,
+            String::new(),
+            String::new(),
+            "",
+        );
         self.shutdown.store(true, Ordering::SeqCst);
     }
 

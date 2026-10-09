@@ -43,6 +43,10 @@ pub struct TimelineItemSnapshot {
     pub trace_status: String,
     pub tool_call_id: String,
     pub tool_name: String,
+    /// Raw arguments of the tool call, joined through `tool_calls`. `trace_content` is
+    /// overwritten with the result summary once the tool finishes, so the UI reads this
+    /// when it needs the actual command/URL/path.
+    pub trace_arguments: String,
     pub attachments: Vec<AttachmentRecord>,
 }
 

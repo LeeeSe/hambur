@@ -229,4 +229,7 @@ dependencies {
     debugImplementation("androidx.compose.ui:ui-tooling:1.11.2")
 
     testImplementation("junit:junit:4.13.2")
+    // 单元测试跑在 JVM 上，android.jar 里的 org.json 只是空壳（方法调用会抛
+    // "not mocked"），所以补一份真实实现，供解析工具调用参数的纯函数使用。
+    testImplementation("org.json:json:20240303")
 }

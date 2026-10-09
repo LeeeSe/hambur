@@ -42,9 +42,9 @@ impl RuntimeEngine {
             "nextSteps": [],
             "autoSubmitted": true
         });
-        let _ = self
-            .database
-            .update_trace_span_status(&state.trace_id, "completed", &summary, true);
+        let _ =
+            self.database
+                .update_trace_span_status(&state.trace_id, "completed", &summary, true);
         let _ = state.sender.send(DelegateCompletionPayload {
             is_error: false,
             content,
@@ -73,8 +73,7 @@ impl RuntimeEngine {
             );
         }
         if invocation.name == "submit_delegate_result" {
-            return self
-                .resolve_submit_delegate_result(session_id, invocation, arguments);
+            return self.resolve_submit_delegate_result(session_id, invocation, arguments);
         }
         if self
             .delegate_sessions
@@ -240,9 +239,9 @@ impl RuntimeEngine {
             .and_then(Value::as_str)
             .unwrap_or("Delegate result submitted")
             .to_string();
-        let _ = self
-            .database
-            .update_trace_span_status(&state.trace_id, "completed", &summary, true);
+        let _ =
+            self.database
+                .update_trace_span_status(&state.trace_id, "completed", &summary, true);
         let _ = state.sender.send(DelegateCompletionPayload {
             is_error: false,
             content: content.clone(),
@@ -474,16 +473,10 @@ impl RuntimeEngine {
             .unwrap_or_default()
             .to_string();
 
-        let delegate_session_id = match self
-            .database
-            .create_internal_session(
-                &format!(
-                "Delegate: {}",
-                task.chars().take(72).collect::<String>()
-                ),
-                "delegate",
-            )
-        {
+        let delegate_session_id = match self.database.create_internal_session(
+            &format!("Delegate: {}", task.chars().take(72).collect::<String>()),
+            "delegate",
+        ) {
             Ok(session_id) => session_id,
             Err(error) => {
                 return ToolResult::failed(
@@ -500,26 +493,23 @@ impl RuntimeEngine {
                 error.to_string(),
             );
         }
-        let trace = match self
-            .database
-            .insert_trace_span(NewTraceSpan {
-                session_id: session_id.to_string(),
-                turn_id: turn_id.to_string(),
-                kind: "tool".to_string(),
-                title: "Delegate session".to_string(),
-                content: format!("delegateSessionId={delegate_session_id}\ntask={task}"),
-                status: "running".to_string(),
-                tool_call_id: invocation.tool_call_id.clone(),
-                payload_json: json!({
-                    "delegateSessionId": delegate_session_id,
-                    "task": task,
-                    "toolsets": toolsets
-                })
-                .to_string(),
-                visible: true,
-                ..Default::default()
+        let trace = match self.database.insert_trace_span(NewTraceSpan {
+            session_id: session_id.to_string(),
+            turn_id: turn_id.to_string(),
+            kind: "tool".to_string(),
+            title: "Delegate session".to_string(),
+            content: format!("delegateSessionId={delegate_session_id}\ntask={task}"),
+            status: "running".to_string(),
+            tool_call_id: invocation.tool_call_id.clone(),
+            payload_json: json!({
+                "delegateSessionId": delegate_session_id,
+                "task": task,
+                "toolsets": toolsets
             })
-        {
+            .to_string(),
+            visible: true,
+            ..Default::default()
+        }) {
             Ok(trace) => trace,
             Err(error) => {
                 return ToolResult::failed(
@@ -530,22 +520,23 @@ impl RuntimeEngine {
             }
         };
 
-        let prepared = match self
-            .prepare_delegate_child_turn(
-                session_id,
-                turn_id,
-                &delegate_session_id,
-                &task,
-                payload_json,
-                route.clone(),
-                route_candidates.to_vec(),
-            )
-        {
+        let prepared = match self.prepare_delegate_child_turn(
+            session_id,
+            turn_id,
+            &delegate_session_id,
+            &task,
+            payload_json,
+            route.clone(),
+            route_candidates.to_vec(),
+        ) {
             Ok(prepared) => prepared,
             Err(error) => {
-                let _ = self
-                    .database
-                    .update_trace_span_status(&trace.id, "failed", &error.to_string(), true);
+                let _ = self.database.update_trace_span_status(
+                    &trace.id,
+                    "failed",
+                    &error.to_string(),
+                    true,
+                );
                 return ToolResult::failed(
                     &invocation.tool_call_id,
                     &invocation.name,
@@ -623,43 +614,40 @@ impl RuntimeEngine {
         let child_content = format!(
             "Delegate task from parent session {parent_session_id}, turn {parent_turn_id}.\n\n{task}\n\nFinish by calling submit_delegate_result."
         );
-        let turn = self
-            .database
-            .create_turn_with_route(delegate_session_id, "StreamingAssistant", &route)?;
-        let user_message = self
-            .database
-            .insert_message_with_route(
-                delegate_session_id,
-                "user",
-                &child_content,
-                "",
-                "completed",
-                &turn.id,
-                &route,
-            )?;
-        self.database
-            .upsert_timeline_item(
-                delegate_session_id,
-                NewTimelineItem {
-                    stable_key: user_message.id.clone(),
-                    content_type: "user_message".to_string(),
-                    display_sequence: user_message.created_at_ms,
-                    payload_ref: user_message.id.clone(),
-                    small_summary: child_content.chars().take(160).collect(),
-                    kind: "UserMessage".to_string(),
-                },
-            )?;
-        let assistant_message = self
-            .database
-            .insert_message_with_route(
-                delegate_session_id,
-                "assistant",
-                "",
-                "",
-                "streaming",
-                &turn.id,
-                &route,
-            )?;
+        let turn = self.database.create_turn_with_route(
+            delegate_session_id,
+            "StreamingAssistant",
+            &route,
+        )?;
+        let user_message = self.database.insert_message_with_route(
+            delegate_session_id,
+            "user",
+            &child_content,
+            "",
+            "completed",
+            &turn.id,
+            &route,
+        )?;
+        self.database.upsert_timeline_item(
+            delegate_session_id,
+            NewTimelineItem {
+                stable_key: user_message.id.clone(),
+                content_type: "user_message".to_string(),
+                display_sequence: user_message.created_at_ms,
+                payload_ref: user_message.id.clone(),
+                small_summary: child_content.chars().take(160).collect(),
+                kind: "UserMessage".to_string(),
+            },
+        )?;
+        let assistant_message = self.database.insert_message_with_route(
+            delegate_session_id,
+            "assistant",
+            "",
+            "",
+            "streaming",
+            &turn.id,
+            &route,
+        )?;
         self.insert_initial_pending_markdown_block(
             delegate_session_id,
             &turn.id,
@@ -715,6 +703,9 @@ impl RuntimeEngine {
         let tools_json = self.compile_enabled_delegate_tools_json();
         let skills_index_prompt = self.build_skills_index_prompt();
         let memory_system_prompt = self.build_memory_system_prompt();
+        // Delegated leaf agents speak for the same assistant, so the user-defined
+        // persona applies to them as well.
+        let persona_system_prompt = self.build_persona_system_prompt();
         let child_model_content = format!(
             "[Current Time: {}]\n\n{}",
             format_beijing_timestamp_with_weekday(now_ms()),
@@ -736,6 +727,7 @@ impl RuntimeEngine {
                     &tools_json,
                     &skills_index_prompt,
                     &memory_system_prompt,
+                    &persona_system_prompt,
                     false,
                     false,
                 )

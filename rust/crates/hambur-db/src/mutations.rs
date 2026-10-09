@@ -7,11 +7,7 @@ impl HamburDatabase {
         self.snapshot_for_selected(Some(&id))
     }
 
-    pub fn create_internal_session(
-        &self,
-        title: &str,
-        purpose: &str,
-    ) -> HamburResult<String> {
+    pub fn create_internal_session(&self, title: &str, purpose: &str) -> HamburResult<String> {
         self.insert_session(title, purpose)
     }
 
@@ -27,7 +23,6 @@ impl HamburDatabase {
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![id.clone(), title, purpose, now as i64, now as i64],
             )
-            
             .map_err(database_error)?;
         Ok(id)
     }
@@ -44,7 +39,6 @@ impl HamburDatabase {
                  WHERE id = ?3 AND deleted_at_ms IS NULL",
                 params![title, now as i64, session_id],
             )
-            
             .map_err(database_error)?;
         if changed == 0 {
             return Err(HamburError::InvalidCommand(format!(
@@ -54,11 +48,7 @@ impl HamburDatabase {
         self.snapshot_for_selected(Some(session_id))
     }
 
-    pub fn set_session_pinned(
-        &self,
-        session_id: &str,
-        pinned: bool,
-    ) -> HamburResult<AppSnapshot> {
+    pub fn set_session_pinned(&self, session_id: &str, pinned: bool) -> HamburResult<AppSnapshot> {
         self.ensure_session_exists(session_id)?;
         let now = now_ms();
         let pinned_at_ms = if pinned { now } else { 0 };
@@ -70,7 +60,6 @@ impl HamburDatabase {
                  WHERE id = ?3 AND deleted_at_ms IS NULL",
                 params![pinned_at_ms as i64, now as i64, session_id],
             )
-            
             .map_err(database_error)?;
         if changed == 0 {
             return Err(HamburError::InvalidCommand(format!(
@@ -90,7 +79,6 @@ impl HamburDatabase {
                  WHERE id = ?2 AND deleted_at_ms IS NULL",
                 params![now as i64, session_id],
             )
-            
             .map_err(database_error)?;
 
         if changed == 0 {
@@ -129,7 +117,6 @@ impl HamburDatabase {
                     now as i64
                 ],
             )
-            
             .map_err(database_error)?;
         self.touch_session(session_id, now)?;
 
@@ -180,7 +167,6 @@ impl HamburDatabase {
             route,
             "",
         )
-        
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -303,7 +289,6 @@ impl HamburDatabase {
                     message_id
                 ],
             )
-            
             .map_err(database_error)?;
 
         if changed == 0 {
@@ -311,8 +296,7 @@ impl HamburDatabase {
                 "message not found: {message_id}"
             )));
         }
-        self.message_by_id(message_id)
-            ?
+        self.message_by_id(message_id)?
             .ok_or_else(|| HamburError::Internal(format!("message disappeared: {message_id}")))
     }
 
@@ -343,7 +327,6 @@ impl HamburDatabase {
                     message_id,
                 ],
             )
-            
             .map_err(database_error)?;
 
         if changed == 0 {
@@ -351,8 +334,7 @@ impl HamburDatabase {
                 "message not found: {message_id}"
             )));
         }
-        self.message_by_id(message_id)
-            ?
+        self.message_by_id(message_id)?
             .ok_or_else(|| HamburError::Internal(format!("message disappeared: {message_id}")))
     }
 
@@ -415,8 +397,7 @@ impl HamburDatabase {
             .map_err(database_error)?;
         self.touch_session(session_id, now)?;
 
-        self.message_by_id(&id)
-            ?
+        self.message_by_id(&id)?
             .ok_or_else(|| HamburError::Internal(format!("tool message disappeared: {id}")))
     }
 
@@ -459,7 +440,6 @@ impl HamburDatabase {
                     input.visible,
                 ],
             )
-            
             .map_err(database_error)?;
 
         if input.visible {
@@ -478,8 +458,7 @@ impl HamburDatabase {
                         _ => "TraceSpan".to_string(),
                     },
                 },
-            )
-            ?;
+            )?;
         }
 
         self.trace_span_by_id(&id)
@@ -504,7 +483,6 @@ impl HamburDatabase {
                  WHERE id = ?5",
                 params![status, content, ended, now as i64, trace_id],
             )
-            
             .map_err(database_error)?;
         if changed == 0 {
             return Err(HamburError::InvalidCommand(format!(
@@ -526,8 +504,7 @@ impl HamburDatabase {
                     _ => "TraceSpan".to_string(),
                 },
             },
-        )
-        ?;
+        )?;
         Ok(trace)
     }
 
@@ -623,7 +600,6 @@ impl HamburDatabase {
                     tool_call_id,
                 ],
             )
-            
             .map_err(database_error)?;
         if changed == 0 {
             return Err(HamburError::InvalidCommand(format!(
@@ -676,7 +652,6 @@ impl HamburDatabase {
                     now as i64,
                 ],
             )
-            
             .map_err(database_error)?;
 
         self.tool_result_by_id(&id)
@@ -738,7 +713,6 @@ impl HamburDatabase {
                     retention_policy,
                 ],
             )
-            
             .map_err(database_error)?;
 
         self.file_by_id(&id)
@@ -816,7 +790,6 @@ impl HamburDatabase {
                     now as i64,
                 ],
             )
-            
             .map_err(database_error)?;
         self.attachment_by_id(&id)
     }
@@ -854,7 +827,6 @@ impl HamburDatabase {
                      WHERE id = ?3",
                     params![message_id, now as i64, attachment_id.clone()],
                 )
-                
                 .map_err(database_error)?;
             attached.push(self.attachment_by_id(attachment_id)?);
         }
@@ -887,12 +859,10 @@ impl HamburDatabase {
                  WHERE id = ?2",
                 params![now as i64, attachment_id],
             )
-            
             .map_err(database_error)?;
         let removed = self.attachment_by_id(attachment_id)?;
         let cleanup = self
             .schedule_file_cleanup(&removed.file_id, "pending_attachment_removed")
-            
             .ok();
         Ok((removed, cleanup))
     }
@@ -932,7 +902,6 @@ impl HamburDatabase {
                 ",
                 params![cutoff as i64],
             )
-            
             .map_err(database_error)?;
 
         let mut expired = Vec::new();
@@ -951,11 +920,9 @@ impl HamburDatabase {
                      WHERE id = ?2 AND status = 'pending'",
                     params![now as i64, attachment.id],
                 )
-                
                 .map_err(database_error)?;
-            if let Ok(job) = self
-                .schedule_file_cleanup(&attachment.file_id, "pending_attachment_expired")
-                
+            if let Ok(job) =
+                self.schedule_file_cleanup(&attachment.file_id, "pending_attachment_expired")
             {
                 jobs.push(job);
             }
@@ -993,7 +960,6 @@ impl HamburDatabase {
                     now as i64,
                 ],
             )
-            
             .map_err(database_error)?;
         self.file_cleanup_job_by_id(&id)
     }
@@ -1009,7 +975,6 @@ impl HamburDatabase {
                  WHERE id = ?2",
                 params![now as i64, job_id],
             )
-            
             .map_err(database_error)?;
         if changed == 0 {
             return Err(HamburError::InvalidCommand(format!(
@@ -1079,12 +1044,10 @@ impl HamburDatabase {
                     now as i64
                 ],
             )
-            
             .map_err(database_error)?;
         self.touch_session(session_id, now)?;
 
         self.timeline_item_by_stable_key(session_id, &stable_key)
-            
     }
 
     pub fn upsert_message_block_payload(
@@ -1161,16 +1124,12 @@ impl HamburDatabase {
                     now as i64
                 ],
             )
-            
             .map_err(database_error)?;
         self.touch_session(session_id, now)?;
 
-        let record = self
-            .message_block_by_stable_key(session_id, &stable_key)
-            ?;
+        let record = self.message_block_by_stable_key(session_id, &stable_key)?;
         let display_base = self
-            .message_by_id(&record.message_id)
-            ?
+            .message_by_id(&record.message_id)?
             .map(|message| message.created_at_ms)
             .unwrap_or(record.created_at_ms);
         let (content_type, display_sequence, kind) = if record.block_type == "reasoning" {
@@ -1188,7 +1147,14 @@ impl HamburDatabase {
         } else {
             (
                 "assistant_pending_block".to_string(),
-                display_base.saturating_add(record.block_id),
+                // 尾部占位块要排在所有已提交块之后：它的 block_id 来自
+                // mdstream 的 "当前待定块编号"，永远大于等于已提交块的最大
+                // 编号，所以 display_base + block_id + 1 一定排在已提交块后面。
+                // 之前用 display_base + block_id，会让占位块夹在已提交块中间，
+                // 于是流式尾部看起来停在上一段之前。
+                display_base
+                    .saturating_add(record.block_id)
+                    .saturating_add(1),
                 "AssistantPendingBlock".to_string(),
             )
         };
@@ -1202,11 +1168,9 @@ impl HamburDatabase {
                 small_summary: record.small_summary.clone(),
                 kind,
             },
-        )
-        ?;
+        )?;
         if record.block_type == "content" && record.committed {
-            self.hide_timeline_item(session_id, &pending_markdown_stable_key(&record.message_id))
-                ?;
+            self.hide_timeline_item(session_id, &pending_markdown_stable_key(&record.message_id))?;
         }
         Ok(record)
     }
@@ -1217,7 +1181,6 @@ impl HamburDatabase {
         message_id: &str,
     ) -> HamburResult<()> {
         self.hide_timeline_item(session_id, &pending_markdown_stable_key(message_id))
-            
     }
 
     pub(crate) fn hide_timeline_item(
@@ -1238,7 +1201,6 @@ impl HamburDatabase {
                  WHERE session_id = ?1 AND stable_key = ?2",
                 params![session_id, stable_key, now as i64],
             )
-            
             .map(|_| ())
             .map_err(database_error)
     }
@@ -1255,7 +1217,6 @@ impl HamburDatabase {
                  VALUES (?1, ?2, ?3, ?4, ?4, NULL)",
                 params![id.clone(), session_id, status.clone(), now as i64],
             )
-            
             .map_err(database_error)?;
         self.touch_session(session_id, now)?;
 
@@ -1321,7 +1282,6 @@ impl HamburDatabase {
                     route.model_group_id.clone()
                 ],
             )
-            
             .map_err(database_error)?;
         self.touch_session(session_id, now)?;
 
@@ -1361,7 +1321,6 @@ impl HamburDatabase {
                  WHERE id = ?4",
                 params![status, now as i64, finished, turn_id],
             )
-            
             .map_err(database_error)?;
 
         if changed == 0 {
@@ -1402,7 +1361,6 @@ impl HamburDatabase {
                     turn_id,
                 ],
             )
-            
             .map_err(database_error)?;
 
         if changed == 0 {
@@ -1434,7 +1392,6 @@ impl HamburDatabase {
                  WHERE id = ?5",
                 params![status, now as i64, error_code, error_message, turn_id],
             )
-            
             .map_err(database_error)?;
 
         if changed == 0 {
@@ -1457,7 +1414,6 @@ impl HamburDatabase {
                 "UPDATE sessions SET memory_reviewed = ?1 WHERE id = ?2 AND deleted_at_ms IS NULL",
                 params![reviewed, session_id],
             )
-            
             .map(|_| ())
             .map_err(database_error)
     }
@@ -1469,7 +1425,6 @@ impl HamburDatabase {
                 "UPDATE sessions SET memory_reviewed = 0 WHERE id = ?1 AND deleted_at_ms IS NULL",
                 params![session_id],
             )
-            
             .map(|_| ())
             .map_err(database_error)
     }
@@ -1501,7 +1456,6 @@ impl HamburDatabase {
                 .as_str(),
                 params![session_id, message.created_at_ms as i64],
             )
-            
             .map_err(database_error)?;
         let mut message_ids = Vec::new();
         while let Some(row) = rows.next().map_err(database_error)? {
@@ -1512,8 +1466,7 @@ impl HamburDatabase {
         }
         let now = now_ms();
         for hidden_message_id in message_ids {
-            self.hide_timeline_for_message_id(session_id, &hidden_message_id, now)
-                ?;
+            self.hide_timeline_for_message_id(session_id, &hidden_message_id, now)?;
         }
         Ok(())
     }
@@ -1538,7 +1491,6 @@ impl HamburDatabase {
                    AND payload_ref = ?3",
                 params![now as i64, session_id, message_id],
             )
-            
             .map_err(database_error)?;
         self.connection
             .execute(
@@ -1554,7 +1506,6 @@ impl HamburDatabase {
                    )",
                 params![now as i64, session_id, message_id],
             )
-            
             .map_err(database_error)?;
         self.connection
             .execute(
@@ -1589,7 +1540,6 @@ impl HamburDatabase {
                     message.created_at_ms as i64
                 ],
             )
-            
             .map_err(database_error)?;
         Ok(())
     }
@@ -1647,7 +1597,6 @@ impl HamburDatabase {
         let changed = self
             .connection
             .execute("DELETE FROM providers WHERE id = ?1", params![provider_id])
-            
             .map_err(database_error)?;
         if changed == 0 {
             return Err(HamburError::ProviderUnavailable(format!(
@@ -1738,37 +1687,29 @@ impl HamburDatabase {
                         now as i64
                     ],
                 )
-                
                 .map_err(database_error)?;
         }
 
         let saved = self.provider_models(provider_id)?;
         if let Some(first) = saved.first() {
-            self.ensure_default_model_groups(provider_id, &first.model_id)
-                ?;
+            self.ensure_default_model_groups(provider_id, &first.model_id)?;
         }
         Ok(saved)
     }
 
-    pub fn delete_provider_model(
-        &self,
-        provider_id: &str,
-        model_id: &str,
-    ) -> HamburResult<()> {
+    pub fn delete_provider_model(&self, provider_id: &str, model_id: &str) -> HamburResult<()> {
         self.provider_by_id(provider_id)?;
         self.connection
             .execute(
                 "DELETE FROM provider_models WHERE provider_id = ?1 AND model_id = ?2",
                 params![provider_id, model_id],
             )
-            
             .map_err(database_error)?;
         self.connection
             .execute(
                 "DELETE FROM model_group_members WHERE provider_id = ?1 AND model_id = ?2",
                 params![provider_id, model_id],
             )
-            
             .map_err(database_error)?;
         Ok(())
     }
@@ -1840,7 +1781,6 @@ impl HamburDatabase {
                     now as i64
                 ],
             )
-            
             .map_err(database_error)?;
 
         self.provider_model_by_key(&provider_id, &model_id)
@@ -1868,7 +1808,6 @@ impl HamburDatabase {
                      ON CONFLICT(id) DO UPDATE SET updated_at_ms = excluded.updated_at_ms",
                     params![group_id, name, now as i64],
                 )
-                
                 .map_err(database_error)?;
             self.connection
                 .execute(
@@ -1879,7 +1818,6 @@ impl HamburDatabase {
                         updated_at_ms = excluded.updated_at_ms",
                     params![default_key, group_id, now as i64],
                 )
-                
                 .map_err(database_error)?;
         }
 
@@ -1891,7 +1829,6 @@ impl HamburDatabase {
                  ON CONFLICT(group_id, provider_id, model_id) DO UPDATE SET enabled = 1",
                 params![new_id("mgm"), provider_id, model_id],
             )
-            
             .map_err(database_error)?;
         Ok(())
     }
@@ -1912,7 +1849,6 @@ impl HamburDatabase {
                  ON CONFLICT(id) DO UPDATE SET updated_at_ms = excluded.updated_at_ms",
                 params![now as i64],
             )
-            
             .map_err(database_error)?;
         self.connection
             .execute(
@@ -1923,7 +1859,6 @@ impl HamburDatabase {
                     updated_at_ms = excluded.updated_at_ms",
                 params![now as i64],
             )
-            
             .map_err(database_error)?;
         self.connection
             .execute(
@@ -1935,7 +1870,6 @@ impl HamburDatabase {
                     enabled = 1",
                 params![new_id("mgm"), provider_id, model_id, position as i64],
             )
-            
             .map_err(database_error)?;
         Ok(())
     }
@@ -1970,7 +1904,6 @@ impl HamburDatabase {
                     now as i64
                 ],
             )
-            
             .map_err(database_error)?;
         self.model_group_by_id(&group_id)
     }
@@ -2002,10 +1935,8 @@ impl HamburDatabase {
                     enabled
                 ],
             )
-            
             .map_err(database_error)?;
         self.model_group_member_by_key(group_id, provider_id, model_id)
-            
     }
 
     pub fn delete_model_group_member(
@@ -2043,7 +1974,6 @@ impl HamburDatabase {
                     updated_at_ms = excluded.updated_at_ms",
                 params![key.clone(), group_id, now as i64],
             )
-            
             .map_err(database_error)?;
         Ok(DefaultModelGroupRecord {
             key,
@@ -2052,11 +1982,7 @@ impl HamburDatabase {
         })
     }
 
-    pub fn upsert_app_setting(
-        &self,
-        key: &str,
-        value: &str,
-    ) -> HamburResult<AppSettingRecord> {
+    pub fn upsert_app_setting(&self, key: &str, value: &str) -> HamburResult<AppSettingRecord> {
         let key = normalize_app_setting_key(key)?;
         let value = normalize_app_setting_value(&key, value)?;
         let now = now_ms();
@@ -2069,7 +1995,6 @@ impl HamburDatabase {
                     updated_at_ms = excluded.updated_at_ms",
                 params![key.clone(), value.clone(), now as i64],
             )
-            
             .map_err(database_error)?;
         Ok(AppSettingRecord {
             key,
@@ -2094,7 +2019,6 @@ impl HamburDatabase {
                     synced_at_ms = excluded.synced_at_ms",
                 params![key.clone(), catalog_json, synced_at_ms as i64],
             )
-            
             .map_err(database_error)?;
         Ok(ModelCatalogCacheRecord {
             key,
@@ -2110,11 +2034,9 @@ impl HamburDatabase {
                 "DELETE FROM default_model_groups WHERE group_id = ?1",
                 params![group_id.clone()],
             )
-            
             .map_err(database_error)?;
         self.connection
             .execute("DELETE FROM model_groups WHERE id = ?1", params![group_id])
-            
             .map_err(database_error)?;
         Ok(())
     }
@@ -2123,7 +2045,6 @@ impl HamburDatabase {
         let key = normalize_app_setting_key(key)?;
         self.connection
             .execute("DELETE FROM app_settings WHERE key = ?1", params![key])
-            
             .map_err(database_error)?;
         Ok(())
     }
@@ -2612,83 +2533,55 @@ impl HamburDatabase {
                     ON config_audit(created_at_ms DESC, id DESC);
                 ",
             )
-            
             .map_err(database_error)?;
 
-        self.add_column_if_missing("sessions", "pinned_at_ms", "INTEGER NOT NULL DEFAULT 0")
-            ?;
-        self.add_column_if_missing("messages", "turn_id", "TEXT NOT NULL DEFAULT ''")
-            ?;
-        self.add_column_if_missing("messages", "status", "TEXT NOT NULL DEFAULT 'completed'")
-            ?;
-        self.add_column_if_missing("messages", "reasoning_content", "TEXT NOT NULL DEFAULT ''")
-            ?;
+        self.add_column_if_missing("sessions", "pinned_at_ms", "INTEGER NOT NULL DEFAULT 0")?;
+        self.add_column_if_missing("messages", "turn_id", "TEXT NOT NULL DEFAULT ''")?;
+        self.add_column_if_missing("messages", "status", "TEXT NOT NULL DEFAULT 'completed'")?;
+        self.add_column_if_missing("messages", "reasoning_content", "TEXT NOT NULL DEFAULT ''")?;
         self.add_column_if_missing(
             "messages",
             "provider_id_snapshot",
             "TEXT NOT NULL DEFAULT ''",
-        )
-        ?;
+        )?;
         self.add_column_if_missing(
             "messages",
             "provider_name_snapshot",
             "TEXT NOT NULL DEFAULT ''",
-        )
-        ?;
-        self.add_column_if_missing("messages", "provider_protocol", "TEXT NOT NULL DEFAULT ''")
-            ?;
-        self.add_column_if_missing("messages", "model_id_snapshot", "TEXT NOT NULL DEFAULT ''")
-            ?;
+        )?;
+        self.add_column_if_missing("messages", "provider_protocol", "TEXT NOT NULL DEFAULT ''")?;
+        self.add_column_if_missing("messages", "model_id_snapshot", "TEXT NOT NULL DEFAULT ''")?;
         self.add_column_if_missing(
             "messages",
             "model_name_snapshot",
             "TEXT NOT NULL DEFAULT ''",
-        )
-        ?;
-        self.add_column_if_missing("messages", "model_group_id", "TEXT NOT NULL DEFAULT ''")
-            ?;
-        self.add_column_if_missing("messages", "finish_reason", "TEXT NOT NULL DEFAULT ''")
-            ?;
+        )?;
+        self.add_column_if_missing("messages", "model_group_id", "TEXT NOT NULL DEFAULT ''")?;
+        self.add_column_if_missing("messages", "finish_reason", "TEXT NOT NULL DEFAULT ''")?;
         self.add_column_if_missing(
             "messages",
             "native_finish_reason",
             "TEXT NOT NULL DEFAULT ''",
-        )
-        ?;
-        self.add_column_if_missing("messages", "tool_call_id", "TEXT NOT NULL DEFAULT ''")
-            ?;
-        self.add_column_if_missing("messages", "tool_name", "TEXT NOT NULL DEFAULT ''")
-            ?;
-        self.add_column_if_missing("messages", "tool_title", "TEXT NOT NULL DEFAULT ''")
-            ?;
-        self.add_column_if_missing("messages", "prompt_prefix", "TEXT NOT NULL DEFAULT ''")
-            ?;
-        self.add_column_if_missing("timeline_items", "visible", "INTEGER NOT NULL DEFAULT 1")
-            ?;
-        self.add_column_if_missing("turns", "selected_provider_id", "TEXT NOT NULL DEFAULT ''")
-            ?;
+        )?;
+        self.add_column_if_missing("messages", "tool_call_id", "TEXT NOT NULL DEFAULT ''")?;
+        self.add_column_if_missing("messages", "tool_name", "TEXT NOT NULL DEFAULT ''")?;
+        self.add_column_if_missing("messages", "tool_title", "TEXT NOT NULL DEFAULT ''")?;
+        self.add_column_if_missing("messages", "prompt_prefix", "TEXT NOT NULL DEFAULT ''")?;
+        self.add_column_if_missing("timeline_items", "visible", "INTEGER NOT NULL DEFAULT 1")?;
+        self.add_column_if_missing("turns", "selected_provider_id", "TEXT NOT NULL DEFAULT ''")?;
         self.add_column_if_missing(
             "turns",
             "selected_provider_name",
             "TEXT NOT NULL DEFAULT ''",
-        )
-        ?;
-        self.add_column_if_missing("turns", "provider_protocol", "TEXT NOT NULL DEFAULT ''")
-            ?;
-        self.add_column_if_missing("turns", "selected_model_id", "TEXT NOT NULL DEFAULT ''")
-            ?;
-        self.add_column_if_missing("turns", "selected_model_name", "TEXT NOT NULL DEFAULT ''")
-            ?;
-        self.add_column_if_missing("turns", "model_group_id", "TEXT NOT NULL DEFAULT ''")
-            ?;
-        self.add_column_if_missing("turns", "error_code", "TEXT NOT NULL DEFAULT ''")
-            ?;
-        self.add_column_if_missing("turns", "error_message", "TEXT NOT NULL DEFAULT ''")
-            ?;
-        self.add_column_if_missing("sessions", "memory_reviewed", "INTEGER NOT NULL DEFAULT 0")
-            ?;
-        self.add_column_if_missing("sessions", "purpose", "TEXT NOT NULL DEFAULT 'chat'")
-            ?;
+        )?;
+        self.add_column_if_missing("turns", "provider_protocol", "TEXT NOT NULL DEFAULT ''")?;
+        self.add_column_if_missing("turns", "selected_model_id", "TEXT NOT NULL DEFAULT ''")?;
+        self.add_column_if_missing("turns", "selected_model_name", "TEXT NOT NULL DEFAULT ''")?;
+        self.add_column_if_missing("turns", "model_group_id", "TEXT NOT NULL DEFAULT ''")?;
+        self.add_column_if_missing("turns", "error_code", "TEXT NOT NULL DEFAULT ''")?;
+        self.add_column_if_missing("turns", "error_message", "TEXT NOT NULL DEFAULT ''")?;
+        self.add_column_if_missing("sessions", "memory_reviewed", "INTEGER NOT NULL DEFAULT 0")?;
+        self.add_column_if_missing("sessions", "purpose", "TEXT NOT NULL DEFAULT 'chat'")?;
         self.connection
             .execute(
                 "UPDATE sessions
@@ -2696,7 +2589,6 @@ impl HamburDatabase {
                  WHERE purpose = 'chat' AND title LIKE 'Delegate:%'",
                 params![],
             )
-            
             .map_err(database_error)?;
         self.connection
             .execute(
@@ -2707,10 +2599,8 @@ impl HamburDatabase {
                    )",
                 params![],
             )
-            
             .map_err(database_error)?;
-        self.add_column_if_missing("tool_calls", "call_index", "INTEGER NOT NULL DEFAULT 0")
-            ?;
+        self.add_column_if_missing("tool_calls", "call_index", "INTEGER NOT NULL DEFAULT 0")?;
 
         Ok(())
     }
@@ -2724,7 +2614,6 @@ impl HamburDatabase {
         let mut rows = self
             .connection
             .query(pragma.as_str(), params![])
-            
             .map_err(database_error)?;
         while let Some(row) = rows.next().map_err(database_error)? {
             let name = row.get::<String>(1).map_err(database_error)?;
@@ -2736,7 +2625,6 @@ impl HamburDatabase {
         let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {definition}");
         self.connection
             .execute(sql.as_str(), params![])
-            
             .map(|_| ())
             .map_err(database_error)
     }
@@ -2758,7 +2646,6 @@ impl HamburDatabase {
                  WHERE id = ?2 AND deleted_at_ms IS NULL",
                 params![now as i64, session_id],
             )
-            
             .map_err(database_error)?;
         Ok(())
     }
@@ -2775,7 +2662,6 @@ impl HamburDatabase {
                         updated_at_ms = excluded.updated_at_ms",
                     params![session_id, now as i64],
                 )
-                
                 .map(|_| ())
                 .map_err(database_error),
             None => self
@@ -2784,7 +2670,6 @@ impl HamburDatabase {
                     "DELETE FROM app_state WHERE key = 'active_session_id'",
                     params![],
                 )
-                
                 .map(|_| ())
                 .map_err(database_error),
         }

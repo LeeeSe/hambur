@@ -699,8 +699,9 @@ class AndroidPlatformAdapter(
                 "clipboard_set" -> setClipboard(actionObj.optString("text"))
                 "vibrate" -> triggerVibrate(actionObj.optLong("duration_ms", 200L))
                 "send_notification" -> sendNotification(
-                    actionObj.optString("title", "Hambur Notification"),
-                    actionObj.optString("content", "")
+                    actionObj.optString("notification_title").ifBlank { "Hambur Notification" },
+                    actionObj.optString("notification_content")
+                        .ifBlank { actionObj.optString("content") }
                 )
                 "torch" -> setTorch(actionObj.optBoolean("enabled", false))
                 else -> throw IllegalArgumentException("Unsupported android_cli action: $action")

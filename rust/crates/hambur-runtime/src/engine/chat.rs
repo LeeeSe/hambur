@@ -44,7 +44,7 @@ impl RuntimeEngine {
         }
 
         self.database
-                    .source_user_message_for(&command.session_id, &source_message_id)
+            .source_user_message_for(&command.session_id, &source_message_id)
             .map(|message| message.content_text)
     }
 
@@ -63,12 +63,11 @@ impl RuntimeEngine {
 
         match command_kind {
             "EditMessage" => {
-                self.database
-                    .hide_visible_timeline_after_message(
-                        &command.session_id,
-                        &source_message_id,
-                        true,
-                    )?;
+                self.database.hide_visible_timeline_after_message(
+                    &command.session_id,
+                    &source_message_id,
+                    true,
+                )?;
                 Ok(None)
             }
             "RetryTurn" | "RegenerateMessage" => {
@@ -84,12 +83,11 @@ impl RuntimeEngine {
                 let source_user = self
                     .database
                     .source_user_message_for(&command.session_id, &source_message_id)?;
-                self.database
-                    .hide_visible_timeline_after_message(
-                        &command.session_id,
-                        &source_message_id,
-                        !is_user,
-                    )?;
+                self.database.hide_visible_timeline_after_message(
+                    &command.session_id,
+                    &source_message_id,
+                    !is_user,
+                )?;
                 Ok(Some(source_user))
             }
             _ => Ok(None),
@@ -131,7 +129,8 @@ impl RuntimeEngine {
             for call_id in open_tool_call_ids {
                 messages.push(ModelMessage {
                     role: "tool".to_string(),
-                    content: "Tool execution was cancelled or interrupted before completion.".to_string(),
+                    content: "Tool execution was cancelled or interrupted before completion."
+                        .to_string(),
                     tool_call_id: call_id,
                     ..Default::default()
                 });
@@ -195,26 +194,47 @@ impl RuntimeEngine {
         route: &ModelRouteSnapshot,
         cancel: &Arc<AtomicBool>,
     ) -> HamburResult<String> {
+        self.resolve_secret_ref(
+            session_id,
+            turn_id,
+            route.secret_ref.trim(),
+            &route.provider_id,
+            cancel,
+        )
+        .await
+    }
+
+    /// Resolve one credential reference: `env://NAME` from the launching environment, or
+    /// `android-secret://…` through the host's secret store. `owner_id` travels with the
+    /// platform request so the host can attribute the lookup (a provider id, or the web
+    /// tool that asked for a search credential).
+    pub(crate) async fn resolve_secret_ref(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        secret_ref: &str,
+        owner_id: &str,
+        cancel: &Arc<AtomicBool>,
+    ) -> HamburResult<String> {
         if cancel.load(Ordering::SeqCst) || self.shutdown.load(Ordering::SeqCst) {
             return Err(HamburError::Cancelled);
         }
-        let secret_ref = route.secret_ref.trim();
         if let Some(env_name) = secret_ref.strip_prefix("env://") {
             let value = std::env::var(env_name).map_err(|_| {
                 HamburError::ProviderUnavailable(format!(
-                    "provider secret env var is not available: {env_name}"
+                    "secret env var is not available: {env_name}"
                 ))
             })?;
             if value.trim().is_empty() {
                 return Err(HamburError::ProviderUnavailable(format!(
-                    "provider secret env var is empty: {env_name}"
+                    "secret env var is empty: {env_name}"
                 )));
             }
             return Ok(value);
         }
         if !secret_ref.starts_with("android-secret://") {
             return Err(HamburError::ProviderUnavailable(
-                "unsupported provider secret_ref".to_string(),
+                "unsupported secret_ref".to_string(),
             ));
         }
 
@@ -227,7 +247,7 @@ impl RuntimeEngine {
             kind: "ResolveSecret".to_string(),
             payload_json: json!({
                 "secretRef": secret_ref,
-                "providerId": route.provider_id
+                "providerId": owner_id
             })
             .to_string(),
             timeout_ms,
@@ -304,10 +324,7 @@ impl RuntimeEngine {
 
             for (attempt_index, route) in current_routes.iter().cloned().enumerate() {
                 if attempt_index > 0 {
-                    if let Err(error) = self
-                        .database
-                        .update_turn_route_snapshot(&turn_id, &route)
-                    {
+                    if let Err(error) = self.database.update_turn_route_snapshot(&turn_id, &route) {
                         self.finish_failed_turn(
                             &session_id,
                             &turn_id,
@@ -352,6 +369,7 @@ impl RuntimeEngine {
                     .cloned()
                     .unwrap_or_else(|| {
                         let tools_json = self.compile_enabled_main_tools_json();
+                        let persona_system_prompt = self.build_persona_system_prompt();
                         provider_stream_source(
                             &session_id,
                             &turn_id,
@@ -360,6 +378,7 @@ impl RuntimeEngine {
                             &tools_json,
                             "",
                             "",
+                            &persona_system_prompt,
                             false,
                             false,
                         )
@@ -494,9 +513,7 @@ impl RuntimeEngine {
                     OPENAI_RESPONSES_PROTOCOL => {
                         ResponsesApiAdapter::build_stream_request(&request, &target, &api_key)
                     }
-                    _ => {
-                        OpenAiCompatibleAdapter::build_stream_request(&request, &target, &api_key)
-                    }
+                    _ => OpenAiCompatibleAdapter::build_stream_request(&request, &target, &api_key),
                 };
                 let spec = match spec_result {
                     Ok(spec) => spec,
@@ -507,11 +524,8 @@ impl RuntimeEngine {
                         };
                     }
                 };
-                let thinking_trace = openai_request_thinking_trace(
-                    &request,
-                    &route,
-                    &spec.body_json,
-                );
+                let thinking_trace =
+                    openai_request_thinking_trace(&request, &route, &spec.body_json);
                 let snapshot = self
                     .database
                     .session_snapshot(&session_id)
@@ -602,8 +616,7 @@ impl RuntimeEngine {
         if let Some(update) =
             self.append_stream_markdown(&session_id, &assistant_message_id, "", true)
         {
-            let _ = self
-                .emit_markdown_persisted(session_id.clone(), turn_id.clone(), update);
+            let _ = self.emit_markdown_persisted(session_id.clone(), turn_id.clone(), update);
         }
 
         let final_finish_reason = state.finish_reason.if_blank("stop".to_string());
@@ -672,17 +685,14 @@ impl RuntimeEngine {
             };
         }
 
-        if let Err(error) = self
-            .database
-            .update_message_stream_result(
-                &assistant_message_id,
-                &state.content,
-                &state.reasoning,
-                "completed",
-                &final_finish_reason,
-                &final_native_finish_reason,
-            )
-        {
+        if let Err(error) = self.database.update_message_stream_result(
+            &assistant_message_id,
+            &state.content,
+            &state.reasoning,
+            "completed",
+            &final_finish_reason,
+            &final_native_finish_reason,
+        ) {
             self.finish_failed_turn(
                 &session_id,
                 &turn_id,
@@ -696,13 +706,12 @@ impl RuntimeEngine {
                 semantic_delta_started: true,
             };
         }
-        let _ = self
-            .persist_reasoning_block_for_timeline(
-                &session_id,
-                &turn_id,
-                &assistant_message_id,
-                &state.reasoning,
-            );
+        let _ = self.persist_reasoning_block_for_timeline(
+            &session_id,
+            &turn_id,
+            &assistant_message_id,
+            &state.reasoning,
+        );
         let snapshot = self
             .database
             .session_snapshot(&session_id)
@@ -722,10 +731,7 @@ impl RuntimeEngine {
             ),
             None,
         );
-        if let Err(error) = self
-            .database
-            .update_turn_status(&turn_id, "Finished", true)
-        {
+        if let Err(error) = self.database.update_turn_status(&turn_id, "Finished", true) {
             self.finish_failed_turn(
                 &session_id,
                 &turn_id,
@@ -822,12 +828,8 @@ impl RuntimeEngine {
                 state.thinking_raw_trace_count += 1;
             }
             let parsed_events = match provider_protocol {
-                OPENAI_RESPONSES_PROTOCOL => {
-                    ResponsesApiAdapter::parse_stream_payload(&payload)
-                }
-                _ => {
-                    OpenAiCompatibleAdapter::parse_stream_payload(&payload)
-                }
+                OPENAI_RESPONSES_PROTOCOL => ResponsesApiAdapter::parse_stream_payload(&payload),
+                _ => OpenAiCompatibleAdapter::parse_stream_payload(&payload),
             };
             let events = match parsed_events {
                 Ok(events) => events,
@@ -869,13 +871,12 @@ impl RuntimeEngine {
                         state.thinking_parsed_trace_count += 1;
                         if !state.reasoning.is_empty() && !state.reasoning_persisted {
                             state.reasoning_persisted = true;
-                            let _ = self
-                                .persist_reasoning_block_for_timeline(
-                                    session_id,
-                                    turn_id,
-                                    assistant_message_id,
-                                    &state.reasoning,
-                                );
+                            let _ = self.persist_reasoning_block_for_timeline(
+                                session_id,
+                                turn_id,
+                                assistant_message_id,
+                                &state.reasoning,
+                            );
                         }
                         if let Some(update) = self.append_stream_markdown(
                             session_id,
@@ -884,14 +885,17 @@ impl RuntimeEngine {
                             false,
                         ) {
                             if !update.committed_nodes.is_empty() {
-                                let _ = self
-                                    .emit_markdown_persisted(
-                                        session_id.to_string(),
-                                        turn_id.to_string(),
-                                        update,
-                                    );
+                                let _ = self.emit_markdown_persisted(
+                                    session_id.to_string(),
+                                    turn_id.to_string(),
+                                    update,
+                                );
                             } else {
-                                let _ = self.emit_markdown(session_id.to_string(), turn_id.to_string(), update);
+                                let _ = self.emit_markdown(
+                                    session_id.to_string(),
+                                    turn_id.to_string(),
+                                    update,
+                                );
                             }
                         }
                     }
@@ -903,31 +907,23 @@ impl RuntimeEngine {
                             !state.reasoning_persisted && !state.reasoning.is_empty();
                         if should_persist {
                             state.reasoning_persisted = true;
-                            let _ = self
-                                .persist_reasoning_block_for_timeline(
-                                    session_id,
-                                    turn_id,
-                                    assistant_message_id,
-                                    &state.reasoning,
-                                );
+                            let _ = self.persist_reasoning_block_for_timeline(
+                                session_id,
+                                turn_id,
+                                assistant_message_id,
+                                &state.reasoning,
+                            );
                             let snapshot = self
                                 .database
                                 .session_snapshot(session_id)
                                 .unwrap_or_default();
                             let _ = self.emit_with_snapshot(
-
                                 RuntimeEventKind::TurnStateChanged,
-
                                 session_id.to_string(),
-
                                 turn_id.to_string(),
-
                                 snapshot,
-
                                 "ReasoningStarted".to_string(),
-
                                 None,
-
                             );
                         }
                         let _ = self.emit_delta(
@@ -947,7 +943,7 @@ impl RuntimeEngine {
                             session_id.to_string(),
                             turn_id.to_string(),
                             "Tool call delta",
-                            );
+                        );
                     }
                     ProviderStreamEvent::Finish {
                         finish_reason,
@@ -1015,23 +1011,20 @@ impl RuntimeEngine {
         content: &str,
         reasoning: &str,
     ) {
-        let _ = self
-            .database
-            .update_message_stream_result(
-                assistant_message_id,
-                content,
-                reasoning,
-                "cancelled",
-                "cancelled",
-                "cancelled",
-            );
-        let _ = self
-            .persist_reasoning_block_for_timeline(
-                session_id,
-                turn_id,
-                assistant_message_id,
-                reasoning,
-            );
+        let _ = self.database.update_message_stream_result(
+            assistant_message_id,
+            content,
+            reasoning,
+            "cancelled",
+            "cancelled",
+            "cancelled",
+        );
+        let _ = self.persist_reasoning_block_for_timeline(
+            session_id,
+            turn_id,
+            assistant_message_id,
+            reasoning,
+        );
         let _ = self
             .database
             .fail_turn(turn_id, "Cancelled", "Cancelled", "turn cancelled");
@@ -1060,26 +1053,23 @@ impl RuntimeEngine {
         reasoning: &str,
         error: HamburError,
     ) {
-        let _ = self
-            .database
-            .update_message_stream_result(
-                assistant_message_id,
-                content,
-                reasoning,
-                "failed_partial",
-                "error",
-                error.code().as_str(),
-            );
-        let _ = self
-            .persist_reasoning_block_for_timeline(
-                session_id,
-                turn_id,
-                assistant_message_id,
-                reasoning,
-            );
-        let _ = self
-            .database
-            .fail_turn(turn_id, "Failed", error.code().as_str(), &error.to_string());
+        let _ = self.database.update_message_stream_result(
+            assistant_message_id,
+            content,
+            reasoning,
+            "failed_partial",
+            "error",
+            error.code().as_str(),
+        );
+        let _ = self.persist_reasoning_block_for_timeline(
+            session_id,
+            turn_id,
+            assistant_message_id,
+            reasoning,
+        );
+        let _ =
+            self.database
+                .fail_turn(turn_id, "Failed", error.code().as_str(), &error.to_string());
         self.maybe_fail_delegate_session(session_id, &error.to_string());
         self.clear_active_turn(session_id, turn_id);
         let snapshot = self
@@ -1102,8 +1092,8 @@ fn openai_request_thinking_trace(
     route: &ModelRouteSnapshot,
     body_json: &str,
 ) -> String {
-    let body = serde_json::from_str::<serde_json::Value>(body_json)
-        .unwrap_or(serde_json::Value::Null);
+    let body =
+        serde_json::from_str::<serde_json::Value>(body_json).unwrap_or(serde_json::Value::Null);
     let thinking = body
         .get("thinking")
         .map(serde_json::Value::to_string)

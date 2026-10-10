@@ -46,6 +46,10 @@ impl RuntimeEngine {
                     approval_required,
                     &approval_token,
                 )?;
+            // 采集开关要和落库值保持一致：关闭后 Rust tracing 不再产出条目。
+            if setting.key == "loggingEnabled" {
+                self.set_logging_enabled(setting.value == "true");
+            }
             Ok::<(), HamburError>(())
         })();
         self.finish_settings_command(command, result, "Setting updated")

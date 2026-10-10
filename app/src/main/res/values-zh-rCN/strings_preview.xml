@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 文件预览页，见 values/strings_preview.xml。 -->
+<resources>
+    <!-- 顶部栏 -->
+    <string name="preview_title">文件预览</string>
+
+    <!-- 空状态与错误提示 -->
+    <string name="preview_file_not_available">文件不可用</string>
+    <string name="preview_no_file_selected">未选择文件</string>
+    <string name="preview_file_not_found">文件不存在</string>
+    <string name="preview_unsupported_target">不支持的目标</string>
+    <string name="preview_not_regular_file">%1$s 不是常规文件。</string>
+    <string name="preview_read_failed">读取失败</string>
+    <string name="preview_pdf_read_failed">PDF 读取失败</string>
+    <string name="preview_empty_pdf">空 PDF</string>
+
+    <!-- 图片 -->
+    <string name="preview_image_load_failed">图片加载失败</string>
+    <string name="preview_image">图片</string>
+    <string name="preview_local_image">本地图片</string>
+    <string name="preview_web_image">网络图片</string>
+    <string name="preview_web_file">网络文件</string>
+
+    <!-- 音频与其它类型 -->
+    <string name="preview_audio_unavailable">音频预览在 Android 上会交给系统播放器打开，新版界面暂未内嵌音频控件。</string>
+    <string name="preview_no_inline_preview">该文件类型暂不支持内嵌预览。</string>
+
+    <!-- 文本截断后缀，开头的换行由代码拼接，这里照原样保留 -->
+    <string name="preview_truncated">\n\n... 预览已截断</string>
+
+    <!-- 文件信息 -->
+    <string name="preview_section_file">文件</string>
+    <string name="preview_label_path">路径</string>
+    <string name="preview_label_size">大小</string>
+    <string name="preview_label_kind">类型</string>
+
+    <!-- PDF 分页 -->
+    <string name="preview_page_render_failed">第 %1$d 页渲染失败</string>
+    <string name="preview_page_content_description">第 %1$d 页</string>
+    <string name="preview_page_indicator">%1$d / %2$d</string>
+</resources>

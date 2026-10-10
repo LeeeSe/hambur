@@ -70,9 +70,12 @@ pub(crate) fn route_snapshot_from_target(target: &ProviderTarget) -> ModelRouteS
     }
 }
 
+/// 中断的工具调用在发给模型时的占位结果：明确告诉模型这次执行没拿到结果。
+pub(crate) const INTERRUPTED_TOOL_RESULT: &str =
+    "Tool execution was cancelled or interrupted before completion.";
+
 pub(crate) fn append_transcript_entry_to_context(
     messages: &mut Vec<ModelMessage>,
-    open_tool_call_ids: &mut HashSet<String>,
     entry: hambur_db::ChatTranscriptEntry,
     attachments: &[AttachmentRecord],
 ) -> HamburResult<()> {
@@ -101,9 +104,6 @@ pub(crate) fn append_transcript_entry_to_context(
             } else {
                 tool_calls_json_from_records(&entry.tool_calls)?
             };
-            for call in &entry.tool_calls {
-                open_tool_call_ids.insert(call.id.clone());
-            }
             messages.push(ModelMessage {
                 role: "assistant".to_string(),
                 content: message.content_text,
@@ -114,10 +114,7 @@ pub(crate) fn append_transcript_entry_to_context(
             });
         }
         "tool" => {
-            if message.status != "completed"
-                || message.tool_call_id.trim().is_empty()
-                || !open_tool_call_ids.remove(&message.tool_call_id)
-            {
+            if message.status != "completed" || message.tool_call_id.trim().is_empty() {
                 return Ok(());
             }
             messages.push(ModelMessage {
@@ -132,6 +129,95 @@ pub(crate) fn append_transcript_entry_to_context(
         _ => {}
     }
     Ok(())
+}
+
+/// OpenAI / DeepSeek 兼容接口是硬校验：带 `tool_calls` 的 assistant 消息后面必须紧跟
+/// 覆盖每个 `tool_call_id` 的 tool 消息，否则整个请求直接 400。
+///
+/// 进程被中断（被杀 / 崩溃 / 覆盖安装）会让某次工具执行只留下 assistant 一侧，
+/// DB 里的 tool_call 永远停在 `running`、tool 结果永远不会再来。旧实现把缺失的结果
+/// 一律追加到上下文末尾，只要这段历史不在末尾就依然是非法序列——真机上就是这么触发
+/// HTTP 400 的（用户看到「消息发出去了，模型完全不回复」）。
+///
+/// 这里在发请求前就地修复：
+/// - 缺结果的调用补一条说明性 tool 消息，位置紧跟对应 assistant 消息，顺序按原始调用顺序；
+/// - 不属于任何前置 assistant 调用的孤立 tool 消息丢掉。
+pub(crate) fn repair_tool_call_pairing(messages: &mut Vec<ModelMessage>) {
+    struct PendingToolCalls {
+        ids: Vec<String>,
+        results: HashMap<String, ModelMessage>,
+    }
+
+    fn flush(pending: &mut Option<PendingToolCalls>, out: &mut Vec<ModelMessage>) {
+        let Some(mut pending) = pending.take() else {
+            return;
+        };
+        for id in pending.ids.drain(..) {
+            let message = pending.results.remove(&id).unwrap_or_else(|| ModelMessage {
+                role: "tool".to_string(),
+                content: INTERRUPTED_TOOL_RESULT.to_string(),
+                tool_call_id: id,
+                ..Default::default()
+            });
+            out.push(message);
+        }
+    }
+
+    let mut repaired = Vec::with_capacity(messages.len());
+    let mut pending: Option<PendingToolCalls> = None;
+    for message in messages.drain(..) {
+        match message.role.as_str() {
+            "assistant" => {
+                flush(&mut pending, &mut repaired);
+                let ids = tool_call_ids_from_json(&message.tool_calls_json);
+                if !ids.is_empty() {
+                    pending = Some(PendingToolCalls {
+                        ids,
+                        results: HashMap::new(),
+                    });
+                }
+                repaired.push(message);
+            }
+            "tool" => {
+                if let Some(pending) = pending.as_mut()
+                    && pending.ids.iter().any(|id| id == &message.tool_call_id)
+                {
+                    pending
+                        .results
+                        .entry(message.tool_call_id.clone())
+                        .or_insert(message);
+                }
+            }
+            _ => {
+                flush(&mut pending, &mut repaired);
+                repaired.push(message);
+            }
+        }
+    }
+    flush(&mut pending, &mut repaired);
+    *messages = repaired;
+}
+
+fn tool_call_ids_from_json(tool_calls_json: &str) -> Vec<String> {
+    let trimmed = tool_calls_json.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    serde_json::from_str::<Value>(trimmed)
+        .ok()
+        .and_then(|value| {
+            value.as_array().map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        item.get("id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+        .unwrap_or_default()
 }
 
 pub(crate) fn assistant_message_is_context_eligible(
@@ -529,9 +615,32 @@ pub(crate) fn parse_openai_non_stream_message(
             }
         }
     }
+    let usage = value.get("usage").map(|usage| {
+        let read = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+        let prompt_tokens = read("prompt_tokens");
+        let completion_tokens = read("completion_tokens");
+        ModelTokenUsage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: read("total_tokens").max(prompt_tokens + completion_tokens),
+            cached_tokens: usage
+                .get("prompt_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+                .and_then(Value::as_u64)
+                // DeepSeek 的顶层命中字段。
+                .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(Value::as_u64))
+                .unwrap_or(0),
+            reasoning_tokens: usage
+                .get("completion_tokens_details")
+                .and_then(|details| details.get("reasoning_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        }
+    });
     Ok(MemoryReviewAssistantMessage {
         content,
         tool_calls,
+        usage,
     })
 }
 
@@ -884,5 +993,170 @@ mod tests {
                 .iter()
                 .any(|block| block.contains(HAMBUR_TOOL_TITLE_SYSTEM_PROMPT))
         );
+    }
+
+    fn assistant_with_calls(ids: &[&str]) -> ModelMessage {
+        let calls = ids
+            .iter()
+            .map(|id| {
+                serde_json::json!({
+                    "id": id,
+                    "type": "function",
+                    "function": { "name": "terminal", "arguments": "{}" },
+                })
+            })
+            .collect::<Vec<_>>();
+        ModelMessage {
+            role: "assistant".to_string(),
+            tool_calls_json: serde_json::Value::Array(calls).to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn tool_result(id: &str) -> ModelMessage {
+        ModelMessage {
+            role: "tool".to_string(),
+            content: format!("result for {id}"),
+            tool_call_id: id.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn user_message(text: &str) -> ModelMessage {
+        ModelMessage {
+            role: "user".to_string(),
+            content: text.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// 供应商侧真正的硬约束：assistant 的每个 tool_call 必须在紧邻的后续消息里按顺序被
+    /// tool 消息覆盖，且不能出现无主的 tool 消息。
+    fn assert_tool_call_pairing(messages: &[ModelMessage]) {
+        let mut index = 0;
+        while index < messages.len() {
+            let message = &messages[index];
+            if message.role == "assistant" {
+                let ids = tool_call_ids_from_json(&message.tool_calls_json);
+                if !ids.is_empty() {
+                    let following = messages[index + 1..]
+                        .iter()
+                        .take_while(|next| next.role == "tool")
+                        .map(|next| next.tool_call_id.clone())
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        following, ids,
+                        "assistant tool_calls at {index} are not answered in order"
+                    );
+                    index += 1 + ids.len();
+                    continue;
+                }
+            } else if message.role == "tool" {
+                panic!("stray tool message at {index}: {}", message.tool_call_id);
+            }
+            index += 1;
+        }
+    }
+
+    #[test]
+    fn repair_tool_call_pairing_completes_a_batch_that_was_never_answered() {
+        // 中断现场：assistant 发了两个工具调用，结果一条都没落库，后面直接接了用户消息。
+        // 旧实现只会把缺的结果追加到上下文末尾，中间这段依然非法 → 供应商 400。
+        let mut messages = vec![
+            assistant_with_calls(&["call_a", "call_b"]),
+            user_message("我装好 Python 了"),
+        ];
+
+        repair_tool_call_pairing(&mut messages);
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].role, "assistant");
+        assert_eq!(messages[1].role, "tool");
+        assert_eq!(messages[1].tool_call_id, "call_a");
+        assert_eq!(messages[2].tool_call_id, "call_b");
+        assert_eq!(messages[3].role, "user");
+        assert_eq!(messages[1].content, INTERRUPTED_TOOL_RESULT);
+        assert_tool_call_pairing(&messages);
+    }
+
+    #[test]
+    fn repair_tool_call_pairing_keeps_missing_results_in_call_order() {
+        // 只缺中间那个：补齐后必须仍是 c0、c1、c2 的顺序。
+        let mut messages = vec![
+            assistant_with_calls(&["c0", "c1", "c2"]),
+            tool_result("c0"),
+            tool_result("c2"),
+        ];
+
+        repair_tool_call_pairing(&mut messages);
+
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| (message.role.as_str(), message.tool_call_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("assistant", ""),
+                ("tool", "c0"),
+                ("tool", "c1"),
+                ("tool", "c2"),
+            ]
+        );
+        assert_eq!(messages[2].content, INTERRUPTED_TOOL_RESULT);
+        assert_eq!(messages[1].content, "result for c0");
+        assert_eq!(messages[3].content, "result for c2");
+        assert_tool_call_pairing(&messages);
+    }
+
+    #[test]
+    fn repair_tool_call_pairing_drops_orphan_tool_messages() {
+        let mut messages = vec![
+            tool_result("ghost"),
+            user_message("hi"),
+            assistant_with_calls(&["c0"]),
+            tool_result("c0"),
+        ];
+
+        repair_tool_call_pairing(&mut messages);
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[2].tool_call_id, "c0");
+        assert_tool_call_pairing(&messages);
+    }
+
+    #[test]
+    fn repair_tool_call_pairing_leaves_healthy_transcripts_alone() {
+        let mut messages = vec![
+            user_message("跑一下"),
+            assistant_with_calls(&["c0", "c1"]),
+            tool_result("c0"),
+            tool_result("c1"),
+            assistant_with_calls(&["c2"]),
+            tool_result("c2"),
+        ];
+        let before = messages.clone();
+
+        repair_tool_call_pairing(&mut messages);
+
+        assert_eq!(messages, before);
+        assert_tool_call_pairing(&messages);
+    }
+
+    #[test]
+    fn repair_tool_call_pairing_closes_a_trailing_open_batch() {
+        // 最后一次工具调用还没回来就退出了：必须补一条结果，否则整段历史永远非法。
+        let mut messages = vec![
+            user_message("开始"),
+            assistant_with_calls(&["tail"]),
+        ];
+
+        repair_tool_call_pairing(&mut messages);
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[2].tool_call_id, "tail");
+        assert_eq!(messages[2].content, INTERRUPTED_TOOL_RESULT);
+        assert_tool_call_pairing(&messages);
     }
 }

@@ -4,8 +4,15 @@
       这个 XML 主题只负责「Compose 首帧之前」的那一小段时间：窗口底色、系统栏图标明暗、
       浮动控件底色。真正的界面配色在 HamburTheme（Compose）里。
       暗色版本见 values-night/styles.xml。
+
+      父主题必须是 Theme.AppCompat.*：MainActivity 继承 AppCompatActivity（按应用语言在
+      Android 12/12L 上要它来回填 locale），而 AppCompatActivity 会检查主题里有没有
+      windowActionBar 属性，直接用 Theme.Material.* 会当场抛
+      "You need to use a Theme.AppCompat theme (or descendant) with this activity."
+      这里显式分 Light/暗色两份（而不是用 Theme.AppCompat.DayNight），保持原来的行为：
+      首帧按系统深色模式选底色。
     -->
-    <style name="Theme.Hambur" parent="android:style/Theme.Material.Light.NoActionBar">
+    <style name="Theme.Hambur" parent="Theme.AppCompat.Light.NoActionBar">
         <item name="android:windowLightStatusBar">true</item>
         <item name="android:windowLightNavigationBar">true</item>
         <item name="android:windowBackground">@color/app_window_background</item>

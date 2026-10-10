@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  公共组件（HamburUiComponents / HamburImageZoomSandbox）。
+  通用按钮与状态文案复用 values/strings.xml 里的 common_*；
+  这里只放只有组件自己才用得到的文案。中文见 values-zh-rCN/strings_components.xml。
+-->
+<resources>
+    <!-- 沉浸式图片查看器 -->
+    <string name="components_image_load_failed">Failed to load image</string>
+    <string name="components_reset_zoom">Reset zoom</string>
+    <string name="components_zoom_hint">Pinch to zoom · Double tap to enlarge · Swipe down to exit</string>
+</resources>

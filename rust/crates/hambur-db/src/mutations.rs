@@ -1403,6 +1403,74 @@ impl HamburDatabase {
         self.turn_by_id(turn_id)
     }
 
+    /// 收敛上一次进程退出（被杀 / 崩溃 / 覆盖安装）留下的中间态。
+    ///
+    /// 中断时正在执行的行不会自愈，会一直停在：
+    /// - `turns`：`StreamingAssistant` / `ExecutingTools` / `ContinuingAfterTools`
+    /// - `tool_calls` / `trace_spans`：`running`
+    /// - `messages`：`streaming`
+    ///
+    /// 这不只是显示问题：带 `tool_calls` 的 assistant 消息留在会话里，而对应的 tool
+    /// 结果永远不会再写进来，后续请求就是「assistant 带 tool_calls 却没有紧跟 tool 响应」，
+    /// OpenAI 兼容接口会直接返回 HTTP 400——用户看到的现象是消息发出去了但完全不回复。
+    /// 启动时统一落成终止态，上下文构建侧再对配对做兜底修复。
+    pub fn reconcile_interrupted_state(&self) -> HamburResult<InterruptedStateSummary> {
+        let now = now_ms() as i64;
+        let turns = self
+            .connection
+            .execute(
+                "UPDATE turns
+                 SET status = 'Failed',
+                     error_code = 'Interrupted',
+                     error_message = ?1,
+                     updated_at_ms = ?2,
+                     finished_at_ms = ?2
+                 WHERE status IN ('StreamingAssistant', 'ExecutingTools', 'ContinuingAfterTools')",
+                params![INTERRUPTED_TURN_MESSAGE, now],
+            )
+            .map_err(database_error)?;
+        let tool_calls = self
+            .connection
+            .execute(
+                "UPDATE tool_calls
+                 SET status = 'failed',
+                     error_code = 'Interrupted',
+                     error_message = ?1,
+                     ended_at_ms = ?2
+                 WHERE status = 'running'",
+                params![INTERRUPTED_TURN_MESSAGE, now],
+            )
+            .map_err(database_error)?;
+        let trace_spans = self
+            .connection
+            .execute(
+                "UPDATE trace_spans
+                 SET status = 'failed',
+                     ended_at_ms = ?1
+                 WHERE status = 'running' AND ended_at_ms IS NULL",
+                params![now],
+            )
+            .map_err(database_error)?;
+        let messages = self
+            .connection
+            .execute(
+                "UPDATE messages
+                 SET status = 'failed_partial',
+                     finish_reason = 'interrupted',
+                     native_finish_reason = 'interrupted',
+                     version_sequence = version_sequence + 1
+                 WHERE status = 'streaming'",
+                params![],
+            )
+            .map_err(database_error)?;
+        Ok(InterruptedStateSummary {
+            turns: turns as u64,
+            tool_calls: tool_calls as u64,
+            trace_spans: trace_spans as u64,
+            messages: messages as u64,
+        })
+    }
+
     pub fn mark_session_memory_reviewed(
         &self,
         session_id: &str,
@@ -2098,6 +2166,56 @@ impl HamburDatabase {
         Ok(record)
     }
 
+    /// 记录一次模型请求的 token 用量。每个请求只写一行（绝不按流式 token 写）。
+    pub fn insert_token_usage(&self, usage: NewTokenUsage) -> HamburResult<TokenUsageRecord> {
+        let record = TokenUsageRecord {
+            id: new_id("usage"),
+            session_id: usage.session_id.trim().chars().take(160).collect(),
+            turn_id: usage.turn_id.trim().chars().take(160).collect(),
+            provider_id: usage.provider_id.trim().chars().take(120).collect(),
+            model_id: usage.model_id.trim().chars().take(200).collect(),
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+            cached_tokens: usage.cached_tokens,
+            reasoning_tokens: usage.reasoning_tokens,
+            created_at_ms: now_ms(),
+        };
+        self.connection
+            .execute(
+                "INSERT INTO token_usage
+                    (id, session_id, turn_id, provider_id, model_id, prompt_tokens,
+                     completion_tokens, total_tokens, cached_tokens, reasoning_tokens, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    record.id.clone(),
+                    record.session_id.clone(),
+                    record.turn_id.clone(),
+                    record.provider_id.clone(),
+                    record.model_id.clone(),
+                    record.prompt_tokens as i64,
+                    record.completion_tokens as i64,
+                    record.total_tokens as i64,
+                    record.cached_tokens as i64,
+                    record.reasoning_tokens as i64,
+                    record.created_at_ms as i64
+                ],
+            )
+            .map_err(database_error)?;
+        Ok(record)
+    }
+
+    /// 会话被硬删除时清掉它的用量行，避免留下孤儿统计。
+    pub fn delete_token_usage_for_session(&self, session_id: &str) -> HamburResult<()> {
+        self.connection
+            .execute(
+                "DELETE FROM token_usage WHERE session_id = ?1",
+                params![session_id],
+            )
+            .map_err(database_error)?;
+        Ok(())
+    }
+
     pub(crate) fn migrate(&self) -> HamburResult<()> {
         self.connection
             .execute_batch(
@@ -2531,6 +2649,26 @@ impl HamburDatabase {
 
                 CREATE INDEX IF NOT EXISTS idx_config_audit_created
                     ON config_audit(created_at_ms DESC, id DESC);
+
+                CREATE TABLE IF NOT EXISTS token_usage (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    session_id TEXT NOT NULL DEFAULT '',
+                    turn_id TEXT NOT NULL DEFAULT '',
+                    provider_id TEXT NOT NULL DEFAULT '',
+                    model_id TEXT NOT NULL DEFAULT '',
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                    completion_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    cached_tokens INTEGER NOT NULL DEFAULT 0,
+                    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                    created_at_ms INTEGER NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_token_usage_created
+                    ON token_usage(created_at_ms DESC, id DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_token_usage_provider_model
+                    ON token_usage(provider_id, model_id);
                 ",
             )
             .map_err(database_error)?;

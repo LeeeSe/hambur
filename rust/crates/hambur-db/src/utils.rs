@@ -70,6 +70,7 @@ pub(crate) fn normalize_app_setting_key(value: &str) -> HamburResult<String> {
         "fontScale",
         "startupChatMode",
         "thinkingBlockDisplayMode",
+        "autoFocusInputAfterReply",
         "lastSelectedSessionId",
         "loggingEnabled",
         "predictiveBackEnabled",
@@ -189,7 +190,8 @@ pub(crate) fn normalize_app_setting_value(key: &str, value: &str) -> HamburResul
         | "predictiveBackEnabled"
         | "fpsOverlayEnabled"
         | "defaultDeepThinkingEnabled"
-        | "startupTasksEnabled" => normalize_bool_setting(key, value),
+        | "startupTasksEnabled"
+        | "autoFocusInputAfterReply" => normalize_bool_setting(key, value),
         "lastSelectedSessionId" => Ok(value.chars().take(160).collect()),
         "browser_tool_settings" => normalize_browser_tool_settings(value),
         "web_search_settings" | "web_fetch_settings" => normalize_web_settings(key, value),
@@ -337,8 +339,12 @@ pub(crate) fn normalize_status(status: &str) -> HamburResult<String> {
     Ok(status.chars().take(80).collect())
 }
 
-pub(crate) fn unsigned_ms(value: i64) -> u64 {
+pub(crate) fn unsigned_u64(value: i64) -> u64 {
     u64::try_from(value).unwrap_or_default()
+}
+
+pub(crate) fn unsigned_ms(value: i64) -> u64 {
+    unsigned_u64(value)
 }
 
 pub(crate) fn unsigned_count(value: i64) -> u32 {
@@ -875,5 +881,20 @@ mod tests {
         );
         // An absent provider is fine: the runtime applies the default.
         assert!(normalize_app_setting_value("web_search_settings", r#"{"maxQueries":2}"#).is_ok());
+    }
+
+    #[test]
+    fn auto_focus_input_after_reply_is_a_bool_setting() {
+        let key = "autoFocusInputAfterReply";
+        assert_eq!(normalize_app_setting_key(key).expect("key"), key);
+        assert_eq!(
+            normalize_app_setting_value(key, "true").expect("value"),
+            "true"
+        );
+        assert_eq!(
+            normalize_app_setting_value(key, "false").expect("value"),
+            "false"
+        );
+        assert!(normalize_app_setting_value(key, "yes").is_err());
     }
 }

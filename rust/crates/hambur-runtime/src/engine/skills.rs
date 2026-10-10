@@ -118,10 +118,8 @@ impl RuntimeEngine {
     }
 
     pub(crate) fn skills_root(&self) -> PathBuf {
-        PathBuf::from(&self.bootstrap.app_files_dir)
-            .join("sandbox")
-            .join("global")
-            .join("skills")
+        // 持久目录在 sandbox 之外，RootFS 重置不会清掉技能。
+        self.sandbox.persistent_dir("skills")
     }
 
     pub(crate) fn ensure_seeded_skills(&self) -> HamburResult<()> {
@@ -279,13 +277,15 @@ impl RuntimeEngine {
     }
 
     pub(crate) fn disabled_skill_paths(&self) -> HashSet<String> {
-        self.database.settings_snapshot()
+        self.database
+            .settings_snapshot()
             .map(disabled_skill_paths_from_snapshot)
             .unwrap_or_default()
     }
 
     pub(crate) fn disabled_tool_names(&self) -> HashSet<String> {
-        self.database.settings_snapshot()
+        self.database
+            .settings_snapshot()
             .map(|snapshot| disabled_tool_names_from_snapshot(&snapshot))
             .unwrap_or_default()
     }

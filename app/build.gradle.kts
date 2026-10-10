@@ -215,6 +215,10 @@ tasks.matching { it.name == "preReleaseBuild" }.configureEach {
 
 dependencies {
     implementation("androidx.core:core-ktx:1.18.0")
+    // 按应用语言（Appearance → 显示语言）走 AppCompat 的 AppCompatDelegate.setApplicationLocales：
+    // Android 13+ 转发给系统 LocaleManager，Android 12/12L 由 AppCompat 自己存储并回填。
+    // 这也是 MainActivity 继承 AppCompatActivity、主题换成 Theme.AppCompat.* 的原因。
+    implementation("androidx.appcompat:appcompat:1.8.0")
     implementation("androidx.activity:activity-compose:1.13.0")
     implementation("androidx.compose.ui:ui:1.11.2")
     implementation("androidx.compose.ui:ui-tooling-preview:1.11.2")

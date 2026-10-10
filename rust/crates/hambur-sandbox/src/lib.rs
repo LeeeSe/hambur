@@ -13,6 +13,15 @@ const HAMBUR_PREFIX: &str = "/var/hambur";
 const AUTOSTART_PREFIX: &str = "/var/minis/autostart";
 const PROBE_CACHE_TTL_MS: u64 = 30_000;
 
+/// 持久数据在宿主侧的根目录名（相对 app_files_dir）。
+///
+/// 记忆、技能、shared 这些「用户的长期数据」放这里，而不是以前的 `sandbox/global/`：
+/// 那个目录会被 [`SandboxService::reset_rootfs`] 整个删掉，2026-10-05 的一次 RootFS 重置
+/// 就是这样把用户的 MEMORY.md / USER.md 和全部自定义技能一起清空的。
+/// 沙箱内的路径不变（仍然挂在 /var/hambur/...），所以 terminal / 文件工具完全无感。
+const PERSISTENT_DIR: &str = "persistent";
+const PERSISTENT_SUBDIRS: &[&str] = &["memory", "skills", "shared", "download"];
+
 const ROOTFS_RELEASES_BASE_URLS: &[&str] = &[
     "https://mirrors.tuna.tsinghua.edu.cn/alpine/latest-stable/releases/aarch64/",
     "https://mirrors.bfsu.edu.cn/alpine/latest-stable/releases/aarch64/",
@@ -229,8 +238,18 @@ impl SandboxService {
         let root = app_files_dir.join("sandbox");
         fs::create_dir_all(&root)
             .map_err(|error| HamburError::Internal(format!("create sandbox root: {error}")))?;
+        // 持久数据根必须一开始就存在：ensure_inside_root 会对 guard root 做 canonicalize，
+        // 而 memory/skills 的 guard 就是这个目录（旧代码的 guard 是 sandbox 根，构造时就建好了）。
+        let persistent_root = app_files_dir.join(PERSISTENT_DIR);
+        fs::create_dir_all(&persistent_root)
+            .map_err(|error| HamburError::Internal(format!("create persistent root: {error}")))?;
+        for name in PERSISTENT_SUBDIRS {
+            fs::create_dir_all(persistent_root.join(name)).map_err(|error| {
+                HamburError::Internal(format!("create persistent dir {name}: {error}"))
+            })?;
+        }
         let rootfs_dir = app_files_dir.join("alpine-rootfs");
-        eprintln!(
+        tracing::info!(
             "RootfsDebug sandbox_new app_files_dir={} native_library_dir={} root={} rootfs_dir={} root_exists={} rootfs_exists={}",
             app_files_dir.display(),
             native_library_dir
@@ -242,7 +261,7 @@ impl SandboxService {
             root.exists(),
             rootfs_dir.exists()
         );
-        Ok(Self {
+        let service = Self {
             root,
             app_files_dir,
             native_library_dir,
@@ -252,7 +271,10 @@ impl SandboxService {
             chroot_mount_state: Arc::new(Mutex::new(ChrootMountState::default())),
             chroot_exec_lock: Arc::new(Mutex::new(())),
             startup_tasks_ran: Arc::new(Mutex::new(false)),
-        })
+        };
+        // 迁移必须早于任何 reset_rootfs（后者以前会删掉 sandbox/global）。
+        service.migrate_legacy_global_dir();
+        Ok(service)
     }
 
     pub fn root(&self) -> &Path {
@@ -265,6 +287,74 @@ impl SandboxService {
 
     pub fn app_files_dir(&self) -> &Path {
         &self.app_files_dir
+    }
+
+    /// 持久数据根：不随 RootFS 重置消失。
+    pub fn persistent_root(&self) -> PathBuf {
+        self.app_files_dir.join(PERSISTENT_DIR)
+    }
+
+    /// 持久数据的某个子目录（memory / skills / shared / download）。
+    /// 宿主侧就是 `<app_files_dir>/persistent/<name>`，沙箱里仍然看到 `/var/hambur/<name>`。
+    pub fn persistent_dir(&self, name: &str) -> PathBuf {
+        self.persistent_root().join(name)
+    }
+
+    /// 把 0.1.x 时代放在 `sandbox/global/` 里的持久数据搬到 `persistent/`（一次性、幂等）。
+    ///
+    /// 必须在任何 [`Self::reset_rootfs`] 之前跑，所以挂在构造函数里。同名条目以目标为准
+    /// （不覆盖较新的数据），被跳过的旧副本就留在 `sandbox/global/` 里不再使用。
+    fn migrate_legacy_global_dir(&self) {
+        let legacy = self.root.join("global");
+        if !legacy.is_dir() {
+            return;
+        }
+        for name in PERSISTENT_SUBDIRS {
+            let from = legacy.join(name);
+            if !from.is_dir() {
+                continue;
+            }
+            let to = self.persistent_dir(name);
+            if let Err(error) = fs::create_dir_all(&to) {
+                tracing::warn!("PersistentMigrate create {}: {error}", to.display());
+                continue;
+            }
+            let Ok(entries) = fs::read_dir(&from) else {
+                continue;
+            };
+            let mut moved = 0_u32;
+            for entry in entries.flatten() {
+                let target = to.join(entry.file_name());
+                if target.exists() {
+                    continue;
+                }
+                let source = entry.path();
+                if fs::rename(&source, &target).is_err() {
+                    // rename 失败通常是跨挂载点：退化成拷贝。
+                    let copied = if source.is_dir() {
+                        copy_dir_all(&source, &target)
+                    } else {
+                        fs::copy(&source, &target).map(|_| ())
+                    };
+                    if copied.is_err() {
+                        continue;
+                    }
+                    let _ = if source.is_dir() {
+                        fs::remove_dir_all(&source)
+                    } else {
+                        fs::remove_file(&source)
+                    };
+                }
+                moved += 1;
+            }
+            if moved > 0 {
+                tracing::info!(
+                    "PersistentMigrate moved {moved} entries from {} to {}",
+                    from.display(),
+                    to.display()
+                );
+            }
+        }
     }
 
     pub fn rootfs_status(&self) -> RootfsStatus {
@@ -287,6 +377,8 @@ impl SandboxService {
         }
 
         let mut host_path = self.root.clone();
+        // 持久数据（memory/skills/shared/download）在 sandbox 之外，见 PERSISTENT_DIR。
+        let persistent_root = self.persistent_root();
         let guard_root: &Path;
         let android_download = Path::new("/storage/emulated/0/Download");
         if virtual_root.name == "download" && android_download.exists() {
@@ -315,8 +407,8 @@ impl SandboxService {
                 host_path = self.rootfs_dir.clone();
                 guard_root = &self.rootfs_dir;
             } else {
-                host_path.push("global");
-                guard_root = &self.root;
+                host_path = persistent_root.clone();
+                guard_root = &persistent_root;
             }
         }
         host_path.push(virtual_root.host_prefix);
@@ -326,6 +418,7 @@ impl SandboxService {
         ensure_inside_root(guard_root, &host_path)?;
         let relative_path = host_path
             .strip_prefix(&self.root)
+            .or_else(|_| host_path.strip_prefix(&self.app_files_dir))
             .unwrap_or(&host_path)
             .to_string_lossy()
             .replace('\\', "/");
@@ -415,7 +508,7 @@ impl SandboxService {
             .map(|metadata| metadata.file_type().is_file())
             .unwrap_or(false);
         let installed = shell_exists && busybox_is_file;
-        eprintln!(
+        tracing::info!(
             "RootfsDebug is_rootfs_installed installed={} rootfs_dir={} shell={} shell_ok={} shell_err={} busybox={} busybox_file={} busybox_err={}",
             installed,
             self.rootfs_dir.display(),
@@ -517,13 +610,20 @@ impl SandboxService {
             })?;
         }
         let resolv_conf = self.rootfs_dir.join("etc/resolv.conf");
-        if !resolv_conf.exists() || fs::read_to_string(&resolv_conf).map(|s| s.trim().is_empty()).unwrap_or(true) {
-            let _ = fs::write(&resolv_conf, "nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 114.114.114.114\n");
+        if !resolv_conf.exists()
+            || fs::read_to_string(&resolv_conf)
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
+        {
+            let _ = fs::write(
+                &resolv_conf,
+                "nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 114.114.114.114\n",
+            );
         }
-        let global = self.root.join("global");
-        for name in &["memory", "skills", "shared", "download"] {
-            fs::create_dir_all(global.join(name))
-                .map_err(|e| HamburError::Internal(format!("create global dir {}: {e}", name)))?;
+        // 持久数据目录建在 sandbox 之外：RootFS 重置不会碰它们。
+        for name in PERSISTENT_SUBDIRS {
+            fs::create_dir_all(self.persistent_dir(name))
+                .map_err(|e| HamburError::Internal(format!("create persistent dir {name}: {e}")))?;
         }
         Ok(())
     }
@@ -540,7 +640,9 @@ impl SandboxService {
         self.clear_chroot_mount_state();
         self.clear_probe_cache();
         self.clear_startup_tasks_state();
-        let _ = fs::remove_dir_all(self.root.join("global"));
+        // 以前这里会 `remove_dir_all(sandbox/global)`，把用户的记忆和技能一起删掉。
+        // 持久数据现在在 <app_files_dir>/persistent/（构造时已从旧位置迁移过来），
+        // 重置只重建 rootfs 本身，不再触碰用户数据。
         self.recreate_rootfs_dir_for_install()?;
         self.extract_tar_archive(&rootfs_archive.file)?;
         self.ensure_rootfs_skeleton()?;
@@ -644,14 +746,14 @@ impl SandboxService {
 
     pub fn probe_rootfs_status(&self, requested_backend: &str) -> RootfsStatus {
         let abi = android_abi();
-        eprintln!(
+        tracing::info!(
             "RootfsDebug probe_rootfs_status_start requested_backend={} abi={} rootfs_dir={}",
             requested_backend,
             abi,
             self.rootfs_dir.display()
         );
         if abi != "arm64-v8a" {
-            eprintln!(
+            tracing::info!(
                 "RootfsDebug probe_rootfs_status_result available=false backend={} reason=UnsupportedAbi",
                 normalize_backend(requested_backend)
             );
@@ -664,7 +766,7 @@ impl SandboxService {
         }
         let rootfs_installed = self.is_rootfs_installed();
         if !rootfs_installed {
-            eprintln!(
+            tracing::info!(
                 "RootfsDebug probe_rootfs_status_result available=false backend={} reason=rootfs_not_initialized",
                 normalize_backend(requested_backend)
             );
@@ -691,9 +793,12 @@ impl SandboxService {
         } else {
             proot_available
         };
-        eprintln!(
+        tracing::info!(
             "RootfsDebug probe_rootfs_status_probes backend={} chroot_available={} proot_available={} fallback_proot_available={}",
-            backend, chroot_available, proot_available, fallback_proot_available
+            backend,
+            chroot_available,
+            proot_available,
+            fallback_proot_available
         );
         if backend == "chroot" {
             if chroot_available {
@@ -740,7 +845,7 @@ impl SandboxService {
     pub fn probe_root_available(&self) -> bool {
         if let Ok(cache) = self.probe_cache.lock() {
             if let Some(probe) = cache.root.as_ref().filter(|probe| probe.is_fresh()) {
-                eprintln!(
+                tracing::info!(
                     "RootfsDebug probe_root_available cached=true available={}",
                     probe.available
                 );
@@ -753,9 +858,9 @@ impl SandboxService {
             .output();
         let available = match root_check {
             Ok(out) => out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "0",
-                Err(_) => false,
-            };
-        eprintln!("RootfsDebug probe_root_available available={available}");
+            Err(_) => false,
+        };
+        tracing::info!("RootfsDebug probe_root_available available={available}");
         if let Ok(mut cache) = self.probe_cache.lock() {
             cache.root = Some(TimedProbe {
                 available,
@@ -768,7 +873,7 @@ impl SandboxService {
     pub fn probe_chroot_available(&self) -> bool {
         if let Ok(cache) = self.probe_cache.lock() {
             if let Some(probe) = cache.chroot.as_ref().filter(|probe| probe.is_fresh()) {
-                eprintln!(
+                tracing::info!(
                     "RootfsDebug probe_chroot_available cached=true available={}",
                     probe.available
                 );
@@ -787,7 +892,7 @@ impl SandboxService {
                 .output();
                 match chroot_check {
                     Ok(out) => {
-                        eprintln!(
+                        tracing::info!(
                             "RootfsDebug probe_chroot_available status={} stdout={} stderr={}",
                             out.status,
                             String::from_utf8_lossy(&out.stdout).trim(),
@@ -797,12 +902,12 @@ impl SandboxService {
                             && String::from_utf8_lossy(&out.stdout).contains("hambur-chroot-ok")
                     }
                     Err(error) => {
-                        eprintln!("RootfsDebug probe_chroot_available spawn_error={error}");
+                        tracing::warn!("RootfsDebug probe_chroot_available spawn_error={error}");
                         false
                     }
                 }
             };
-        eprintln!("RootfsDebug probe_chroot_available available={available}");
+        tracing::info!("RootfsDebug probe_chroot_available available={available}");
         if let Ok(mut cache) = self.probe_cache.lock() {
             cache.chroot = Some(TimedProbe {
                 available,
@@ -815,7 +920,7 @@ impl SandboxService {
     pub fn probe_proot_available(&self) -> bool {
         if let Ok(cache) = self.probe_cache.lock() {
             if let Some(probe) = cache.proot.as_ref().filter(|probe| probe.is_fresh()) {
-                eprintln!(
+                tracing::info!(
                     "RootfsDebug probe_proot_available cached=true available={}",
                     probe.available
                 );
@@ -842,7 +947,7 @@ impl SandboxService {
                 .output();
             match proot_check {
                 Ok(out) => {
-                    eprintln!(
+                    tracing::info!(
                         "RootfsDebug probe_proot_available bin={} status={} stdout={} stderr={}",
                         proot_bin.display(),
                         out.status,
@@ -853,7 +958,7 @@ impl SandboxService {
                         && String::from_utf8_lossy(&out.stdout).contains("hambur-proot-ok")
                 }
                 Err(error) => {
-                    eprintln!(
+                    tracing::warn!(
                         "RootfsDebug probe_proot_available bin={} spawn_error={error}",
                         proot_bin.display()
                     );
@@ -861,10 +966,10 @@ impl SandboxService {
                 }
             }
         } else {
-            eprintln!("RootfsDebug probe_proot_available missing_proot_binary=true");
+            tracing::info!("RootfsDebug probe_proot_available missing_proot_binary=true");
             false
         };
-        eprintln!("RootfsDebug probe_proot_available available={available}");
+        tracing::info!("RootfsDebug probe_proot_available available={available}");
         if let Ok(mut cache) = self.probe_cache.lock() {
             cache.proot = Some(TimedProbe {
                 available,
@@ -1154,9 +1259,12 @@ impl SandboxService {
                 Ok(mut r) => {
                     let has_marker = r.stdout.contains("__HAMBUR_SANDBOX_READY__");
                     if has_marker {
-                        if let Some(stripped) = r.stdout.strip_prefix("__HAMBUR_SANDBOX_READY__\n") {
+                        if let Some(stripped) = r.stdout.strip_prefix("__HAMBUR_SANDBOX_READY__\n")
+                        {
                             r.stdout = stripped.to_string();
-                        } else if let Some(stripped) = r.stdout.strip_prefix("__HAMBUR_SANDBOX_READY__\r\n") {
+                        } else if let Some(stripped) =
+                            r.stdout.strip_prefix("__HAMBUR_SANDBOX_READY__\r\n")
+                        {
                             r.stdout = stripped.to_string();
                         } else {
                             r.stdout = r
@@ -1166,7 +1274,11 @@ impl SandboxService {
                                 .replace("__HAMBUR_SANDBOX_READY__", "");
                         }
                     }
-                    if has_marker || r.exit_code >= 0 || r.timed_out || !self.probe_proot_available() {
+                    if has_marker
+                        || r.exit_code >= 0
+                        || r.timed_out
+                        || !self.probe_proot_available()
+                    {
                         return Ok(r);
                     }
                     let mut pr = self.execute_proot(session_id, command, cwd, timeout_ms)?;
@@ -1202,7 +1314,8 @@ impl SandboxService {
         let _guard = exec_lock
             .lock()
             .map_err(|_| HamburError::Internal("chroot execution lock poisoned".to_string()))?;
-        let (program, args, _env) = self.build_chroot_command(session_id, command, cwd, true, timeout_ms)?;
+        let (program, args, _env) =
+            self.build_chroot_command(session_id, command, cwd, true, timeout_ms)?;
         self.run_process_blocking(
             program,
             args,
@@ -1221,7 +1334,8 @@ impl SandboxService {
         cwd: &str,
         timeout_ms: u64,
     ) -> HamburResult<SandboxExecResult> {
-        let (program, args, env) = self.build_proot_command(session_id, command, cwd, false, timeout_ms)?;
+        let (program, args, env) =
+            self.build_proot_command(session_id, command, cwd, false, timeout_ms)?;
         self.run_process_blocking(program, args, env, timeout_ms, "proot", session_id, cwd)
     }
 
@@ -1287,9 +1401,9 @@ impl SandboxService {
         let proot_bin = self
             .find_proot_executable()
             .ok_or_else(|| HamburError::Internal("proot binary is missing".to_string()))?;
-        let global_memory = self.root.join("global/memory");
-        let global_skills = self.root.join("global/skills");
-        let global_shared = self.root.join("global/shared");
+        let persistent_memory = self.persistent_dir("memory");
+        let persistent_skills = self.persistent_dir("skills");
+        let persistent_shared = self.persistent_dir("shared");
         let marker_line = if emit_ready_marker {
             "printf '__HAMBUR_SANDBOX_READY__\\n'\n"
         } else {
@@ -1317,11 +1431,11 @@ impl SandboxService {
             "-b".to_string(),
             "/sys:/sys".to_string(),
             "-b".to_string(),
-            format!("{}:/var/hambur/memory", global_memory.to_string_lossy()),
+            format!("{}:/var/hambur/memory", persistent_memory.to_string_lossy()),
             "-b".to_string(),
-            format!("{}:/var/hambur/skills", global_skills.to_string_lossy()),
+            format!("{}:/var/hambur/skills", persistent_skills.to_string_lossy()),
             "-b".to_string(),
-            format!("{}:/var/hambur/shared", global_shared.to_string_lossy()),
+            format!("{}:/var/hambur/shared", persistent_shared.to_string_lossy()),
             "-b".to_string(),
             format!(
                 "{}:/var/hambur/attachments",
@@ -1418,10 +1532,10 @@ impl SandboxService {
                 .map_err(|e| HamburError::Internal(format!("create process dir: {e}")))?;
         }
         let root = self.rootfs_dir.to_string_lossy().into_owned();
-        let global_memory = self.root.join("global/memory");
-        let global_skills = self.root.join("global/skills");
-        let global_shared = self.root.join("global/shared");
-        for dir in [&global_memory, &global_skills, &global_shared] {
+        let persistent_memory = self.persistent_dir("memory");
+        let persistent_skills = self.persistent_dir("skills");
+        let persistent_shared = self.persistent_dir("shared");
+        for dir in [&persistent_memory, &persistent_skills, &persistent_shared] {
             fs::create_dir_all(dir).map_err(|e| {
                 HamburError::Internal(format!("create chroot host dir {}: {e}", dir.display()))
             })?;
@@ -1471,9 +1585,9 @@ impl SandboxService {
              exit $?",
             shell_quote(&root),
             shell_quote(&pid_file.to_string_lossy()),
-            shell_quote(&global_memory.to_string_lossy()),
-            shell_quote(&global_skills.to_string_lossy()),
-            shell_quote(&global_shared.to_string_lossy()),
+            shell_quote(&persistent_memory.to_string_lossy()),
+            shell_quote(&persistent_skills.to_string_lossy()),
+            shell_quote(&persistent_shared.to_string_lossy()),
             shell_quote(&session_paths.attachments.to_string_lossy()),
             shell_quote(&session_paths.browser.to_string_lossy()),
             shell_quote(&session_paths.mounts.to_string_lossy()),
@@ -1579,7 +1693,9 @@ impl SandboxService {
                         }
                         let _ = std::process::Command::new("su")
                             .arg("-c")
-                            .arg(format!("kill -KILL -{pid} 2>/dev/null; pkill -KILL -s {pid} 2>/dev/null"))
+                            .arg(format!(
+                                "kill -KILL -{pid} 2>/dev/null; pkill -KILL -s {pid} 2>/dev/null"
+                            ))
                             .output();
                     }
                     let _ = child.kill();
@@ -1652,10 +1768,10 @@ impl SandboxService {
             return Ok(());
         }
         self.ensure_rootfs_skeleton()?;
-        let global_memory = self.root.join("global/memory");
-        let global_skills = self.root.join("global/skills");
-        let global_shared = self.root.join("global/shared");
-        for dir in [&global_memory, &global_skills, &global_shared] {
+        let persistent_memory = self.persistent_dir("memory");
+        let persistent_skills = self.persistent_dir("skills");
+        let persistent_shared = self.persistent_dir("shared");
+        for dir in [&persistent_memory, &persistent_skills, &persistent_shared] {
             fs::create_dir_all(dir).map_err(|e| {
                 HamburError::Internal(format!("create chroot host dir {}: {e}", dir.display()))
             })?;
@@ -1683,9 +1799,9 @@ impl SandboxService {
              fi\n\
              chroot \"$ROOT\" /bin/busybox --install -s /bin >/dev/null 2>&1 || true",
             shell_quote(&root),
-            shell_quote(&global_memory.to_string_lossy()),
-            shell_quote(&global_skills.to_string_lossy()),
-            shell_quote(&global_shared.to_string_lossy())
+            shell_quote(&persistent_memory.to_string_lossy()),
+            shell_quote(&persistent_skills.to_string_lossy()),
+            shell_quote(&persistent_shared.to_string_lossy())
         );
         let out = std::process::Command::new("su")
             .arg("-c")

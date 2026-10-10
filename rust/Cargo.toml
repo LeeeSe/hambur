@@ -48,6 +48,9 @@ tar = "0.4.43"
 flate2 = "1.0.35"
 sha2 = "0.10.8"
 regex = "1.11.1"
+# 结构化日志。刻意不开默认 features：默认会拉 tracing-attributes（本机离线缓存里没有），
+# 只保留 std，够用且不改变现有依赖解析。
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 
 [profile.release]
 opt-level = "z"       # Optimize for size

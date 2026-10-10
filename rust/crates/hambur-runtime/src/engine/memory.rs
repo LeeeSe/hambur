@@ -25,10 +25,7 @@ impl RuntimeEngine {
             if engine.shutdown.load(Ordering::SeqCst) {
                 return;
             }
-            let sessions = engine
-                .database
-                .unreviewed_sessions(50)
-                .unwrap_or_default();
+            let sessions = engine.database.unreviewed_sessions(50).unwrap_or_default();
             for session in sessions {
                 engine
                     .clone()
@@ -109,7 +106,7 @@ impl RuntimeEngine {
             let _ = self
                 .database
                 .mark_session_memory_reviewed(&session_id, true);
-                        let _ = self.emit_plain(
+            let _ = self.emit_plain(
                 RuntimeEventKind::SettingsChanged,
                 session_id,
                 String::new(),
@@ -165,10 +162,8 @@ impl RuntimeEngine {
         mut messages: Vec<ModelMessage>,
     ) -> HamburResult<bool> {
         let mut executed_memory_tool = false;
-        let tools_json = compile_named_tools_json(
-            &self.compile_enabled_main_tools_json(),
-            &["memory"],
-        )?;
+        let tools_json =
+            compile_named_tools_json(&self.compile_enabled_main_tools_json(), &["memory"])?;
         for _ in 0..MAX_MEMORY_REVIEW_TOOL_ITERATIONS {
             let request = ModelRequest {
                 request_id: new_id("llm_req"),
@@ -231,14 +226,28 @@ impl RuntimeEngine {
         let target = provider_target_from_route(route.clone());
         let spec = openai_non_stream_request(request, &target, &api_key)?;
         let body = reqwest_json(spec).await?;
-        parse_openai_non_stream_message(&body)
+        let assistant = parse_openai_non_stream_message(&body)?;
+        if let Some(usage) = &assistant.usage
+            && let Err(error) = self.database.insert_token_usage(NewTokenUsage {
+                session_id: request.session_id.clone(),
+                turn_id: request.turn_id.clone(),
+                provider_id: route.provider_id.clone(),
+                model_id: route.model_id.clone(),
+                prompt_tokens: usage.prompt_tokens,
+                completion_tokens: usage.completion_tokens,
+                total_tokens: usage.total_tokens,
+                cached_tokens: usage.cached_tokens,
+                reasoning_tokens: usage.reasoning_tokens,
+            })
+        {
+            tracing::warn!("record memory review token usage failed: {error}");
+        }
+        Ok(assistant)
     }
 
     pub(crate) fn memory_root(&self) -> PathBuf {
-        PathBuf::from(&self.bootstrap.app_files_dir)
-            .join("sandbox")
-            .join("global")
-            .join("memory")
+        // 持久目录在 sandbox 之外，RootFS 重置不会清掉记忆（见 hambur-sandbox 的 PERSISTENT_DIR）。
+        self.sandbox.persistent_dir("memory")
     }
 
     pub(crate) fn build_memory_system_prompt(&self) -> String {

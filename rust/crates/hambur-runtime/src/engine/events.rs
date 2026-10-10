@@ -16,6 +16,8 @@ impl RuntimeEngine {
         }
 
         let sequence = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
+        // 诊断日志与事件共享序号：记录这条事件之后写入的日志都能对上是哪个事件之后的。
+        self.diagnostics.set_backend_sequence(sequence);
         let (error_code, message) = match error {
             Some(error) => (error.code().as_str().to_string(), error.to_string()),
             None => (String::new(), message),

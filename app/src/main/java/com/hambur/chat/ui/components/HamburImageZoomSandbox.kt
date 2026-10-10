@@ -56,6 +56,7 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -67,6 +68,7 @@ import com.composables.icons.lucide.FileText
 import com.composables.icons.lucide.Lucide
 import com.composables.icons.lucide.RefreshCw
 import com.composables.icons.lucide.X
+import com.hambur.chat.R
 import java.io.File
 import kotlin.math.roundToInt
 import kotlinx.coroutines.launch
@@ -110,12 +112,14 @@ fun HamburImageZoomSandbox(
     var isDismissing by remember { mutableStateOf(false) }
     var showChrome by remember { mutableStateOf(true) }
 
-    val displayTitle = remember(state.title, state.model) {
+    // 标题兜底文案在 @Composable 作用域先读出来，remember 的 lambda 里不能再调 stringResource。
+    val imagePreviewLabel = stringResource(R.string.common_image_preview)
+    val displayTitle = remember(state.title, state.model, imagePreviewLabel) {
         if (state.title.isNotBlank()) state.title
         else when (val m = state.model) {
-            is String -> m.substringBefore('?').substringAfterLast('/').ifBlank { "图片预览" }
+            is String -> m.substringBefore('?').substringAfterLast('/').ifBlank { imagePreviewLabel }
             is File -> m.name
-            else -> "图片预览"
+            else -> imagePreviewLabel
         }
     }
 
@@ -282,7 +286,7 @@ fun HamburImageZoomSandbox(
                             modifier = Modifier.size(36.dp),
                         )
                         Text(
-                            text = "图片加载失败",
+                            text = stringResource(R.string.components_image_load_failed),
                             style = MaterialTheme.typography.bodyMedium,
                             fontWeight = FontWeight.Medium,
                             color = Color.White.copy(alpha = 0.9f),
@@ -330,7 +334,7 @@ fun HamburImageZoomSandbox(
                 ) {
                     Icon(
                         imageVector = Lucide.X,
-                        contentDescription = "Close",
+                        contentDescription = stringResource(R.string.common_close),
                         tint = Color.White,
                         modifier = Modifier.size(20.dp),
                     )
@@ -375,7 +379,7 @@ fun HamburImageZoomSandbox(
                     ) {
                         Icon(
                             imageVector = Lucide.RefreshCw,
-                            contentDescription = "Reset Zoom",
+                            contentDescription = stringResource(R.string.components_reset_zoom),
                             tint = Color.White.copy(alpha = 0.85f),
                             modifier = Modifier.size(13.dp),
                         )
@@ -411,7 +415,7 @@ fun HamburImageZoomSandbox(
                     border = androidx.compose.foundation.BorderStroke(0.5.dp, Color.White.copy(alpha = 0.15f)),
                 ) {
                     Text(
-                        text = "双指缩放 · 双击放大 · 下拉退出",
+                        text = stringResource(R.string.components_zoom_hint),
                         color = Color.White.copy(alpha = 0.65f),
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Normal,

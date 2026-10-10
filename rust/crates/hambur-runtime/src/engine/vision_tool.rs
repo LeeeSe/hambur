@@ -162,7 +162,7 @@ impl RuntimeEngine {
         let (width, height) = match std::fs::read(&host_path) {
             Ok(bytes) => parse_image_dimensions(&bytes),
             Err(error) => {
-                eprintln!("failed to read host image file {}: {error}", host_path.display());
+                tracing::warn!("failed to read host image file {}: {error}", host_path.display());
                 (0, 0)
             }
         };

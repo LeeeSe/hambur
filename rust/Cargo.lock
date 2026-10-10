@@ -551,6 +551,7 @@ dependencies = [
  "hambur-core",
  "serde",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -588,6 +589,7 @@ dependencies = [
  "reqwest",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -602,6 +604,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tar",
+ "tracing",
 ]
 
 [[package]]

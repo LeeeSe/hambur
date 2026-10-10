@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  对话页（HamburChatScreen）。
+  中文见 values-zh-rCN/strings_chat.xml，两份的键必须一一对应。
+  工具标题的后端前缀（"Search web: " 等）是协议的一部分，不翻译，只把命中的那段换成这里的资源。
+-->
+<resources>
+    <!-- 顶部栏与抽屉 -->
+    <string name="chat_conversations">Conversations</string>
+    <string name="chat_new_chat">New chat</string>
+    <string name="chat_settings_description">Settings</string>
+    <!-- 账号占位：真实账号信息应由数据层提供，这里只做外提，两种语言保持同值。 -->
+    <string name="chat_account_id">153******85</string>
+    <string name="chat_search_hint">Search chats...</string>
+
+    <!-- 抽屉会话分组 -->
+    <string name="chat_drawer_today">Today</string>
+    <string name="chat_drawer_week">Previous 7 days</string>
+    <string name="chat_drawer_month">Previous 30 days</string>
+    <string name="chat_drawer_earlier">Earlier</string>
+
+    <!-- 会话长按菜单 -->
+    <string name="chat_pin">Pin</string>
+    <string name="chat_unpin">Unpin</string>
+
+    <!-- 空状态与提示 -->
+    <string name="chat_empty_state_title">I\'m Hambur. What can I help you with?</string>
+    <string name="chat_already_in_new_chat">Already in a new chat</string>
+    <string name="chat_send_failed">Send failed. Check the model\'s capabilities.</string>
+    <string name="chat_backend_gap_message">The old UI had this action, but the new backend does not expose a command or persisted field for it yet.</string>
+    <string name="chat_dialog_ok">OK</string>
+
+    <!-- 消息操作 -->
+    <string name="chat_loading_message">Loading message...</string>
+    <string name="chat_select_text">Select text</string>
+    <string name="chat_select_all">Select all</string>
+    <string name="chat_copy_all">Copy all</string>
+    <string name="chat_regenerate">Regenerate</string>
+    <string name="chat_reply_failed">Reply failed</string>
+    <string name="chat_retry">Retry</string>
+    <string name="chat_copied">Copied</string>
+    <string name="chat_copied_to_clipboard">Copied to clipboard</string>
+
+    <!-- 输入区 -->
+    <string name="chat_editing_message">Editing message</string>
+    <string name="chat_input_placeholder">Send a message or hold to talk</string>
+    <string name="chat_thinking_toggle">Think</string>
+    <string name="chat_attachments">Attachments</string>
+    <string name="chat_stop">Stop</string>
+    <string name="chat_send">Send</string>
+
+    <!-- 思考块 -->
+    <string name="chat_thinking_in_progress">Thinking...</string>
+    <string name="chat_thought">Thought</string>
+    <string name="chat_thought_for_seconds">Thought for %1$d seconds</string>
+    <string name="chat_tool_running">(Running...)</string>
+    <string name="chat_tool_failed">(Failed)</string>
+    <string name="chat_expand_details">Expand details</string>
+    <string name="chat_collapse_details">Collapse details</string>
+
+    <!-- 附件面板与结果提示 -->
+    <string name="chat_attachment_camera">Camera</string>
+    <string name="chat_attachment_gallery">Gallery</string>
+    <string name="chat_attachment_file">File</string>
+    <string name="chat_remove_attachment">Remove</string>
+    <string name="chat_attachment_size_bytes">%1$s bytes</string>
+    <string name="chat_attachment_size_kb">%1$s KB</string>
+    <string name="chat_attachment_size_mb">%1$s MB</string>
+    <string name="chat_camera_permission_granted">Camera permission granted</string>
+    <string name="chat_camera_permission_denied">Camera permission denied</string>
+    <string name="chat_gallery_permission_granted">Gallery permission granted</string>
+    <string name="chat_gallery_permission_denied">Gallery permission denied</string>
+    <string name="chat_photo_taken">Photo taken</string>
+    <string name="chat_photo_save_failed">Failed to save photo</string>
+
+    <!-- 工具步骤标题：无参数的工具名兜底 -->
+    <string name="chat_tool_search_web">Search web</string>
+    <string name="chat_tool_fetch_web_page">Fetch web page</string>
+    <string name="chat_tool_search_files">Search files</string>
+    <string name="chat_tool_browse">Use browser</string>
+    <string name="chat_tool_terminal">Run terminal command</string>
+    <string name="chat_tool_read_file">Read file</string>
+    <string name="chat_tool_write_file">Write file</string>
+    <string name="chat_tool_patch_file">Patch file</string>
+    <string name="chat_tool_search_sessions">Search sessions</string>
+    <string name="chat_tool_view_image">View image</string>
+    <string name="chat_tool_delegate">Delegate session</string>
+    <string name="chat_tool_process">Control process</string>
+    <string name="chat_tool_load_skill">Load skill</string>
+
+    <!-- 工具步骤标题：后端标题命中前缀后带参数 -->
+    <string name="chat_tool_search_web_arg">Search web: %1$s</string>
+    <string name="chat_tool_fetch_web_page_arg">Fetch web page: %1$s</string>
+    <string name="chat_tool_search_files_arg">Search files: %1$s</string>
+    <string name="chat_tool_browse_arg">Browser: %1$s</string>
+    <string name="chat_tool_terminal_arg">Run terminal command: %1$s</string>
+    <string name="chat_tool_read_file_arg">Read file: %1$s</string>
+    <string name="chat_tool_write_file_arg">Write file: %1$s</string>
+    <string name="chat_tool_patch_file_arg">Patch file: %1$s</string>
+    <string name="chat_tool_search_sessions_arg">Search sessions: %1$s</string>
+    <string name="chat_tool_view_image_arg">View image: %1$s</string>
+
+    <!-- 工具步骤标题：工具名兜底 -->
+    <string name="chat_tool_named">Tool: %1$s</string>
+    <string name="chat_tool_unknown">Tool call</string>
+</resources>

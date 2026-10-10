@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 对话页（HamburChatScreen），见 values/strings_chat.xml。 -->
+<resources>
+    <!-- 顶部栏与抽屉 -->
+    <string name="chat_conversations">会话列表</string>
+    <string name="chat_new_chat">新对话</string>
+    <string name="chat_settings_description">设置</string>
+    <string name="chat_account_id">153******85</string>
+    <string name="chat_search_hint">搜索对话内容...</string>
+
+    <!-- 抽屉会话分组 -->
+    <string name="chat_drawer_today">今天</string>
+    <string name="chat_drawer_week">7 天内</string>
+    <string name="chat_drawer_month">30 天内</string>
+    <string name="chat_drawer_earlier">更早</string>
+
+    <!-- 会话长按菜单 -->
+    <string name="chat_pin">置顶</string>
+    <string name="chat_unpin">取消置顶</string>
+
+    <!-- 空状态与提示 -->
+    <string name="chat_empty_state_title">我是 Hambur，有什么我可以帮您的？</string>
+    <string name="chat_already_in_new_chat">已经在新聊天</string>
+    <string name="chat_send_failed">发送失败，请检查模型能力</string>
+    <string name="chat_backend_gap_message">旧版界面有该操作，但新后端尚未提供对应的命令或持久化字段。</string>
+    <string name="chat_dialog_ok">确定</string>
+
+    <!-- 消息操作 -->
+    <string name="chat_loading_message">正在加载消息...</string>
+    <string name="chat_select_text">选择文本</string>
+    <string name="chat_select_all">全选</string>
+    <string name="chat_copy_all">复制全文</string>
+    <string name="chat_regenerate">重新生成</string>
+    <string name="chat_reply_failed">回复失败</string>
+    <string name="chat_retry">重试</string>
+    <string name="chat_copied">已复制</string>
+    <string name="chat_copied_to_clipboard">已复制到剪贴板</string>
+
+    <!-- 输入区 -->
+    <string name="chat_editing_message">正在编辑消息</string>
+    <string name="chat_input_placeholder">发消息或按住说话</string>
+    <string name="chat_thinking_toggle">思考</string>
+    <string name="chat_attachments">附件</string>
+    <string name="chat_stop">停止</string>
+    <string name="chat_send">发送</string>
+
+    <!-- 思考块 -->
+    <string name="chat_thinking_in_progress">正在思考...</string>
+    <string name="chat_thought">已思考</string>
+    <string name="chat_thought_for_seconds">已思考（用时 %1$d 秒）</string>
+    <string name="chat_tool_running">(执行中...)</string>
+    <string name="chat_tool_failed">(失败)</string>
+    <string name="chat_expand_details">展开详情</string>
+    <string name="chat_collapse_details">收起详情</string>
+
+    <!-- 附件面板与结果提示 -->
+    <string name="chat_attachment_camera">拍照</string>
+    <string name="chat_attachment_gallery">相册</string>
+    <string name="chat_attachment_file">文件</string>
+    <string name="chat_remove_attachment">移除</string>
+    <string name="chat_attachment_size_bytes">%1$s 字节</string>
+    <string name="chat_attachment_size_kb">%1$s KB</string>
+    <string name="chat_attachment_size_mb">%1$s MB</string>
+    <string name="chat_camera_permission_granted">相机权限已获取</string>
+    <string name="chat_camera_permission_denied">相机权限已被拒绝</string>
+    <string name="chat_gallery_permission_granted">相册权限已获取</string>
+    <string name="chat_gallery_permission_denied">相册权限已被拒绝</string>
+    <string name="chat_photo_taken">已拍摄照片</string>
+    <string name="chat_photo_save_failed">照片保存失败</string>
+
+    <!-- 工具步骤标题：无参数的工具名兜底 -->
+    <string name="chat_tool_search_web">搜索网页</string>
+    <string name="chat_tool_fetch_web_page">抓取网页</string>
+    <string name="chat_tool_search_files">搜索文件</string>
+    <string name="chat_tool_browse">浏览网页</string>
+    <string name="chat_tool_terminal">执行终端命令</string>
+    <string name="chat_tool_read_file">读取文件</string>
+    <string name="chat_tool_write_file">写入文件</string>
+    <string name="chat_tool_patch_file">编辑文件</string>
+    <string name="chat_tool_search_sessions">搜索历史对话</string>
+    <string name="chat_tool_view_image">查看图片</string>
+    <string name="chat_tool_delegate">委派子任务</string>
+    <string name="chat_tool_process">控制进程</string>
+    <string name="chat_tool_load_skill">加载技能</string>
+
+    <!-- 工具步骤标题：后端标题命中前缀后带参数 -->
+    <string name="chat_tool_search_web_arg">搜索网页: %1$s</string>
+    <string name="chat_tool_fetch_web_page_arg">抓取网页: %1$s</string>
+    <string name="chat_tool_search_files_arg">搜索文件: %1$s</string>
+    <string name="chat_tool_browse_arg">浏览网页: %1$s</string>
+    <string name="chat_tool_terminal_arg">执行终端命令: %1$s</string>
+    <string name="chat_tool_read_file_arg">读取文件: %1$s</string>
+    <string name="chat_tool_write_file_arg">写入文件: %1$s</string>
+    <string name="chat_tool_patch_file_arg">编辑文件: %1$s</string>
+    <string name="chat_tool_search_sessions_arg">搜索历史对话: %1$s</string>
+    <string name="chat_tool_view_image_arg">查看图片: %1$s</string>
+
+    <!-- 工具步骤标题：工具名兜底 -->
+    <string name="chat_tool_named">调用工具: %1$s</string>
+    <string name="chat_tool_unknown">调用工具</string>
+</resources>

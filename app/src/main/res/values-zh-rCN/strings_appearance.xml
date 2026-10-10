@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Appearance（外观）设置页，见 values/strings_appearance.xml。 -->
+<resources>
+    <string name="appearance_title">外观</string>
+
+    <!-- 显示语言 -->
+    <string name="appearance_language_section">语言</string>
+    <string name="appearance_language_title">显示语言</string>
+    <string name="appearance_language_summary">对整个应用生效。「跟随系统」使用设备语言。</string>
+    <string name="appearance_language_system">跟随系统</string>
+    <string name="appearance_language_english">English</string>
+    <string name="appearance_language_chinese">简体中文</string>
+
+    <!-- 主题 -->
+    <string name="appearance_section_theme">主题</string>
+    <string name="appearance_theme_title">配色主题</string>
+    <string name="appearance_theme_system">跟随系统</string>
+    <string name="appearance_theme_light">浅色</string>
+    <string name="appearance_theme_dark">深色</string>
+
+    <!-- 文字 -->
+    <string name="appearance_section_text">文字</string>
+    <string name="appearance_font_scale_title">字体大小</string>
+    <string name="appearance_font_scale_small">小</string>
+    <string name="appearance_font_scale_default">默认</string>
+    <string name="appearance_font_scale_large">大</string>
+    <string name="appearance_font_scale_extra_large">特大</string>
+
+    <!-- 启动 -->
+    <string name="appearance_section_startup">启动</string>
+    <string name="appearance_startup_title">启动时打开</string>
+    <string name="appearance_startup_last_chat">上次的对话</string>
+    <string name="appearance_startup_new_chat">新对话</string>
+
+    <!-- 思考 -->
+    <string name="appearance_section_thinking">思考</string>
+    <string name="appearance_thinking_title">思考块展示方式</string>
+    <string name="appearance_thinking_auto_expand">自动展开</string>
+    <string name="appearance_thinking_collapsed">保持折叠</string>
+    <string name="appearance_thinking_auto_collapse">思考时展开，结束后折叠</string>
+
+    <!-- 输入 -->
+    <string name="appearance_section_input">输入</string>
+    <string name="appearance_focus_after_reply_title">回复后自动聚焦输入框</string>
+    <string name="appearance_focus_after_reply_summary">当前对话的回复结束后，自动聚焦输入框并弹出键盘。</string>
+
+    <!-- 当前设置（调试用的键值一览） -->
+    <string name="appearance_section_current">当前设置</string>
+</resources>

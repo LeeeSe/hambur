@@ -166,6 +166,51 @@ pub struct RuntimeSettingsSnapshot {
     pub settings: SettingsSnapshot,
 }
 
+/// 一条 Rust 结构化诊断日志，映射自 [`crate::DiagnosticRecord`]。
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeDiagnosticEntry {
+    pub ordinal: u64,
+    pub backend_sequence: u64,
+    pub created_at_ms: u64,
+    pub level: String,
+    pub target: String,
+    pub message: String,
+}
+
+/// Settings → 日志 拉取 Rust 侧增量用的只读快照。
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeDiagnosticsSnapshot {
+    pub snapshot_sequence: u64,
+    pub created_at_ms: u64,
+    pub entries: Vec<RuntimeDiagnosticEntry>,
+}
+
+/// 按 provider（`model_id` 为空）或 provider+model 聚合的一行 token 用量。
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeTokenUsageGroup {
+    pub provider_id: String,
+    pub model_id: String,
+    pub request_count: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+}
+
+/// Settings → Token 用量 的只读汇总。
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeTokenUsageSnapshot {
+    pub snapshot_sequence: u64,
+    pub created_at_ms: u64,
+    pub request_count: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub cached_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub by_provider: Vec<RuntimeTokenUsageGroup>,
+    pub by_model: Vec<RuntimeTokenUsageGroup>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RuntimeEventKind {
     RuntimeReady,

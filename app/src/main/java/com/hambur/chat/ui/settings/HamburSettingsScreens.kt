@@ -1,8 +1,12 @@
 package com.hambur.chat.ui.settings
 
+import androidx.annotation.StringRes
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -22,6 +26,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.OutlinedTextField
@@ -32,6 +37,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import android.widget.Toast
 import com.composables.icons.lucide.Trash2
 import com.composables.icons.lucide.Cloud
@@ -46,11 +52,13 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.composables.icons.lucide.Brain
+import com.composables.icons.lucide.ChevronRight
 import com.composables.icons.lucide.Database
 import com.composables.icons.lucide.Globe
 import com.composables.icons.lucide.HardDrive
@@ -60,7 +68,13 @@ import com.composables.icons.lucide.ListTodo
 import com.composables.icons.lucide.Lucide
 import com.composables.icons.lucide.Terminal
 import com.composables.icons.lucide.Wrench
+import com.hambur.chat.R
+import com.hambur.chat.diagnostics.DiagLevel
+import com.hambur.chat.diagnostics.DiagLogEntry
+import com.hambur.chat.diagnostics.DiagSource
 import com.hambur.chat.uniffi.BackendEventKind
+import com.hambur.chat.platform.HamburAppLocale
+import com.hambur.chat.reducer.AUTO_FOCUS_INPUT_AFTER_REPLY_KEY
 import com.hambur.chat.reducer.HamburUiState
 import com.hambur.chat.reducer.HamburUiStore
 import com.hambur.chat.reducer.PERSONA_BYTE_LIMIT
@@ -74,6 +88,8 @@ import com.hambur.chat.reducer.UiModelGroupSettings
 import com.hambur.chat.reducer.UiProviderModelSettings
 import com.hambur.chat.reducer.UiProviderSettings
 import com.hambur.chat.reducer.UiSkillSummary
+import com.hambur.chat.reducer.UiTokenUsageGroup
+import com.hambur.chat.reducer.UiTokenUsageSnapshot
 import com.hambur.chat.ui.components.ConfirmDangerDialog
 import com.hambur.chat.ui.components.HamburSection
 import com.hambur.chat.ui.components.HamburTopBar
@@ -84,8 +100,16 @@ import com.hambur.chat.ui.components.SummaryLine
 import com.hambur.chat.ui.theme.HamburThemeDefaults
 import com.hambur.chat.ui.theme.HamburThemeSettingKeys
 import java.text.DateFormat
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.Date
+import java.util.Locale
+import kotlinx.coroutines.delay
 import org.json.JSONObject
+
+/** 日志时间戳只用时分秒毫秒，避免每条都建 SimpleDateFormat。 */
+private val LogTimeFormatter: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm:ss.SSS")
 
 @Composable
 fun HamburSettingsHomeScreen(
@@ -110,8 +134,12 @@ fun HamburSettingsHomeScreen(
             .statusBarsPadding(),
     ) {
         HamburTopBar(
-            title = "Settings",
-            subtitle = "${state.providers.size} providers / ${state.modelGroups.size} model groups",
+            title = stringResource(R.string.settings_title),
+            subtitle = stringResource(
+                R.string.settings_subtitle_providers_groups,
+                state.providers.size,
+                state.modelGroups.size,
+            ),
             onBack = onBack,
         )
         LazyColumn(
@@ -120,98 +148,88 @@ fun HamburSettingsHomeScreen(
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
             item {
-                HamburSection(title = "Models") {
+                HamburSection(title = stringResource(R.string.settings_section_models)) {
                     SettingsNavigationRow(
                         icon = Lucide.KeyRound,
-                        title = "Providers",
-                        summary = "API compatible providers, API keys, model refresh",
+                        title = stringResource(R.string.settings_providers_title),
+                        summary = stringResource(R.string.settings_providers_summary),
                         onClick = onOpenProviders,
                     )
                     SettingsNavigationRow(
                         icon = Lucide.Layers,
-                        title = "Model groups",
-                        summary = "Routing strategy, fallback policy, default groups",
+                        title = stringResource(R.string.settings_model_groups_title),
+                        summary = stringResource(R.string.settings_model_groups_summary),
                         onClick = onOpenModelGroups,
                     )
                 }
             }
             item {
-                HamburSection(title = "Agent Runtime") {
+                HamburSection(title = stringResource(R.string.settings_section_agent_runtime)) {
                     SettingsNavigationRow(
                         icon = Lucide.ListTodo,
-                        title = "Skills",
-                        summary = "Skill enablement and skill JSON payloads",
+                        title = stringResource(R.string.settings_skills_title),
+                        summary = stringResource(R.string.settings_skills_summary),
                         onClick = onOpenSkills,
                     )
                     SettingsNavigationRow(
                         icon = Lucide.Database,
-                        title = "Memory",
-                        summary = "Persistent memory projection settings",
+                        title = stringResource(R.string.settings_memory_title),
+                        summary = stringResource(R.string.settings_memory_summary),
                         onClick = onOpenMemory,
                     )
                     SettingsNavigationRow(
                         icon = Lucide.Wrench,
-                        title = "Tools",
-                        summary = "Tool settings and browser tool settings",
+                        title = stringResource(R.string.settings_tools_title),
+                        summary = stringResource(R.string.settings_tools_summary),
                         onClick = onOpenTools,
                     )
                     SettingsNavigationRow(
                         icon = Lucide.Terminal,
-                        title = "Startup tasks",
-                        summary = "Tasks that require explicit approval",
+                        title = stringResource(R.string.settings_startup_tasks_title),
+                        summary = stringResource(R.string.settings_startup_tasks_summary),
                         onClick = onOpenStartupTasks,
                     )
                     SettingsNavigationRow(
                         icon = Lucide.HardDrive,
-                        title = "Rootfs",
-                        summary = "Rootfs settings, warmup, reset",
+                        title = stringResource(R.string.settings_rootfs_title),
+                        summary = stringResource(R.string.settings_rootfs_summary),
                         onClick = onOpenRootfs,
                     )
                     SettingsNavigationRow(
                         icon = Lucide.Wrench,
-                        title = "Environment variables",
-                        summary = "Inject variables into sandbox sessions",
+                        title = stringResource(R.string.settings_env_vars_title),
+                        summary = stringResource(R.string.settings_env_vars_summary),
                         onClick = onOpenEnvironmentVariables,
                     )
                     SettingsNavigationRow(
                         icon = Lucide.Brain,
-                        title = "Persona",
-                        summary = "SOUL.md text injected into the system prompt of every chat turn",
+                        title = stringResource(R.string.settings_persona_title),
+                        summary = stringResource(R.string.settings_persona_summary),
                         onClick = onOpenPersona,
                     )
                 }
             }
             item {
-                HamburSection(title = "App") {
+                HamburSection(title = stringResource(R.string.settings_section_app)) {
                     SettingsNavigationRow(
                         icon = Lucide.Settings,
-                        title = "Appearance",
-                        summary = "Theme, font scale, and startup chat behavior",
+                        title = stringResource(R.string.appearance_title),
+                        summary = stringResource(R.string.settings_appearance_summary),
                         onClick = onOpenAppearance,
                     )
-                }
-            }
-            item {
-                HamburSection(
-                    title = "Waiting for backend",
-                    subtitle = "Kept visible so old UI feature coverage is explicit",
-                ) {
                     SettingsNavigationRow(
                         icon = Lucide.Terminal,
-                        title = "Logs",
-                        summary = "In-app log capture and log viewer are not exposed by the new backend yet",
+                        title = stringResource(R.string.settings_logs_title),
+                        summary = stringResource(R.string.settings_logs_summary),
                         onClick = onOpenLogs,
                     )
                     SettingsNavigationRow(
                         icon = Lucide.Database,
-                        title = "Token usage",
-                        summary = "Usage accounting and provider billing summaries are not exposed yet",
+                        title = stringResource(R.string.settings_token_usage_title),
+                        summary = stringResource(R.string.settings_token_usage_summary),
                         onClick = onOpenTokenUsage,
                     )
                 }
-            }
-            item {
-                ConfigAuditPreview(configAudits = state.configAudits)
             }
         }
     }
@@ -226,21 +244,24 @@ fun ProvidersListScreen(
     onOpenProvider: (String) -> Unit,
 ) {
     SettingsPage(
-        title = "Providers",
-        subtitle = "OpenAI-compatible provider list",
+        title = stringResource(R.string.settings_providers_title),
+        subtitle = stringResource(R.string.settings_providers_subtitle),
         onBack = onBack,
     ) {
         item {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(onClick = onNewProvider) {
-                    Text("New provider")
+                    Text(stringResource(R.string.settings_provider_new))
                 }
             }
         }
         item {
-            HamburSection(title = "OpenAI Compatible") {
+            HamburSection(title = stringResource(R.string.settings_providers_section_openai)) {
                 if (state.providers.isEmpty()) {
-                    Text("No providers configured", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(
+                        stringResource(R.string.settings_providers_empty),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 } else {
                     state.providers.forEach { provider ->
                         ProviderListRow(
@@ -262,7 +283,7 @@ fun ProviderNewScreen(
     onBack: () -> Unit,
 ) {
     ProviderEditorScreen(
-        title = "New Provider",
+        title = stringResource(R.string.settings_provider_new_title),
         state = state,
         store = store,
         providerId = "",
@@ -282,9 +303,9 @@ fun ProviderDetailScreen(
     var pendingDelete by rememberSaveable { mutableStateOf(false) }
     if (pendingDelete) {
         ConfirmDangerDialog(
-            title = "Delete provider",
-            text = "This deletes the provider configuration after explicit approval.",
-            confirmText = "Delete",
+            title = stringResource(R.string.settings_provider_delete_title),
+            text = stringResource(R.string.settings_provider_delete_message),
+            confirmText = stringResource(R.string.common_delete),
             onConfirm = {
                 store.deleteProvider(providerId, true)
                 pendingDelete = false
@@ -295,17 +316,23 @@ fun ProviderDetailScreen(
     }
 
     ProviderEditorScreen(
-        title = provider?.name ?: "Provider Detail",
+        title = provider?.name ?: stringResource(R.string.settings_provider_detail_title),
         state = state,
         store = store,
         providerId = providerId,
         onBack = onBack,
         extraContent = {
             item {
-                HamburSection(title = "Models", subtitle = "Tap a model for detail") {
+                HamburSection(
+                    title = stringResource(R.string.settings_section_models),
+                    subtitle = stringResource(R.string.settings_provider_models_subtitle),
+                ) {
                     val models = state.providerModels.filter { it.providerId == providerId }
                     if (models.isEmpty()) {
-                        Text("No models synced", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(
+                            stringResource(R.string.settings_provider_models_empty),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
                     } else {
                         models.forEach { model ->
                             ModelListRow(
@@ -317,9 +344,12 @@ fun ProviderDetailScreen(
                 }
             }
             item {
-                HamburSection(title = "Danger zone") {
+                HamburSection(title = stringResource(R.string.settings_danger_zone)) {
                     TextButton(onClick = { pendingDelete = true }) {
-                        Text("Delete provider", color = MaterialTheme.colorScheme.error)
+                        Text(
+                            stringResource(R.string.settings_provider_delete_title),
+                            color = MaterialTheme.colorScheme.error,
+                        )
                     }
                 }
             }
@@ -349,60 +379,71 @@ fun ModelDetailScreen(
 
     SettingsPage(title = displayName.ifBlank { modelId }, subtitle = provider?.name ?: providerId, onBack = onBack) {
         item {
-            HamburSection(title = "模型") {
-                SummaryLine(label = "模型 ID", value = modelId)
-                SummaryLine(label = "提供商", value = provider?.name ?: providerId)
-                SummaryLine(label = "同步时间", value = model?.syncedAtMs?.toDateTimeText().orEmpty().ifBlank { "暂无" })
+            HamburSection(title = stringResource(R.string.settings_model_section)) {
+                SummaryLine(label = stringResource(R.string.settings_model_id), value = modelId)
+                SummaryLine(label = stringResource(R.string.settings_model_provider), value = provider?.name ?: providerId)
+                SummaryLine(
+                    label = stringResource(R.string.settings_model_synced_at),
+                    value = model?.syncedAtMs?.toDateTimeText().orEmpty()
+                        .ifBlank { stringResource(R.string.common_not_available) },
+                )
                 OutlinedTextField(
                     value = displayName,
                     onValueChange = { displayName = it },
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = true,
-                    label = { Text("显示名称") },
+                    label = { Text(stringResource(R.string.settings_model_display_name)) },
                 )
             }
         }
         item {
-            HamburSection(title = "基本信息") {
-                SummaryLine(label = "模型家族", value = metadata.family.ifBlank { "暂无" })
-                SummaryLine(label = "知识截止", value = metadata.knowledgeCutoff.ifBlank { "暂无" })
-                SummaryLine(label = "发布时间", value = metadata.releaseDate.ifBlank { "暂无" })
-                SummaryLine(label = "最近更新", value = metadata.lastUpdated.ifBlank { "暂无" })
-                SummaryLine(label = "状态", value = metadata.status.ifBlank { "暂无" })
+            HamburSection(title = stringResource(R.string.settings_model_basic_info)) {
+                SummaryLine(label = stringResource(R.string.settings_model_family), value = metadata.family.ifBlank { stringResource(R.string.common_not_available) })
+                SummaryLine(label = stringResource(R.string.settings_model_knowledge_cutoff), value = metadata.knowledgeCutoff.ifBlank { stringResource(R.string.common_not_available) })
+                SummaryLine(label = stringResource(R.string.settings_model_release_date), value = metadata.releaseDate.ifBlank { stringResource(R.string.common_not_available) })
+                SummaryLine(label = stringResource(R.string.settings_model_last_updated), value = metadata.lastUpdated.ifBlank { stringResource(R.string.common_not_available) })
+                SummaryLine(label = stringResource(R.string.settings_model_status), value = metadata.status.ifBlank { stringResource(R.string.common_not_available) })
             }
         }
         item {
-            HamburSection(title = "模型能力") {
-                SummaryLine(label = "输入模态", value = metadata.inputModalities.joinToString(" / ").ifBlank { if (supportsImage) "text / image" else "text" })
-                SummaryLine(label = "输出模态", value = metadata.outputModalities.joinToString(" / ").ifBlank { "text" })
-                CapabilityIndicator("支持附件", metadata.supportsAttachments || supportsImage)
-                CapabilitySwitch("支持推理", supportsReasoning) { supportsReasoning = it }
-                CapabilitySwitch("支持工具调用", supportsTool) { supportsTool = it }
-                CapabilitySwitch("图片输入", supportsImage) { supportsImage = it }
-                CapabilityIndicator("结构化输出", model?.supportsStructuredOutput ?: false)
-                CapabilityIndicator("可调温度", model?.supportsTemperature ?: true)
-                CapabilityIndicator("开放权重", metadata.openWeights)
-                SummaryLine(label = "推理内容字段", value = model?.reasoningField.orEmpty().ifBlank { metadata.interleavedField.ifBlank { "暂无" } })
-                SummaryLine(label = "推理选项", value = metadata.reasoningOptions.joinToString("、").ifBlank { "暂无" })
+            HamburSection(title = stringResource(R.string.settings_model_capabilities)) {
+                SummaryLine(label = stringResource(R.string.settings_model_input_modalities), value = metadata.inputModalities.joinToString(" / ").ifBlank { if (supportsImage) "text / image" else "text" })
+                SummaryLine(label = stringResource(R.string.settings_model_output_modalities), value = metadata.outputModalities.joinToString(" / ").ifBlank { "text" })
+                CapabilityIndicator(stringResource(R.string.settings_model_supports_attachments), metadata.supportsAttachments || supportsImage)
+                CapabilitySwitch(stringResource(R.string.settings_model_supports_reasoning), supportsReasoning) { supportsReasoning = it }
+                CapabilitySwitch(stringResource(R.string.settings_model_supports_tool_call), supportsTool) { supportsTool = it }
+                CapabilitySwitch(stringResource(R.string.settings_model_image_input), supportsImage) { supportsImage = it }
+                CapabilityIndicator(stringResource(R.string.settings_model_structured_output), model?.supportsStructuredOutput ?: false)
+                CapabilityIndicator(stringResource(R.string.settings_model_temperature), model?.supportsTemperature ?: true)
+                CapabilityIndicator(stringResource(R.string.settings_model_open_weights), metadata.openWeights)
+                SummaryLine(label = stringResource(R.string.settings_model_reasoning_field), value = model?.reasoningField.orEmpty().ifBlank { metadata.interleavedField.ifBlank { stringResource(R.string.common_not_available) } })
+                SummaryLine(label = stringResource(R.string.settings_model_reasoning_options), value = metadata.reasoningOptions.joinToString("、").ifBlank { stringResource(R.string.common_not_available) })
             }
         }
         item {
-            HamburSection(title = "限制与价格") {
-                OutlinedTextField(value = contextLimit, onValueChange = { contextLimit = it.filter(Char::isDigit) }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("上下文长度") })
-                OutlinedTextField(value = outputLimit, onValueChange = { outputLimit = it.filter(Char::isDigit) }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("最大输出") })
-                SummaryLine(label = "输入价格", value = metadata.inputCostPerMillion.toCostText())
-                SummaryLine(label = "输出价格", value = metadata.outputCostPerMillion.toCostText())
-                SummaryLine(label = "缓存读取价格", value = metadata.cacheReadCostPerMillion.toCostText())
+            HamburSection(title = stringResource(R.string.settings_model_limits_pricing)) {
+                OutlinedTextField(value = contextLimit, onValueChange = { contextLimit = it.filter(Char::isDigit) }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text(stringResource(R.string.settings_model_context_limit)) })
+                OutlinedTextField(value = outputLimit, onValueChange = { outputLimit = it.filter(Char::isDigit) }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text(stringResource(R.string.settings_model_max_output)) })
+                SummaryLine(label = stringResource(R.string.settings_model_input_price), value = metadata.inputCostPerMillion.toCostText())
+                SummaryLine(label = stringResource(R.string.settings_model_output_price), value = metadata.outputCostPerMillion.toCostText())
+                SummaryLine(label = stringResource(R.string.settings_model_cache_read_price), value = metadata.cacheReadCostPerMillion.toCostText())
             }
         }
         item {
-            HamburSection(title = "参考资料") {
-                SummaryLine(label = "权重链接", value = metadata.weightLinks.joinToString { it.label.ifBlank { it.url } }.ifBlank { "暂无" })
-                SummaryLine(label = "基准测试", value = if (metadata.benchmarks.isEmpty()) "暂无" else "${metadata.benchmarks.size} 项")
+            HamburSection(title = stringResource(R.string.settings_model_references)) {
+                SummaryLine(label = stringResource(R.string.settings_model_weight_links), value = metadata.weightLinks.joinToString { it.label.ifBlank { it.url } }.ifBlank { stringResource(R.string.common_not_available) })
+                SummaryLine(
+                    label = stringResource(R.string.settings_model_benchmarks),
+                    value = if (metadata.benchmarks.isEmpty()) {
+                        stringResource(R.string.common_not_available)
+                    } else {
+                        stringResource(R.string.settings_model_benchmarks_count, metadata.benchmarks.size)
+                    },
+                )
             }
         }
         item {
-            HamburSection(title = "覆盖设置") {
+            HamburSection(title = stringResource(R.string.settings_model_override_section)) {
                 Button(
                     enabled = providerId.isNotBlank() && modelId.isNotBlank(),
                     onClick = {
@@ -418,18 +459,18 @@ fun ModelDetailScreen(
                         )
                     },
                 ) {
-                    Text("保存覆盖")
+                    Text(stringResource(R.string.settings_model_override_save))
                 }
             }
         }
         item {
-            HamburSection(title = "Danger zone") {
+            HamburSection(title = stringResource(R.string.settings_danger_zone)) {
                 var pendingDeleteModel by rememberSaveable(modelId) { mutableStateOf(false) }
                 if (pendingDeleteModel) {
                     ConfirmDangerDialog(
-                        title = "Delete model",
-                        text = "Are you sure you want to delete model '$modelId'?",
-                        confirmText = "Delete",
+                        title = stringResource(R.string.settings_model_delete_title),
+                        text = stringResource(R.string.settings_model_delete_message, modelId),
+                        confirmText = stringResource(R.string.common_delete),
                         onConfirm = {
                             store.deleteProviderModel(providerId, modelId)
                             pendingDeleteModel = false
@@ -439,7 +480,7 @@ fun ModelDetailScreen(
                     )
                 }
                 TextButton(onClick = { pendingDeleteModel = true }) {
-                    Text("Delete model", color = MaterialTheme.colorScheme.error)
+                    Text(stringResource(R.string.settings_model_delete_title), color = MaterialTheme.colorScheme.error)
                 }
             }
         }
@@ -481,19 +522,19 @@ private fun ProviderEditorScreen(
         val currentSequence = state.lastAppliedSequence.toLong()
         if (lastCommandSequence > 0L && currentSequence > lastCommandSequence) {
             if (pendingAction == "Refresh" && state.latestEventKind == BackendEventKind.MODELS_UPDATED.name) {
-                Toast.makeText(context, state.footer.ifBlank { "Models refreshed successfully" }, Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, state.footer.ifBlank { context.getString(R.string.settings_toast_models_refreshed) }, Toast.LENGTH_SHORT).show()
                 lastCommandSequence = 0L
                 pendingAction = ""
             } else if (pendingAction == "Save" && state.latestEventKind == BackendEventKind.SETTINGS_CHANGED.name) {
-                Toast.makeText(context, "Provider saved successfully", Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, context.getString(R.string.settings_toast_provider_saved), Toast.LENGTH_SHORT).show()
                 lastCommandSequence = 0L
                 pendingAction = ""
             } else if (pendingAction == "AddModel" && state.latestEventKind == BackendEventKind.SETTINGS_CHANGED.name) {
-                Toast.makeText(context, "Model added successfully", Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, context.getString(R.string.settings_toast_model_added), Toast.LENGTH_SHORT).show()
                 lastCommandSequence = 0L
                 pendingAction = ""
             } else if (state.runtimeStatus == "Error") {
-                Toast.makeText(context, "Operation failed: ${state.footer}", Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, context.getString(R.string.settings_toast_operation_failed, state.footer), Toast.LENGTH_SHORT).show()
                 lastCommandSequence = 0L
                 pendingAction = ""
             }
@@ -502,22 +543,22 @@ private fun ProviderEditorScreen(
 
     SettingsPage(title = title, subtitle = name, onBack = onBack) {
         item {
-            HamburSection(title = "Provider") {
+            HamburSection(title = stringResource(R.string.settings_provider_editor_section)) {
                 if (provider != null) {
-                    SummaryLine(label = "Provider ID", value = id)
+                    SummaryLine(label = stringResource(R.string.settings_provider_id), value = id)
                 }
-                OutlinedTextField(value = name, onValueChange = { name = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Name") })
-                OutlinedTextField(value = baseUrl, onValueChange = { baseUrl = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Base URL") })
-                OutlinedTextField(value = apiKey, onValueChange = { apiKey = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("API Key (leave blank to keep current)") })
+                OutlinedTextField(value = name, onValueChange = { name = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text(stringResource(R.string.settings_provider_name)) })
+                OutlinedTextField(value = baseUrl, onValueChange = { baseUrl = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text(stringResource(R.string.settings_provider_base_url)) })
+                OutlinedTextField(value = apiKey, onValueChange = { apiKey = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text(stringResource(R.string.settings_provider_api_key)) })
                 
-                Text("API Protocol", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 8.dp))
+                Text(stringResource(R.string.settings_provider_api_protocol), style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 8.dp))
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     listOf(
-                        "OpenAiCompatible" to "Chat Completions (/v1/chat/completions)",
-                        "OpenAiResponses" to "Responses API (/v1/responses)"
+                        "OpenAiCompatible" to stringResource(R.string.settings_provider_protocol_chat_completions),
+                        "OpenAiResponses" to stringResource(R.string.settings_provider_protocol_responses)
                     ).forEach { (typeKey, label) ->
                         val selected = apiType == typeKey
                         OutlinedCard(
@@ -545,7 +586,7 @@ private fun ProviderEditorScreen(
                     }
                 }
 
-                Text("Select Icon", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 8.dp))
+                Text(stringResource(R.string.settings_provider_select_icon), style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 8.dp))
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
                     horizontalArrangement = Arrangement.spacedBy(16.dp)
@@ -576,34 +617,34 @@ private fun ProviderEditorScreen(
 
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Switch(checked = enabled, onCheckedChange = { enabled = it })
-                    Text("Enabled", modifier = Modifier.padding(start = 8.dp))
+                    Text(stringResource(R.string.common_enabled), modifier = Modifier.padding(start = 8.dp))
                 }
                 Button(
                     enabled = id.isNotBlank() && baseUrl.isNotBlank() && name.isNotBlank() && secretRef.isNotBlank(),
                     onClick = {
                         lastCommandSequence = state.lastAppliedSequence.toLong()
                         pendingAction = "Save"
-                        Toast.makeText(context, "Saving provider...", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, context.getString(R.string.settings_toast_provider_saving), Toast.LENGTH_SHORT).show()
                         store.saveProvider(id, name, baseUrl, secretRef, apiKey, enabled, iconName, apiType)
                     },
                 ) {
-                    Text("Save provider")
+                    Text(stringResource(R.string.settings_provider_save))
                 }
             }
         }
         item {
-            HamburSection(title = "Model sync") {
+            HamburSection(title = stringResource(R.string.settings_provider_model_sync_section)) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     SecondaryActionButton(
-                        text = "Refresh models",
+                        text = stringResource(R.string.settings_provider_refresh_models),
                         enabled = id.isNotBlank() && provider != null,
                         onClick = {
                             lastCommandSequence = state.lastAppliedSequence.toLong()
                             pendingAction = "Refresh"
-                            Toast.makeText(context, "Syncing models from provider...", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(context, context.getString(R.string.settings_toast_models_syncing), Toast.LENGTH_SHORT).show()
                             store.refreshProviderModels(
                                 providerId = id,
                                 baseUrl = baseUrl,
@@ -614,7 +655,7 @@ private fun ProviderEditorScreen(
                         },
                     )
                     SecondaryActionButton(
-                        text = "Add model",
+                        text = stringResource(R.string.settings_provider_add_model),
                         enabled = id.isNotBlank() && provider != null,
                         onClick = {
                             showAddCustomModelDialog = true
@@ -623,7 +664,7 @@ private fun ProviderEditorScreen(
                 }
                 if (provider == null) {
                     Text(
-                        "Please save provider first to sync or add models.",
+                        stringResource(R.string.settings_provider_save_first_hint),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(top = 4.dp)
@@ -637,7 +678,7 @@ private fun ProviderEditorScreen(
     if (showAddCustomModelDialog) {
         AlertDialog(
             onDismissRequest = { showAddCustomModelDialog = false },
-            title = { Text("Add Model") },
+            title = { Text(stringResource(R.string.settings_provider_add_model)) },
             text = {
                 Column(
                     modifier = Modifier.verticalScroll(rememberScrollState()),
@@ -646,30 +687,30 @@ private fun ProviderEditorScreen(
                     OutlinedTextField(
                         value = customModelId,
                         onValueChange = { customModelId = it },
-                        label = { Text("Model ID *") },
-                        placeholder = { Text("e.g. gpt-4o, deepseek-chat") },
+                        label = { Text(stringResource(R.string.settings_model_id_required)) },
+                        placeholder = { Text(stringResource(R.string.settings_model_id_placeholder)) },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
                     )
                     OutlinedTextField(
                         value = customDisplayName,
                         onValueChange = { customDisplayName = it },
-                        label = { Text("Display Name") },
-                        placeholder = { Text("Optional") },
+                        label = { Text(stringResource(R.string.settings_model_display_name)) },
+                        placeholder = { Text(stringResource(R.string.settings_optional)) },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
                     )
                     OutlinedTextField(
                         value = customContextLimit,
                         onValueChange = { customContextLimit = it.filter(Char::isDigit) },
-                        label = { Text("Context Limit") },
+                        label = { Text(stringResource(R.string.settings_model_context_limit)) },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
                     )
                     OutlinedTextField(
                         value = customOutputLimit,
                         onValueChange = { customOutputLimit = it.filter(Char::isDigit) },
-                        label = { Text("Output Limit") },
+                        label = { Text(stringResource(R.string.settings_model_max_output)) },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
                     )
@@ -678,7 +719,7 @@ private fun ProviderEditorScreen(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Text("Supports Reasoning")
+                        Text(stringResource(R.string.settings_model_supports_reasoning))
                         Switch(
                             checked = customSupportsReasoning,
                             onCheckedChange = { customSupportsReasoning = it }
@@ -689,7 +730,7 @@ private fun ProviderEditorScreen(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Text("Supports Tool Call")
+                        Text(stringResource(R.string.settings_model_supports_tool_call))
                         Switch(
                             checked = customSupportsToolCall,
                             onCheckedChange = { customSupportsToolCall = it }
@@ -700,7 +741,7 @@ private fun ProviderEditorScreen(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Text("Supports Vision / Image")
+                        Text(stringResource(R.string.settings_model_supports_vision))
                         Switch(
                             checked = customSupportsImageInput,
                             onCheckedChange = { customSupportsImageInput = it }
@@ -714,7 +755,7 @@ private fun ProviderEditorScreen(
                     onClick = {
                         lastCommandSequence = state.lastAppliedSequence.toLong()
                         pendingAction = "AddModel"
-                        Toast.makeText(context, "Adding model...", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, context.getString(R.string.settings_toast_model_adding), Toast.LENGTH_SHORT).show()
                         store.saveModelOverride(
                             providerId = id,
                             modelId = customModelId.trim(),
@@ -736,12 +777,12 @@ private fun ProviderEditorScreen(
                         customOutputLimit = "4096"
                     }
                 ) {
-                    Text("Add")
+                    Text(stringResource(R.string.settings_add))
                 }
             },
             dismissButton = {
                 TextButton(onClick = { showAddCustomModelDialog = false }) {
-                    Text("Cancel")
+                    Text(stringResource(R.string.common_cancel))
                 }
             }
         )
@@ -762,16 +803,16 @@ fun ModelGroupsListScreen(
     val primaryGroup = state.defaultModelGroups.firstOrNull { it.key == "primary" }?.groupId.orEmpty()
     val secondaryGroup = state.defaultModelGroups.firstOrNull { it.key == "secondary" }?.groupId.orEmpty()
 
-    SettingsPage(title = "Model Groups", onBack = onBack) {
+    SettingsPage(title = stringResource(R.string.settings_model_groups_title), onBack = onBack) {
         item {
             Button(onClick = onNewGroup, modifier = Modifier.fillMaxWidth()) {
-                Text("New model group")
+                Text(stringResource(R.string.settings_model_group_new))
             }
         }
         item {
-            HamburSection(title = "Groups") {
+            HamburSection(title = stringResource(R.string.settings_model_groups_section)) {
                 if (state.modelGroups.isEmpty()) {
-                    Text("No model groups configured", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(stringResource(R.string.settings_model_groups_empty), color = MaterialTheme.colorScheme.onSurfaceVariant)
                 } else {
                     state.modelGroups.forEach { group ->
                         ModelGroupListRow(
@@ -784,8 +825,9 @@ fun ModelGroupsListScreen(
             }
         }
         item {
-            HamburSection(title = "Default model groups") {
-                val primaryGroupName = state.modelGroups.firstOrNull { it.id == primaryGroup }?.name ?: primaryGroup.ifBlank { "Select group" }
+            HamburSection(title = stringResource(R.string.settings_model_groups_default_section)) {
+                val primaryGroupName = state.modelGroups.firstOrNull { it.id == primaryGroup }?.name
+                    ?: primaryGroup.ifBlank { stringResource(R.string.settings_model_group_select) }
                 Surface(
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(8.dp),
@@ -794,12 +836,13 @@ fun ModelGroupsListScreen(
                     onClick = { showPrimaryMenu = true }
                 ) {
                     Column(modifier = Modifier.padding(12.dp)) {
-                        Text("Primary Model Group (Main chat)", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                        Text(stringResource(R.string.settings_model_group_primary), style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
                         Text(primaryGroupName, color = MaterialTheme.colorScheme.primary)
                     }
                 }
 
-                val secondaryGroupName = state.modelGroups.firstOrNull { it.id == secondaryGroup }?.name ?: secondaryGroup.ifBlank { "Select group" }
+                val secondaryGroupName = state.modelGroups.firstOrNull { it.id == secondaryGroup }?.name
+                    ?: secondaryGroup.ifBlank { stringResource(R.string.settings_model_group_select) }
                 Surface(
                     modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
                     shape = RoundedCornerShape(8.dp),
@@ -808,7 +851,7 @@ fun ModelGroupsListScreen(
                     onClick = { showSecondaryMenu = true }
                 ) {
                     Column(modifier = Modifier.padding(12.dp)) {
-                        Text("Secondary Model Group (Fallback tasks)", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                        Text(stringResource(R.string.settings_model_group_secondary), style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
                         Text(secondaryGroupName, color = MaterialTheme.colorScheme.primary)
                     }
                 }
@@ -819,7 +862,7 @@ fun ModelGroupsListScreen(
     if (showPrimaryMenu) {
         AlertDialog(
             onDismissRequest = { showPrimaryMenu = false },
-            title = { Text("Select Primary Group") },
+            title = { Text(stringResource(R.string.settings_model_group_select_primary)) },
             text = {
                 LazyColumn(
                     modifier = Modifier.fillMaxWidth(),
@@ -842,7 +885,7 @@ fun ModelGroupsListScreen(
                 }
             },
             confirmButton = {
-                TextButton(onClick = { showPrimaryMenu = false }) { Text("Cancel") }
+                TextButton(onClick = { showPrimaryMenu = false }) { Text(stringResource(R.string.common_cancel)) }
             }
         )
     }
@@ -850,7 +893,7 @@ fun ModelGroupsListScreen(
     if (showSecondaryMenu) {
         AlertDialog(
             onDismissRequest = { showSecondaryMenu = false },
-            title = { Text("Select Secondary Group") },
+            title = { Text(stringResource(R.string.settings_model_group_select_secondary)) },
             text = {
                 LazyColumn(
                     modifier = Modifier.fillMaxWidth(),
@@ -873,7 +916,7 @@ fun ModelGroupsListScreen(
                 }
             },
             confirmButton = {
-                TextButton(onClick = { showSecondaryMenu = false }) { Text("Cancel") }
+                TextButton(onClick = { showSecondaryMenu = false }) { Text(stringResource(R.string.common_cancel)) }
             }
         )
     }
@@ -900,11 +943,11 @@ fun ModelGroupDetailScreen(
         val currentSequence = state.lastAppliedSequence.toLong()
         if (lastCommandSequence > 0L && currentSequence > lastCommandSequence) {
             if (pendingAction == "SaveGroup" && state.latestEventKind == BackendEventKind.SETTINGS_CHANGED.name) {
-                Toast.makeText(context, "Model group saved successfully", Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, context.getString(R.string.settings_toast_model_group_saved), Toast.LENGTH_SHORT).show()
                 lastCommandSequence = 0L
                 pendingAction = ""
             } else if (state.runtimeStatus == "Error") {
-                Toast.makeText(context, "Operation failed: ${state.footer}", Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, context.getString(R.string.settings_toast_operation_failed, state.footer), Toast.LENGTH_SHORT).show()
                 lastCommandSequence = 0L
                 pendingAction = ""
             }
@@ -916,9 +959,9 @@ fun ModelGroupDetailScreen(
 
     if (pendingDeleteGroup) {
         ConfirmDangerDialog(
-            title = "Delete model group",
-            text = "Are you sure you want to delete this model group? This action cannot be undone.",
-            confirmText = "Delete",
+            title = stringResource(R.string.settings_model_group_delete_title),
+            text = stringResource(R.string.settings_model_group_delete_message),
+            confirmText = stringResource(R.string.common_delete),
             onConfirm = {
                 store.deleteModelGroup(id, true)
                 pendingDeleteGroup = false
@@ -928,20 +971,23 @@ fun ModelGroupDetailScreen(
         )
     }
 
-    SettingsPage(title = if (existing == null) "New Model Group" else existing.name, subtitle = name, onBack = onBack) {
+    SettingsPage(title = if (existing == null) stringResource(R.string.settings_model_group_new) else existing.name, subtitle = name, onBack = onBack) {
         item {
-            HamburSection(title = "Group Settings") {
+            HamburSection(title = stringResource(R.string.settings_model_group_settings_section)) {
                 if (existing != null) {
-                    SummaryLine(label = "Group ID", value = id)
+                    SummaryLine(label = stringResource(R.string.settings_model_group_id), value = id)
                 }
-                OutlinedTextField(value = name, onValueChange = { name = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Name") })
+                OutlinedTextField(value = name, onValueChange = { name = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text(stringResource(R.string.settings_provider_name)) })
 
-                Text("Routing Strategy", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 8.dp))
+                Text(stringResource(R.string.settings_model_group_routing_strategy), style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 8.dp))
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
                     horizontalArrangement = Arrangement.spacedBy(16.dp)
                 ) {
-                    listOf("fallback" to "Fallback", "load_balance" to "Load Balance").forEach { (strategyKey, strategyLabel) ->
+                    listOf(
+                        "fallback" to stringResource(R.string.settings_model_group_strategy_fallback),
+                        "load_balance" to stringResource(R.string.settings_model_group_strategy_load_balance),
+                    ).forEach { (strategyKey, strategyLabel) ->
                         val selected = routingStrategy == strategyKey
                         OutlinedCard(
                             onClick = { routingStrategy = strategyKey },
@@ -961,12 +1007,15 @@ fun ModelGroupDetailScreen(
                     }
                 }
 
-                Text("Fallback Policy", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 8.dp))
+                Text(stringResource(R.string.settings_model_group_fallback_policy), style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 8.dp))
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
                     horizontalArrangement = Arrangement.spacedBy(16.dp)
                 ) {
-                    listOf("default" to "Default", "always" to "Always").forEach { (policyKey, policyLabel) ->
+                    listOf(
+                        "default" to stringResource(R.string.settings_model_group_policy_default),
+                        "always" to stringResource(R.string.settings_model_group_policy_always),
+                    ).forEach { (policyKey, policyLabel) ->
                         val selected = fallbackPolicy == policyKey
                         OutlinedCard(
                             onClick = { fallbackPolicy = policyKey },
@@ -990,21 +1039,24 @@ fun ModelGroupDetailScreen(
                     onClick = {
                         lastCommandSequence = state.lastAppliedSequence.toLong()
                         pendingAction = "SaveGroup"
-                        Toast.makeText(context, "Saving group...", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, context.getString(R.string.settings_toast_group_saving), Toast.LENGTH_SHORT).show()
                         store.saveModelGroup(id, name, routingStrategy, fallbackPolicy)
                     },
                     enabled = id.isNotBlank() && name.isNotBlank(),
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Text("Save group")
+                    Text(stringResource(R.string.settings_model_group_save))
                 }
             }
         }
         item {
-            HamburSection(title = "Members", subtitle = "Routing priority of models in this group") {
+            HamburSection(
+                title = stringResource(R.string.settings_model_group_members),
+                subtitle = stringResource(R.string.settings_model_group_members_subtitle),
+            ) {
                 val members = state.modelGroupMembers.filter { it.groupId == id }
                 if (members.isEmpty()) {
-                    Text("No members configured", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(stringResource(R.string.settings_model_group_members_empty), color = MaterialTheme.colorScheme.onSurfaceVariant)
                 } else {
                     members.sortedBy { it.position }.forEach { member ->
                         Surface(
@@ -1027,7 +1079,7 @@ fun ModelGroupDetailScreen(
                                 ) {
                                     Icon(
                                         imageVector = Lucide.Trash2,
-                                        contentDescription = "Delete member",
+                                        contentDescription = stringResource(R.string.settings_model_group_delete_member),
                                         tint = MaterialTheme.colorScheme.error
                                     )
                                 }
@@ -1040,15 +1092,15 @@ fun ModelGroupDetailScreen(
                     onClick = { showAddModelDialog = true },
                     modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
                 ) {
-                    Text("Add model")
+                    Text(stringResource(R.string.settings_provider_add_model))
                 }
             }
         }
         if (existing != null) {
             item {
-                HamburSection(title = "Danger zone") {
+                HamburSection(title = stringResource(R.string.settings_danger_zone)) {
                     TextButton(onClick = { pendingDeleteGroup = true }) {
-                        Text("Delete model group", color = MaterialTheme.colorScheme.error)
+                        Text(stringResource(R.string.settings_model_group_delete_title), color = MaterialTheme.colorScheme.error)
                     }
                 }
             }
@@ -1061,10 +1113,10 @@ fun ModelGroupDetailScreen(
         }
         AlertDialog(
             onDismissRequest = { showAddModelDialog = false },
-            title = { Text("Add Model") },
+            title = { Text(stringResource(R.string.settings_provider_add_model)) },
             text = {
                 if (availableModels.isEmpty()) {
-                    Text("No available models found. Please configure a provider and sync models first.")
+                    Text(stringResource(R.string.settings_model_group_no_available_models))
                 } else {
                     LazyColumn(
                         modifier = Modifier.fillMaxWidth().height(300.dp),
@@ -1100,7 +1152,7 @@ fun ModelGroupDetailScreen(
             },
             confirmButton = {
                 TextButton(onClick = { showAddModelDialog = false }) {
-                    Text("Cancel")
+                    Text(stringResource(R.string.common_cancel))
                 }
             }
         )
@@ -1115,13 +1167,13 @@ fun SkillsListScreen(
     onBack: () -> Unit,
     onOpenSkill: (String) -> Unit,
 ) {
-    SettingsPage(title = "Skills", onBack = onBack) {
+    SettingsPage(title = stringResource(R.string.settings_skills_title), onBack = onBack) {
         val builtInSkills = state.skills.filter { it.builtIn }
         val userSkills = state.skills.filterNot { it.builtIn }
         item {
             SkillSection(
-                title = "Built-in skills",
-                emptyText = "No built-in skills discovered",
+                title = stringResource(R.string.settings_skills_builtin),
+                emptyText = stringResource(R.string.settings_skills_builtin_empty),
                 skills = builtInSkills,
                 store = store,
                 onOpenSkill = onOpenSkill,
@@ -1129,16 +1181,16 @@ fun SkillsListScreen(
         }
         item {
             SkillSection(
-                title = "User skills",
-                emptyText = "No user skills discovered",
+                title = stringResource(R.string.settings_skills_user),
+                emptyText = stringResource(R.string.settings_skills_user_empty),
                 skills = userSkills,
                 store = store,
                 onOpenSkill = onOpenSkill,
             )
         }
         item {
-            HamburSection(title = "Actions") {
-                SecondaryActionButton(text = "Refresh", onClick = store::refreshKnowledgeSnapshots)
+            HamburSection(title = stringResource(R.string.settings_section_actions)) {
+                SecondaryActionButton(text = stringResource(R.string.settings_refresh), onClick = store::refreshKnowledgeSnapshots)
             }
         }
     }
@@ -1159,9 +1211,12 @@ fun SkillDetailScreen(
     var showDeleteDialog by rememberSaveable(skillId) { mutableStateOf(false) }
     if (showDeleteDialog) {
         ConfirmDangerDialog(
-            title = "Delete skill",
-            text = "Delete ${selectedSkill?.name ?: skillId}? This removes the skill directory and all files inside it.",
-            confirmText = "Delete",
+            title = stringResource(R.string.settings_skill_delete_title),
+            text = stringResource(
+                R.string.settings_skill_delete_message,
+                selectedSkill?.name ?: skillId,
+            ),
+            confirmText = stringResource(R.string.common_delete),
             onConfirm = {
                 showDeleteDialog = false
                 store.deleteSkill(skillId)
@@ -1170,33 +1225,33 @@ fun SkillDetailScreen(
             onDismiss = { showDeleteDialog = false },
         )
     }
-    SettingsPage(title = "Skill Detail", subtitle = skillId, onBack = onBack) {
+    SettingsPage(title = stringResource(R.string.settings_skill_detail_title), subtitle = skillId, onBack = onBack) {
         item {
-            HamburSection(title = "Skill") {
-                SummaryLine(label = "Name", value = selectedSkill?.name ?: skillId)
-                SummaryLine(label = "Path", value = selectedSkill?.path ?: skillId)
-                SummaryLine(label = "Created", value = selectedSkill?.createdAtMs?.toDateTimeText().orEmpty())
-                SummaryLine(label = "Modified", value = selectedSkill?.modifiedAtMs?.toDateTimeText().orEmpty())
-                CapabilitySwitch("Enabled", selectedSkill?.enabled ?: true) { checked ->
+            HamburSection(title = stringResource(R.string.settings_skill_section)) {
+                SummaryLine(label = stringResource(R.string.settings_provider_name), value = selectedSkill?.name ?: skillId)
+                SummaryLine(label = stringResource(R.string.settings_skill_path), value = selectedSkill?.path ?: skillId)
+                SummaryLine(label = stringResource(R.string.settings_skill_created), value = selectedSkill?.createdAtMs?.toDateTimeText().orEmpty())
+                SummaryLine(label = stringResource(R.string.settings_skill_modified), value = selectedSkill?.modifiedAtMs?.toDateTimeText().orEmpty())
+                CapabilitySwitch(stringResource(R.string.common_enabled), selectedSkill?.enabled ?: true) { checked ->
                     store.setSkillEnabled(skillId, checked)
                 }
-                SecondaryActionButton(text = "Delete skill", onClick = { showDeleteDialog = true })
+                SecondaryActionButton(text = stringResource(R.string.settings_skill_delete_title), onClick = { showDeleteDialog = true })
             }
         }
         item {
-            HamburSection(title = "Description") {
+            HamburSection(title = stringResource(R.string.settings_section_description)) {
                 Text(
-                    text = selectedSkill?.description.orEmpty().ifBlank { "No description" },
+                    text = selectedSkill?.description.orEmpty().ifBlank { stringResource(R.string.settings_skill_no_description) },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
         }
         item {
-            HamburSection(title = "Files") {
+            HamburSection(title = stringResource(R.string.settings_skill_files)) {
                 val files = selectedSkill?.files.orEmpty()
                 if (files.isEmpty()) {
-                    Text("No files", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(stringResource(R.string.settings_skill_no_files), color = MaterialTheme.colorScheme.onSurfaceVariant)
                 } else {
                     files.forEach { file ->
                         Text(file, style = MaterialTheme.typography.bodySmall)
@@ -1205,9 +1260,9 @@ fun SkillDetailScreen(
             }
         }
         item {
-            HamburSection(title = "Content") {
+            HamburSection(title = stringResource(R.string.settings_skill_content)) {
                 Text(
-                    text = detail?.content ?: "Loading skill...",
+                    text = detail?.content ?: stringResource(R.string.settings_skill_loading),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -1222,14 +1277,18 @@ fun MemoryFilesListScreen(
     onBack: () -> Unit,
     onOpenMemory: (String) -> Unit,
 ) {
-    SettingsPage(title = "Memory", onBack = onBack) {
+    SettingsPage(title = stringResource(R.string.settings_memory_title), onBack = onBack) {
         item {
-            HamburSection(title = "Memory files") {
+            HamburSection(title = stringResource(R.string.settings_memory_files_section)) {
                 if (state.memoryFiles.isEmpty()) {
-                    Text("No memory files discovered", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(stringResource(R.string.settings_memory_files_empty), color = MaterialTheme.colorScheme.onSurfaceVariant)
                 } else {
                     state.memoryFiles.forEach { file ->
-                        MemoryListRow(file.name, file.preview.ifBlank { "${file.entryCount} entries" }, onOpenMemory)
+                        MemoryListRow(
+                            file.name,
+                            file.preview.ifBlank { stringResource(R.string.settings_memory_entries_count, file.entryCount.toString()) },
+                            onOpenMemory,
+                        )
                     }
                 }
             }
@@ -1248,13 +1307,16 @@ fun MemoryDetailScreen(
         store.loadMemoryFileDetail(memoryKey)
     }
     val detail = state.memoryFileDetails[memoryKey]
-    SettingsPage(title = "Memory Detail", subtitle = memoryKey, onBack = onBack) {
+    SettingsPage(title = stringResource(R.string.settings_memory_detail_title), subtitle = memoryKey, onBack = onBack) {
         item {
-            HamburSection(title = "File") {
-                SummaryLine(label = "Size", value = "${detail?.sizeBytes ?: 0UL} bytes")
-                SummaryLine(label = "Entries", value = "${detail?.entryCount ?: 0u}")
+            HamburSection(title = stringResource(R.string.settings_memory_file_section)) {
+                SummaryLine(
+                    label = stringResource(R.string.settings_memory_size),
+                    value = stringResource(R.string.settings_memory_bytes, (detail?.sizeBytes ?: 0UL).toString()),
+                )
+                SummaryLine(label = stringResource(R.string.settings_memory_entries), value = "${detail?.entryCount ?: 0u}")
                 Text(
-                    text = detail?.content ?: "Loading memory file...",
+                    text = detail?.content ?: stringResource(R.string.settings_memory_loading),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -1270,39 +1332,45 @@ fun ToolsListScreen(
     onOpenTool: (String) -> Unit,
     onOpenWebTools: () -> Unit,
 ) {
-    SettingsPage(title = "Tools", onBack = onBack) {
+    SettingsPage(title = stringResource(R.string.settings_tools_title), onBack = onBack) {
         item {
-            HamburSection(title = "Web tools", subtitle = "Search provider, credentials, fetch limits") {
+            HamburSection(
+                title = stringResource(R.string.settings_tools_web_section),
+                subtitle = stringResource(R.string.settings_tools_web_section_subtitle),
+            ) {
                 val search = state.webSearchSettings()
                 SettingsNavigationRow(
                     icon = Lucide.Globe,
-                    title = "Web search & fetch",
-                    summary = "Provider: ${search.provider} · web_fetch: " +
-                        if (state.webFetchSettings().enabled) "on" else "off",
+                    title = stringResource(R.string.settings_tools_web_search_fetch),
+                    summary = stringResource(
+                        R.string.settings_tools_web_summary,
+                        search.provider,
+                        stringResource(if (state.webFetchSettings().enabled) R.string.settings_on else R.string.settings_off),
+                    ),
                     onClick = onOpenWebTools,
                 )
             }
         }
         item {
-            HamburSection(title = "Built-in tools") {
+            HamburSection(title = stringResource(R.string.settings_tools_builtin_section)) {
                 listOf(
-                    "skills_list" to "List available skills with minimal metadata.",
-                    "skill_view" to "Load a skill's main content or linked file.",
-                    "terminal" to "Run a shell command inside the Linux sandbox.",
-                    "process" to "Manage background processes started by terminal.",
-                    "read_file" to "Read a text file with line numbers and pagination.",
-                    "write_file" to "Write content to a sandbox file.",
-                    "patch" to "Targeted find-and-replace edits in files.",
-                    "search_files" to "Search file contents or find files by name.",
-                    "hambur_config" to "Read and update Hambur app configuration.",
-                    "web_search" to "Search the web for information. Returns titles, URLs and snippets; accepts 1-4 queries.",
-                    "web_fetch" to "Fetch one URL, or up to 5 URLs, and return them as Markdown.",
-                    "browser_use" to "Control the shared Android WebView browser.",
-                    "android_cli" to "Access native Android hardware and system features on demand.",
-                    "session_search" to "Search past chat sessions stored locally.",
-                    "memory" to "Save durable information to persistent memory.",
-                    "delegate_task" to "Spawn isolated leaf subagents.",
-                    "view_image" to "View a local image file from the sandbox.",
+                    "skills_list" to stringResource(R.string.settings_tool_desc_skills_list),
+                    "skill_view" to stringResource(R.string.settings_tool_desc_skill_view),
+                    "terminal" to stringResource(R.string.settings_tool_desc_terminal),
+                    "process" to stringResource(R.string.settings_tool_desc_process),
+                    "read_file" to stringResource(R.string.settings_tool_desc_read_file),
+                    "write_file" to stringResource(R.string.settings_tool_desc_write_file),
+                    "patch" to stringResource(R.string.settings_tool_desc_patch),
+                    "search_files" to stringResource(R.string.settings_tool_desc_search_files),
+                    "hambur_config" to stringResource(R.string.settings_tool_desc_hambur_config),
+                    "web_search" to stringResource(R.string.settings_tool_desc_web_search),
+                    "web_fetch" to stringResource(R.string.settings_tool_desc_web_fetch),
+                    "browser_use" to stringResource(R.string.settings_tool_desc_browser_use),
+                    "android_cli" to stringResource(R.string.settings_tool_desc_android_cli),
+                    "session_search" to stringResource(R.string.settings_tool_desc_session_search),
+                    "memory" to stringResource(R.string.settings_tool_desc_memory),
+                    "delegate_task" to stringResource(R.string.settings_tool_desc_delegate_task),
+                    "view_image" to stringResource(R.string.settings_tool_desc_view_image),
                 ).forEach { (name, description) ->
                     ToolListRow(
                         name = name,
@@ -1332,13 +1400,13 @@ fun ToolDetailScreen(
     val viewImageScaleMode = state.settingValue("viewImageScaleMode", "resize_fit")
     val browserSettings = state.browserToolSettings()
     val toolEnabled = state.settingValue("tool_enabled:$toolName", "true") == "true"
-    SettingsPage(title = "Tool Detail", subtitle = toolName, onBack = onBack) {
+    SettingsPage(title = stringResource(R.string.settings_tool_detail_title), subtitle = toolName, onBack = onBack) {
         item {
-            HamburSection(title = "Status") {
+            HamburSection(title = stringResource(R.string.settings_tool_status_section)) {
                 SettingsSwitchRow(
-                    title = "Enabled",
-                    summary = if (toolEnabled) "The model can see and call this tool."
-                    else "Hidden from the model; calls to it are rejected.",
+                    title = stringResource(R.string.common_enabled),
+                    summary = if (toolEnabled) stringResource(R.string.settings_tool_enabled_summary)
+                    else stringResource(R.string.settings_tool_disabled_summary),
                     checked = toolEnabled,
                     onCheckedChange = {
                         store.saveRawAppSetting("tool_enabled:$toolName", it.toString())
@@ -1347,10 +1415,10 @@ fun ToolDetailScreen(
             }
         }
         item {
-            HamburSection(title = "Description") {
-                SummaryLine(label = "Name", value = toolName)
+            HamburSection(title = stringResource(R.string.settings_section_description)) {
+                SummaryLine(label = stringResource(R.string.settings_provider_name), value = toolName)
                 SummaryLine(
-                    label = "Backend",
+                    label = stringResource(R.string.settings_tool_backend),
                     value = when (toolName) {
                         "browser_use" -> "AndroidPlatformAdapter browser actions"
                         "android_cli" -> "AndroidPlatformAdapter native device CLI"
@@ -1361,11 +1429,14 @@ fun ToolDetailScreen(
         }
         if (toolName == "view_image") {
             item {
-                HamburSection(title = "Configuration") {
+                HamburSection(title = stringResource(R.string.settings_section_configuration)) {
                     ChoiceRow(
-                        title = "Image size handling",
+                        title = stringResource(R.string.settings_tool_view_image_scale),
                         current = viewImageScaleMode,
-                        options = listOf("resize_fit" to "Resize fit", "original" to "Original"),
+                        options = listOf(
+                            "resize_fit" to stringResource(R.string.settings_tool_scale_resize_fit),
+                            "original" to stringResource(R.string.settings_tool_scale_original),
+                        ),
                         onSelect = { store.saveRawAppSetting("viewImageScaleMode", it) },
                     )
                 }
@@ -1373,18 +1444,18 @@ fun ToolDetailScreen(
         }
         if (toolName == "browser_use") {
             item {
-                HamburSection(title = "Browser settings") {
+                HamburSection(title = stringResource(R.string.settings_tool_browser_section)) {
                     SettingsSwitchRow(
-                        title = "Accept cookies",
-                        summary = if (browserSettings.acceptCookies) "WebView stores and sends site cookies" else "New browser tabs reject cookies",
+                        title = stringResource(R.string.settings_tool_accept_cookies),
+                        summary = if (browserSettings.acceptCookies) stringResource(R.string.settings_tool_accept_cookies_on) else stringResource(R.string.settings_tool_accept_cookies_off),
                         checked = browserSettings.acceptCookies,
                         onCheckedChange = {
                             store.saveBrowserToolSettings(browserSettings.copy(acceptCookies = it, acceptThirdPartyCookies = it && browserSettings.acceptThirdPartyCookies).toJson())
                         },
                     )
                     SettingsSwitchRow(
-                        title = "Third-party cookies",
-                        summary = if (browserSettings.acceptThirdPartyCookies) "Useful for login redirects and embedded auth" else "Only first-party cookies are allowed",
+                        title = stringResource(R.string.settings_tool_third_party_cookies),
+                        summary = if (browserSettings.acceptThirdPartyCookies) stringResource(R.string.settings_tool_third_party_cookies_on) else stringResource(R.string.settings_tool_third_party_cookies_off),
                         checked = browserSettings.acceptCookies && browserSettings.acceptThirdPartyCookies,
                         enabled = browserSettings.acceptCookies,
                         onCheckedChange = {
@@ -1392,7 +1463,7 @@ fun ToolDetailScreen(
                         },
                     )
                     ChoiceRow(
-                        title = "Fetch download limit",
+                        title = stringResource(R.string.settings_tool_fetch_download_limit),
                         current = browserSettings.maxFetchBytes.toString(),
                         options = listOf(
                             "1000000" to "1.00 MB",
@@ -1405,15 +1476,15 @@ fun ToolDetailScreen(
                         },
                     )
                     ChoiceRow(
-                        title = "Idle auto close",
+                        title = stringResource(R.string.settings_tool_idle_auto_close),
                         current = browserSettings.autoCloseMinutes.toString(),
                         options = listOf(
-                            "0" to "Never",
-                            "5" to "5 minutes",
-                            "15" to "15 minutes",
-                            "30" to "30 minutes",
-                            "60" to "60 minutes",
-                            "120" to "120 minutes",
+                            "0" to stringResource(R.string.settings_never),
+                            "5" to stringResource(R.string.settings_minutes_count, 5),
+                            "15" to stringResource(R.string.settings_minutes_count, 15),
+                            "30" to stringResource(R.string.settings_minutes_count, 30),
+                            "60" to stringResource(R.string.settings_minutes_count, 60),
+                            "120" to stringResource(R.string.settings_minutes_count, 120),
                         ),
                         onSelect = {
                             store.saveBrowserToolSettings(browserSettings.copy(autoCloseMinutes = it.toInt()).toJson())
@@ -1423,10 +1494,10 @@ fun ToolDetailScreen(
             }
         }
         item {
-            HamburSection(title = "Tool settings") {
+            HamburSection(title = stringResource(R.string.settings_tool_settings_section)) {
                 OutlinedTextField(value = toolSettings, onValueChange = { toolSettings = it }, modifier = Modifier.fillMaxWidth(), minLines = 5, label = { Text("tool_settings") })
                 Button(onClick = { store.saveAppSetting("tool_settings", toolSettings, false) }) {
-                    Text("Save tool settings")
+                    Text(stringResource(R.string.settings_tool_save))
                 }
             }
         }
@@ -1443,17 +1514,17 @@ fun StartupTasksListScreen(
     val tasks = state.appSettings.filter {
         it.key == "startup_tasks" || it.key.startsWith("startup_task:")
     }
-    SettingsPage(title = "Startup Tasks", onBack = onBack) {
+    SettingsPage(title = stringResource(R.string.settings_startup_tasks_title), onBack = onBack) {
         item {
             Button(onClick = onNewTask) {
-                Text("New startup task")
+                Text(stringResource(R.string.settings_startup_task_new))
             }
         }
         item {
-            HamburSection(title = "Tasks") {
+            HamburSection(title = stringResource(R.string.settings_startup_tasks_section)) {
                 if (tasks.isEmpty()) {
-                    Text("No startup tasks configured", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    SecondaryActionButton(text = "Open startup_tasks", onClick = { onOpenTask("startup-default") })
+                    Text(stringResource(R.string.settings_startup_tasks_empty), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    SecondaryActionButton(text = stringResource(R.string.settings_startup_task_open_default), onClick = { onOpenTask("startup-default") })
                 } else {
                     tasks.forEach { setting ->
                         StartupTaskListRow(setting.key.removePrefix("startup_task:"), setting.value, onOpenTask)
@@ -1482,9 +1553,9 @@ fun StartupTaskDetailScreen(
 
     if (pendingDelete) {
         ConfirmDangerDialog(
-            title = "Delete startup task",
-            text = "Startup task changes require approval.",
-            confirmText = "Delete",
+            title = stringResource(R.string.settings_startup_task_delete_title),
+            text = stringResource(R.string.settings_startup_task_delete_message),
+            confirmText = stringResource(R.string.common_delete),
             onConfirm = {
                 store.deleteStartupTask(id, true)
                 pendingDelete = false
@@ -1494,20 +1565,28 @@ fun StartupTaskDetailScreen(
         )
     }
 
-    SettingsPage(title = "Startup Task Detail", subtitle = id, onBack = onBack) {
+    SettingsPage(title = stringResource(R.string.settings_startup_task_detail_title), subtitle = id, onBack = onBack) {
         item {
-            HamburSection(title = "Task") {
-                OutlinedTextField(value = id, onValueChange = { id = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Task id") })
-                OutlinedTextField(value = payload, onValueChange = { payload = it }, modifier = Modifier.fillMaxWidth(), minLines = 8, label = { Text("Task JSON") })
+            HamburSection(title = stringResource(R.string.settings_startup_task_section)) {
+                OutlinedTextField(value = id, onValueChange = { id = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text(stringResource(R.string.settings_startup_task_id)) })
+                OutlinedTextField(value = payload, onValueChange = { payload = it }, modifier = Modifier.fillMaxWidth(), minLines = 8, label = { Text(stringResource(R.string.settings_startup_task_json)) })
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(onClick = { store.saveStartupTask(id, payload, true) }, enabled = id.isNotBlank() && payload.isNotBlank()) {
-                        Text("Approve and save")
+                        Text(stringResource(R.string.settings_startup_task_approve_save))
                     }
-                    SecondaryActionButton(text = "Delete", enabled = id.isNotBlank(), onClick = { pendingDelete = true })
+                    SecondaryActionButton(text = stringResource(R.string.common_delete), enabled = id.isNotBlank(), onClick = { pendingDelete = true })
                 }
             }
         }
     }
+}
+
+/** 语言选项的显示名。未知标签按「跟随系统」显示，正常不会走到。 */
+@StringRes
+private fun languageLabelRes(tag: String): Int = when (tag) {
+    HamburAppLocale.English -> R.string.appearance_language_english
+    HamburAppLocale.SimplifiedChinese -> R.string.appearance_language_chinese
+    else -> R.string.appearance_language_system
 }
 
 @Composable
@@ -1529,70 +1608,103 @@ fun AppearanceSettingsScreen(
         THINKING_BLOCK_DISPLAY_MODE_KEY,
         THINKING_BLOCK_DISPLAY_AUTO_EXPAND,
     )
+    val focusInputAfterReply = state.settingValue(AUTO_FOCUS_INPUT_AFTER_REPLY_KEY, "false") == "true"
+    // 语言不在 app_settings 里：它由 AppCompat/系统保存（见 HamburAppLocale）。
+    // 下面的 stringResource 已经订阅了 Configuration，所以切语言时这里会跟着重组重读。
+    val languageTag = HamburAppLocale.current()
 
-    SettingsPage(title = "Appearance", onBack = onBack) {
+    SettingsPage(title = stringResource(R.string.appearance_title), onBack = onBack) {
         item {
-            HamburSection(title = "Theme") {
+            HamburSection(
+                title = stringResource(R.string.appearance_language_section),
+                subtitle = stringResource(R.string.appearance_language_summary),
+            ) {
                 ChoiceRow(
-                    title = "Color theme",
+                    title = stringResource(R.string.appearance_language_title),
+                    current = languageTag,
+                    // 选项列表以 HamburAppLocale.options 为准（和 res/xml/locales_config.xml 对齐），
+                    // 这里只负责把值映射成显示名。
+                    options = HamburAppLocale.options.map { it to stringResource(languageLabelRes(it)) },
+                    onSelect = { HamburAppLocale.apply(it) },
+                )
+            }
+        }
+        item {
+            HamburSection(title = stringResource(R.string.appearance_section_theme)) {
+                ChoiceRow(
+                    title = stringResource(R.string.appearance_theme_title),
                     current = themeMode,
                     options = listOf(
-                        "system" to "System",
-                        "light" to "Light",
-                        "dark" to "Dark",
+                        "system" to stringResource(R.string.appearance_theme_system),
+                        "light" to stringResource(R.string.appearance_theme_light),
+                        "dark" to stringResource(R.string.appearance_theme_dark),
                     ),
                     onSelect = { store.saveRawAppSetting("themeMode", it) },
                 )
             }
         }
         item {
-            HamburSection(title = "Text") {
+            HamburSection(title = stringResource(R.string.appearance_section_text)) {
                 ChoiceRow(
-                    title = "Font scale",
+                    title = stringResource(R.string.appearance_font_scale_title),
                     current = fontScale,
                     options = listOf(
-                        "small" to "Small",
-                        "default" to "Default",
-                        "large" to "Large",
-                        "extra_large" to "Extra large",
+                        "small" to stringResource(R.string.appearance_font_scale_small),
+                        "default" to stringResource(R.string.appearance_font_scale_default),
+                        "large" to stringResource(R.string.appearance_font_scale_large),
+                        "extra_large" to stringResource(R.string.appearance_font_scale_extra_large),
                     ),
                     onSelect = { store.saveRawAppSetting("fontScale", it) },
                 )
             }
         }
         item {
-            HamburSection(title = "Startup") {
+            HamburSection(title = stringResource(R.string.appearance_section_startup)) {
                 ChoiceRow(
-                    title = "Chat on app start",
+                    title = stringResource(R.string.appearance_startup_title),
                     current = startupChatMode,
                     options = listOf(
-                        "last_chat" to "Last chat",
-                        "new_chat" to "New chat",
+                        "last_chat" to stringResource(R.string.appearance_startup_last_chat),
+                        "new_chat" to stringResource(R.string.appearance_startup_new_chat),
                     ),
                     onSelect = { store.saveRawAppSetting("startupChatMode", it) },
                 )
             }
         }
         item {
-            HamburSection(title = "Thinking") {
+            HamburSection(title = stringResource(R.string.appearance_section_thinking)) {
                 ChoiceRow(
-                    title = "Thinking block display",
+                    title = stringResource(R.string.appearance_thinking_title),
                     current = thinkingBlockMode,
                     options = listOf(
-                        THINKING_BLOCK_DISPLAY_AUTO_EXPAND to "Auto expand",
-                        THINKING_BLOCK_DISPLAY_COLLAPSED to "Keep collapsed",
-                        THINKING_BLOCK_DISPLAY_AUTO_COLLAPSE to "Expand while thinking, collapse when done",
+                        THINKING_BLOCK_DISPLAY_AUTO_EXPAND to stringResource(R.string.appearance_thinking_auto_expand),
+                        THINKING_BLOCK_DISPLAY_COLLAPSED to stringResource(R.string.appearance_thinking_collapsed),
+                        THINKING_BLOCK_DISPLAY_AUTO_COLLAPSE to stringResource(R.string.appearance_thinking_auto_collapse),
                     ),
                     onSelect = { store.saveRawAppSetting(THINKING_BLOCK_DISPLAY_MODE_KEY, it) },
                 )
             }
         }
         item {
-            HamburSection(title = "Current settings") {
+            HamburSection(title = stringResource(R.string.appearance_section_input)) {
+                SettingsSwitchRow(
+                    title = stringResource(R.string.appearance_focus_after_reply_title),
+                    summary = stringResource(R.string.appearance_focus_after_reply_summary),
+                    checked = focusInputAfterReply,
+                    onCheckedChange = {
+                        store.saveRawAppSetting(AUTO_FOCUS_INPUT_AFTER_REPLY_KEY, it.toString())
+                    },
+                )
+            }
+        }
+        item {
+            HamburSection(title = stringResource(R.string.appearance_section_current)) {
+                SummaryLine(label = "language", value = languageTag)
                 SummaryLine(label = "themeMode", value = themeMode)
                 SummaryLine(label = "fontScale", value = fontScale)
                 SummaryLine(label = "startupChatMode", value = startupChatMode)
                 SummaryLine(label = "thinkingBlockDisplayMode", value = thinkingBlockMode)
+                SummaryLine(label = AUTO_FOCUS_INPUT_AFTER_REPLY_KEY, value = focusInputAfterReply.toString())
             }
         }
     }
@@ -1630,43 +1742,43 @@ fun PersonaSettingsScreen(
                 // 只把"已保存内容"对齐到刚提交的文本，编辑框保持用户输入不动：
                 // 设置快照刷新可能晚一拍到达，这里不依赖它，避免把草稿冲掉。
                 loadedPersona = trimmedDraft
-                Toast.makeText(context, "Persona saved", Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, context.getString(R.string.settings_toast_persona_saved), Toast.LENGTH_SHORT).show()
                 lastCommandSequence = 0L
             } else if (state.runtimeStatus == "Error") {
-                Toast.makeText(context, "Save failed: ${state.footer}", Toast.LENGTH_LONG).show()
+                Toast.makeText(context, context.getString(R.string.settings_toast_save_failed, state.footer), Toast.LENGTH_LONG).show()
                 lastCommandSequence = 0L
             }
         }
     }
 
-    SettingsPage(title = "Persona", subtitle = "SOUL.md", onBack = onBack) {
+    SettingsPage(title = stringResource(R.string.settings_persona_title), subtitle = "SOUL.md", onBack = onBack) {
         item {
             HamburSection(
                 title = "SOUL.md",
-                subtitle = "Prepended to the system prompt of every chat turn",
+                subtitle = stringResource(R.string.settings_persona_section_subtitle),
             ) {
                 OutlinedTextField(
                     value = draft,
                     onValueChange = { draft = it },
                     modifier = Modifier.fillMaxWidth(),
                     minLines = 10,
-                    label = { Text("Persona") },
+                    label = { Text(stringResource(R.string.settings_persona_title)) },
                     placeholder = {
-                        Text("For example: You are a terse senior engineer. Answer in Chinese, prefer concrete steps, never pad with pleasantries.")
+                        Text(stringResource(R.string.settings_persona_placeholder))
                     },
                     isError = tooLong,
                 )
-                SummaryLine(label = "Length (UTF-8 bytes)", value = "$draftBytes / $PERSONA_BYTE_LIMIT")
+                SummaryLine(label = stringResource(R.string.settings_persona_length), value = "$draftBytes / $PERSONA_BYTE_LIMIT")
                 if (tooLong) {
                     Text(
-                        text = "The backend rejects persona text longer than $PERSONA_BYTE_LIMIT UTF-8 bytes.",
+                        text = stringResource(R.string.settings_persona_too_long, PERSONA_BYTE_LIMIT),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.error,
                     )
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     SecondaryActionButton(
-                        text = "Reload",
+                        text = stringResource(R.string.common_reload),
                         enabled = dirty,
                         onClick = {
                             draft = savedPersona
@@ -1674,11 +1786,11 @@ fun PersonaSettingsScreen(
                         },
                     )
                     SecondaryActionButton(
-                        text = "Save",
+                        text = stringResource(R.string.common_save),
                         enabled = dirty && !tooLong,
                         onClick = {
                             lastCommandSequence = state.lastAppliedSequence.toLong()
-                            Toast.makeText(context, "Saving persona...", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(context, context.getString(R.string.settings_toast_persona_saving), Toast.LENGTH_SHORT).show()
                             store.savePersona(draft)
                         },
                     )
@@ -1686,11 +1798,11 @@ fun PersonaSettingsScreen(
             }
         }
         item {
-            HamburSection(title = "How it applies") {
-                SummaryLine(label = "Stored as", value = PERSONA_SETTING_KEY)
-                SummaryLine(label = "Applied to", value = "Main chat and delegated subagents")
+            HamburSection(title = stringResource(R.string.settings_persona_how_section)) {
+                SummaryLine(label = stringResource(R.string.settings_persona_stored_as), value = PERSONA_SETTING_KEY)
+                SummaryLine(label = stringResource(R.string.settings_persona_applied_to), value = stringResource(R.string.settings_persona_applied_to_value))
                 Text(
-                    text = "Clearing the text and saving removes the persona; the default assistant style applies again. Changes take effect from the next message.",
+                    text = stringResource(R.string.settings_persona_how_hint),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -1717,7 +1829,7 @@ fun GenericJsonSettingsScreen(
 
     SettingsPage(title = title, subtitle = summary, onBack = onBack) {
         item {
-            HamburSection(title = "JSON payload") {
+            HamburSection(title = stringResource(R.string.settings_json_payload_section)) {
                 OutlinedTextField(
                     value = value,
                     onValueChange = { value = it },
@@ -1727,20 +1839,20 @@ fun GenericJsonSettingsScreen(
                     label = { Text(settingKey) },
                 )
                 Button(onClick = { store.saveAppSetting(settingKey, value, false) }, enabled = value.isNotBlank()) {
-                    Text("Save")
+                    Text(stringResource(R.string.common_save))
                 }
             }
         }
         if (settingKey == "skills") {
             item {
-                HamburSection(title = "Skill enabled flag") {
-                    OutlinedTextField(value = skillId, onValueChange = { skillId = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Skill id") })
+                HamburSection(title = stringResource(R.string.settings_json_skill_flag_section)) {
+                    OutlinedTextField(value = skillId, onValueChange = { skillId = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text(stringResource(R.string.settings_skill_id)) })
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Switch(checked = skillEnabled, onCheckedChange = { skillEnabled = it })
-                        Text("Enabled", modifier = Modifier.padding(start = 8.dp))
+                        Text(stringResource(R.string.common_enabled), modifier = Modifier.padding(start = 8.dp))
                     }
                     SecondaryActionButton(
-                        text = "Save skill flag",
+                        text = stringResource(R.string.settings_json_skill_flag_save),
                         enabled = skillId.isNotBlank(),
                         onClick = { store.setSkillEnabled(skillId, skillEnabled) },
                     )
@@ -1797,41 +1909,44 @@ fun ToolSettingsScreen(
         maxChars = webFetchMaxChars.trim().toIntOrNull() ?: webFetchStored.maxChars,
     )
 
-    SettingsPage(title = "Tools", onBack = onBack) {
+    SettingsPage(title = stringResource(R.string.settings_tools_title), onBack = onBack) {
         item {
-            HamburSection(title = "Tool settings") {
+            HamburSection(title = stringResource(R.string.settings_tool_settings_section)) {
                 OutlinedTextField(value = toolSettings, onValueChange = { toolSettings = it }, modifier = Modifier.fillMaxWidth(), minLines = 5, label = { Text("tool_settings") })
                 Button(onClick = { store.saveAppSetting("tool_settings", toolSettings, false) }) {
-                    Text("Save tool settings")
+                    Text(stringResource(R.string.settings_tool_save))
                 }
             }
         }
         item {
-            HamburSection(title = "Browser tool settings") {
+            HamburSection(title = stringResource(R.string.settings_tools_browser_settings_section)) {
                 OutlinedTextField(value = browserSettings, onValueChange = { browserSettings = it }, modifier = Modifier.fillMaxWidth(), minLines = 5, label = { Text("browser_tool_settings") })
-                SecondaryActionButton(text = "Save browser settings", onClick = { store.saveBrowserToolSettings(browserSettings) })
+                SecondaryActionButton(text = stringResource(R.string.settings_tools_save_browser), onClick = { store.saveBrowserToolSettings(browserSettings) })
             }
         }
         item {
-            HamburSection(title = "Web search", subtitle = "web_search_settings：Auto 在可用后端里挑一个，Off 直接关闭") {
+            HamburSection(
+                title = stringResource(R.string.settings_tools_web_search_section),
+                subtitle = stringResource(R.string.settings_tools_web_search_subtitle),
+            ) {
                 ChoiceRow(
-                    title = "Provider",
+                    title = stringResource(R.string.settings_model_provider),
                     current = webSearchProvider,
                     options = listOf(
-                        "auto" to "Auto",
-                        "deepseek-official" to "DeepSeek official",
-                        "exa" to "Exa",
-                        "off" to "Off",
+                        "auto" to stringResource(R.string.settings_tools_provider_auto),
+                        "deepseek-official" to stringResource(R.string.settings_tools_provider_deepseek),
+                        "exa" to stringResource(R.string.settings_tools_provider_exa),
+                        "off" to stringResource(R.string.settings_tools_provider_off),
                     ),
                     onSelect = { webSearchProvider = it },
                 )
-                OutlinedTextField(value = webSearchEndpoint, onValueChange = { webSearchEndpoint = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Endpoint") })
-                OutlinedTextField(value = webSearchModel, onValueChange = { webSearchModel = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Model") })
-                OutlinedTextField(value = webSearchMaxResults, onValueChange = { webSearchMaxResults = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Max results (1-25)") })
-                OutlinedTextField(value = webSearchMaxQueries, onValueChange = { webSearchMaxQueries = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Max queries (1-8)") })
-                OutlinedTextField(value = webSearchMaxUses, onValueChange = { webSearchMaxUses = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Max uses (1-20)") })
+                OutlinedTextField(value = webSearchEndpoint, onValueChange = { webSearchEndpoint = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text(stringResource(R.string.settings_tools_endpoint)) })
+                OutlinedTextField(value = webSearchModel, onValueChange = { webSearchModel = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text(stringResource(R.string.settings_model_section)) })
+                OutlinedTextField(value = webSearchMaxResults, onValueChange = { webSearchMaxResults = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text(stringResource(R.string.settings_tools_max_results)) })
+                OutlinedTextField(value = webSearchMaxQueries, onValueChange = { webSearchMaxQueries = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text(stringResource(R.string.settings_tools_max_queries)) })
+                OutlinedTextField(value = webSearchMaxUses, onValueChange = { webSearchMaxUses = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text(stringResource(R.string.settings_tools_max_uses)) })
                 SecondaryActionButton(
-                    text = "Save web search settings",
+                    text = stringResource(R.string.settings_tools_save_web_search),
                     enabled = webSearchEndpoint.isNotBlank() && webSearchModel.isNotBlank(),
                     onClick = {
                         val json = webSearchForm.toJson()
@@ -1842,10 +1957,13 @@ fun ToolSettingsScreen(
             }
         }
         item {
-            HamburSection(title = "Web search keys", subtitle = "密钥只写入 Android Secret Store，不会存进设置 JSON") {
-                OutlinedTextField(value = deepseekSearchKey, onValueChange = { deepseekSearchKey = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, visualTransformation = PasswordVisualTransformation(), label = { Text("DeepSeek API key ($WEB_SEARCH_DEEPSEEK_SECRET_REF)") })
+            HamburSection(
+                title = stringResource(R.string.settings_tools_web_search_keys_section),
+                subtitle = stringResource(R.string.settings_tools_web_search_keys_subtitle),
+            ) {
+                OutlinedTextField(value = deepseekSearchKey, onValueChange = { deepseekSearchKey = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, visualTransformation = PasswordVisualTransformation(), label = { Text(stringResource(R.string.settings_tools_deepseek_key, WEB_SEARCH_DEEPSEEK_SECRET_REF)) })
                 SecondaryActionButton(
-                    text = "Save DeepSeek key",
+                    text = stringResource(R.string.settings_tools_save_deepseek_key),
                     enabled = deepseekSearchKey.isNotBlank(),
                     onClick = {
                         if (store.saveWebSearchSecret(WEB_SEARCH_DEEPSEEK_SECRET_REF, deepseekSearchKey)) {
@@ -1857,44 +1975,47 @@ fun ToolSettingsScreen(
                                 webSearchJson = json
                             }
                             deepseekSearchKey = ""
-                            Toast.makeText(context, "DeepSeek search key saved", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(context, context.getString(R.string.settings_toast_deepseek_key_saved), Toast.LENGTH_SHORT).show()
                         } else {
-                            Toast.makeText(context, "Failed to save DeepSeek search key", Toast.LENGTH_LONG).show()
+                            Toast.makeText(context, context.getString(R.string.settings_toast_deepseek_key_save_failed), Toast.LENGTH_LONG).show()
                         }
                     },
                 )
-                OutlinedTextField(value = exaSearchKey, onValueChange = { exaSearchKey = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, visualTransformation = PasswordVisualTransformation(), label = { Text("Exa API key ($WEB_SEARCH_EXA_SECRET_REF)") })
+                OutlinedTextField(value = exaSearchKey, onValueChange = { exaSearchKey = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, visualTransformation = PasswordVisualTransformation(), label = { Text(stringResource(R.string.settings_tools_exa_key, WEB_SEARCH_EXA_SECRET_REF)) })
                 SecondaryActionButton(
-                    text = "Save Exa key",
+                    text = stringResource(R.string.settings_tools_save_exa_key),
                     enabled = exaSearchKey.isNotBlank(),
                     onClick = {
                         if (store.saveWebSearchSecret(WEB_SEARCH_EXA_SECRET_REF, exaSearchKey)) {
                             exaSearchKey = ""
-                            Toast.makeText(context, "Exa search key saved", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(context, context.getString(R.string.settings_toast_exa_key_saved), Toast.LENGTH_SHORT).show()
                         } else {
-                            Toast.makeText(context, "Failed to save Exa search key", Toast.LENGTH_LONG).show()
+                            Toast.makeText(context, context.getString(R.string.settings_toast_exa_key_save_failed), Toast.LENGTH_LONG).show()
                         }
                     },
                 )
             }
         }
         item {
-            HamburSection(title = "Web fetch", subtitle = "web_fetch_settings：抓取单个 URL 并转成 Markdown") {
+            HamburSection(
+                title = stringResource(R.string.settings_tools_web_fetch_section),
+                subtitle = stringResource(R.string.settings_tools_web_fetch_subtitle),
+            ) {
                 SettingsSwitchRow(
-                    title = "Enabled",
-                    summary = if (webFetchEnabled) "The model can call web_fetch." else "Hidden from the model; calls to it are rejected.",
+                    title = stringResource(R.string.common_enabled),
+                    summary = if (webFetchEnabled) stringResource(R.string.settings_tools_web_fetch_on) else stringResource(R.string.settings_tool_disabled_summary),
                     checked = webFetchEnabled,
                     onCheckedChange = { webFetchEnabled = it },
                 )
                 SettingsSwitchRow(
-                    title = "Allow private hosts",
-                    summary = if (webFetchAllowPrivateHosts) "允许访问回环和内网地址（慎用）" else "只允许公网地址",
+                    title = stringResource(R.string.settings_tools_allow_private_hosts),
+                    summary = if (webFetchAllowPrivateHosts) stringResource(R.string.settings_tools_allow_private_hosts_on) else stringResource(R.string.settings_tools_allow_private_hosts_off),
                     checked = webFetchAllowPrivateHosts,
                     onCheckedChange = { webFetchAllowPrivateHosts = it },
                 )
-                OutlinedTextField(value = webFetchMaxChars, onValueChange = { webFetchMaxChars = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Max chars (1000-400000)") })
+                OutlinedTextField(value = webFetchMaxChars, onValueChange = { webFetchMaxChars = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text(stringResource(R.string.settings_tools_max_chars)) })
                 SecondaryActionButton(
-                    text = "Save web fetch settings",
+                    text = stringResource(R.string.settings_tools_save_web_fetch),
                     onClick = {
                         val json = webFetchForm.toJson()
                         store.saveAppSetting("web_fetch_settings", json, false)
@@ -1904,16 +2025,19 @@ fun ToolSettingsScreen(
             }
         }
         item {
-            HamburSection(title = "Web tools raw JSON", subtitle = "兜底编辑入口：文本会原样写进对应的 app setting") {
+            HamburSection(
+                title = stringResource(R.string.settings_tools_raw_json_section),
+                subtitle = stringResource(R.string.settings_tools_raw_json_subtitle),
+            ) {
                 OutlinedTextField(value = webSearchJson, onValueChange = { webSearchJson = it }, modifier = Modifier.fillMaxWidth(), minLines = 5, label = { Text("web_search_settings") })
                 SecondaryActionButton(
-                    text = "Save raw web search JSON",
+                    text = stringResource(R.string.settings_tools_save_raw_web_search),
                     enabled = webSearchJson.isNotBlank(),
                     onClick = { store.saveAppSetting("web_search_settings", webSearchJson, false) },
                 )
                 OutlinedTextField(value = webFetchJson, onValueChange = { webFetchJson = it }, modifier = Modifier.fillMaxWidth(), minLines = 5, label = { Text("web_fetch_settings") })
                 SecondaryActionButton(
-                    text = "Save raw web fetch JSON",
+                    text = stringResource(R.string.settings_tools_save_raw_web_fetch),
                     enabled = webFetchJson.isNotBlank(),
                     onClick = { store.saveAppSetting("web_fetch_settings", webFetchJson, false) },
                 )
@@ -1940,9 +2064,9 @@ fun StartupTaskSettingsScreen(
 
     if (pendingDelete.isNotBlank()) {
         ConfirmDangerDialog(
-            title = "Delete startup task",
-            text = "Startup task changes require approval.",
-            confirmText = "Delete",
+            title = stringResource(R.string.settings_startup_task_delete_title),
+            text = stringResource(R.string.settings_startup_task_delete_message),
+            confirmText = stringResource(R.string.common_delete),
             onConfirm = {
                 store.deleteStartupTask(pendingDelete, true)
                 pendingDelete = ""
@@ -1951,16 +2075,19 @@ fun StartupTaskSettingsScreen(
         )
     }
 
-    SettingsPage(title = "Startup Tasks", onBack = onBack) {
+    SettingsPage(title = stringResource(R.string.settings_startup_tasks_title), onBack = onBack) {
         item {
-            HamburSection(title = "Task editor", subtitle = "Saved through approved backend commands") {
-                OutlinedTextField(value = taskId, onValueChange = { taskId = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("Task id") })
-                OutlinedTextField(value = payload, onValueChange = { payload = it }, modifier = Modifier.fillMaxWidth(), minLines = 6, label = { Text("Task JSON") })
+            HamburSection(
+                title = stringResource(R.string.settings_startup_task_editor_section),
+                subtitle = stringResource(R.string.settings_startup_task_editor_subtitle),
+            ) {
+                OutlinedTextField(value = taskId, onValueChange = { taskId = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text(stringResource(R.string.settings_startup_task_id)) })
+                OutlinedTextField(value = payload, onValueChange = { payload = it }, modifier = Modifier.fillMaxWidth(), minLines = 6, label = { Text(stringResource(R.string.settings_startup_task_json)) })
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(onClick = { store.saveStartupTask(taskId, payload, true) }, enabled = taskId.isNotBlank() && payload.isNotBlank()) {
-                        Text("Approve and save")
+                        Text(stringResource(R.string.settings_startup_task_approve_save))
                     }
-                    SecondaryActionButton(text = "Delete", enabled = taskId.isNotBlank(), onClick = { pendingDelete = taskId })
+                    SecondaryActionButton(text = stringResource(R.string.common_delete), enabled = taskId.isNotBlank(), onClick = { pendingDelete = taskId })
                 }
             }
         }
@@ -1988,15 +2115,15 @@ fun RootfsSettingsScreen(
         var preserveRoot by remember { mutableStateOf(true) }
         AlertDialog(
             onDismissRequest = { confirmReset = false },
-            title = { Text("重置 RootFS") },
+            title = { Text(stringResource(R.string.settings_rootfs_reset_dialog_title)) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Text("重置会重新下载并解包 Alpine rootfs。这需要一点时间并会清除现有环境。")
+                    Text(stringResource(R.string.settings_rootfs_reset_dialog_message))
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("是否保留用户数据 (/root)", modifier = Modifier.weight(1f))
+                        Text(stringResource(R.string.settings_rootfs_reset_preserve), modifier = Modifier.weight(1f))
                         Switch(
                             checked = preserveRoot,
                             onCheckedChange = { preserveRoot = it }
@@ -2015,59 +2142,69 @@ fun RootfsSettingsScreen(
                         contentColor = MaterialTheme.colorScheme.onError
                     )
                 ) {
-                    Text("重置")
+                    Text(stringResource(R.string.settings_reset))
                 }
             },
             dismissButton = {
                 TextButton(onClick = { confirmReset = false }) {
-                    Text("取消")
+                    Text(stringResource(R.string.common_cancel))
                 }
             }
         )
     }
 
-    SettingsPage(title = "Rootfs 管理", onBack = onBack) {
+    SettingsPage(title = stringResource(R.string.settings_rootfs_screen_title), onBack = onBack) {
         item {
             val status = state.rootfsStatus
-            HamburSection(title = "Rootfs 状态") {
+            HamburSection(title = stringResource(R.string.settings_rootfs_status_section)) {
                 SummaryLine(
-                    label = "RootFS 版本",
-                    value = status?.let { if (it.rootfsInstalled) it.version.ifBlank { "未知" } else "未初始化" } ?: "未知"
+                    label = stringResource(R.string.settings_rootfs_version),
+                    value = status?.let {
+                        if (it.rootfsInstalled) {
+                            it.version.ifBlank { stringResource(R.string.common_unknown) }
+                        } else {
+                            stringResource(R.string.settings_rootfs_uninitialized)
+                        }
+                    } ?: stringResource(R.string.common_unknown)
                 )
                 SummaryLine(
-                    label = "在线 RootFS",
-                    value = status?.let { "已配置" } ?: "未检测"
+                    label = stringResource(R.string.settings_rootfs_online),
+                    value = status?.let { stringResource(R.string.settings_rootfs_configured) }
+                        ?: stringResource(R.string.settings_rootfs_not_detected)
                 )
                 SummaryLine(
-                    label = "存储占用",
-                    value = status?.rootfsSizeBytes?.toLong()?.toReadableSize() ?: "未知"
+                    label = stringResource(R.string.settings_rootfs_storage_used),
+                    value = status?.rootfsSizeBytes?.toLong()?.toReadableSize() ?: stringResource(R.string.common_unknown)
                 )
                 SummaryLine(
-                    label = "root 权限",
-                    value = status?.let { if (it.rootAvailable) "是" else "否" } ?: "未知"
+                    label = stringResource(R.string.settings_rootfs_root_access),
+                    value = status?.let { if (it.rootAvailable) stringResource(R.string.common_yes) else stringResource(R.string.common_no) }
+                        ?: stringResource(R.string.common_unknown)
                 )
                 SummaryLine(
-                    label = "chroot 状态",
-                    value = status?.let { if (it.chrootAvailable) "是" else "否" } ?: "未知"
+                    label = stringResource(R.string.settings_rootfs_chroot_status),
+                    value = status?.let { if (it.chrootAvailable) stringResource(R.string.common_yes) else stringResource(R.string.common_no) }
+                        ?: stringResource(R.string.common_unknown)
                 )
                 SummaryLine(
-                    label = "proot 状态",
-                    value = status?.let { if (it.prootAvailable) "是" else "否" } ?: "未知"
+                    label = stringResource(R.string.settings_rootfs_proot_status),
+                    value = status?.let { if (it.prootAvailable) stringResource(R.string.common_yes) else stringResource(R.string.common_no) }
+                        ?: stringResource(R.string.common_unknown)
                 )
                 SummaryLine(
-                    label = "浏览路径",
-                    value = status?.rootfsPath ?: "未初始化"
+                    label = stringResource(R.string.settings_rootfs_browse_path),
+                    value = status?.rootfsPath ?: stringResource(R.string.settings_rootfs_uninitialized)
                 )
             }
         }
         item {
-            HamburSection(title = "后端选择") {
+            HamburSection(title = stringResource(R.string.settings_rootfs_backend_section)) {
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("当前后端", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+                    Text(stringResource(R.string.settings_rootfs_current_backend), style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
                     
                     val currentBackend = state.appSettings.find { it.key == "rootfsBackend" || it.key == "rootfs_setting:rootfsBackend" }?.value?.trim('"', ' ') ?: "proot"
                     val chrootSupported = state.rootfsStatus?.rootAvailable == true
@@ -2120,13 +2257,13 @@ fun RootfsSettingsScreen(
             }
         }
         item {
-            HamburSection(title = "控制") {
-                SummaryLine(label = "当前会话", value = state.selectedSessionId)
+            HamburSection(title = stringResource(R.string.settings_rootfs_control_section)) {
+                SummaryLine(label = stringResource(R.string.settings_rootfs_current_session), value = state.selectedSessionId)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(onClick = { store.runRootfsWarmup(state.selectedSessionId) }) {
-                        Text("Warm up")
+                        Text(stringResource(R.string.settings_rootfs_warmup))
                     }
-                    SecondaryActionButton(text = "Reset", onClick = { confirmReset = true })
+                    SecondaryActionButton(text = stringResource(R.string.settings_reset), onClick = { confirmReset = true })
                 }
                 Text(
                     text = state.footer,
@@ -2136,11 +2273,11 @@ fun RootfsSettingsScreen(
             }
         }
         item {
-            HamburSection(title = "高级配置") {
-                OutlinedTextField(value = key, onValueChange = { key = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("配置项 Key") })
-                OutlinedTextField(value = value, onValueChange = { value = it }, modifier = Modifier.fillMaxWidth(), minLines = 5, label = { Text("配置项 Value (JSON/Text)") })
+            HamburSection(title = stringResource(R.string.settings_rootfs_advanced_section)) {
+                OutlinedTextField(value = key, onValueChange = { key = it }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text(stringResource(R.string.settings_rootfs_config_key)) })
+                OutlinedTextField(value = value, onValueChange = { value = it }, modifier = Modifier.fillMaxWidth(), minLines = 5, label = { Text(stringResource(R.string.settings_rootfs_config_value)) })
                 Button(onClick = { store.saveRootfsSetting(key, value, true) }, enabled = key.isNotBlank() && value.isNotBlank()) {
-                    Text("保存并应用")
+                    Text(stringResource(R.string.settings_rootfs_save_apply))
                 }
             }
         }
@@ -2187,15 +2324,15 @@ private fun ProviderRow(
         Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(provider.name, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-                StatusPill(text = if (provider.enabled) "Enabled" else "Disabled", active = provider.enabled)
+                StatusPill(text = if (provider.enabled) stringResource(R.string.common_enabled) else stringResource(R.string.common_disabled), active = provider.enabled)
             }
-            SummaryLine(label = "ID", value = provider.id)
-            SummaryLine(label = "Base URL", value = provider.baseUrl)
-            SummaryLine(label = "Secret", value = provider.secretLabel)
+            SummaryLine(label = stringResource(R.string.settings_id), value = provider.id)
+            SummaryLine(label = stringResource(R.string.settings_provider_base_url), value = provider.baseUrl)
+            SummaryLine(label = stringResource(R.string.settings_provider_secret), value = provider.secretLabel)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                SecondaryActionButton(text = "Edit", onClick = onUse)
+                SecondaryActionButton(text = stringResource(R.string.common_edit), onClick = onUse)
                 TextButton(onClick = onDelete) {
-                    Text("Delete", color = MaterialTheme.colorScheme.error)
+                    Text(stringResource(R.string.common_delete), color = MaterialTheme.colorScheme.error)
                 }
             }
         }
@@ -2204,14 +2341,23 @@ private fun ProviderRow(
 
 @Composable
 private fun ProviderModelsSection(models: List<UiProviderModelSettings>) {
-    HamburSection(title = "Provider models", subtitle = "Most recent model metadata known by backend") {
+    HamburSection(
+        title = stringResource(R.string.settings_provider_models_section),
+        subtitle = stringResource(R.string.settings_provider_models_section_subtitle),
+    ) {
         if (models.isEmpty()) {
-            Text("No models synced", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(stringResource(R.string.settings_provider_models_empty), color = MaterialTheme.colorScheme.onSurfaceVariant)
         } else {
             models.take(20).forEach { model ->
                 SummaryLine(
                     label = model.modelId,
-                    value = "ctx ${model.contextLimit}, out ${model.outputLimit}, tools ${model.supportsToolCall}, image ${model.supportsImageInput}",
+                    value = stringResource(
+                        R.string.settings_provider_model_summary,
+                        model.contextLimit.toString(),
+                        model.outputLimit.toString(),
+                        model.supportsToolCall.toString(),
+                        model.supportsImageInput.toString(),
+                    ),
                 )
             }
         }
@@ -2223,10 +2369,10 @@ private fun CurrentSettingsSection(
     state: HamburUiState,
     prefix: String,
 ) {
-    HamburSection(title = "Current backend settings") {
+    HamburSection(title = stringResource(R.string.settings_current_settings_section)) {
         val settings = state.appSettings.filter { it.key.startsWith(prefix) || it.key.contains(prefix) }
         if (settings.isEmpty()) {
-            Text("No matching settings", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(stringResource(R.string.settings_current_settings_empty), color = MaterialTheme.colorScheme.onSurfaceVariant)
         } else {
             settings.forEach { setting ->
                 SummaryLine(label = setting.key, value = setting.value)
@@ -2237,9 +2383,12 @@ private fun CurrentSettingsSection(
 
 @Composable
 private fun ConfigAuditPreview(configAudits: List<UiConfigAudit>) {
-    HamburSection(title = "Config audit", subtitle = "Recent backend configuration writes") {
+    HamburSection(
+        title = stringResource(R.string.settings_config_audit_section),
+        subtitle = stringResource(R.string.settings_config_audit_subtitle),
+    ) {
         if (configAudits.isEmpty()) {
-            Text("No config changes recorded", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(stringResource(R.string.settings_config_audit_empty), color = MaterialTheme.colorScheme.onSurfaceVariant)
         } else {
             configAudits.take(8).forEach { audit ->
                 SummaryLine(
@@ -2251,18 +2400,34 @@ private fun ConfigAuditPreview(configAudits: List<UiConfigAudit>) {
     }
 }
 
+/**
+ * 「后端还没暴露这个功能」的占位页类型。
+ *
+ * 以前这个页面拿标题字面量做分支（`when (title) { "Logs" -> ... }`），文案外提之后 title 是
+ * 本地化字符串——中文下 "Logs" 变成「日志」，分支会全部落空只剩兜底文案。所以改成枚举：
+ * 标题只用来显示，分支走类型。
+ */
+enum class BackendGapFeature(
+    @StringRes val titleRes: Int,
+    @StringRes val summaryRes: Int,
+) {
+    EnvironmentVariables(
+        R.string.app_environment_variables_title,
+        R.string.app_environment_variables_summary,
+    ),
+}
+
 @Composable
 fun FeatureUnavailableScreen(
-    title: String,
-    summary: String,
+    feature: BackendGapFeature,
     onBack: () -> Unit,
 ) {
-    var toggleOne by rememberSaveable(title) { mutableStateOf(false) }
-    var textValue by rememberSaveable(title) { mutableStateOf("") }
-    var choiceValue by rememberSaveable(title) { mutableStateOf("") }
-    SettingsPage(title = title, subtitle = "Waiting for backend", onBack = onBack) {
+    val title = stringResource(feature.titleRes)
+    val summary = stringResource(feature.summaryRes)
+    var textValue by rememberSaveable(feature) { mutableStateOf("") }
+    SettingsPage(title = title, subtitle = stringResource(R.string.settings_section_waiting_backend), onBack = onBack) {
         item {
-            HamburSection(title = "Backend gap") {
+            HamburSection(title = stringResource(R.string.settings_feature_backend_gap)) {
                 Text(
                     text = summary,
                     style = MaterialTheme.typography.bodyMedium,
@@ -2271,58 +2436,25 @@ fun FeatureUnavailableScreen(
             }
         }
         item {
-            HamburSection(title = "UI surface") {
-                when (title) {
-                    "Logs" -> {
-                        CapabilitySwitch("Record logs", toggleOne) { toggleOne = it }
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            SecondaryActionButton(text = "All", onClick = { choiceValue = "All" })
-                            SecondaryActionButton(text = "Jank", onClick = { choiceValue = "Jank" })
-                            SecondaryActionButton(text = "Warnings", onClick = { choiceValue = "Warnings" })
-                        }
+            HamburSection(title = stringResource(R.string.settings_feature_ui_surface)) {
+                when (feature) {
+                    BackendGapFeature.EnvironmentVariables -> {
                         OutlinedTextField(
                             value = textValue,
                             onValueChange = { textValue = it },
                             modifier = Modifier.fillMaxWidth(),
                             minLines = 8,
-                            label = { Text("Log viewer") },
-                            placeholder = { Text("Runtime logs are not exposed to UI state yet.") },
-                        )
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            SecondaryActionButton(text = "Clear logs", enabled = false, onClick = {})
-                            SummaryLine(label = "Selected tab", value = choiceValue.ifBlank { "All" })
-                        }
-                    }
-                    "Token Usage" -> {
-                        SummaryLine(label = "Prompt tokens", value = "Not exposed")
-                        SummaryLine(label = "Completion tokens", value = "Not exposed")
-                        SummaryLine(label = "Cost", value = "Not exposed")
-                        OutlinedTextField(
-                            value = choiceValue,
-                            onValueChange = { choiceValue = it },
-                            modifier = Modifier.fillMaxWidth(),
-                            singleLine = true,
-                            label = { Text("Provider filter") },
-                        )
-                    }
-                    "Environment Variables" -> {
-                        OutlinedTextField(
-                            value = textValue,
-                            onValueChange = { textValue = it },
-                            modifier = Modifier.fillMaxWidth(),
-                            minLines = 8,
-                            label = { Text("Environment") },
+                            label = { Text(stringResource(R.string.settings_feature_environment)) },
                             placeholder = { Text("KEY=value") },
                         )
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            SecondaryActionButton(text = "Validate", enabled = false, onClick = {})
-                            SecondaryActionButton(text = "Save", enabled = false, onClick = {})
+                            SecondaryActionButton(text = stringResource(R.string.settings_validate), enabled = false, onClick = {})
+                            SecondaryActionButton(text = stringResource(R.string.common_save), enabled = false, onClick = {})
                         }
                     }
-                    else -> Text("No local UI controls defined", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
                 Text(
-                    text = "These controls are intentionally local-only until the backend exposes a contract.",
+                    text = stringResource(R.string.settings_feature_local_only_hint),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -2330,6 +2462,521 @@ fun FeatureUnavailableScreen(
         }
     }
 }
+
+/** Settings → 日志 的筛选页签。 */
+private enum class LogFilterTab(@StringRes val labelRes: Int) {
+    All(R.string.settings_logs_tab_all),
+    Jank(R.string.settings_logs_tab_jank),
+    Warnings(R.string.settings_logs_tab_warnings),
+    ;
+
+    fun matches(entry: DiagLogEntry): Boolean = when (this) {
+        All -> true
+        Jank -> entry.source == DiagSource.JANK
+        Warnings -> entry.level.rank >= DiagLevel.WARN.rank
+    }
+}
+
+/**
+ * Settings → 日志：应用内诊断日志查看器。
+ *
+ * 数据来自进程内环形缓冲区（[com.hambur.chat.diagnostics.DiagnosticLogs]），包含三类来源：
+ * 应用日志、会话切换卡顿跟踪（[com.hambur.chat.perf.ChatJankTracer]）、Rust 结构化 tracing。
+ * 「清空日志」只清这个内存缓冲区，不写数据库也不删聊天数据；记录开关经
+ * app_settings.loggingEnabled 落库，同时交给 Rust 侧决定是否产出 tracing 条目。
+ */
+@Composable
+fun DiagnosticsLogsScreen(
+    state: HamburUiState,
+    store: HamburUiStore,
+    onBack: () -> Unit,
+) {
+    var tab by rememberSaveable { mutableStateOf(LogFilterTab.All) }
+    // 页面存活期间轮询 Rust 侧增量；离开页面 LaunchedEffect 取消，不会后台常驻。
+    LaunchedEffect(Unit) {
+        while (true) {
+            store.refreshDiagnostics()
+            delay(1000)
+        }
+    }
+    val entries = remember(state.diagnosticLogs, tab) {
+        state.diagnosticLogs.filter(tab::matches)
+    }
+    SettingsPage(
+        title = stringResource(R.string.settings_logs_title),
+        subtitle = stringResource(R.string.settings_logs_summary),
+        onBack = onBack,
+    ) {
+        item {
+            HamburSection(title = stringResource(R.string.settings_logs_section_record)) {
+                CapabilitySwitch(
+                    label = stringResource(R.string.settings_logs_record_title),
+                    checked = state.loggingEnabled,
+                    onCheckedChange = store::setLoggingEnabled,
+                )
+                Text(
+                    text = stringResource(R.string.settings_logs_record_summary),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        // 配置审计属于诊断信息：从主设置页移到这里，和日志放一起。
+        item {
+            ConfigAuditPreview(configAudits = state.configAudits)
+        }
+        item {
+            HamburSection(
+                title = stringResource(R.string.settings_logs_section_entries),
+                subtitle = stringResource(R.string.settings_logs_count, entries.size),
+            ) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    LogFilterTab.entries.forEach { candidate ->
+                        if (candidate == tab) {
+                            Button(onClick = { tab = candidate }) {
+                                Text(stringResource(candidate.labelRes))
+                            }
+                        } else {
+                            SecondaryActionButton(
+                                text = stringResource(candidate.labelRes),
+                                onClick = { tab = candidate },
+                            )
+                        }
+                    }
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    SecondaryActionButton(
+                        text = stringResource(R.string.settings_logs_clear),
+                        enabled = state.diagnosticLogs.isNotEmpty(),
+                        onClick = store::clearDiagnosticLogs,
+                    )
+                }
+                Text(
+                    text = stringResource(R.string.settings_logs_hint),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        if (entries.isEmpty()) {
+            item {
+                Text(
+                    text = stringResource(
+                        if (state.loggingEnabled) {
+                            R.string.settings_logs_empty
+                        } else {
+                            R.string.settings_logs_disabled
+                        },
+                    ),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        } else {
+            items(items = entries, key = { it.id }) { entry ->
+                DiagnosticLogRow(entry)
+            }
+        }
+    }
+}
+
+@Composable
+private fun DiagnosticLogRow(entry: DiagLogEntry) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(8.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+    ) {
+        Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                StatusPill(
+                    text = entry.level.label,
+                    active = entry.level.rank >= DiagLevel.WARN.rank,
+                )
+                Text(
+                    text = entry.source.label,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    text = entry.tag,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
+                )
+                Text(
+                    text = formatLogTimestamp(entry.timestampMs),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Text(
+                text = entry.message,
+                style = MaterialTheme.typography.bodySmall,
+                fontFamily = FontFamily.Monospace,
+            )
+            if (entry.sequence > 0L) {
+                Text(
+                    text = "#${entry.sequence}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+private fun formatLogTimestamp(timestampMs: Long): String {
+    return Instant.ofEpochMilli(timestampMs)
+        .atZone(ZoneId.systemDefault())
+        .format(LogTimeFormatter)
+}
+
+/**
+ * 把 token 数格式化成 1.2k / 3.4M / 5.6B 这样的紧凑文本（与用量页截图一致的风格）。
+ */
+internal fun formatTokenCount(value: ULong): String {
+    val number = value.toDouble()
+    return when {
+        value >= 1_000_000_000UL -> String.format(Locale.US, "%.1fB", number / 1_000_000_000.0)
+        value >= 1_000_000UL -> String.format(Locale.US, "%.1fM", number / 1_000_000.0)
+        value >= 1_000UL -> String.format(Locale.US, "%.1fk", number / 1_000.0)
+        else -> value.toString()
+    }
+}
+
+/** 缓存命中率 = 缓存读取 / 总输入。没有输入时按 0 处理，避免除零。 */
+internal fun formatCacheHitRate(cachedTokens: ULong, promptTokens: ULong): String {
+    if (promptTokens == 0UL) return "0.0%"
+    val rate = cachedTokens.toDouble() / promptTokens.toDouble() * 100.0
+    return String.format(Locale.US, "%.1f%%", rate)
+}
+
+/** 用量页里的一行模型（标题已解析成显示名，缺失时退回 id）。 */
+internal data class TokenUsageModelRow(
+    val providerId: String,
+    val modelId: String,
+    val title: String,
+    /** provider 还在配置里，但这个模型已经不在当前模型列表里。 */
+    val notConfigured: Boolean,
+    val group: UiTokenUsageGroup,
+)
+
+/** 用量页里按 provider 分组的一段。 */
+internal data class TokenUsageProviderGroup(
+    val providerId: String,
+    val title: String,
+    /** provider 已不在当前配置中，标题改用「未知」并排到最后。 */
+    val unknownProvider: Boolean,
+    val rows: List<TokenUsageModelRow>,
+)
+
+/**
+ * 把 byModel 汇总按 provider 分组：已知 provider 在前，未知 provider 排最后；
+ * 组内与组间都按总 token 倒序，展示名缺失时回退到 id。
+ */
+internal fun buildTokenUsageGroups(
+    usage: UiTokenUsageSnapshot,
+    providerNames: Map<String, String>,
+    modelNames: Map<Pair<String, String>, String>,
+): List<TokenUsageProviderGroup> {
+    val groups = usage.byModel.groupBy { it.providerId }.map { (providerId, rows) ->
+        val known = providerNames.containsKey(providerId)
+        TokenUsageProviderGroup(
+            providerId = providerId,
+            title = providerNames[providerId].orEmpty().ifBlank { providerId },
+            unknownProvider = !known,
+            rows = rows.sortedByDescending { it.totalTokens }.map { group ->
+                val displayName = modelNames[group.providerId to group.modelId].orEmpty()
+                TokenUsageModelRow(
+                    providerId = group.providerId,
+                    modelId = group.modelId,
+                    title = displayName.ifBlank { group.modelId },
+                    notConfigured = known && displayName.isBlank(),
+                    group = group,
+                )
+            },
+        )
+    }
+    return groups.sortedWith(
+        compareBy(
+            { it.unknownProvider },
+            { -it.rows.sumOf { row -> row.group.totalTokens.toLong() } },
+            { it.title },
+        ),
+    )
+}
+
+
+/**
+ * Settings → Token 用量：模仿 iOS 风格「用量」页。
+ *
+ * 顶部一张白色总用量卡片，下面按 provider 分组列出各模型，行右侧是「输入 / 输出」，
+ * 点进去看该模型的细分。数据来自 Rust 的 `token_usage` 表（每个模型请求一行），
+ * 只统计 token，不显示价格或费用——provider schema 里没有价格字段。
+ */
+@Composable
+fun TokenUsageScreen(
+    state: HamburUiState,
+    store: HamburUiStore,
+    onBack: () -> Unit,
+) {
+    LaunchedEffect(Unit) { store.refreshTokenUsage() }
+    val usage = state.tokenUsage
+    // 用量表里只有 provider/model id，展示名从已有设置快照里取，避免为展示再查一次库。
+    val providerNames = remember(state.providers) {
+        state.providers.associate { it.id to it.name }
+    }
+    val modelNames = remember(state.providerModels) {
+        state.providerModels.associate { (it.providerId to it.modelId) to it.displayName }
+    }
+    val groups = remember(usage, providerNames, modelNames) {
+        buildTokenUsageGroups(usage, providerNames, modelNames)
+    }
+    var detailKey by rememberSaveable { mutableStateOf("") }
+    val detailRow = groups.asSequence()
+        .flatMap { it.rows.asSequence() }
+        .firstOrNull { "${it.providerId}|${it.modelId}" == detailKey }
+
+    Surface(
+        modifier = Modifier.fillMaxSize(),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .statusBarsPadding(),
+        ) {
+            HamburTopBar(
+                title = stringResource(R.string.settings_token_usage_title),
+                onBack = onBack,
+            )
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(18.dp),
+            ) {
+                item { TokenUsageTotalsCard(usage) }
+                if (groups.isEmpty()) {
+                    item {
+                        Text(
+                            text = stringResource(R.string.token_usage_empty),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(horizontal = 4.dp),
+                        )
+                    }
+                }
+                items(items = groups, key = { "provider:${it.providerId}" }) { group ->
+                    TokenUsageProviderSection(
+                        group = group,
+                        onOpenModel = { row -> detailKey = "${row.providerId}|${row.modelId}" },
+                    )
+                }
+            }
+        }
+    }
+
+    if (detailRow != null) {
+        TokenUsageModelDetailDialog(row = detailRow, onDismiss = { detailKey = "" })
+    }
+}
+
+@Composable
+private fun TokenUsageTotalsCard(usage: UiTokenUsageSnapshot) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            text = stringResource(R.string.token_usage_section_totals),
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.padding(start = 4.dp),
+        )
+        UsageCard {
+            UsageMetricRow(
+                label = stringResource(R.string.token_usage_total_input),
+                value = formatTokenCount(usage.promptTokens),
+                showDivider = true,
+            )
+            UsageMetricRow(
+                label = stringResource(R.string.token_usage_output),
+                value = formatTokenCount(usage.completionTokens),
+                showDivider = true,
+            )
+            UsageMetricRow(
+                label = stringResource(R.string.token_usage_cache_read),
+                value = formatTokenCount(usage.cachedTokens),
+                showDivider = true,
+            )
+            UsageMetricRow(
+                label = stringResource(R.string.token_usage_cache_hit_rate),
+                value = formatCacheHitRate(usage.cachedTokens, usage.promptTokens),
+                showDivider = false,
+            )
+        }
+    }
+}
+
+@Composable
+private fun TokenUsageProviderSection(
+    group: TokenUsageProviderGroup,
+    onOpenModel: (TokenUsageModelRow) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            text = if (group.unknownProvider) {
+                stringResource(R.string.common_unknown)
+            } else {
+                group.title.uppercase(Locale.getDefault())
+            },
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(start = 4.dp),
+        )
+        UsageCard {
+            group.rows.forEachIndexed { index, row ->
+                UsageModelRow(
+                    row = row,
+                    showDivider = index != group.rows.lastIndex,
+                    onClick = { onOpenModel(row) },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun UsageModelRow(
+    row: TokenUsageModelRow,
+    showDivider: Boolean,
+    onClick: () -> Unit,
+) {
+    Column {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(onClick = onClick)
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                Text(
+                    text = row.title,
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = FontWeight.Medium,
+                )
+                if (row.notConfigured) {
+                    Text(
+                        text = stringResource(R.string.token_usage_model_not_configured),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            Text(
+                text = "${formatTokenCount(row.group.promptTokens)} / " +
+                    formatTokenCount(row.group.completionTokens),
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Icon(
+                imageVector = Lucide.ChevronRight,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(20.dp),
+            )
+        }
+        if (showDivider) {
+            HorizontalDivider(
+                modifier = Modifier.padding(start = 16.dp),
+                color = MaterialTheme.colorScheme.outlineVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun TokenUsageModelDetailDialog(row: TokenUsageModelRow, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        confirmButton = {
+            TextButton(onClick = onDismiss) {
+                Text(stringResource(R.string.common_close))
+            }
+        },
+        title = { Text(row.title) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                SummaryLine(
+                    label = stringResource(R.string.token_usage_requests),
+                    value = row.group.requestCount.toString(),
+                )
+                SummaryLine(
+                    label = stringResource(R.string.token_usage_prompt),
+                    value = formatTokenCount(row.group.promptTokens),
+                )
+                SummaryLine(
+                    label = stringResource(R.string.token_usage_completion),
+                    value = formatTokenCount(row.group.completionTokens),
+                )
+                SummaryLine(
+                    label = stringResource(R.string.token_usage_total),
+                    value = formatTokenCount(row.group.totalTokens),
+                )
+            }
+        },
+    )
+}
+
+/** 白色圆角卡片：截图里的分组容器。 */
+@Composable
+private fun UsageCard(content: @Composable ColumnScope.() -> Unit) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.surface,
+    ) {
+        Column(content = content)
+    }
+}
+
+@Composable
+private fun UsageMetricRow(label: String, value: String, showDivider: Boolean) {
+    Column {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.bodyLarge,
+                modifier = Modifier.weight(1f),
+            )
+            Text(
+                text = value,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+        }
+        if (showDivider) {
+            HorizontalDivider(
+                modifier = Modifier.padding(start = 16.dp),
+                color = MaterialTheme.colorScheme.outlineVariant,
+            )
+        }
+    }
+}
+
 
 @Composable
 private fun ProviderListRow(
@@ -2353,10 +3000,10 @@ private fun ProviderListRow(
                     modifier = Modifier.size(24.dp)
                 )
                 Text(provider.name, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-                StatusPill(text = if (provider.enabled) "Enabled" else "Disabled", active = provider.enabled)
+                StatusPill(text = if (provider.enabled) stringResource(R.string.common_enabled) else stringResource(R.string.common_disabled), active = provider.enabled)
             }
-            SummaryLine(label = "Models", value = "$modelCount available")
-            SummaryLine(label = "Base URL", value = provider.baseUrl)
+            SummaryLine(label = stringResource(R.string.settings_section_models), value = stringResource(R.string.settings_provider_models_available, modelCount))
+            SummaryLine(label = stringResource(R.string.settings_provider_base_url), value = provider.baseUrl)
         }
     }
 }
@@ -2375,8 +3022,16 @@ private fun ModelListRow(
     ) {
         Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Text(model.displayName.ifBlank { model.modelId }, fontWeight = FontWeight.SemiBold)
-            SummaryLine(label = "Model ID", value = model.modelId)
-            SummaryLine(label = "Capabilities", value = "tools ${model.supportsToolCall}, reasoning ${model.supportsReasoning}, image ${model.supportsImageInput}")
+            SummaryLine(label = stringResource(R.string.settings_model_id), value = model.modelId)
+            SummaryLine(
+                label = stringResource(R.string.settings_model_capabilities),
+                value = stringResource(
+                    R.string.settings_model_capabilities_summary,
+                    model.supportsToolCall.toString(),
+                    model.supportsReasoning.toString(),
+                    model.supportsImageInput.toString(),
+                ),
+            )
         }
     }
 }
@@ -2396,9 +3051,9 @@ private fun ModelGroupListRow(
     ) {
         Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Text(group.name, fontWeight = FontWeight.SemiBold)
-            SummaryLine(label = "ID", value = group.id)
-            SummaryLine(label = "Models", value = "$memberCount members")
-            SummaryLine(label = "Routing", value = "${group.routingStrategy} / ${group.fallbackPolicy}")
+            SummaryLine(label = stringResource(R.string.settings_id), value = group.id)
+            SummaryLine(label = stringResource(R.string.settings_section_models), value = stringResource(R.string.settings_model_group_members_count, memberCount))
+            SummaryLine(label = stringResource(R.string.settings_model_group_routing), value = "${group.routingStrategy} / ${group.fallbackPolicy}")
         }
     }
 }
@@ -2447,10 +3102,10 @@ private fun SkillListRow(
             Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(skill.name, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    StatusPill(text = if (skill.builtIn) "Built-in" else "User", active = skill.builtIn)
+                    StatusPill(text = if (skill.builtIn) stringResource(R.string.settings_skill_badge_builtin) else stringResource(R.string.settings_skill_badge_user), active = skill.builtIn)
                 }
                 Text(
-                    skill.description.ifBlank { "No description" },
+                    skill.description.ifBlank { stringResource(R.string.settings_skill_no_description) },
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     style = MaterialTheme.typography.bodySmall,
                     maxLines = 1,
@@ -2500,7 +3155,7 @@ private fun ToolListRow(
     ) {
         Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Text(
-                if (enabled) name else "$name (disabled)",
+                if (enabled) name else stringResource(R.string.settings_tool_disabled_suffix, name),
                 fontWeight = FontWeight.SemiBold,
                 color = if (enabled) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -2876,11 +3531,15 @@ private fun org.json.JSONArray?.toBenchmarkLabels(): List<String> {
     }.filter { it.isNotBlank() }
 }
 
+// 只被 Composable 调用，价格与「暂无」兜底文案走资源。
+@Composable
 private fun Double?.toCostText(): String {
-    return this?.let { "$$it / 1M tokens" } ?: "暂无"
+    return this?.let { stringResource(R.string.settings_cost_per_million, it.toString()) }
+        ?: stringResource(R.string.common_not_available)
 }
 
 private fun Long.toReadableSize(): String {
+    // 单位是通用缩写，不做翻译。
     if (this <= 0) return "0 B"
     val units = arrayOf("B", "KB", "MB", "GB", "TB")
     val digitGroups = (Math.log10(this.toDouble()) / Math.log10(1024.0)).toInt()

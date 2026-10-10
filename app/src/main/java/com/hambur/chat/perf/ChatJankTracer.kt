@@ -4,6 +4,9 @@ import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import android.view.Choreographer
+import com.hambur.chat.diagnostics.DiagLevel
+import com.hambur.chat.diagnostics.DiagSource
+import com.hambur.chat.diagnostics.DiagnosticLogs
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.max
@@ -261,6 +264,19 @@ object ChatJankTracer {
             Log.ERROR -> Log.e(Tag, message)
             else -> Log.i(Tag, message)
         }
+        // 同步进入 Settings → 日志 的内存缓冲区，这样卡顿可以直接在应用内查看，
+        // 不必连 adb logcat。
+        DiagnosticLogs.record(
+            level = when (level) {
+                Log.WARN -> DiagLevel.WARN
+                Log.ERROR -> DiagLevel.ERROR
+                Log.DEBUG -> DiagLevel.DEBUG
+                else -> DiagLevel.INFO
+            },
+            source = DiagSource.JANK,
+            tag = Tag,
+            message = message,
+        )
     }
 
     private data class SwitchTrace(

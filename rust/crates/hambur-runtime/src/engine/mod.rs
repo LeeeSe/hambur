@@ -3,6 +3,7 @@ use crate::*;
 mod chat;
 mod config_tool;
 mod delegate;
+mod diagnostics;
 mod events;
 mod markdown;
 mod memory;
@@ -27,17 +28,16 @@ impl RuntimeEngine {
             .map_err(|error| HamburError::Internal(format!("tokio runtime: {error}")))?;
         let database_path = database_path(&bootstrap);
         let database = HamburDatabase::open(database_path)?;
+        // 上一次进程被杀/崩溃/覆盖安装会留下非终态的 turn、tool_call、trace span 和
+        // streaming 消息。必须在 bootstrap_snapshot 之前收敛，否则 UI 会拿着脏快照，
+        // 而且这些「有 tool_calls 没有 tool 结果」的消息会让后续请求直接 HTTP 400。
+        let interrupted = database.reconcile_interrupted_state()?;
         let filestore = FileStore::new(&bootstrap.app_files_dir)?;
         let sandbox = SandboxService::new_with_native_library_dir(
             &bootstrap.app_files_dir,
             &bootstrap.native_library_dir,
         )?;
-        seed_bundled_skills(
-            &PathBuf::from(&bootstrap.app_files_dir)
-                .join("sandbox")
-                .join("global")
-                .join("skills"),
-        )?;
+        seed_bundled_skills(&sandbox.persistent_dir("skills"))?;
         let jobs = database.cleanup_pending_attachments(0)?;
         for job in jobs {
             let _ = filestore.delete_relative_if_exists(&job.relative_path);
@@ -50,6 +50,24 @@ impl RuntimeEngine {
         let tools = ToolScheduler::new(PathBuf::from(&bootstrap.app_files_dir).join("offloads"))?
             .with_app_files_dir(&bootstrap.app_files_dir);
         let (sender, receiver) = mpsc::channel(1024);
+        // 诊断日志缓冲区：先按 app_settings.loggingEnabled（默认开）决定是否采集，
+        // 再安装全局 tracing subscriber，让各 crate 的结构化日志进入同一缓冲区。
+        let diagnostics = Arc::new(DiagnosticsBuffer::new(DIAGNOSTIC_BUFFER_CAPACITY));
+        let logging_enabled = database
+            .app_setting("loggingEnabled")?
+            .map(|value| value == "true")
+            .unwrap_or(true);
+        diagnostics.set_enabled(logging_enabled);
+        install_diagnostics_subscriber(Arc::clone(&diagnostics));
+        if !interrupted.is_empty() {
+            tracing::info!(
+                "reconciled interrupted state on startup: turns={} toolCalls={} traceSpans={} messages={}",
+                interrupted.turns,
+                interrupted.tool_calls,
+                interrupted.trace_spans,
+                interrupted.messages,
+            );
+        }
         let engine = Arc::new(Self {
             tokio,
             self_ref: Mutex::new(Weak::new()),
@@ -72,6 +90,7 @@ impl RuntimeEngine {
             receiver: Mutex::new(receiver),
             sequence: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
+            diagnostics,
         });
 
         if let Ok(mut self_ref) = engine.self_ref.lock() {

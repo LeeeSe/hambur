@@ -1589,7 +1589,9 @@ nativeFinishReason
 capabilityDowngradesJson
 ```
 
-Do not persist token counts, token prices, request price, or billing statistics.
+Persist token usage counts (prompt, completion, total) once per model request so the
+Token usage screen can aggregate them. Do not persist third-party pricing, request
+price, or billing statistics.
 
 ### Secrets And Logging
 
@@ -2101,6 +2103,8 @@ Use only these keys:
 themeMode                  // system, light, dark
 fontScale                  // small, default, large, extra_large
 startupChatMode            // new_chat, last_chat
+thinkingBlockDisplayMode   // auto_expand, collapsed, auto_collapse
+autoFocusInputAfterReply   // bool, focus the chat input when a reply finishes
 lastSelectedSessionId      // session id or empty string
 loggingEnabled             // bool
 predictiveBackEnabled      // bool
@@ -2553,9 +2557,9 @@ Soft delete is for normal deletion.
 
 Hard purge must cascade child rows and schedule file cleanup.
 
-No token-level database writes.
-
-No token billing or token cost tracking.
+Token usage is recorded once per model request (never written per streamed token) and
+aggregated on demand for the Token usage screen. Provider pricing and cost tracking
+are not part of the app.
 
 ## Agent Tool / Sandbox / File / Platform Capability Architecture
 
@@ -3905,7 +3909,8 @@ Provider API key input must go through PlatformBridge secret storage.
 
 Kotlin must never expose API keys back into UI state after save.
 
-Token usage, token billing, and token cost screens must not exist in the new UI.
+The Token usage screen reports aggregated prompt/completion/total token counts from
+recorded model requests. It must not display provider pricing or cost.
 
 ### Dialogs And Effects
 

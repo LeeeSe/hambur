@@ -28,7 +28,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.zIndex
+import com.hambur.chat.R
 import com.hambur.chat.platform.AndroidPlatformAdapter
 import com.hambur.chat.reducer.HamburUiState
 import com.hambur.chat.reducer.HamburUiStore
@@ -38,6 +40,8 @@ import com.hambur.chat.ui.components.HamburImageZoomSandbox
 import com.hambur.chat.ui.components.HamburZoomImageState
 import com.hambur.chat.ui.preview.HamburFilePreviewScreen
 import com.hambur.chat.ui.settings.AppearanceSettingsScreen
+import com.hambur.chat.ui.settings.BackendGapFeature
+import com.hambur.chat.ui.settings.DiagnosticsLogsScreen
 import com.hambur.chat.ui.settings.FeatureUnavailableScreen
 import com.hambur.chat.ui.settings.MemoryDetailScreen
 import com.hambur.chat.ui.settings.MemoryFilesListScreen
@@ -54,6 +58,7 @@ import com.hambur.chat.ui.settings.SkillDetailScreen
 import com.hambur.chat.ui.settings.SkillsListScreen
 import com.hambur.chat.ui.settings.StartupTaskDetailScreen
 import com.hambur.chat.ui.settings.StartupTasksListScreen
+import com.hambur.chat.ui.settings.TokenUsageScreen
 import com.hambur.chat.ui.settings.ToolDetailScreen
 import com.hambur.chat.ui.settings.ToolSettingsScreen
 import com.hambur.chat.ui.settings.ToolsListScreen
@@ -175,6 +180,8 @@ fun HamburApp(
     }
 
     val context = LocalContext.current
+    // 两个 remember 的 lambda 里都不能调 stringResource，先在 @Composable 作用域把兜底文案读出来。
+    val imagePreviewFallback = stringResource(R.string.common_image_preview)
     val isImageTarget: (String) -> Boolean = remember {
         { path ->
             val clean = path.substringBefore('?').lowercase()
@@ -188,7 +195,7 @@ fun HamburApp(
             val isWeb = target.startsWith("http://", ignoreCase = true) || target.startsWith("https://", ignoreCase = true)
             val isWebImage = isWeb && isImageTarget(target)
             if (isImageTarget(target)) {
-                val cleanName = target.substringBefore('?').substringAfterLast('/').ifBlank { "图片预览" }
+                val cleanName = target.substringBefore('?').substringAfterLast('/').ifBlank { imagePreviewFallback }
                 activeZoomImage = HamburZoomImageState(
                     model = target,
                     title = cleanName,
@@ -365,14 +372,14 @@ fun HamburApp(
                             store = store,
                             onBack = goBack,
                         )
-                        HamburScreen.Logs -> FeatureUnavailableScreen(
-                            title = "Logs",
-                            summary = "In-app log capture, filtering, and clearing are not exposed by the new backend yet.",
+                        HamburScreen.Logs -> DiagnosticsLogsScreen(
+                            state = state,
+                            store = store,
                             onBack = goBack,
                         )
-                        HamburScreen.TokenUsage -> FeatureUnavailableScreen(
-                            title = "Token Usage",
-                            summary = "Per-provider usage accounting and billing summaries are not exposed by the new backend yet.",
+                        HamburScreen.TokenUsage -> TokenUsageScreen(
+                            state = state,
+                            store = store,
                             onBack = goBack,
                         )
                         HamburScreen.Persona -> PersonaSettingsScreen(
@@ -381,8 +388,7 @@ fun HamburApp(
                             onBack = goBack,
                         )
                         HamburScreen.EnvironmentVariables -> FeatureUnavailableScreen(
-                            title = "Environment Variables",
-                            summary = "Sandbox environment variable management is not exposed by the new backend yet.",
+                            feature = BackendGapFeature.EnvironmentVariables,
                             onBack = goBack,
                         )
                         HamburScreen.Browser -> SharedBrowserScreen(

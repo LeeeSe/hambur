@@ -107,7 +107,6 @@ impl RuntimeEngine {
             .database
             .visible_chat_transcript_before_message(session_id, &current_user_message.id)?;
         let mut messages = Vec::new();
-        let mut open_tool_call_ids = HashSet::<String>::new();
 
         for entry in transcript {
             let attachments = if entry.message.role == "user" {
@@ -117,25 +116,12 @@ impl RuntimeEngine {
             } else {
                 Vec::new()
             };
-            append_transcript_entry_to_context(
-                &mut messages,
-                &mut open_tool_call_ids,
-                entry,
-                &attachments,
-            )?;
+            append_transcript_entry_to_context(&mut messages, entry, &attachments)?;
         }
 
-        if !open_tool_call_ids.is_empty() {
-            for call_id in open_tool_call_ids {
-                messages.push(ModelMessage {
-                    role: "tool".to_string(),
-                    content: "Tool execution was cancelled or interrupted before completion."
-                        .to_string(),
-                    tool_call_id: call_id,
-                    ..Default::default()
-                });
-            }
-        }
+        // 工具调用的 assistant/tool 必须成对且相邻。历史里可能有中断留下的半截调用，
+        // 直接用会让供应商返回 400；这里在追加本轮用户消息之前把配对补齐。
+        repair_tool_call_pairing(&mut messages);
 
         if append_current_user {
             messages.push(ModelMessage {
@@ -486,6 +472,8 @@ impl RuntimeEngine {
                             &cancel,
                             &chunk,
                             &route.provider_protocol,
+                            &route.provider_id,
+                            &route.model_id,
                             true,
                         )
                         .await
@@ -593,6 +581,8 @@ impl RuntimeEngine {
                             &cancel,
                             chunk.as_ref(),
                             &route.provider_protocol,
+                            &route.provider_id,
+                            &route.model_id,
                             false,
                         )
                         .await
@@ -785,6 +775,8 @@ impl RuntimeEngine {
         cancel: &Arc<AtomicBool>,
         chunk: &[u8],
         provider_protocol: &str,
+        provider_id: &str,
+        model_id: &str,
         delay_scripted_chunk: bool,
     ) -> Option<StreamAttemptResult> {
         if cancel.load(Ordering::SeqCst) || self.shutdown.load(Ordering::SeqCst) {
@@ -951,6 +943,33 @@ impl RuntimeEngine {
                     } => {
                         state.finish_reason = finish_reason;
                         state.native_finish_reason = native_finish_reason;
+                    }
+                    ProviderStreamEvent::Usage {
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens,
+                        cached_tokens,
+                        reasoning_tokens,
+                    } => {
+                        // 一个 attempt 只记一行：个别网关会在收尾重复下发 usage。
+                        // Usage 不算语义增量，绝不能因此置 semantic_delta_started，
+                        // 否则 should_fallback 会在 usage 到达后放弃重试。
+                        if !state.usage_recorded {
+                            state.usage_recorded = true;
+                            if let Err(error) = self.database.insert_token_usage(NewTokenUsage {
+                                session_id: session_id.to_string(),
+                                turn_id: turn_id.to_string(),
+                                provider_id: provider_id.to_string(),
+                                model_id: model_id.to_string(),
+                                prompt_tokens: u64::from(prompt_tokens),
+                                completion_tokens: u64::from(completion_tokens),
+                                total_tokens: u64::from(total_tokens),
+                                cached_tokens: u64::from(cached_tokens),
+                                reasoning_tokens: u64::from(reasoning_tokens),
+                            }) {
+                                tracing::warn!("record token usage failed: {error}");
+                            }
+                        }
                     }
                     ProviderStreamEvent::Error { code, message } => {
                         let error = stream_error_from_provider(code, message);

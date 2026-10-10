@@ -10,11 +10,12 @@ use hambur_markdown::{
     MarkdownBlockNode, MarkdownInlineNode, MarkdownRenderUpdate, MarkdownTableRow,
 };
 use hambur_runtime::{
-    AppBootstrap, PlatformRequest, RuntimeCommand, RuntimeCommandAck, RuntimeEngine, RuntimeEvent,
-    RuntimeEventKind, RuntimeEventPayload, RuntimeFileResolution, RuntimeMemoryFileDetail,
-    RuntimeMemoryFileSummary, RuntimeMessageSnapshot, RuntimeRootfsStatus, RuntimeSearchSnapshot,
-    RuntimeSessionListSnapshot, RuntimeSessionSnapshot, RuntimeSettingsSnapshot,
-    RuntimeSkillDetail, RuntimeSkillSummary, RuntimeTimelinePage,
+    AppBootstrap, PlatformRequest, RuntimeCommand, RuntimeCommandAck, RuntimeDiagnosticEntry,
+    RuntimeDiagnosticsSnapshot, RuntimeEngine, RuntimeEvent, RuntimeEventKind, RuntimeEventPayload,
+    RuntimeFileResolution, RuntimeMemoryFileDetail, RuntimeMemoryFileSummary,
+    RuntimeMessageSnapshot, RuntimeRootfsStatus, RuntimeSearchSnapshot, RuntimeSessionListSnapshot,
+    RuntimeSessionSnapshot, RuntimeSettingsSnapshot, RuntimeSkillDetail, RuntimeSkillSummary,
+    RuntimeTimelinePage, RuntimeTokenUsageGroup, RuntimeTokenUsageSnapshot,
 };
 
 uniffi::include_scaffolding!("hambur_uniffi");
@@ -320,6 +321,43 @@ pub struct SettingsSnapshotDTO {
     pub config_audits: Vec<ConfigAuditDTO>,
 }
 
+pub struct DiagnosticsSnapshotDTO {
+    pub snapshot_sequence: u64,
+    pub created_at_ms: u64,
+    pub entries: Vec<DiagnosticEntryDTO>,
+}
+
+pub struct DiagnosticEntryDTO {
+    pub ordinal: u64,
+    pub backend_sequence: u64,
+    pub created_at_ms: u64,
+    pub level: String,
+    pub target: String,
+    pub message: String,
+}
+
+pub struct TokenUsageGroupDTO {
+    pub provider_id: String,
+    pub model_id: String,
+    pub request_count: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+}
+
+pub struct TokenUsageSnapshotDTO {
+    pub snapshot_sequence: u64,
+    pub created_at_ms: u64,
+    pub request_count: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub cached_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub by_provider: Vec<TokenUsageGroupDTO>,
+    pub by_model: Vec<TokenUsageGroupDTO>,
+}
+
 pub struct SessionListSnapshotDTO {
     pub snapshot_sequence: u64,
     pub created_at_ms: u64,
@@ -520,6 +558,20 @@ impl BackendRuntime {
 
     pub fn get_settings_snapshot(&self) -> SettingsSnapshotDTO {
         self.engine.get_settings_snapshot().into()
+    }
+
+    pub fn get_diagnostics_snapshot(
+        &self,
+        since_ordinal: u64,
+        limit: u32,
+    ) -> DiagnosticsSnapshotDTO {
+        self.engine
+            .get_diagnostics_snapshot(since_ordinal, limit)
+            .into()
+    }
+
+    pub fn get_token_usage_snapshot(&self) -> TokenUsageSnapshotDTO {
+        self.engine.get_token_usage_snapshot().into()
     }
 
     pub fn create_session(&self, title: String) -> CommandAck {
@@ -861,6 +913,71 @@ impl From<RuntimeSettingsSnapshot> for SettingsSnapshotDTO {
                 .into_iter()
                 .map(ConfigAuditDTO::from)
                 .collect(),
+        }
+    }
+}
+
+impl From<RuntimeDiagnosticsSnapshot> for DiagnosticsSnapshotDTO {
+    fn from(value: RuntimeDiagnosticsSnapshot) -> Self {
+        Self {
+            snapshot_sequence: value.snapshot_sequence,
+            created_at_ms: value.created_at_ms,
+            entries: value
+                .entries
+                .into_iter()
+                .map(DiagnosticEntryDTO::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<RuntimeDiagnosticEntry> for DiagnosticEntryDTO {
+    fn from(value: RuntimeDiagnosticEntry) -> Self {
+        Self {
+            ordinal: value.ordinal,
+            backend_sequence: value.backend_sequence,
+            created_at_ms: value.created_at_ms,
+            level: value.level,
+            target: value.target,
+            message: value.message,
+        }
+    }
+}
+
+impl From<RuntimeTokenUsageSnapshot> for TokenUsageSnapshotDTO {
+    fn from(value: RuntimeTokenUsageSnapshot) -> Self {
+        Self {
+            snapshot_sequence: value.snapshot_sequence,
+            created_at_ms: value.created_at_ms,
+            request_count: value.request_count,
+            prompt_tokens: value.prompt_tokens,
+            completion_tokens: value.completion_tokens,
+            total_tokens: value.total_tokens,
+            cached_tokens: value.cached_tokens,
+            reasoning_tokens: value.reasoning_tokens,
+            by_provider: value
+                .by_provider
+                .into_iter()
+                .map(TokenUsageGroupDTO::from)
+                .collect(),
+            by_model: value
+                .by_model
+                .into_iter()
+                .map(TokenUsageGroupDTO::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<RuntimeTokenUsageGroup> for TokenUsageGroupDTO {
+    fn from(value: RuntimeTokenUsageGroup) -> Self {
+        Self {
+            provider_id: value.provider_id,
+            model_id: value.model_id,
+            request_count: value.request_count,
+            prompt_tokens: value.prompt_tokens,
+            completion_tokens: value.completion_tokens,
+            total_tokens: value.total_tokens,
         }
     }
 }

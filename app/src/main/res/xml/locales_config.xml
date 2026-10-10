@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  应用支持的语言清单（Android 13+ 的「设置 → 应用 → 某个应用 → 语言」会读它）。
+  新增一门语言时，这里、values-xx/ 资源目录、以及 HamburAppLocale.options 三处要一起加。
+-->
+<locale-config xmlns:android="http://schemas.android.com/apk/res/android">
+    <locale android:name="en" />
+    <locale android:name="zh-CN" />
+</locale-config>

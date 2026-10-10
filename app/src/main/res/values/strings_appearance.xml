@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Appearance（外观）设置页。
+  「显示语言」不是 app_settings 里的键，它由 AppCompat/系统保存（见 HamburAppLocale），
+  这里的标签只负责显示。
+-->
+<resources>
+    <string name="appearance_title">Appearance</string>
+
+    <!-- 显示语言 -->
+    <string name="appearance_language_section">Language</string>
+    <string name="appearance_language_title">Display language</string>
+    <string name="appearance_language_summary">Applies to the whole app. Follow system uses the device language.</string>
+    <string name="appearance_language_system">Follow system</string>
+    <!-- 语言名按惯例用自己的语言书写，两份 strings 里保持一致。 -->
+    <string name="appearance_language_english">English</string>
+    <string name="appearance_language_chinese">简体中文</string>
+
+    <!-- 主题 -->
+    <string name="appearance_section_theme">Theme</string>
+    <string name="appearance_theme_title">Color theme</string>
+    <string name="appearance_theme_system">System</string>
+    <string name="appearance_theme_light">Light</string>
+    <string name="appearance_theme_dark">Dark</string>
+
+    <!-- 文字 -->
+    <string name="appearance_section_text">Text</string>
+    <string name="appearance_font_scale_title">Font scale</string>
+    <string name="appearance_font_scale_small">Small</string>
+    <string name="appearance_font_scale_default">Default</string>
+    <string name="appearance_font_scale_large">Large</string>
+    <string name="appearance_font_scale_extra_large">Extra large</string>
+
+    <!-- 启动 -->
+    <string name="appearance_section_startup">Startup</string>
+    <string name="appearance_startup_title">Chat on app start</string>
+    <string name="appearance_startup_last_chat">Last chat</string>
+    <string name="appearance_startup_new_chat">New chat</string>
+
+    <!-- 思考 -->
+    <string name="appearance_section_thinking">Thinking</string>
+    <string name="appearance_thinking_title">Thinking block display</string>
+    <string name="appearance_thinking_auto_expand">Auto expand</string>
+    <string name="appearance_thinking_collapsed">Keep collapsed</string>
+    <string name="appearance_thinking_auto_collapse">Expand while thinking, collapse when done</string>
+
+    <!-- 输入 -->
+    <string name="appearance_section_input">Input</string>
+    <string name="appearance_focus_after_reply_title">Focus input after reply</string>
+    <string name="appearance_focus_after_reply_summary">When a reply finishes in the current chat, focus the input and show the keyboard.</string>
+
+    <!-- 当前设置（调试用的键值一览） -->
+    <string name="appearance_section_current">Current settings</string>
+</resources>

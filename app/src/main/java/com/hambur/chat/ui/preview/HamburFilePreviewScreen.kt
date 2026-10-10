@@ -1,5 +1,6 @@
 package com.hambur.chat.ui.preview
 
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.pdf.PdfRenderer
 import android.net.Uri
@@ -45,7 +46,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -56,6 +59,7 @@ import coil3.compose.AsyncImage
 import coil3.compose.SubcomposeAsyncImage
 import com.composables.icons.lucide.FileText
 import com.composables.icons.lucide.Lucide
+import com.hambur.chat.R
 import com.hambur.chat.reducer.HamburUiState
 import com.hambur.chat.reducer.HamburUiStore
 import com.hambur.chat.ui.components.HamburSection
@@ -113,6 +117,7 @@ fun HamburFilePreviewScreen(
     onOpenFile: (String) -> Unit,
     onOpenZoomImage: ((HamburZoomImageState) -> Unit)? = null,
 ) {
+    val context = LocalContext.current
     val resolved = remember(path, state.selectedSessionId) {
         val cleanPath = when {
             path.startsWith("file://") -> Uri.parse(path).path.orEmpty()
@@ -138,6 +143,7 @@ fun HamburFilePreviewScreen(
             else -> ""
         }
         resolvePreviewFile(
+            context = context,
             path = path,
             sandboxHostPath = hostPath,
         )
@@ -149,24 +155,26 @@ fun HamburFilePreviewScreen(
             .statusBarsPadding(),
     ) {
         HamburTopBar(
-            title = resolved?.displayName ?: "File Preview",
+            title = resolved?.displayName ?: stringResource(R.string.preview_title),
             subtitle = path,
             onBack = onBack,
         )
+        // ifBlank 的 lambda 不是 Composable，先在作用域里取好文案。
+        val noFileSelected = stringResource(R.string.preview_no_file_selected)
         when {
             resolved == null -> FilePreviewMessage(
-                title = "File is not available",
-                message = path.ifBlank { "No file selected" },
+                title = stringResource(R.string.preview_file_not_available),
+                message = path.ifBlank { noFileSelected },
                 modifier = Modifier.fillMaxSize(),
             )
             resolved.file != null && !resolved.file.exists() -> FilePreviewMessage(
-                title = "File not found",
+                title = stringResource(R.string.preview_file_not_found),
                 message = resolved.file.absolutePath,
                 modifier = Modifier.fillMaxSize(),
             )
             resolved.file != null && !resolved.file.isFile -> FilePreviewMessage(
-                title = "Unsupported target",
-                message = "${resolved.file.absolutePath} is not a regular file.",
+                title = stringResource(R.string.preview_unsupported_target),
+                message = stringResource(R.string.preview_not_regular_file, resolved.file.absolutePath),
                 modifier = Modifier.fillMaxSize(),
             )
             else -> FilePreviewBody(
@@ -273,7 +281,7 @@ private fun ImagePreview(
                         modifier = Modifier.size(32.dp),
                     )
                     Text(
-                        text = "图片加载失败",
+                        text = stringResource(R.string.preview_image_load_failed),
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -295,7 +303,7 @@ private fun ImagePreview(
 private fun AudioPreview(resolved: ResolvedPreviewFile) {
     MediaInfoPreview(
         title = resolved.displayName,
-        message = "Audio preview uses the system player when opened from Android. Inline audio controls are not wired in the new UI yet.",
+        message = stringResource(R.string.preview_audio_unavailable),
         resolved = resolved,
     )
 }
@@ -353,9 +361,10 @@ private fun MarkdownFilePreview(
     val markdownStyle = rememberMarkdownStyle()
     val markdownCache = rememberMarkdownRenderCache()
 
+    val truncatedSuffix = stringResource(R.string.preview_truncated)
     val content = preview?.getOrNull()?.let {
         if (it.truncated) {
-            it.text + "\n\n... preview truncated"
+            it.text + truncatedSuffix
         } else {
             it.text
         }
@@ -377,7 +386,7 @@ private fun MarkdownFilePreview(
     when {
         preview == null -> LoadingPreview()
         preview?.isFailure == true -> FilePreviewMessage(
-            title = "Read failed",
+            title = stringResource(R.string.preview_read_failed),
             message = preview?.exceptionOrNull()?.message ?: file.absolutePath,
             modifier = Modifier.fillMaxSize(),
         )
@@ -413,6 +422,7 @@ private fun MarkdownFilePreview(
 @Composable
 private fun TextFilePreview(resolved: ResolvedPreviewFile) {
     val file = resolved.file ?: return
+    val truncatedSuffix = stringResource(R.string.preview_truncated)
     val preview by produceState<Result<TextPreview>?>(initialValue = null, file) {
         value = runCatching { readTextPreview(file) }
     }
@@ -420,14 +430,14 @@ private fun TextFilePreview(resolved: ResolvedPreviewFile) {
     when {
         preview == null -> LoadingPreview()
         preview?.isFailure == true -> FilePreviewMessage(
-            title = "Read failed",
+            title = stringResource(R.string.preview_read_failed),
             message = preview?.exceptionOrNull()?.message ?: file.absolutePath,
             modifier = Modifier.fillMaxSize(),
         )
         else -> {
             val result = preview!!.getOrThrow()
             val text = if (result.truncated) {
-                result.text + "\n\n... preview truncated"
+                result.text + truncatedSuffix
             } else {
                 result.text
             }
@@ -456,12 +466,12 @@ private fun PdfPreview(resolved: ResolvedPreviewFile) {
     when {
         pageCount == null -> LoadingPreview()
         pageCount?.isFailure == true -> FilePreviewMessage(
-            title = "PDF read failed",
+            title = stringResource(R.string.preview_pdf_read_failed),
             message = pageCount?.exceptionOrNull()?.message ?: file.absolutePath,
             modifier = Modifier.fillMaxSize(),
         )
         pageCount!!.getOrThrow() <= 0 -> FilePreviewMessage(
-            title = "Empty PDF",
+            title = stringResource(R.string.preview_empty_pdf),
             message = file.absolutePath,
             modifier = Modifier.fillMaxSize(),
         )
@@ -522,7 +532,7 @@ private fun PdfPage(
                 CircularProgressIndicator(modifier = Modifier.size(24.dp))
             }
             pageBitmap?.isFailure == true -> Text(
-                text = "Page ${pageIndex + 1} render failed",
+                text = stringResource(R.string.preview_page_render_failed, pageIndex + 1),
                 modifier = Modifier.padding(24.dp),
                 style = MaterialTheme.typography.bodyMedium,
             )
@@ -531,12 +541,19 @@ private fun PdfPage(
                 Box(modifier = Modifier.fillMaxWidth()) {
                     Image(
                         bitmap = rendered.bitmap.asImageBitmap(),
-                        contentDescription = "Page ${rendered.pageNumber}",
+                        contentDescription = stringResource(
+                            R.string.preview_page_content_description,
+                            rendered.pageNumber,
+                        ),
                         modifier = Modifier.fillMaxWidth(),
                         contentScale = ContentScale.FillWidth,
                     )
                     Text(
-                        text = "${rendered.pageNumber} / ${rendered.pageCount}",
+                        text = stringResource(
+                            R.string.preview_page_indicator,
+                            rendered.pageNumber,
+                            rendered.pageCount,
+                        ),
                         style = MaterialTheme.typography.labelSmall,
                         modifier = Modifier
                             .align(Alignment.BottomEnd)
@@ -555,7 +572,7 @@ private fun PdfPage(
 private fun FileInfoPreview(resolved: ResolvedPreviewFile) {
     MediaInfoPreview(
         title = resolved.displayName,
-        message = "This file type does not have an inline preview yet.",
+        message = stringResource(R.string.preview_no_inline_preview),
         resolved = resolved,
     )
 }
@@ -584,10 +601,13 @@ private fun MediaInfoPreview(
 
 @Composable
 private fun FileMetadataSection(resolved: ResolvedPreviewFile) {
-    HamburSection(title = "File") {
-        MetadataRow(label = "Path", value = resolved.file?.absolutePath ?: resolved.originalPath)
-        MetadataRow(label = "Size", value = resolved.sizeLabel)
-        MetadataRow(label = "Kind", value = resolved.kind.name)
+    HamburSection(title = stringResource(R.string.preview_section_file)) {
+        MetadataRow(
+            label = stringResource(R.string.preview_label_path),
+            value = resolved.file?.absolutePath ?: resolved.originalPath,
+        )
+        MetadataRow(label = stringResource(R.string.preview_label_size), value = resolved.sizeLabel)
+        MetadataRow(label = stringResource(R.string.preview_label_kind), value = resolved.kind.name)
     }
 }
 
@@ -655,7 +675,11 @@ private fun FilePreviewMessage(
     }
 }
 
-private fun resolvePreviewFile(path: String, sandboxHostPath: String = ""): ResolvedPreviewFile? {
+private fun resolvePreviewFile(
+    context: Context,
+    path: String,
+    sandboxHostPath: String = "",
+): ResolvedPreviewFile? {
     if (path.isBlank()) return null
     if (path.startsWith("http://", ignoreCase = true) || path.startsWith("https://", ignoreCase = true)) {
         val cleanUrl = path.substringBefore('?')
@@ -670,7 +694,11 @@ private fun resolvePreviewFile(path: String, sandboxHostPath: String = ""): Reso
             webUrl = path,
             displayName = fileName,
             kind = if (isImage) PreviewFileKind.Image else PreviewFileKind.Other,
-            sizeLabel = if (isImage) "网络图片" else "网络文件",
+            sizeLabel = if (isImage) {
+                context.getString(R.string.preview_web_image)
+            } else {
+                context.getString(R.string.preview_web_file)
+            },
         )
     }
     if (path.startsWith("content://", ignoreCase = true)) {
@@ -680,9 +708,9 @@ private fun resolvePreviewFile(path: String, sandboxHostPath: String = ""): Reso
             file = null,
             uri = parsedUri,
             webUrl = null,
-            displayName = "图片",
+            displayName = context.getString(R.string.preview_image),
             kind = PreviewFileKind.Image,
-            sizeLabel = "本地图片",
+            sizeLabel = context.getString(R.string.preview_local_image),
         )
     }
     val normalized = when {

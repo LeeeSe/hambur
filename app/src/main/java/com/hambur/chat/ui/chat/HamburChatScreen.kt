@@ -3,6 +3,7 @@ package com.hambur.chat.ui.chat
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.annotation.StringRes
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
@@ -120,6 +121,8 @@ import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onGloballyPositioned
@@ -132,6 +135,7 @@ import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalView
 import kotlin.math.abs
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -165,6 +169,7 @@ import com.composables.icons.lucide.Camera
 import com.composables.icons.lucide.ChartNoAxesGantt
 import com.composables.icons.lucide.Check
 import com.composables.icons.lucide.ChevronRight
+import com.composables.icons.lucide.CircleAlert
 import com.composables.icons.lucide.CircleArrowUp
 import com.composables.icons.lucide.CirclePause
 import com.composables.icons.lucide.CirclePlus
@@ -208,6 +213,7 @@ import android.view.View
 import android.widget.Toast
 import com.hambur.chat.R
 import com.hambur.chat.perf.ChatJankTracer
+import com.hambur.chat.reducer.AUTO_FOCUS_INPUT_AFTER_REPLY_KEY
 import com.hambur.chat.reducer.HamburUiState
 import com.hambur.chat.reducer.HamburUiStore
 import com.hambur.chat.reducer.THINKING_BLOCK_DISPLAY_AUTO_COLLAPSE
@@ -409,10 +415,11 @@ fun HamburChatScreen(
     fun handleNewChatClick() {
         if (newSessionBlank) {
             haptics.reject()
-            Toast.makeText(context, "已经在新聊天", Toast.LENGTH_SHORT).show()
+            Toast.makeText(context, context.getString(R.string.chat_already_in_new_chat), Toast.LENGTH_SHORT).show()
             return
         }
         haptics.confirm()
+        // "New chat" 是后端默认标题（协议值），显示时会被替换成资源里的默认标题。
         store.createSession("New chat")
     }
 
@@ -432,6 +439,32 @@ fun HamburChatScreen(
             pendingOpenSessionId = ""
             delayedOpenSessionJob = null
         }
+    }
+
+    // 回复结束（完成/失败/取消）后是否自动聚焦输入框，由外观设置里的开关控制（默认关闭）。
+    // 只认「当前选中会话」的结束：切走别的会话时 activeTurnSessionIds 一起变化，
+    // previousActiveTurnSessionIds 同步跟进，所以切会话本身不会误触发聚焦。
+    val chatInputFocusRequester = remember { FocusRequester() }
+    val focusInputAfterReply = state.autoFocusInputAfterReplyEnabled()
+    val activeTurnSessionIds = state.activeTurnIds.keys
+    val previousActiveTurnSessionIds = remember { mutableStateOf<Set<String>>(emptySet()) }
+    LaunchedEffect(activeTurnSessionIds, focusInputAfterReply, state.selectedSessionId) {
+        val finishedSessionIds = previousActiveTurnSessionIds.value - activeTurnSessionIds
+        previousActiveTurnSessionIds.value = activeTurnSessionIds
+        val selectedSessionId = state.selectedSessionId
+        // 会话打开动画 / 空会话期间输入框是禁用的，弹窗和附件面板打开时也不该抢焦点。
+        if (!focusInputAfterReply ||
+            selectedSessionId.isBlank() ||
+            isSessionOpenPending ||
+            selectedSessionId !in finishedSessionIds ||
+            selectingText.isNotBlank() ||
+            unavailableAction.isNotBlank() ||
+            attachmentPanelOpen
+        ) {
+            return@LaunchedEffect
+        }
+        runCatching { chatInputFocusRequester.requestFocus() }
+            .onSuccess { keyboardController?.show() }
     }
 
     BackHandler(enabled = drawerOffset > 0f) {
@@ -598,6 +631,7 @@ fun HamburChatScreen(
                             attachmentPanelHeight = attachmentPanelHeight,
                             pendingAttachments = visibleState.pendingAttachments,
                             editing = editingMessageId.isNotBlank(),
+                            focusRequester = chatInputFocusRequester,
                             onToggleThinking = {
                                 haptics.toggle(turningOn = !thinkingEnabled)
                                 Log.i(
@@ -664,7 +698,7 @@ fun HamburChatScreen(
                                             scope.launch {
                                                 Toast.makeText(
                                                     context,
-                                                    message.ifBlank { "发送失败，请检查模型能力" },
+                                                    message.ifBlank { context.getString(R.string.chat_send_failed) },
                                                     Toast.LENGTH_SHORT,
                                                 ).show()
                                             }
@@ -720,14 +754,15 @@ private fun ChatHeader(
         ChatIconButton(onClick = onOpenDrawer, size = tokens.headerIconButtonSize) {
             Icon(
                 imageVector = Lucide.ChartNoAxesGantt,
-                contentDescription = "Conversations",
+                contentDescription = stringResource(R.string.chat_conversations),
                 tint = MaterialTheme.colorScheme.onBackground,
                 modifier = Modifier.size(tokens.headerMenuIconSize),
             )
         }
 
+        val fallbackTitle = stringResource(R.string.chat_new_chat)
         Text(
-            text = title.ifBlank { "新对话" },
+            text = title.ifBlank { fallbackTitle },
             color = MaterialTheme.colorScheme.onBackground,
             fontSize = tokens.headerTitleFontSize,
             fontWeight = FontWeight.Bold,
@@ -746,7 +781,7 @@ private fun ChatHeader(
             ) {
                 Icon(
                     imageVector = Lucide.MessageCirclePlus,
-                    contentDescription = "New chat",
+                    contentDescription = stringResource(R.string.chat_new_chat),
                     tint = MaterialTheme.colorScheme.onBackground.copy(
                         alpha = if (canCreateNewChat) 1f else 0.32f,
                     ),
@@ -825,9 +860,9 @@ private fun ChatDrawerContent(
             ) {
                 groupedSessions.forEach { group ->
                     if (group.sessions.isNotEmpty()) {
-                        item(key = "header-${group.title}") {
+                        item(key = "header-${group.titleRes}") {
                             DrawerCategoryHeader(
-                                text = group.title,
+                                text = stringResource(group.titleRes),
                                 color = mutedText,
                             )
                         }
@@ -883,7 +918,7 @@ private fun DrawerSearchField(
         Box(modifier = Modifier.weight(1f)) {
             if (value.isEmpty()) {
                 Text(
-                    text = "搜索对话内容...",
+                    text = stringResource(R.string.chat_search_hint),
                     color = placeholderColor,
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.SemiBold,
@@ -907,7 +942,7 @@ private fun DrawerSearchField(
 }
 
 private data class DrawerSessionGroup(
-    val title: String,
+    @StringRes val titleRes: Int,
     val sessions: List<UiSessionSummary>,
 )
 
@@ -933,10 +968,10 @@ private fun groupDrawerSessions(
     }
 
     return listOf(
-        DrawerSessionGroup("今天", today),
-        DrawerSessionGroup("7 天内", week),
-        DrawerSessionGroup("30 天内", month),
-        DrawerSessionGroup("更早", earlier),
+        DrawerSessionGroup(R.string.chat_drawer_today, today),
+        DrawerSessionGroup(R.string.chat_drawer_week, week),
+        DrawerSessionGroup(R.string.chat_drawer_month, month),
+        DrawerSessionGroup(R.string.chat_drawer_earlier, earlier),
     )
 }
 
@@ -988,8 +1023,9 @@ private fun DrawerSessionRow(
             .padding(horizontal = 14.dp),
         contentAlignment = Alignment.CenterStart,
     ) {
+        val fallbackSessionTitle = stringResource(R.string.chat_new_chat)
         Text(
-            text = session.title.ifBlank { "新对话" },
+            text = session.title.ifBlank { fallbackSessionTitle },
             color = contentColor.copy(alpha = if (selected) 1f else 0.82f),
             style = MaterialTheme.typography.titleMedium,
             fontWeight = if (selected) FontWeight.Bold else FontWeight.SemiBold,
@@ -1005,7 +1041,11 @@ private fun DrawerSessionRow(
             ) {
                 ContextMenuActionRow(
                     icon = Lucide.Pin,
-                    label = if (session.pinnedAtMs > 0UL) "取消置顶" else "置顶",
+                    label = if (session.pinnedAtMs > 0UL) {
+                        stringResource(R.string.chat_unpin)
+                    } else {
+                        stringResource(R.string.chat_pin)
+                    },
                     onClick = {
                         showMenu = false
                         onPin()
@@ -1014,7 +1054,7 @@ private fun DrawerSessionRow(
                 ContextMenuDivider()
                 ContextMenuActionRow(
                     icon = Lucide.Trash2,
-                    label = "删除",
+                    label = stringResource(R.string.common_delete),
                     danger = true,
                     onClick = {
                         showMenu = false
@@ -1057,7 +1097,7 @@ private fun DrawerBottomBar(
             }
             Spacer(modifier = Modifier.width(12.dp))
             Text(
-                text = "153******85",
+                text = stringResource(R.string.chat_account_id),
                 color = contentColor,
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold,
@@ -1070,7 +1110,7 @@ private fun DrawerBottomBar(
         ) {
             Icon(
                 imageVector = Lucide.Settings,
-                contentDescription = "Settings",
+                contentDescription = stringResource(R.string.chat_settings_description),
                 tint = contentColor,
                 modifier = Modifier.size(32.dp),
             )
@@ -1087,13 +1127,13 @@ private fun BackendGapDialog(
         onDismissRequest = onDismiss,
         confirmButton = {
             TextButton(onClick = onDismiss) {
-                Text("OK")
+                Text(stringResource(R.string.chat_dialog_ok))
             }
         },
         title = { Text(title) },
         text = {
             Text(
-                text = "The old UI had this action, but the new backend does not expose a command or persisted field for it yet.",
+                text = stringResource(R.string.chat_backend_gap_message),
                 style = MaterialTheme.typography.bodyMedium,
             )
         },
@@ -1363,6 +1403,15 @@ private fun ChatTimeline(
                         modifier = Modifier.padding(top = topPadding),
                     )
                 }
+
+                is ChatDisplayItem.AssistantFailure -> {
+                    AssistantFailureItem(
+                        onRetry = {
+                            store.regenerateMessage(state.selectedSessionId, item.messageId)
+                        },
+                        modifier = Modifier.padding(top = topPadding),
+                    )
+                }
             }
         }
         item(key = "bottom-anchor", contentType = "bottom-anchor") {
@@ -1408,7 +1457,7 @@ private fun EmptyChatState(
             )
             Spacer(modifier = Modifier.height(tokens.emptyStateIconTextGap))
             Text(
-                text = "我是 Hambur，有什么我可以帮您的？",
+                text = stringResource(R.string.chat_empty_state_title),
                 color = MaterialTheme.colorScheme.onBackground,
                 fontSize = tokens.emptyStateTitleFontSize,
                 lineHeight = tokens.emptyStateTitleLineHeight,
@@ -1585,7 +1634,7 @@ private fun SelectTextDialog(
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Text(
-                            text = "选择文本",
+                            text = stringResource(R.string.chat_select_text),
                             style = MaterialTheme.typography.titleMedium.copy(
                                 fontWeight = FontWeight.SemiBold,
                             ),
@@ -1597,7 +1646,7 @@ private fun SelectTextDialog(
                         ) {
                             Icon(
                                 imageVector = Lucide.X,
-                                contentDescription = "关闭",
+                                contentDescription = stringResource(R.string.common_close),
                                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
                                 modifier = Modifier.size(20.dp),
                             )
@@ -1651,10 +1700,14 @@ private fun SelectTextDialog(
                                         ) {
                                             HorizontalToolbarActionItem(
                                                 icon = Lucide.Copy,
-                                                label = "复制",
+                                                label = stringResource(R.string.common_copy),
                                                 onClick = {
                                                     toolbarState?.onCopy?.invoke()
-                                                    Toast.makeText(context, "已复制", Toast.LENGTH_SHORT).show()
+                                                    Toast.makeText(
+                                                        context,
+                                                        context.getString(R.string.chat_copied),
+                                                        Toast.LENGTH_SHORT,
+                                                    ).show()
                                                     customTextToolbar.hide()
                                                 },
                                             )
@@ -1667,7 +1720,7 @@ private fun SelectTextDialog(
                                                 )
                                                 HorizontalToolbarActionItem(
                                                     icon = Lucide.Check,
-                                                    label = "全选",
+                                                    label = stringResource(R.string.chat_select_all),
                                                     onClick = {
                                                         toolbarState?.onSelectAll?.invoke()
                                                     },
@@ -1710,7 +1763,7 @@ private fun SelectTextDialog(
                                 modifier = Modifier.size(16.dp),
                             )
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("复制全文", fontSize = 14.sp)
+                            Text(stringResource(R.string.chat_copy_all), fontSize = 14.sp)
                         }
 
                         Button(
@@ -1724,7 +1777,7 @@ private fun SelectTextDialog(
                                 contentColor = MaterialTheme.colorScheme.onPrimary,
                             ),
                         ) {
-                            Text("完成", fontSize = 14.sp)
+                            Text(stringResource(R.string.common_done), fontSize = 14.sp)
                         }
                     }
                 }
@@ -1755,9 +1808,10 @@ private fun MessageTimelineItem(
     }
 
     val rawContentText = message?.contentText.orEmpty()
+    val loadingMessage = stringResource(R.string.chat_loading_message)
     val displayText = when {
         rawContentText.isNotBlank() -> rawContentText
-        attachments.isEmpty() -> item.smallSummary.ifBlank { "Loading message..." }
+        attachments.isEmpty() -> item.smallSummary.ifBlank { loadingMessage }
         else -> ""
     }
 
@@ -2068,7 +2122,7 @@ private fun MessageLongPressMenuBox(
             ) {
                 ContextMenuActionRow(
                     icon = Lucide.Copy,
-                    label = "复制",
+                    label = stringResource(R.string.common_copy),
                     onClick = {
                         showMenu = false
                         onCopy()
@@ -2077,7 +2131,7 @@ private fun MessageLongPressMenuBox(
                 ContextMenuDivider()
                 ContextMenuActionRow(
                     icon = Lucide.Type,
-                    label = "选择文本",
+                    label = stringResource(R.string.chat_select_text),
                     onClick = {
                         showMenu = false
                         onSelectText()
@@ -2087,7 +2141,7 @@ private fun MessageLongPressMenuBox(
                     ContextMenuDivider()
                     ContextMenuActionRow(
                         icon = Lucide.RefreshCw,
-                        label = "重新生成",
+                        label = stringResource(R.string.chat_regenerate),
                         onClick = {
                             showMenu = false
                             retry()
@@ -2098,7 +2152,7 @@ private fun MessageLongPressMenuBox(
                     ContextMenuDivider()
                     ContextMenuActionRow(
                         icon = Lucide.RefreshCw,
-                        label = "重新生成",
+                        label = stringResource(R.string.chat_regenerate),
                         onClick = {
                             showMenu = false
                             regenerate()
@@ -2109,7 +2163,7 @@ private fun MessageLongPressMenuBox(
                     ContextMenuDivider()
                     ContextMenuActionRow(
                         icon = Lucide.Pencil,
-                        label = "编辑",
+                        label = stringResource(R.string.common_edit),
                         onClick = {
                             showMenu = false
                             edit()
@@ -2192,7 +2246,9 @@ private fun ExecutionProcessBlock(
         fontWeight = FontWeight.Normal,
     )
 
-    val headerTitle = resolveProcessHeaderTitle(steps, isGenerating, durationSeconds)
+    val headerTitle = processHeaderTitleText(
+        resolveProcessHeaderTitle(steps, isGenerating, durationSeconds),
+    )
 
     Column(
         modifier = modifier
@@ -2241,7 +2297,11 @@ private fun ExecutionProcessBlock(
 
             Icon(
                 imageVector = Lucide.ChevronRight,
-                contentDescription = if (isExpanded) "收起" else "展开",
+                contentDescription = if (isExpanded) {
+                    stringResource(R.string.common_collapse)
+                } else {
+                    stringResource(R.string.common_expand)
+                },
                 tint = headerTextColor.copy(alpha = 0.6f),
                 modifier = Modifier
                     .size(15.dp)
@@ -2381,7 +2441,7 @@ private fun ProcessToolStepRow(
     onToggleDetail: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val displayTitle = formatToolStepTitle(step.toolName, step.title)
+    val displayTitle = toolTitleText(step.toolName, step.title)
     val detail = toolCallDetail(step.toolName, step.argumentsJson)
         .takeIf { it.isNotBlank() && !displayTitle.contains(it) }
 
@@ -2417,7 +2477,11 @@ private fun ProcessToolStepRow(
             if (detail != null) {
                 Icon(
                     imageVector = Lucide.ChevronRight,
-                    contentDescription = if (detailExpanded) "收起详情" else "展开详情",
+                    contentDescription = if (detailExpanded) {
+                        stringResource(R.string.chat_collapse_details)
+                    } else {
+                        stringResource(R.string.chat_expand_details)
+                    },
                     tint = contentColor.copy(alpha = 0.45f),
                     modifier = Modifier
                         .size(12.dp)
@@ -2426,7 +2490,7 @@ private fun ProcessToolStepRow(
             }
             if (step.status == "running") {
                 Text(
-                    text = "(执行中...)",
+                    text = stringResource(R.string.chat_tool_running),
                     style = textStyle.copy(
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Medium,
@@ -2435,7 +2499,7 @@ private fun ProcessToolStepRow(
                 )
             } else if (step.status == "failed" || step.status == "error") {
                 Text(
-                    text = "(失败)",
+                    text = stringResource(R.string.chat_tool_failed),
                     style = textStyle.copy(
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Medium,
@@ -2537,47 +2601,77 @@ private fun toolIconFor(toolName: String): ImageVector {
     }
 }
 
-private fun formatToolStepTitle(toolName: String, rawTitle: String): String {
+/**
+ * 工具步骤标题的解析结果（纯函数产物，不含任何资源解析）：
+ * [Res] 落到资源，arg 非空时填 %1$s；[Raw] 是后端给的自由文本，原样显示。
+ */
+internal sealed interface ToolTitleSpec {
+    data class Res(@StringRes val resId: Int, val arg: String? = null) : ToolTitleSpec
+
+    data class Raw(val text: String) : ToolTitleSpec
+}
+
+/**
+ * 把后端给的英文标题本地化。后端标题是协议的一部分，所以前缀匹配（"Search web: " 等）
+ * 保持英文不动，只把命中的那一段换成资源；没命中的自由文本原样返回。
+ */
+internal fun toolTitleSpec(toolName: String, rawTitle: String): ToolTitleSpec {
     val title = rawTitle.trim()
     return when {
-        title.startsWith("Search web: ") -> "搜索网页: " + title.removePrefix("Search web: ")
-        title == "Search web" -> "搜索网页"
-        title.startsWith("Fetch web page: ") -> "抓取网页: " + title.removePrefix("Fetch web page: ")
-        title == "Fetch web page" -> "抓取网页"
-        title.startsWith("Search files: ") -> "搜索文件: " + title.removePrefix("Search files: ")
-        title == "Search files" -> "搜索文件"
-        title.startsWith("Browser: ") -> "浏览网页: " + title.removePrefix("Browser: ")
-        title == "Use browser" -> "浏览网页"
-        title.startsWith("Run terminal command: ") -> "执行终端命令: " + title.removePrefix("Run terminal command: ")
-        title == "Run terminal command" -> "执行终端命令"
-        title.startsWith("Read file: ") -> "读取文件: " + title.removePrefix("Read file: ")
-        title.startsWith("Write file: ") -> "写入文件: " + title.removePrefix("Write file: ")
-        title.startsWith("Patch file: ") -> "编辑文件: " + title.removePrefix("Patch file: ")
-        title.startsWith("Search sessions: ") -> "搜索历史对话: " + title.removePrefix("Search sessions: ")
-        title.startsWith("View image: ") -> "查看图片: " + title.removePrefix("View image: ")
-        title.startsWith("Delegate session") -> "委派子任务"
-        title.isNotBlank() -> title
-        toolName.isNotBlank() -> defaultToolTitle(toolName)
-        else -> "调用工具"
+        title.startsWith("Search web: ") -> ToolTitleSpec.Res(R.string.chat_tool_search_web_arg, title.removePrefix("Search web: "))
+        title == "Search web" -> ToolTitleSpec.Res(R.string.chat_tool_search_web)
+        title.startsWith("Fetch web page: ") -> ToolTitleSpec.Res(R.string.chat_tool_fetch_web_page_arg, title.removePrefix("Fetch web page: "))
+        title == "Fetch web page" -> ToolTitleSpec.Res(R.string.chat_tool_fetch_web_page)
+        title.startsWith("Search files: ") -> ToolTitleSpec.Res(R.string.chat_tool_search_files_arg, title.removePrefix("Search files: "))
+        title == "Search files" -> ToolTitleSpec.Res(R.string.chat_tool_search_files)
+        title.startsWith("Browser: ") -> ToolTitleSpec.Res(R.string.chat_tool_browse_arg, title.removePrefix("Browser: "))
+        title == "Use browser" -> ToolTitleSpec.Res(R.string.chat_tool_browse)
+        title.startsWith("Run terminal command: ") -> ToolTitleSpec.Res(R.string.chat_tool_terminal_arg, title.removePrefix("Run terminal command: "))
+        title == "Run terminal command" -> ToolTitleSpec.Res(R.string.chat_tool_terminal)
+        title.startsWith("Read file: ") -> ToolTitleSpec.Res(R.string.chat_tool_read_file_arg, title.removePrefix("Read file: "))
+        title.startsWith("Write file: ") -> ToolTitleSpec.Res(R.string.chat_tool_write_file_arg, title.removePrefix("Write file: "))
+        title.startsWith("Patch file: ") -> ToolTitleSpec.Res(R.string.chat_tool_patch_file_arg, title.removePrefix("Patch file: "))
+        title.startsWith("Search sessions: ") -> ToolTitleSpec.Res(R.string.chat_tool_search_sessions_arg, title.removePrefix("Search sessions: "))
+        title.startsWith("View image: ") -> ToolTitleSpec.Res(R.string.chat_tool_view_image_arg, title.removePrefix("View image: "))
+        title.startsWith("Delegate session") -> ToolTitleSpec.Res(R.string.chat_tool_delegate)
+        title.isNotBlank() -> ToolTitleSpec.Raw(title)
+        toolName.isNotBlank() -> when (val resId = defaultToolTitle(toolName)) {
+            // 「调用工具: xxx」是唯一需要把工具名带回去的兜底。
+            R.string.chat_tool_named -> ToolTitleSpec.Res(resId, toolName)
+            else -> ToolTitleSpec.Res(resId)
+        }
+        else -> ToolTitleSpec.Res(R.string.chat_tool_unknown)
     }
 }
 
-private fun defaultToolTitle(toolName: String): String {
+@Composable
+internal fun toolTitleText(toolName: String, rawTitle: String): String {
+    return when (val spec = toolTitleSpec(toolName, rawTitle)) {
+        is ToolTitleSpec.Raw -> spec.text
+        is ToolTitleSpec.Res -> {
+            val arg = spec.arg
+            if (arg != null) stringResource(spec.resId, arg) else stringResource(spec.resId)
+        }
+    }
+}
+
+@StringRes
+private fun defaultToolTitle(toolName: String): Int {
     return when (toolName.lowercase().trim()) {
-        "web_search", "search" -> "搜索网页"
-        "web_fetch", "fetch", "fetch_url" -> "抓取网页"
-        "browser_use", "browser" -> "浏览网页"
-        "terminal", "run_command", "bash", "android_cli" -> "执行终端命令"
-        "process" -> "控制进程"
-        "read_file" -> "读取文件"
-        "write_file" -> "写入文件"
-        "patch" -> "编辑文件"
-        "search_files" -> "搜索文件"
-        "session_search" -> "搜索历史对话"
-        "view_image" -> "查看图片"
-        "skills_list", "skill_view" -> "加载技能"
-        "delegate_task" -> "委派子任务"
-        else -> "调用工具: $toolName"
+        "web_search", "search" -> R.string.chat_tool_search_web
+        "web_fetch", "fetch", "fetch_url" -> R.string.chat_tool_fetch_web_page
+        "browser_use", "browser" -> R.string.chat_tool_browse
+        "terminal", "run_command", "bash", "android_cli" -> R.string.chat_tool_terminal
+        "process" -> R.string.chat_tool_process
+        "read_file" -> R.string.chat_tool_read_file
+        "write_file" -> R.string.chat_tool_write_file
+        "patch" -> R.string.chat_tool_patch_file
+        "search_files" -> R.string.chat_tool_search_files
+        "session_search" -> R.string.chat_tool_search_sessions
+        "view_image" -> R.string.chat_tool_view_image
+        "skills_list", "skill_view" -> R.string.chat_tool_load_skill
+        "delegate_task" -> R.string.chat_tool_delegate
+        else -> R.string.chat_tool_named
     }
 }
 
@@ -2651,9 +2745,9 @@ private fun AssistantMarkdownActionsItem(
                 clipboard.setPrimaryClip(
                     ClipData.newPlainText("assistant message", item.assistantText),
                 )
-                Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, context.getString(R.string.chat_copied), Toast.LENGTH_SHORT).show()
             },
-            contentDescription = "Copy",
+            contentDescription = stringResource(R.string.common_copy),
         ) {
             Icon(
                 imageVector = Lucide.Copy,
@@ -2664,13 +2758,54 @@ private fun AssistantMarkdownActionsItem(
         }
         ChatInlineActionButton(
             onClick = onRegenerate,
-            contentDescription = "Regenerate",
+            contentDescription = stringResource(R.string.chat_regenerate),
         ) {
             Icon(
                 imageVector = Lucide.RefreshCw,
                 contentDescription = null,
                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.size(16.dp),
+            )
+        }
+    }
+}
+
+/**
+ * 失败回合的空占位：不能什么都不显示。
+ *
+ * 之前失败时只留下一条空的 pending 块，界面直接跳过——用户看到「消息发出去了，
+ * 但模型完全不回复」，既不知道失败也不知道能重试。这里给出一条可见提示 + 重试。
+ */
+@Composable
+private fun AssistantFailureItem(
+    onRetry: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Row(
+        modifier = modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            imageVector = Lucide.CircleAlert,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.error,
+            modifier = Modifier.size(14.dp),
+        )
+        Spacer(modifier = Modifier.width(6.dp))
+        Text(
+            text = stringResource(R.string.chat_reply_failed),
+            color = MaterialTheme.colorScheme.error,
+            fontSize = 13.sp,
+            modifier = Modifier.weight(1f),
+        )
+        TextButton(
+            onClick = onRetry,
+            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+        ) {
+            Text(
+                text = stringResource(R.string.chat_retry),
+                color = MaterialTheme.colorScheme.primary,
+                fontSize = 13.sp,
             )
         }
     }
@@ -2825,7 +2960,7 @@ private fun copyTextToClipboard(
 ) {
     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
     clipboard.setPrimaryClip(ClipData.newPlainText("text", text))
-    Toast.makeText(context, "已复制到剪贴板", Toast.LENGTH_SHORT).show()
+    Toast.makeText(context, context.getString(R.string.chat_copied_to_clipboard), Toast.LENGTH_SHORT).show()
 }
 
 @Composable
@@ -2878,7 +3013,10 @@ private fun MessageAttachmentRow(
                     overflow = TextOverflow.Ellipsis,
                 )
                 Text(
-                    text = listOf(attachment.mimeType, "${attachment.byteSize} bytes")
+                    text = listOf(
+                        attachment.mimeType,
+                        stringResource(R.string.chat_attachment_size_bytes, attachment.byteSize.toString()),
+                    )
                         .filter { it.isNotBlank() }
                         .joinToString(" - "),
                     style = MaterialTheme.typography.labelSmall,
@@ -2894,7 +3032,7 @@ private fun StandaloneToolTraceItem(
     item: UiTimelineItem,
     modifier: Modifier = Modifier,
 ) {
-    val displayTitle = formatToolStepTitle(item.toolName, item.traceTitle.ifBlank { item.smallSummary })
+    val displayTitle = toolTitleText(item.toolName, item.traceTitle.ifBlank { item.smallSummary })
     val detail = toolCallDetail(item.toolName, item.traceArguments)
         .takeIf { it.isNotBlank() && !displayTitle.contains(it) }
     Row(
@@ -2929,7 +3067,7 @@ private fun StandaloneToolTraceItem(
                 )
                 if (item.traceStatus == "running") {
                     Text(
-                        text = "(执行中...)",
+                        text = stringResource(R.string.chat_tool_running),
                         style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
                         color = MaterialTheme.colorScheme.primary.copy(alpha = 0.85f),
                     )
@@ -2977,6 +3115,7 @@ private fun ChatInputPanel(
     attachmentPanelHeight: Dp,
     pendingAttachments: List<UiPendingAttachment>,
     editing: Boolean,
+    focusRequester: FocusRequester,
     onToggleThinking: () -> Unit,
     onToggleAttachmentPanel: () -> Unit,
     onCloseAttachmentPanel: () -> Unit = {},
@@ -3061,12 +3200,12 @@ private fun ChatInputPanel(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     Text(
-                        text = "Editing message",
+                        text = stringResource(R.string.chat_editing_message),
                         style = MaterialTheme.typography.labelMedium,
                         modifier = Modifier.weight(1f),
                     )
                     TextButton(onClick = onCancelEdit) {
-                        Text("Cancel")
+                        Text(stringResource(R.string.common_cancel))
                     }
                 }
             }
@@ -3117,7 +3256,7 @@ private fun ChatInputPanel(
                 ) {
                     if (message.isBlank()) {
                         Text(
-                            text = "发消息或按住说话",
+                            text = stringResource(R.string.chat_input_placeholder),
                             color = secondaryText.copy(alpha = tokens.inputPlaceholderAlpha),
                             style = MaterialTheme.typography.bodyLarge.copy(
                                 color = secondaryText.copy(alpha = tokens.inputPlaceholderAlpha),
@@ -3136,6 +3275,7 @@ private fun ChatInputPanel(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(start = tokens.inputTextStartPadding)
+                            .focusRequester(focusRequester)
                             .onFocusChanged { focusState ->
                                 isInputFocused = focusState.isFocused
                             },
@@ -3156,7 +3296,7 @@ private fun ChatInputPanel(
                     ) {
                         Icon(
                             imageVector = Lucide.Brain,
-                            contentDescription = "Think",
+                            contentDescription = stringResource(R.string.chat_thinking_toggle),
                             tint = if (thinkingEnabled) Color(THINKING_ACTIVE_COLOR) else primaryText,
                             modifier = Modifier.size(tokens.inputIconSize),
                         )
@@ -3173,7 +3313,7 @@ private fun ChatInputPanel(
                     ) {
                         Icon(
                             imageVector = if (attachmentPanelOpen) Lucide.CircleX else Lucide.CirclePlus,
-                            contentDescription = "Attachments",
+                            contentDescription = stringResource(R.string.chat_attachments),
                             tint = primaryText,
                             modifier = Modifier.size(tokens.inputIconSize),
                         )
@@ -3191,7 +3331,7 @@ private fun ChatInputPanel(
                         ) {
                             Icon(
                                 imageVector = Lucide.CirclePause,
-                                contentDescription = "Stop",
+                                contentDescription = stringResource(R.string.chat_stop),
                                 tint = MaterialTheme.colorScheme.error,
                                 modifier = Modifier.size(tokens.inputIconSize),
                             )
@@ -3208,7 +3348,7 @@ private fun ChatInputPanel(
                         ) {
                             Icon(
                                 imageVector = Lucide.CircleArrowUp,
-                                contentDescription = "Send",
+                                contentDescription = stringResource(R.string.chat_send),
                                 tint = if (canSend) {
                                     primaryText
                                 } else {
@@ -3315,7 +3455,13 @@ private fun AttachmentPickerPanel(
     ) { isGranted ->
         Toast.makeText(
             context,
-            if (isGranted) "相机权限已获取" else "相机权限已被拒绝",
+            context.getString(
+                if (isGranted) {
+                    R.string.chat_camera_permission_granted
+                } else {
+                    R.string.chat_camera_permission_denied
+                },
+            ),
             Toast.LENGTH_SHORT,
         ).show()
     }
@@ -3324,10 +3470,10 @@ private fun AttachmentPickerPanel(
         contract = ActivityResultContracts.RequestMultiplePermissions(),
     ) { grants ->
         if (grants.values.any { it }) {
-            Toast.makeText(context, "相册权限已获取", Toast.LENGTH_SHORT).show()
+            Toast.makeText(context, context.getString(R.string.chat_gallery_permission_granted), Toast.LENGTH_SHORT).show()
             checkAndLoadImages()
         } else {
-            Toast.makeText(context, "相册权限已被拒绝", Toast.LENGTH_SHORT).show()
+            Toast.makeText(context, context.getString(R.string.chat_gallery_permission_denied), Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -3342,9 +3488,9 @@ private fun AttachmentPickerPanel(
                     savedUri.lastPathSegment ?: "camera_${System.currentTimeMillis()}.jpg",
                     "image/jpeg",
                 )
-                Toast.makeText(context, "已拍摄照片", Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, context.getString(R.string.chat_photo_taken), Toast.LENGTH_SHORT).show()
             } else {
-                Toast.makeText(context, "照片保存失败", Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, context.getString(R.string.chat_photo_save_failed), Toast.LENGTH_SHORT).show()
             }
         }
     }
@@ -3467,11 +3613,14 @@ private fun AttachmentPickerPanel(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            val buttons = remember {
+            val cameraLabel = stringResource(R.string.chat_attachment_camera)
+            val galleryLabel = stringResource(R.string.chat_attachment_gallery)
+            val fileLabel = stringResource(R.string.chat_attachment_file)
+            val buttons = remember(cameraLabel, galleryLabel, fileLabel) {
                 listOf(
-                    Triple("拍照", Lucide.Camera, "camera"),
-                    Triple("相册", Lucide.Image, "gallery"),
-                    Triple("文件", Lucide.Folder, "file"),
+                    Triple(cameraLabel, Lucide.Camera, "camera"),
+                    Triple(galleryLabel, Lucide.Image, "gallery"),
+                    Triple(fileLabel, Lucide.Folder, "file"),
                 )
             }
 
@@ -3793,7 +3942,7 @@ private fun PendingAttachmentChip(
             ) {
                 Icon(
                     imageVector = Lucide.X,
-                    contentDescription = "Remove",
+                    contentDescription = stringResource(R.string.chat_remove_attachment),
                     tint = Color.White,
                     modifier = Modifier.size(12.dp),
                 )
@@ -3845,7 +3994,7 @@ private fun PendingAttachmentChip(
             Spacer(modifier = Modifier.width(6.dp))
             Icon(
                 imageVector = Lucide.X,
-                contentDescription = "Remove",
+                contentDescription = stringResource(R.string.chat_remove_attachment),
                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier
                     .size(16.dp)
@@ -3855,21 +4004,31 @@ private fun PendingAttachmentChip(
     }
 }
 
+@Composable
 private fun ULong.toAttachmentSizeText(): String {
     val bytes = toDouble()
     return when {
-        bytes >= 1024.0 * 1024.0 -> String.format("%.1f MB", bytes / 1024.0 / 1024.0)
-        bytes >= 1024.0 -> String.format("%.1f KB", bytes / 1024.0)
-        else -> "$this bytes"
+        bytes >= 1024.0 * 1024.0 -> stringResource(
+            R.string.chat_attachment_size_mb,
+            String.format("%.1f", bytes / 1024.0 / 1024.0),
+        )
+
+        bytes >= 1024.0 -> stringResource(
+            R.string.chat_attachment_size_kb,
+            String.format("%.1f", bytes / 1024.0),
+        )
+
+        else -> stringResource(R.string.chat_attachment_size_bytes, toString())
     }
 }
 
+/**
+ * 会话标题：没有自定义标题时返回空串，由 [ChatHeader] 用资源里的默认标题兜底。
+ * "New chat" / "Hambur Chat" 是后端写入的默认标题（协议值），比较串必须保持原样。
+ */
 private fun HamburUiState.selectedSessionTitle(): String {
     val title = sessions.firstOrNull { it.id == selectedSessionId }?.title.orEmpty()
-    return when {
-        title.isBlank() || title == "New chat" || title == "Hambur Chat" -> "新对话"
-        else -> title
-    }
+    return if (title.isBlank() || title == "New chat" || title == "Hambur Chat") "" else title
 }
 
 internal sealed interface ProcessStep {
@@ -3938,6 +4097,22 @@ internal sealed interface ChatDisplayItem {
         override val stableKey: String = "assistant-actions:$messageId:$firstStableKey"
         override val contentType: String = "assistant_actions"
         override val versionSequence: ULong = lastVersionSequence
+    }
+
+    /**
+     * 回复失败且一个字都没生成时的占位行。
+     *
+     * 失败回合只留下一条空的 pending 块，之前的实现会把它整体跳过——用户看到的就是
+     * 「消息发出去了，但模型完全不回复」。后端日志里有原因（如 Http400），但界面上
+     * 必须至少给出一条可见的失败提示和重试入口。
+     */
+    data class AssistantFailure(
+        val messageId: String,
+        val item: UiTimelineItem,
+    ) : ChatDisplayItem {
+        override val stableKey: String = "assistant-failure:$messageId:${item.stableKey}"
+        override val contentType: String = "assistant_failure"
+        override val versionSequence: ULong = item.versionSequence
     }
 }
 
@@ -4141,6 +4316,18 @@ internal fun List<UiTimelineItem>.toChatDisplayItems(
 
         val nodeText = node?.raw?.ifBlank { node.text }?.trim().orEmpty()
         if (item.isAssistantMarkdownBlock() && (node == null || nodeText.isBlank())) {
+            // 空块只在「这一轮失败了」时保留：给用户一条可见的失败提示，而不是静默消失。
+            val failedMessageId = node?.messageId?.takeIf { it.isNotBlank() }
+                ?: item.stableKey.removeSuffix(":pending").removePrefix("md:pending:")
+            val failedStatus = messagesById[failedMessageId]?.status.orEmpty()
+            if (item.contentType == "assistant_pending_block" && failedStatus in FAILED_MESSAGE_STATUSES) {
+                flushProcessGroup()
+                flushMarkdownGroup()
+                displayItems += ChatDisplayItem.AssistantFailure(
+                    messageId = failedMessageId,
+                    item = item,
+                )
+            }
             continue
         }
 
@@ -4177,6 +4364,9 @@ internal fun List<UiTimelineItem>.toChatDisplayItems(
     }
     return resultItems
 }
+
+/** 会显示成「回复失败」的消息状态：用户主动取消（cancelled）不算失败。 */
+private val FAILED_MESSAGE_STATUSES = setOf("failed", "failed_partial", "error")
 
 private fun ChatDisplayItem.topSpacingAfter(previous: ChatDisplayItem?): Dp {
     if (previous == null) return 0.dp
@@ -4227,6 +4417,24 @@ internal fun initialThinkingBlockExpanded(displayMode: String, isGenerating: Boo
 }
 
 /**
+ * 折叠态思考块主标题的结构化结果：纯函数 [resolveProcessHeaderTitle] 返回它，
+ * 资源解析放在 [processHeaderTitleText] 里完成，这样 JVM 单测不需要 Context。
+ */
+internal sealed interface ProcessHeaderTitle {
+    /** 正在跑工具：显示该工具调用的标题（模型给的描述，或按工具名兜底）。 */
+    data class Tool(val toolName: String, val rawTitle: String) : ProcessHeaderTitle
+
+    /** 正在思考，还没有可显示的工具标题。 */
+    data object Thinking : ProcessHeaderTitle
+
+    /** 回合已结束，显示用时。 */
+    data class ThoughtFor(val seconds: Long) : ProcessHeaderTitle
+
+    /** 回合已结束且没有可用用时。 */
+    data object Thought : ProcessHeaderTitle
+}
+
+/**
  * Title of the collapsed "thinking" block.
  *
  * While the turn is running the header reports the latest activity instead of a constant
@@ -4239,22 +4447,37 @@ internal fun resolveProcessHeaderTitle(
     steps: List<ProcessStep>,
     isGenerating: Boolean,
     durationSeconds: Int?,
-): String {
+): ProcessHeaderTitle {
     if (!isGenerating) {
         return if (durationSeconds != null && durationSeconds > 0) {
-            "已思考（用时 $durationSeconds 秒）"
+            ProcessHeaderTitle.ThoughtFor(durationSeconds.toLong())
         } else {
-            "已思考"
+            ProcessHeaderTitle.Thought
         }
     }
-    val activeToolStep = steps.lastOrNull() as? ProcessStep.ToolCall ?: return "正在思考..."
+    val activeToolStep = steps.lastOrNull() as? ProcessStep.ToolCall ?: return ProcessHeaderTitle.Thinking
     if (activeToolStep.toolName.isBlank() && activeToolStep.title.isBlank()) {
-        return "正在思考..."
+        return ProcessHeaderTitle.Thinking
     }
-    return formatToolStepTitle(activeToolStep.toolName, activeToolStep.title)
+    return ProcessHeaderTitle.Tool(activeToolStep.toolName, activeToolStep.title)
+}
+
+@Composable
+internal fun processHeaderTitleText(title: ProcessHeaderTitle): String {
+    return when (title) {
+        is ProcessHeaderTitle.Tool -> toolTitleText(title.toolName, title.rawTitle)
+        ProcessHeaderTitle.Thinking -> stringResource(R.string.chat_thinking_in_progress)
+        is ProcessHeaderTitle.ThoughtFor -> stringResource(R.string.chat_thought_for_seconds, title.seconds)
+        ProcessHeaderTitle.Thought -> stringResource(R.string.chat_thought)
+    }
 }
 
 private fun HamburUiState.thinkingBlockDisplayMode(): String {
     return appSettings.firstOrNull { it.key == THINKING_BLOCK_DISPLAY_MODE_KEY }?.value
         ?: THINKING_BLOCK_DISPLAY_AUTO_EXPAND
+}
+
+/** 外观设置里的「回复后自动聚焦输入框」，缺省关闭。 */
+private fun HamburUiState.autoFocusInputAfterReplyEnabled(): Boolean {
+    return appSettings.firstOrNull { it.key == AUTO_FOCUS_INPUT_AFTER_REPLY_KEY }?.value == "true"
 }

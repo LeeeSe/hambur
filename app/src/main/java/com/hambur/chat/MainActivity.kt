@@ -3,10 +3,10 @@ package com.hambur.chat
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
-import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import com.hambur.chat.platform.AndroidPlatformAdapter
 import com.hambur.chat.ui.app.HamburApp
@@ -29,7 +29,7 @@ import okhttp3.OkHttpClient
 import java.util.concurrent.TimeUnit
 
 @OptIn(ExperimentalFoundationApi::class)
-class MainActivity : ComponentActivity() {
+class MainActivity : AppCompatActivity() {
     companion object {
         init {
             ComposeFoundationFlags.isNewContextMenuEnabled = false

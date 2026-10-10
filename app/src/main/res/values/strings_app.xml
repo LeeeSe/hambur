@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  应用外壳与路由（HamburApp.kt）。
+  这里放的是在路由分派处直接传给各屏幕的文案（例如尚未接入的功能页标题与说明）。
+  通用文案复用 values/strings.xml 里的 common_*。中文见 values-zh-rCN/strings_app.xml。
+-->
+<resources>
+    <!-- 尚未接入的功能页 -->
+    <string name="app_environment_variables_title">Environment Variables</string>
+    <string name="app_environment_variables_summary">Sandbox environment variable management is not exposed by the new backend yet.</string>
+</resources>

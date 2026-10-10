@@ -22,6 +22,8 @@ pub struct RuntimeEngine {
     pub(crate) receiver: Mutex<mpsc::Receiver<RuntimeEvent>>,
     pub(crate) sequence: AtomicU64,
     pub(crate) shutdown: AtomicBool,
+    /// Rust 结构化 tracing 的内存环形缓冲区（Settings → 日志）。
+    pub(crate) diagnostics: Arc<DiagnosticsBuffer>,
 }
 
 #[derive(Debug, Clone)]
@@ -157,10 +159,21 @@ impl MemorySnapshot {
     }
 }
 
+/// provider 返回的一次请求 token 用量（运行时内部表示）。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ModelTokenUsage {
+    pub(crate) prompt_tokens: u64,
+    pub(crate) completion_tokens: u64,
+    pub(crate) total_tokens: u64,
+    pub(crate) cached_tokens: u64,
+    pub(crate) reasoning_tokens: u64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MemoryReviewAssistantMessage {
     pub(crate) content: String,
     pub(crate) tool_calls: Vec<CompleteToolCall>,
+    pub(crate) usage: Option<ModelTokenUsage>,
 }
 
 pub(crate) enum StreamAttemptResult {
@@ -205,4 +218,6 @@ pub(crate) struct StreamAttemptState {
     pub(crate) saw_tool_delta: bool,
     pub(crate) tool_accumulator: ToolCallAccumulator,
     pub(crate) complete_tool_calls: Vec<CompleteToolCall>,
+    /// 本次 attempt 是否已经记过 token 用量（网关可能重复下发 usage）。
+    pub(crate) usage_recorded: bool,
 }

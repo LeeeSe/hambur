@@ -1937,4 +1937,70 @@ impl HamburDatabase {
         }
         Ok(audits)
     }
+
+    /// Token 用量汇总：总量 + 按 provider / provider+model 分组。
+    pub fn token_usage_summary(&self) -> HamburResult<TokenUsageSummary> {
+        let mut summary = TokenUsageSummary::default();
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT
+                    COUNT(*),
+                    COALESCE(SUM(prompt_tokens), 0),
+                    COALESCE(SUM(completion_tokens), 0),
+                    COALESCE(SUM(total_tokens), 0),
+                    COALESCE(SUM(cached_tokens), 0),
+                    COALESCE(SUM(reasoning_tokens), 0)
+                 FROM token_usage",
+                params![],
+            )
+            .map_err(database_error)?;
+        if let Some(row) = rows.next().map_err(database_error)? {
+            summary.request_count = unsigned_u64(row.get::<i64>(0).map_err(database_error)?);
+            summary.prompt_tokens = unsigned_u64(row.get::<i64>(1).map_err(database_error)?);
+            summary.completion_tokens = unsigned_u64(row.get::<i64>(2).map_err(database_error)?);
+            summary.total_tokens = unsigned_u64(row.get::<i64>(3).map_err(database_error)?);
+            summary.cached_tokens = unsigned_u64(row.get::<i64>(4).map_err(database_error)?);
+            summary.reasoning_tokens = unsigned_u64(row.get::<i64>(5).map_err(database_error)?);
+        }
+
+        summary.by_provider = self.token_usage_groups(
+            "SELECT provider_id, '' AS model_id, COUNT(*),
+                    COALESCE(SUM(prompt_tokens), 0),
+                    COALESCE(SUM(completion_tokens), 0),
+                    COALESCE(SUM(total_tokens), 0)
+             FROM token_usage
+             GROUP BY provider_id
+             ORDER BY SUM(total_tokens) DESC, provider_id ASC",
+        )?;
+        summary.by_model = self.token_usage_groups(
+            "SELECT provider_id, model_id, COUNT(*),
+                    COALESCE(SUM(prompt_tokens), 0),
+                    COALESCE(SUM(completion_tokens), 0),
+                    COALESCE(SUM(total_tokens), 0)
+             FROM token_usage
+             GROUP BY provider_id, model_id
+             ORDER BY SUM(total_tokens) DESC, provider_id ASC, model_id ASC",
+        )?;
+        Ok(summary)
+    }
+
+    fn token_usage_groups(&self, sql: &str) -> HamburResult<Vec<TokenUsageGroup>> {
+        let mut rows = self
+            .connection
+            .query(sql, params![])
+            .map_err(database_error)?;
+        let mut groups = Vec::new();
+        while let Some(row) = rows.next().map_err(database_error)? {
+            groups.push(TokenUsageGroup {
+                provider_id: row.get::<String>(0).map_err(database_error)?,
+                model_id: row.get::<String>(1).map_err(database_error)?,
+                request_count: unsigned_u64(row.get::<i64>(2).map_err(database_error)?),
+                prompt_tokens: unsigned_u64(row.get::<i64>(3).map_err(database_error)?),
+                completion_tokens: unsigned_u64(row.get::<i64>(4).map_err(database_error)?),
+                total_tokens: unsigned_u64(row.get::<i64>(5).map_err(database_error)?),
+            });
+        }
+        Ok(groups)
+    }
 }

@@ -1,5 +1,35 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  默认语言（英文）本身就是 values/ 这一份：设备语言不是中文时全部回落到这里。
+  中文见 values-zh-rCN/strings.xml。
+  为了并行维护不打架，字符串按界面分文件：strings_chat / strings_settings /
+  strings_preview / strings_markdown / strings_browser / strings_components / strings_app，
+  这里只放跨界面复用的通用文案。
+-->
 <resources>
     <string name="app_name">Hambur</string>
-</resources>
 
+    <!-- 通用按钮与状态 -->
+    <string name="common_cancel">Cancel</string>
+    <string name="common_save">Save</string>
+    <string name="common_delete">Delete</string>
+    <string name="common_back">Back</string>
+    <string name="common_reload">Reload</string>
+    <string name="common_copy">Copy</string>
+    <string name="common_done">Done</string>
+    <string name="common_edit">Edit</string>
+    <string name="common_close">Close</string>
+    <string name="common_confirm">Confirm</string>
+    <string name="common_search">Search</string>
+    <string name="common_clear">Clear</string>
+    <string name="common_enabled">Enabled</string>
+    <string name="common_disabled">Disabled</string>
+    <string name="common_yes">Yes</string>
+    <string name="common_no">No</string>
+    <string name="common_unknown">Unknown</string>
+    <string name="common_not_set">Not set</string>
+    <string name="common_not_available">Not available</string>
+    <string name="common_expand">Expand</string>
+    <string name="common_collapse">Collapse</string>
+    <string name="common_image_preview">Image preview</string>
+</resources>

@@ -28,11 +28,19 @@
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
+        android:localeConfig="@xml/locales_config"
         android:supportsRtl="true"
         android:usesCleartextTraffic="true"
         android:theme="@style/Theme.Hambur">
+        <!--
+          configChanges 里带上 locale|layoutDirection 是有意的：语言切换后不重建 Activity，
+          而是由 AppCompatDelegate（Android 12）或系统 LocaleManager（Android 13+）走
+          onConfigurationChanged 就地更新 Resources，Compose 跟着重读 stringResource。
+          不声明这两个的话，切语言会把 Activity 重建一次，用户会被扔回聊天首页。
+        -->
         <activity
             android:name=".MainActivity"
+            android:configChanges="locale|layoutDirection"
             android:exported="true"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
@@ -40,6 +48,20 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!--
+          按应用语言在 Android 12/12L（API 31/32）上的存储：AppCompat 需要一个带
+          autoStoreLocales 元数据的占位 Service 才会把选择的语言写进自己的 SharedPreferences。
+          enabled=false 是它规定的写法，AppCompat 只读元数据、并不真的启动这个 Service。
+        -->
+        <service
+            android:name="androidx.appcompat.app.AppLocalesMetadataHolderService"
+            android:enabled="false"
+            android:exported="false">
+            <meta-data
+                android:name="autoStoreLocales"
+                android:value="true" />
+        </service>
     </application>
 
 </manifest>

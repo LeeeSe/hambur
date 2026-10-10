@@ -1,0 +1,378 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  设置相关界面（设置首页、提供商/模型、模型组、技能、记忆、工具、启动任务、
+  Rootfs、人设、环境变量、日志与用量占位页等）。
+  中文见 values-zh-rCN/strings_settings.xml，两份键名必须一一对应。
+  注意：「app_settings 的键名」以及后端状态码/事件名等不是给人看的字符串不在此列。
+-->
+<resources>
+    <!-- 设置首页 -->
+    <string name="settings_title">Settings</string>
+    <string name="settings_subtitle_providers_groups">%1$d providers / %2$d model groups</string>
+    <string name="settings_section_models">Models</string>
+    <string name="settings_providers_title">Providers</string>
+    <string name="settings_providers_summary">API compatible providers, API keys, model refresh</string>
+    <string name="settings_model_groups_title">Model groups</string>
+    <string name="settings_model_groups_summary">Routing strategy, fallback policy, default groups</string>
+    <string name="settings_section_agent_runtime">Agent Runtime</string>
+    <string name="settings_skills_title">Skills</string>
+    <string name="settings_skills_summary">Skill enablement and skill JSON payloads</string>
+    <string name="settings_memory_title">Memory</string>
+    <string name="settings_memory_summary">Persistent memory projection settings</string>
+    <string name="settings_tools_title">Tools</string>
+    <string name="settings_tools_summary">Tool settings and browser tool settings</string>
+    <string name="settings_startup_tasks_title">Startup tasks</string>
+    <string name="settings_startup_tasks_summary">Tasks that require explicit approval</string>
+    <string name="settings_rootfs_title">Rootfs</string>
+    <string name="settings_rootfs_summary">Rootfs settings, warmup, reset</string>
+    <string name="settings_env_vars_title">Environment variables</string>
+    <string name="settings_env_vars_summary">Inject variables into sandbox sessions</string>
+    <string name="settings_persona_title">Persona</string>
+    <string name="settings_persona_summary">SOUL.md text injected into the system prompt of every chat turn</string>
+    <string name="settings_section_app">App</string>
+    <string name="settings_appearance_summary">Theme, font scale, and startup chat behavior</string>
+    <string name="settings_section_waiting_backend">Waiting for backend</string>
+    <string name="settings_section_waiting_backend_subtitle">Kept visible so old UI feature coverage is explicit</string>
+    <string name="settings_logs_title">Logs</string>
+    <string name="settings_logs_summary">Capture app, jank, and runtime logs in an in-memory viewer</string>
+    <string name="settings_logs_section_record">Recording</string>
+    <string name="settings_logs_record_title">Record logs</string>
+    <string name="settings_logs_record_summary">Capture app, jank, and Rust runtime logs into an in-memory ring buffer</string>
+    <string name="settings_logs_section_entries">Entries</string>
+    <string name="settings_logs_tab_all">All</string>
+    <string name="settings_logs_tab_jank">Jank</string>
+    <string name="settings_logs_tab_warnings">Warnings</string>
+    <string name="settings_logs_clear">Clear logs</string>
+    <string name="settings_logs_count">%1$d entries</string>
+    <string name="settings_logs_empty">No log entries captured yet</string>
+    <string name="settings_logs_disabled">Log recording is off. Turn on Record logs to capture new entries.</string>
+    <string name="settings_logs_hint">Clear only affects this in-memory buffer; it never deletes chat data or writes to the database.</string>
+    <string name="settings_token_usage_title">Token usage</string>
+    <string name="settings_token_usage_summary">Prompt, completion, and total tokens aggregated per provider and model</string>
+    <string name="token_usage_section_totals">Total usage</string>
+    <string name="token_usage_total_input">Total input (incl. cache)</string>
+    <string name="token_usage_output">Output tokens</string>
+    <string name="token_usage_cache_read">Cache reads</string>
+    <string name="token_usage_cache_hit_rate">Cache hit rate</string>
+    <string name="token_usage_requests">Requests</string>
+    <string name="token_usage_prompt">Input tokens</string>
+    <string name="token_usage_completion">Output tokens</string>
+    <string name="token_usage_total">Total tokens</string>
+    <string name="token_usage_model_not_configured">No longer in the configured providers</string>
+    <string name="token_usage_empty">No token usage recorded yet</string>
+
+    <!-- 提供商列表 -->
+    <string name="settings_providers_subtitle">OpenAI-compatible provider list</string>
+    <string name="settings_provider_new">New provider</string>
+    <string name="settings_providers_section_openai">OpenAI Compatible</string>
+    <string name="settings_providers_empty">No providers configured</string>
+
+    <!-- 提供商详情 / 编辑 -->
+    <string name="settings_provider_new_title">New Provider</string>
+    <string name="settings_provider_delete_title">Delete provider</string>
+    <string name="settings_provider_delete_message">This deletes the provider configuration after explicit approval.</string>
+    <string name="settings_provider_detail_title">Provider Detail</string>
+    <string name="settings_provider_models_subtitle">Tap a model for detail</string>
+    <string name="settings_provider_models_empty">No models synced</string>
+    <string name="settings_danger_zone">Danger zone</string>
+    <string name="settings_provider_editor_section">Provider</string>
+    <string name="settings_provider_id">Provider ID</string>
+    <string name="settings_provider_name">Name</string>
+    <string name="settings_provider_base_url">Base URL</string>
+    <string name="settings_provider_api_key">API Key (leave blank to keep current)</string>
+    <string name="settings_provider_api_protocol">API Protocol</string>
+    <string name="settings_provider_protocol_chat_completions">Chat Completions (/v1/chat/completions)</string>
+    <string name="settings_provider_protocol_responses">Responses API (/v1/responses)</string>
+    <string name="settings_provider_select_icon">Select Icon</string>
+    <string name="settings_provider_save">Save provider</string>
+    <string name="settings_provider_model_sync_section">Model sync</string>
+    <string name="settings_provider_refresh_models">Refresh models</string>
+    <string name="settings_provider_add_model">Add model</string>
+    <string name="settings_provider_save_first_hint">Please save provider first to sync or add models.</string>
+    <string name="settings_add">Add</string>
+    <string name="settings_optional">Optional</string>
+
+    <!-- 模型详情 -->
+    <string name="settings_model_section">Model</string>
+    <string name="settings_model_id">Model ID</string>
+    <string name="settings_model_id_required">Model ID *</string>
+    <string name="settings_model_id_placeholder">e.g. gpt-4o, deepseek-chat</string>
+    <string name="settings_model_provider">Provider</string>
+    <string name="settings_model_synced_at">Synced at</string>
+    <string name="settings_model_display_name">Display name</string>
+    <string name="settings_model_basic_info">Basic info</string>
+    <string name="settings_model_family">Model family</string>
+    <string name="settings_model_knowledge_cutoff">Knowledge cutoff</string>
+    <string name="settings_model_release_date">Release date</string>
+    <string name="settings_model_last_updated">Last updated</string>
+    <string name="settings_model_status">Status</string>
+    <string name="settings_model_capabilities">Capabilities</string>
+    <string name="settings_model_input_modalities">Input modalities</string>
+    <string name="settings_model_output_modalities">Output modalities</string>
+    <string name="settings_model_supports_attachments">Supports attachments</string>
+    <string name="settings_model_supports_reasoning">Supports reasoning</string>
+    <string name="settings_model_supports_tool_call">Supports tool calling</string>
+    <string name="settings_model_supports_vision">Supports vision / image</string>
+    <string name="settings_model_image_input">Image input</string>
+    <string name="settings_model_structured_output">Structured output</string>
+    <string name="settings_model_temperature">Adjustable temperature</string>
+    <string name="settings_model_open_weights">Open weights</string>
+    <string name="settings_model_reasoning_field">Reasoning field</string>
+    <string name="settings_model_reasoning_options">Reasoning options</string>
+    <string name="settings_model_limits_pricing">Limits &amp; pricing</string>
+    <string name="settings_model_context_limit">Context limit</string>
+    <string name="settings_model_max_output">Max output</string>
+    <string name="settings_model_input_price">Input price</string>
+    <string name="settings_model_output_price">Output price</string>
+    <string name="settings_model_cache_read_price">Cache read price</string>
+    <string name="settings_model_references">References</string>
+    <string name="settings_model_weight_links">Weight links</string>
+    <string name="settings_model_benchmarks">Benchmarks</string>
+    <string name="settings_model_benchmarks_count">%1$d items</string>
+    <string name="settings_model_override_section">Override settings</string>
+    <string name="settings_model_override_save">Save override</string>
+    <string name="settings_model_delete_title">Delete model</string>
+    <string name="settings_model_delete_message">Are you sure you want to delete model \'%1$s\'?</string>
+    <string name="settings_cost_per_million">$%1$s / 1M tokens</string>
+
+    <!-- Toast / 操作提示（Toast 里用 context.getString，见注释） -->
+    <string name="settings_toast_models_refreshed">Models refreshed successfully</string>
+    <string name="settings_toast_provider_saved">Provider saved successfully</string>
+    <string name="settings_toast_model_added">Model added successfully</string>
+    <string name="settings_toast_operation_failed">Operation failed: %1$s</string>
+    <string name="settings_toast_provider_saving">Saving provider...</string>
+    <string name="settings_toast_models_syncing">Syncing models from provider...</string>
+    <string name="settings_toast_model_adding">Adding model...</string>
+    <!-- 模型组 -->
+    <string name="settings_model_group_new">New model group</string>
+    <string name="settings_model_groups_section">Groups</string>
+    <string name="settings_model_groups_empty">No model groups configured</string>
+    <string name="settings_model_groups_default_section">Default model groups</string>
+    <string name="settings_model_group_select">Select group</string>
+    <string name="settings_model_group_primary">Primary Model Group (Main chat)</string>
+    <string name="settings_model_group_secondary">Secondary Model Group (Fallback tasks)</string>
+    <string name="settings_model_group_select_primary">Select Primary Group</string>
+    <string name="settings_model_group_select_secondary">Select Secondary Group</string>
+    <string name="settings_toast_model_group_saved">Model group saved successfully</string>
+    <string name="settings_model_group_delete_title">Delete model group</string>
+    <string name="settings_model_group_delete_message">Are you sure you want to delete this model group? This action cannot be undone.</string>
+    <string name="settings_model_group_settings_section">Group Settings</string>
+    <string name="settings_model_group_id">Group ID</string>
+    <string name="settings_model_group_routing_strategy">Routing Strategy</string>
+    <string name="settings_model_group_strategy_fallback">Fallback</string>
+    <string name="settings_model_group_strategy_load_balance">Load Balance</string>
+    <string name="settings_model_group_fallback_policy">Fallback Policy</string>
+    <string name="settings_model_group_policy_default">Default</string>
+    <string name="settings_model_group_policy_always">Always</string>
+    <string name="settings_toast_group_saving">Saving group...</string>
+    <string name="settings_model_group_save">Save group</string>
+    <string name="settings_model_group_members">Members</string>
+    <string name="settings_model_group_members_subtitle">Routing priority of models in this group</string>
+    <string name="settings_model_group_members_empty">No members configured</string>
+    <string name="settings_model_group_delete_member">Delete member</string>
+    <string name="settings_model_group_no_available_models">No available models found. Please configure a provider and sync models first.</string>
+
+    <!-- 技能 -->
+    <string name="settings_refresh">Refresh</string>
+    <string name="settings_section_actions">Actions</string>
+    <string name="settings_skills_builtin">Built-in skills</string>
+    <string name="settings_skills_builtin_empty">No built-in skills discovered</string>
+    <string name="settings_skills_user">User skills</string>
+    <string name="settings_skills_user_empty">No user skills discovered</string>
+    <string name="settings_skill_delete_title">Delete skill</string>
+    <string name="settings_skill_delete_message">Delete %1$s? This removes the skill directory and all files inside it.</string>
+    <string name="settings_skill_detail_title">Skill Detail</string>
+    <string name="settings_skill_section">Skill</string>
+    <string name="settings_skill_path">Path</string>
+    <string name="settings_skill_created">Created</string>
+    <string name="settings_skill_modified">Modified</string>
+    <string name="settings_section_description">Description</string>
+    <string name="settings_skill_no_description">No description</string>
+    <string name="settings_skill_files">Files</string>
+    <string name="settings_skill_no_files">No files</string>
+    <string name="settings_skill_content">Content</string>
+    <string name="settings_skill_loading">Loading skill...</string>
+
+    <!-- 记忆 -->
+    <string name="settings_memory_files_section">Memory files</string>
+    <string name="settings_memory_files_empty">No memory files discovered</string>
+    <string name="settings_memory_entries_count">%1$s entries</string>
+    <string name="settings_memory_detail_title">Memory Detail</string>
+    <string name="settings_memory_file_section">File</string>
+    <string name="settings_memory_size">Size</string>
+    <string name="settings_memory_bytes">%1$s bytes</string>
+    <string name="settings_memory_entries">Entries</string>
+    <string name="settings_memory_loading">Loading memory file...</string>
+
+    <!-- 工具 -->
+    <string name="settings_tools_web_section">Web tools</string>
+    <string name="settings_tools_web_section_subtitle">Search provider, credentials, fetch limits</string>
+    <string name="settings_tools_web_search_fetch">Web search &amp; fetch</string>
+    <string name="settings_tools_web_summary">Provider: %1$s · web_fetch: %2$s</string>
+    <string name="settings_on">on</string>
+    <string name="settings_off">off</string>
+    <string name="settings_tools_builtin_section">Built-in tools</string>
+    <string name="settings_tool_desc_skills_list">List available skills with minimal metadata.</string>
+    <string name="settings_tool_desc_skill_view">Load a skill\'s main content or linked file.</string>
+    <string name="settings_tool_desc_terminal">Run a shell command inside the Linux sandbox.</string>
+    <string name="settings_tool_desc_process">Manage background processes started by terminal.</string>
+    <string name="settings_tool_desc_read_file">Read a text file with line numbers and pagination.</string>
+    <string name="settings_tool_desc_write_file">Write content to a sandbox file.</string>
+    <string name="settings_tool_desc_patch">Targeted find-and-replace edits in files.</string>
+    <string name="settings_tool_desc_search_files">Search file contents or find files by name.</string>
+    <string name="settings_tool_desc_hambur_config">Read and update Hambur app configuration.</string>
+    <string name="settings_tool_desc_web_search">Search the web for information. Returns titles, URLs and snippets; accepts 1-4 queries.</string>
+    <string name="settings_tool_desc_web_fetch">Fetch one URL, or up to 5 URLs, and return them as Markdown.</string>
+    <string name="settings_tool_desc_browser_use">Control the shared Android WebView browser.</string>
+    <string name="settings_tool_desc_android_cli">Access native Android hardware and system features on demand.</string>
+    <string name="settings_tool_desc_session_search">Search past chat sessions stored locally.</string>
+    <string name="settings_tool_desc_memory">Save durable information to persistent memory.</string>
+    <string name="settings_tool_desc_delegate_task">Spawn isolated leaf subagents.</string>
+    <string name="settings_tool_desc_view_image">View a local image file from the sandbox.</string>
+    <string name="settings_tool_detail_title">Tool Detail</string>
+    <string name="settings_tool_status_section">Status</string>
+    <string name="settings_tool_enabled_summary">The model can see and call this tool.</string>
+    <string name="settings_tool_disabled_summary">Hidden from the model; calls to it are rejected.</string>
+    <string name="settings_tool_backend">Backend</string>
+    <string name="settings_section_configuration">Configuration</string>
+    <string name="settings_tool_view_image_scale">Image size handling</string>
+    <string name="settings_tool_scale_resize_fit">Resize fit</string>
+    <string name="settings_tool_scale_original">Original</string>
+    <string name="settings_tool_browser_section">Browser settings</string>
+    <string name="settings_tool_accept_cookies">Accept cookies</string>
+    <string name="settings_tool_accept_cookies_on">WebView stores and sends site cookies</string>
+    <string name="settings_tool_accept_cookies_off">New browser tabs reject cookies</string>
+    <string name="settings_tool_third_party_cookies">Third-party cookies</string>
+    <string name="settings_tool_third_party_cookies_on">Useful for login redirects and embedded auth</string>
+    <string name="settings_tool_third_party_cookies_off">Only first-party cookies are allowed</string>
+    <string name="settings_tool_fetch_download_limit">Fetch download limit</string>
+    <string name="settings_tool_idle_auto_close">Idle auto close</string>
+    <string name="settings_never">Never</string>
+    <string name="settings_minutes_count">%1$d minutes</string>
+    <string name="settings_tool_settings_section">Tool settings</string>
+    <string name="settings_tool_save">Save tool settings</string>
+
+    <!-- 启动任务 -->
+    <string name="settings_startup_task_new">New startup task</string>
+    <string name="settings_startup_tasks_section">Tasks</string>
+    <string name="settings_startup_tasks_empty">No startup tasks configured</string>
+    <string name="settings_startup_task_open_default">Open startup_tasks</string>
+    <string name="settings_startup_task_delete_title">Delete startup task</string>
+    <string name="settings_startup_task_delete_message">Startup task changes require approval.</string>
+    <string name="settings_startup_task_detail_title">Startup Task Detail</string>
+    <string name="settings_startup_task_section">Task</string>
+    <string name="settings_startup_task_id">Task id</string>
+    <string name="settings_startup_task_json">Task JSON</string>
+    <string name="settings_startup_task_approve_save">Approve and save</string>
+    <!-- 人设 -->
+    <string name="settings_toast_persona_saved">Persona saved</string>
+    <string name="settings_toast_save_failed">Save failed: %1$s</string>
+    <string name="settings_persona_section_subtitle">Prepended to the system prompt of every chat turn</string>
+    <string name="settings_persona_placeholder">For example: You are a terse senior engineer. Answer in Chinese, prefer concrete steps, never pad with pleasantries.</string>
+    <string name="settings_persona_length">Length (UTF-8 bytes)</string>
+    <string name="settings_persona_too_long">The backend rejects persona text longer than %1$d UTF-8 bytes.</string>
+    <string name="settings_toast_persona_saving">Saving persona...</string>
+    <string name="settings_persona_how_section">How it applies</string>
+    <string name="settings_persona_stored_as">Stored as</string>
+    <string name="settings_persona_applied_to">Applied to</string>
+    <string name="settings_persona_applied_to_value">Main chat and delegated subagents</string>
+    <string name="settings_persona_how_hint">Clearing the text and saving removes the persona; the default assistant style applies again. Changes take effect from the next message.</string>
+
+    <!-- 通用 JSON 设置页 -->
+    <string name="settings_json_payload_section">JSON payload</string>
+    <string name="settings_json_skill_flag_section">Skill enabled flag</string>
+    <string name="settings_skill_id">Skill id</string>
+    <string name="settings_json_skill_flag_save">Save skill flag</string>
+
+    <!-- 工具设置页 -->
+    <string name="settings_tools_browser_settings_section">Browser tool settings</string>
+    <string name="settings_tools_save_browser">Save browser settings</string>
+    <string name="settings_tools_web_search_section">Web search</string>
+    <string name="settings_tools_web_search_subtitle">web_search_settings: Auto picks one of the available backends, Off disables it entirely.</string>
+    <string name="settings_tools_provider_auto">Auto</string>
+    <string name="settings_tools_provider_deepseek">DeepSeek official</string>
+    <string name="settings_tools_provider_exa">Exa</string>
+    <string name="settings_tools_provider_off">Off</string>
+    <string name="settings_tools_endpoint">Endpoint</string>
+    <string name="settings_tools_max_results">Max results (1-25)</string>
+    <string name="settings_tools_max_queries">Max queries (1-8)</string>
+    <string name="settings_tools_max_uses">Max uses (1-20)</string>
+    <string name="settings_tools_save_web_search">Save web search settings</string>
+    <string name="settings_tools_web_search_keys_section">Web search keys</string>
+    <string name="settings_tools_web_search_keys_subtitle">Keys are written only to the Android Secret Store, never to settings JSON.</string>
+    <string name="settings_tools_deepseek_key">DeepSeek API key (%1$s)</string>
+    <string name="settings_tools_save_deepseek_key">Save DeepSeek key</string>
+    <string name="settings_toast_deepseek_key_saved">DeepSeek search key saved</string>
+    <string name="settings_toast_deepseek_key_save_failed">Failed to save DeepSeek search key</string>
+    <string name="settings_tools_exa_key">Exa API key (%1$s)</string>
+    <string name="settings_tools_save_exa_key">Save Exa key</string>
+    <string name="settings_toast_exa_key_saved">Exa search key saved</string>
+    <string name="settings_toast_exa_key_save_failed">Failed to save Exa search key</string>
+    <string name="settings_tools_web_fetch_section">Web fetch</string>
+    <string name="settings_tools_web_fetch_subtitle">web_fetch_settings: fetches a single URL and converts it to Markdown.</string>
+    <string name="settings_tools_web_fetch_on">The model can call web_fetch.</string>
+    <string name="settings_tools_allow_private_hosts">Allow private hosts</string>
+    <string name="settings_tools_allow_private_hosts_on">Allow loopback and private network addresses (use with caution)</string>
+    <string name="settings_tools_allow_private_hosts_off">Only public addresses are allowed</string>
+    <string name="settings_tools_max_chars">Max chars (1000-400000)</string>
+    <string name="settings_tools_save_web_fetch">Save web fetch settings</string>
+    <string name="settings_tools_raw_json_section">Web tools raw JSON</string>
+    <string name="settings_tools_raw_json_subtitle">Fallback editor: the text is written verbatim into the corresponding app setting.</string>
+    <string name="settings_tools_save_raw_web_search">Save raw web search JSON</string>
+    <string name="settings_tools_save_raw_web_fetch">Save raw web fetch JSON</string>
+
+    <!-- 启动任务编辑页 -->
+    <string name="settings_startup_task_editor_section">Task editor</string>
+    <string name="settings_startup_task_editor_subtitle">Saved through approved backend commands</string>
+
+    <!-- Rootfs -->
+    <string name="settings_rootfs_reset_dialog_title">Reset RootFS</string>
+    <string name="settings_rootfs_reset_dialog_message">The reset re-downloads and unpacks the Alpine rootfs. This takes a while; anything you installed inside the sandbox is lost, but memory and skills are kept.</string>
+    <string name="settings_rootfs_reset_preserve">Keep user data (/root)</string>
+    <string name="settings_reset">Reset</string>
+    <string name="settings_rootfs_screen_title">Rootfs management</string>
+    <string name="settings_rootfs_status_section">Rootfs status</string>
+    <string name="settings_rootfs_version">RootFS version</string>
+    <string name="settings_rootfs_uninitialized">Not initialized</string>
+    <string name="settings_rootfs_online">Online RootFS</string>
+    <string name="settings_rootfs_configured">Configured</string>
+    <string name="settings_rootfs_not_detected">Not detected</string>
+    <string name="settings_rootfs_storage_used">Storage used</string>
+    <string name="settings_rootfs_root_access">root access</string>
+    <string name="settings_rootfs_chroot_status">chroot status</string>
+    <string name="settings_rootfs_proot_status">proot status</string>
+    <string name="settings_rootfs_browse_path">Browse path</string>
+    <string name="settings_rootfs_backend_section">Backend selection</string>
+    <string name="settings_rootfs_current_backend">Current backend</string>
+    <string name="settings_rootfs_control_section">Control</string>
+    <string name="settings_rootfs_current_session">Current session</string>
+    <string name="settings_rootfs_warmup">Warm up</string>
+    <string name="settings_rootfs_advanced_section">Advanced configuration</string>
+    <string name="settings_rootfs_config_key">Config key</string>
+    <string name="settings_rootfs_config_value">Config value (JSON/Text)</string>
+    <string name="settings_rootfs_save_apply">Save and apply</string>
+
+    <!-- 列表行与辅助组件 -->
+    <string name="settings_id">ID</string>
+    <string name="settings_provider_secret">Secret</string>
+    <string name="settings_provider_models_section">Provider models</string>
+    <string name="settings_provider_models_section_subtitle">Most recent model metadata known by backend</string>
+    <string name="settings_provider_model_summary">ctx %1$s, out %2$s, tools %3$s, image %4$s</string>
+    <string name="settings_current_settings_section">Current backend settings</string>
+    <string name="settings_current_settings_empty">No matching settings</string>
+    <string name="settings_config_audit_section">Config audit</string>
+    <string name="settings_config_audit_subtitle">Recent backend configuration writes</string>
+    <string name="settings_config_audit_empty">No config changes recorded</string>
+    <string name="settings_feature_backend_gap">Backend gap</string>
+    <string name="settings_feature_ui_surface">UI surface</string>
+    <string name="settings_feature_environment">Environment</string>
+    <string name="settings_validate">Validate</string>
+    <string name="settings_feature_local_only_hint">These controls are intentionally local-only until the backend exposes a contract.</string>
+    <string name="settings_provider_models_available">%1$d available</string>
+    <string name="settings_model_capabilities_summary">tools %1$s, reasoning %2$s, image %3$s</string>
+    <string name="settings_model_group_routing">Routing</string>
+    <string name="settings_model_group_members_count">%1$d members</string>
+    <string name="settings_skill_badge_builtin">Built-in</string>
+    <string name="settings_skill_badge_user">User</string>
+    <string name="settings_tool_disabled_suffix">%1$s (disabled)</string>
+</resources>

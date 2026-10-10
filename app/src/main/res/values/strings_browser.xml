@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  共享浏览器页（SharedBrowserScreen）。
+  中文见 values-zh-rCN/strings_browser.xml。
+  「重新加载」的无障碍文案复用通用键 common_reload。
+-->
+<resources>
+    <string name="browser_title">Shared Browser</string>
+    <string name="browser_close">Close browser</string>
+    <string name="browser_tool_operating">Browser tool is operating</string>
+    <string name="browser_no_active_action">No active action</string>
+    <string name="browser_empty_hint">Open a browser tool call to populate this tab.</string>
+</resources>

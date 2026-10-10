@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 公共组件，见 values/strings_components.xml。 -->
+<resources>
+    <!-- 沉浸式图片查看器 -->
+    <string name="components_image_load_failed">图片加载失败</string>
+    <string name="components_reset_zoom">重置缩放</string>
+    <string name="components_zoom_hint">双指缩放 · 双击放大 · 下拉退出</string>
+</resources>

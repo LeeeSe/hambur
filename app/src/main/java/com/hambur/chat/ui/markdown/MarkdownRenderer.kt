@@ -48,6 +48,7 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.Layout
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextLayoutResult
@@ -62,6 +63,7 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import com.hambur.chat.R
 import com.hambur.chat.perf.ChatJankTracer
 import com.hambur.chat.uniffi.MarkdownBlockNodeDto
 import com.hambur.chat.uniffi.MarkdownInlineNodeDto
@@ -923,7 +925,7 @@ fun MarkdownImageItem(
                             modifier = Modifier.size(24.dp),
                         )
                         Text(
-                            text = "图片加载失败",
+                            text = stringResource(R.string.markdown_image_load_failed),
                             style = markdownStyle.smallTextStyle,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )

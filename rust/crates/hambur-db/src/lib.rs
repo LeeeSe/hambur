@@ -15,6 +15,10 @@ macro_rules! params {
 
 const DEFAULT_SESSION_TITLE: &str = "Untitled session";
 
+/// 中断遗留状态的统一说明文案：既写进 turn/tool_call 的错误列，也给诊断日志用。
+pub(crate) const INTERRUPTED_TURN_MESSAGE: &str =
+    "App exited while the turn was running; the turn was marked interrupted on startup.";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSummary {
     pub id: String,
@@ -137,6 +141,22 @@ pub struct NewTimelineItem {
     pub payload_ref: String,
     pub small_summary: String,
     pub kind: String,
+}
+
+/// 启动时收敛中断遗留状态的统计结果：进程被杀/崩溃/覆盖安装时正在跑的行不会自愈，
+/// 必须显式落成终止态（见 `HamburDatabase::reconcile_interrupted_state`）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InterruptedStateSummary {
+    pub turns: u64,
+    pub tool_calls: u64,
+    pub trace_spans: u64,
+    pub messages: u64,
+}
+
+impl InterruptedStateSummary {
+    pub fn is_empty(&self) -> bool {
+        self.turns == 0 && self.tool_calls == 0 && self.trace_spans == 0 && self.messages == 0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -473,6 +493,60 @@ pub struct ConfigAuditRecord {
     pub approval_required: bool,
     pub approval_token: String,
     pub created_at_ms: u64,
+}
+
+/// 一次模型请求的 token 用量（写入前）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NewTokenUsage {
+    pub session_id: String,
+    pub turn_id: String,
+    pub provider_id: String,
+    pub model_id: String,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub cached_tokens: u64,
+    pub reasoning_tokens: u64,
+}
+
+/// 已落库的一次模型请求用量。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TokenUsageRecord {
+    pub id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub provider_id: String,
+    pub model_id: String,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub cached_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub created_at_ms: u64,
+}
+
+/// 按 provider（`model_id` 为空）或按 provider+model 聚合的一行用量。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TokenUsageGroup {
+    pub provider_id: String,
+    pub model_id: String,
+    pub request_count: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+}
+
+/// Token 用量页的汇总：总量 + 按 provider / model 分组。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TokenUsageSummary {
+    pub request_count: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub cached_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub by_provider: Vec<TokenUsageGroup>,
+    pub by_model: Vec<TokenUsageGroup>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

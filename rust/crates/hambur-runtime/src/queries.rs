@@ -137,6 +137,31 @@ impl RuntimeEngine {
         }
     }
 
+    /// Token 用量汇总。数据库读取失败时返回空快照（页面显示 0），不影响主流程。
+    pub fn get_token_usage_snapshot(&self) -> RuntimeTokenUsageSnapshot {
+        let summary = self.database.token_usage_summary().unwrap_or_default();
+        let to_group = |group: hambur_db::TokenUsageGroup| RuntimeTokenUsageGroup {
+            provider_id: group.provider_id,
+            model_id: group.model_id,
+            request_count: group.request_count,
+            prompt_tokens: group.prompt_tokens,
+            completion_tokens: group.completion_tokens,
+            total_tokens: group.total_tokens,
+        };
+        RuntimeTokenUsageSnapshot {
+            snapshot_sequence: self.snapshot_sequence(),
+            created_at_ms: now_ms(),
+            request_count: summary.request_count,
+            prompt_tokens: summary.prompt_tokens,
+            completion_tokens: summary.completion_tokens,
+            total_tokens: summary.total_tokens,
+            cached_tokens: summary.cached_tokens,
+            reasoning_tokens: summary.reasoning_tokens,
+            by_provider: summary.by_provider.into_iter().map(to_group).collect(),
+            by_model: summary.by_model.into_iter().map(to_group).collect(),
+        }
+    }
+
     pub fn resolve_sandbox_file(
         &self,
         session_id: String,
@@ -180,7 +205,7 @@ impl RuntimeEngine {
         let settings_snap = self.database.settings_snapshot()
             .unwrap_or_default();
         let requested_backend = get_rootfs_backend(&settings_snap.settings);
-        eprintln!(
+        tracing::info!(
             "RootfsDebug get_rootfs_status_start app_files_dir={} requested_backend={}",
             self.app_files_dir(),
             requested_backend
@@ -206,7 +231,7 @@ impl RuntimeEngine {
         };
 
         let size_bytes = rootfs_storage_size(self.sandbox.rootfs_dir());
-        eprintln!(
+        tracing::info!(
             "RootfsDebug get_rootfs_status_result installed={} backend={} probed_available={} probed_reason={} root_available={} chroot_available={} proot_available={} version={} size={} rootfs_path={}",
             rootfs_installed,
             probed.backend,

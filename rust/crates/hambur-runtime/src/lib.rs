@@ -16,8 +16,9 @@ use hambur_core::{DTO_SCHEMA_VERSION, HamburError, HamburResult, new_id, now_ms}
 use hambur_db::{
     AppSnapshot, AttachmentRecord, HamburDatabase, MessageBlockPayloadRecord, MessageRecord,
     ModelRouteSnapshot, NewAttachment, NewFileRecord, NewMessageBlockPayload, NewTimelineItem,
-    NewToolCall, NewToolResult, NewTraceSpan, ProviderModelOverride, ProviderModelUpsert,
-    ProviderUpsert, SessionReviewRecord, SessionSummary, SettingsSnapshot, TimelineItemSnapshot,
+    NewTokenUsage, NewToolCall, NewToolResult, NewTraceSpan, ProviderModelOverride,
+    ProviderModelUpsert, ProviderUpsert, SessionReviewRecord, SessionSummary, SettingsSnapshot,
+    TimelineItemSnapshot,
 };
 use hambur_filestore::FileStore;
 use hambur_llm::{
@@ -40,19 +41,25 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, sleep, timeout};
 
 // Module map:
-//   types    - public DTOs exposed over UniFFI (commands, acks, snapshots, events)
-//   state    - RuntimeEngine struct and private in-flight state (turns, delegates, processes, streams)
-//   engine   - RuntimeEngine behaviour, one file per concern (chat streaming, tool resolvers, memory, skills, events)
-//   commands - RuntimeCommand dispatch and execute_* handlers
-//   queries  - read-only snapshot accessors
-//   utils    - free helper functions grouped by domain (fs, llm, config, prompts, ...)
+//   types       - public DTOs exposed over UniFFI (commands, acks, snapshots, events)
+//   state       - RuntimeEngine struct and private in-flight state (turns, delegates, processes, streams)
+//   engine      - RuntimeEngine behaviour, one file per concern (chat streaming, tool resolvers, memory, skills, events)
+//   commands    - RuntimeCommand dispatch and execute_* handlers
+//   queries     - read-only snapshot accessors
+//   diagnostics - structured tracing ring buffer feeding the Settings log viewer
+//   utils       - free helper functions grouped by domain (fs, llm, config, prompts, ...)
 mod commands;
+mod diagnostics;
 mod engine;
 mod queries;
 mod state;
 mod types;
 mod utils;
 
+pub use diagnostics::{
+    DIAGNOSTIC_BUFFER_CAPACITY, DiagnosticRecord, DiagnosticsBuffer, DiagnosticsSubscriber,
+    install_diagnostics_subscriber, redact,
+};
 pub use state::RuntimeEngine;
 pub(crate) use state::*;
 pub use types::*;

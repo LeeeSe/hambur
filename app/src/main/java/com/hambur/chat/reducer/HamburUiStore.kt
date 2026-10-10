@@ -1,6 +1,10 @@
 package com.hambur.chat.reducer
 
 import android.util.Log
+import com.hambur.chat.diagnostics.DiagLevel
+import com.hambur.chat.diagnostics.DiagLogEntry
+import com.hambur.chat.diagnostics.DiagSource
+import com.hambur.chat.diagnostics.DiagnosticLogs
 import com.hambur.chat.perf.ChatJankTracer
 import com.hambur.chat.uniffi.AppBootstrapConfig
 import com.hambur.chat.uniffi.AppSnapshotDto
@@ -29,6 +33,8 @@ import com.hambur.chat.uniffi.SettingsSnapshotDto
 import com.hambur.chat.uniffi.SkillDetailDto
 import com.hambur.chat.uniffi.SkillSummaryDto
 import com.hambur.chat.uniffi.TimelineItemDto
+import com.hambur.chat.uniffi.TokenUsageGroupDto
+import com.hambur.chat.uniffi.TokenUsageSnapshotDto
 import com.hambur.chat.uniffi.createRuntime
 import com.hambur.chat.platform.AndroidPlatformAdapter
 import com.hambur.chat.platform.PlatformResult
@@ -46,6 +52,12 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import org.json.JSONObject
+
+/** 诊断日志在 logcat／日志页里统一的标签，沿用既有的调试标签以便对照。 */
+private const val DiagnosticsLogTag = "RootfsDebug"
+
+/** 每次从 Rust 拉取诊断日志条目的上限。 */
+private const val DiagnosticsFetchLimit = 200
 
 data class UiSessionSummary(
     val id: String,
@@ -166,6 +178,29 @@ data class UiConfigAudit(
     val createdAtMs: ULong,
 )
 
+/** 按 provider（modelId 为空）或 provider+model 聚合的一行 token 用量。 */
+data class UiTokenUsageGroup(
+    val providerId: String,
+    val modelId: String,
+    val requestCount: ULong,
+    val promptTokens: ULong,
+    val completionTokens: ULong,
+    val totalTokens: ULong,
+)
+
+/** Settings → Token 用量 的汇总。 */
+data class UiTokenUsageSnapshot(
+    val requestCount: ULong = 0UL,
+    val promptTokens: ULong = 0UL,
+    val completionTokens: ULong = 0UL,
+    val totalTokens: ULong = 0UL,
+    val cachedTokens: ULong = 0UL,
+    val reasoningTokens: ULong = 0UL,
+    val byProvider: List<UiTokenUsageGroup> = emptyList(),
+    val byModel: List<UiTokenUsageGroup> = emptyList(),
+    val snapshotSequence: ULong = 0UL,
+)
+
 data class UiSkillSummary(
     val name: String,
     val description: String,
@@ -245,6 +280,12 @@ data class HamburUiState(
     val defaultThinkingEnabled: Boolean = false,
     val turnStartedAtMs: Map<String, Long> = emptyMap(),
     val turnDurationSeconds: Map<String, Int> = emptyMap(),
+    /** Settings → 日志 的可见缓冲区快照（最新在前）。纯内存，不落库。 */
+    val diagnosticLogs: List<DiagLogEntry> = emptyList(),
+    /** app_settings.loggingEnabled 的 UI 镜像；乐观更新，随后端 SETTINGS_CHANGED 归一。 */
+    val loggingEnabled: Boolean = true,
+    /** Settings → Token 用量 的汇总快照；由 refreshTokenUsage() 拉取。 */
+    val tokenUsage: UiTokenUsageSnapshot = UiTokenUsageSnapshot(),
 )
 
 data class UiSessionScrollPosition(
@@ -274,8 +315,9 @@ class HamburUiStore(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val sessionUiStateFile = File(appFilesDir, "session-ui-state.json")
     init {
-        Log.i(
-            "RootfsDebug",
+        DiagnosticLogs.app(
+            DiagLevel.INFO,
+            DiagnosticsLogTag,
             "HamburUiStore init appFilesDir=$appFilesDir nativeLibraryDir=$nativeLibraryDir",
         )
     }
@@ -300,12 +342,26 @@ class HamburUiStore(
     private var sessionUiStatePersistScheduled = false
     private var creatingSession = false
 
+    /** Rust 诊断日志的拉取游标；只前进，清空可见缓冲区时不需要回退。 */
+    private var diagnosticsCursor = 0L
+
     val state: StateFlow<HamburUiState> = _state.asStateFlow()
 
     init {
         sessionScrollPositions.putAll(persistedSessionUiState.scrollPositions)
         _state.update {
             it.copy(thinkingEnabledBySession = persistedSessionUiState.thinkingEnabledBySession)
+        }
+        // Kotlin 侧日志带上"记录时已应用的最新后端事件序号"，与 Rust tracing 的序号对齐。
+        DiagnosticLogs.sequenceProvider = { _state.value.lastAppliedSequence.toLong() }
+        DiagnosticLogs.enabled = _state.value.loggingEnabled
+        scope.launch {
+            DiagnosticLogs.entries.collect { entries ->
+                _state.update { state ->
+                    // 引用相同说明没有新日志，省掉一次 data class 拷贝。
+                    if (state.diagnosticLogs === entries) state else state.copy(diagnosticLogs = entries)
+                }
+            }
         }
         scope.launch { collectBackendEvents() }
         scope.launch { applyInitialSnapshotBaseline() }
@@ -718,6 +774,67 @@ class HamburUiStore(
                     payloadJson = payload,
                 ),
             )
+        }
+    }
+
+    // ── Settings → 日志（诊断） ────────────────────────────────────────────────
+    // 可见缓冲区完全在 Kotlin 内存里，clearDiagnosticLogs 不触碰数据库；
+    // loggingEnabled 才需要经 UpdateAppSetting 落库，让 Rust tracing 也一起开关。
+
+    /** 开关日志记录，乐观更新本地镜像后写入 app_settings.loggingEnabled。 */
+    fun setLoggingEnabled(enabled: Boolean) {
+        if (_state.value.loggingEnabled == enabled) return
+        // 开关变化本身也要留痕：先临时打开，写完标记再落到目标状态。
+        DiagnosticLogs.enabled = true
+        DiagnosticLogs.app(DiagLevel.INFO, DiagnosticsLogTag, "loggingEnabled=$enabled")
+        _state.update { it.copy(loggingEnabled = enabled) }
+        DiagnosticLogs.enabled = enabled
+        saveRawAppSetting("loggingEnabled", enabled.toString())
+    }
+
+    /** 清空可见日志缓冲区。纯内存诊断动作：不写 SQLite、不删领域数据。 */
+    fun clearDiagnosticLogs() {
+        DiagnosticLogs.clear()
+    }
+
+    /** 拉取 Rust 侧结构化 tracing 的新条目，并入同一个内存缓冲区。 */
+    fun refreshDiagnostics() {
+        scope.launch {
+            val snapshot = runCatching {
+                runtime.getDiagnosticsSnapshot(
+                    sinceOrdinal = diagnosticsCursor.toULong(),
+                    limit = DiagnosticsFetchLimit.toUInt(),
+                )
+            }.getOrNull() ?: return@launch
+            snapshot.entries.maxOfOrNull { it.ordinal.toLong() }?.let { latest ->
+                if (latest > diagnosticsCursor) diagnosticsCursor = latest
+            }
+            snapshot.entries.forEach { entry ->
+                DiagnosticLogs.record(
+                    level = DiagLevel.fromLabel(entry.level),
+                    source = DiagSource.BACKEND,
+                    tag = entry.target.ifBlank { "rust" },
+                    message = entry.message,
+                    sequence = entry.backendSequence.toLong(),
+                )
+            }
+        }
+    }
+
+    /** 把 app_settings 里的 loggingEnabled 同步到诊断缓冲区。 */
+    private fun syncDiagnosticsSettings(state: HamburUiState) {
+        DiagnosticLogs.enabled = state.loggingEnabled
+    }
+
+    // ── Settings → Token 用量 ────────────────────────────────────────────────
+    // Rust 在每个模型请求结束（或收到 usage 块）时写一行 token_usage，这里只拉汇总。
+
+    /** 拉取 Token 用量汇总。失败时保留上一次的快照，不清零页面。 */
+    fun refreshTokenUsage() {
+        scope.launch {
+            val snapshot = runCatching { runtime.getTokenUsageSnapshot() }.getOrNull()
+                ?: return@launch
+            _state.update { it.copy(tokenUsage = snapshot.toUiTokenUsage()) }
         }
     }
 
@@ -1253,6 +1370,9 @@ class HamburUiStore(
                 .toList()
                 .also { startupBuffer.clear() }
         }
+        syncDiagnosticsSettings(_state.value)
+        refreshDiagnostics()
+        refreshTokenUsage()
 
         bufferedEvents.forEach(::applyEvent)
         rememberSessionCache(_state.value, selectedSessionId)
@@ -1326,6 +1446,13 @@ class HamburUiStore(
                         footer = error.message ?: "Backend command failed",
                     )
                 }
+                DiagnosticLogs.record(
+                    level = DiagLevel.ERROR,
+                    source = DiagSource.BACKEND,
+                    tag = "command",
+                    message = "dispatch failed kind=$commandKind",
+                    throwable = error,
+                )
                 return@launch
             }
 
@@ -1356,6 +1483,7 @@ class HamburUiStore(
         if (event.kind == BackendEventKind.PLATFORM_REQUEST) {
             handlePlatformRequest(event)
         }
+        recordBackendEventDiagnostic(event)
         if (event.isHighFrequencyStreamEvent()) {
             enqueueMarkdownEvent(event)
             return
@@ -1392,6 +1520,13 @@ class HamburUiStore(
             BackendEventKind.TURN_FINISHED,
             BackendEventKind.TURN_FAILED,
             BackendEventKind.TURN_CANCELLED -> refreshVisibleMessageSnapshots()
+            else -> Unit
+        }
+        when (event.kind) {
+            // 一轮结束后用量才完整；失败/取消也要刷新，usage 块可能先于失败到达。
+            BackendEventKind.TURN_FINISHED,
+            BackendEventKind.TURN_FAILED,
+            BackendEventKind.TURN_CANCELLED -> refreshTokenUsage()
             else -> Unit
         }
         ChatJankTracer.markDuration(
@@ -1506,11 +1641,46 @@ class HamburUiStore(
     private fun applyRejectedAck(ack: CommandAck) {
         if (ack.accepted) return
 
+        DiagnosticLogs.record(
+            level = DiagLevel.WARN,
+            source = DiagSource.BACKEND,
+            tag = "command",
+            message = "rejected ${ack.rejectionCode} ${ack.message}".trim(),
+        )
         _state.update {
             it.copy(
                 footer = ack.message.ifBlank { ack.rejectionCode },
             )
         }
+    }
+
+    /**
+     * 把关键后端事件折进诊断日志。只记错误/警告与运行期生命周期：
+     * 流式 delta 这类高频事件直接跳过，避免把内存缓冲区刷爆。
+     */
+    private fun recordBackendEventDiagnostic(event: BackendEvent) {
+        val level = when (event.kind) {
+            BackendEventKind.RUNTIME_ERROR,
+            BackendEventKind.TURN_FAILED,
+            BackendEventKind.TOOL_CALL_FAILED -> DiagLevel.ERROR
+            BackendEventKind.PLATFORM_REQUEST_TIMED_OUT -> DiagLevel.WARN
+            BackendEventKind.RUNTIME_READY,
+            BackendEventKind.RUNTIME_CLOSED -> DiagLevel.INFO
+            else -> return
+        }
+        val text = buildString {
+            append(event.kind.name)
+            if (event.turnId.isNotBlank()) append(" turn=").append(event.turnId)
+            if (event.errorCode.isNotBlank()) append(" code=").append(event.errorCode)
+            if (event.message.isNotBlank()) append(' ').append(event.message)
+        }
+        DiagnosticLogs.record(
+            level = level,
+            source = DiagSource.BACKEND,
+            tag = "runtime",
+            message = text,
+            sequence = event.sequence.toLong(),
+        )
     }
 
     private fun applyCachedSession(sessionId: String) {
@@ -1624,6 +1794,7 @@ class HamburUiStore(
         _state.update { state ->
             state.applySettingsSnapshot(snapshot)
         }
+        syncDiagnosticsSettings(_state.value)
         refreshKnowledgeSnapshots()
     }
 
@@ -1800,6 +1971,7 @@ private fun HamburUiState.applyBaseline(
         appliedEventIds = emptySet(),
         activeTurnIds = emptyMap(),
         defaultThinkingEnabled = settingsSnapshot.settingBool("defaultDeepThinkingEnabled", false),
+        loggingEnabled = settingsSnapshot.settingBool("loggingEnabled", true),
     )
 }
 
@@ -1813,6 +1985,7 @@ private fun HamburUiState.applySettingsSnapshot(snapshot: SettingsSnapshotDto): 
         appSettings = snapshot.settings.toUiAppSettings(),
         configAudits = snapshot.configAudits.toUiConfigAudits(),
         defaultThinkingEnabled = snapshot.settingBool("defaultDeepThinkingEnabled", defaultThinkingEnabled),
+        loggingEnabled = snapshot.settingBool("loggingEnabled", loggingEnabled),
     )
 }
 
@@ -2431,6 +2604,31 @@ private fun List<ConfigAuditDto>.toUiConfigAudits(): List<UiConfigAudit> {
     }
 }
 
+private fun TokenUsageSnapshotDto.toUiTokenUsage(): UiTokenUsageSnapshot {
+    return UiTokenUsageSnapshot(
+        requestCount = requestCount,
+        promptTokens = promptTokens,
+        completionTokens = completionTokens,
+        totalTokens = totalTokens,
+        cachedTokens = cachedTokens,
+        reasoningTokens = reasoningTokens,
+        byProvider = byProvider.map { it.toUiTokenUsageGroup() },
+        byModel = byModel.map { it.toUiTokenUsageGroup() },
+        snapshotSequence = snapshotSequence,
+    )
+}
+
+private fun TokenUsageGroupDto.toUiTokenUsageGroup(): UiTokenUsageGroup {
+    return UiTokenUsageGroup(
+        providerId = providerId,
+        modelId = modelId,
+        requestCount = requestCount,
+        promptTokens = promptTokens,
+        completionTokens = completionTokens,
+        totalTokens = totalTokens,
+    )
+}
+
 private fun SkillSummaryDto.toUiSkillSummary(): UiSkillSummary {
     return UiSkillSummary(
         name = name,
@@ -2619,6 +2817,9 @@ const val THINKING_BLOCK_DISPLAY_MODE_KEY = "thinkingBlockDisplayMode"
 const val THINKING_BLOCK_DISPLAY_AUTO_EXPAND = "auto_expand"
 const val THINKING_BLOCK_DISPLAY_COLLAPSED = "collapsed"
 const val THINKING_BLOCK_DISPLAY_AUTO_COLLAPSE = "auto_collapse"
+
+// 回复结束后是否自动聚焦输入框。后端按 bool 值归一化（默认关闭）。
+const val AUTO_FOCUS_INPUT_AFTER_REPLY_KEY = "autoFocusInputAfterReply"
 
 // persona 设置键与后端 normalize_json_or_text_setting 的长度上限保持一致。
 // 上限单位是 UTF-8 字节（后端用 Rust String::len()），不是 UTF-16 code unit。

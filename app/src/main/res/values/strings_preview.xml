@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  文件预览页（HamburFilePreviewScreen）。
+  中文见 values-zh-rCN/strings_preview.xml。
+-->
+<resources>
+    <!-- 顶部栏 -->
+    <string name="preview_title">File Preview</string>
+
+    <!-- 空状态与错误提示 -->
+    <string name="preview_file_not_available">File is not available</string>
+    <string name="preview_no_file_selected">No file selected</string>
+    <string name="preview_file_not_found">File not found</string>
+    <string name="preview_unsupported_target">Unsupported target</string>
+    <string name="preview_not_regular_file">%1$s is not a regular file.</string>
+    <string name="preview_read_failed">Read failed</string>
+    <string name="preview_pdf_read_failed">PDF read failed</string>
+    <string name="preview_empty_pdf">Empty PDF</string>
+
+    <!-- 图片 -->
+    <string name="preview_image_load_failed">Failed to load image</string>
+    <string name="preview_image">Image</string>
+    <string name="preview_local_image">Local image</string>
+    <string name="preview_web_image">Web image</string>
+    <string name="preview_web_file">Web file</string>
+
+    <!-- 音频与其它类型 -->
+    <string name="preview_audio_unavailable">Audio preview uses the system player when opened from Android. Inline audio controls are not wired in the new UI yet.</string>
+    <string name="preview_no_inline_preview">This file type does not have an inline preview yet.</string>
+
+    <!-- 文本截断后缀，开头的换行由代码拼接，这里照原样保留 -->
+    <string name="preview_truncated">\n\n... preview truncated</string>
+
+    <!-- 文件信息 -->
+    <string name="preview_section_file">File</string>
+    <string name="preview_label_path">Path</string>
+    <string name="preview_label_size">Size</string>
+    <string name="preview_label_kind">Kind</string>
+
+    <!-- PDF 分页 -->
+    <string name="preview_page_render_failed">Page %1$d render failed</string>
+    <string name="preview_page_content_description">Page %1$d</string>
+    <string name="preview_page_indicator">%1$d / %2$d</string>
+</resources>

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Markdown 渲染（MarkdownRenderer）。
+  中文见 values-zh-rCN/strings_markdown.xml。
+-->
+<resources>
+    <!-- 图片加载失败时的占位提示 -->
+    <string name="markdown_image_load_failed">Failed to load image</string>
+</resources>

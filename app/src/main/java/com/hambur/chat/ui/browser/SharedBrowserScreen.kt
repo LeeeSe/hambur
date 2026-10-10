@@ -21,6 +21,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -28,6 +29,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import com.composables.icons.lucide.Lucide
 import com.composables.icons.lucide.RefreshCw
 import com.composables.icons.lucide.X
+import com.hambur.chat.R
 import com.hambur.chat.platform.AndroidPlatformAdapter
 import com.hambur.chat.reducer.HamburUiState
 import com.hambur.chat.ui.components.HamburTopBar
@@ -51,7 +53,7 @@ fun SharedBrowserScreen(
             .statusBarsPadding(),
     ) {
         HamburTopBar(
-            title = "Shared Browser",
+            title = stringResource(R.string.browser_title),
             subtitle = browserState.url.ifBlank { browserState.status },
             onBack = if (browserState.active) null else onBack,
             actions = {
@@ -61,7 +63,7 @@ fun SharedBrowserScreen(
                         platformAdapter.getOrCreateSharedWebView().reload()
                     },
                 ) {
-                    Icon(imageVector = Lucide.RefreshCw, contentDescription = "Reload")
+                    Icon(imageVector = Lucide.RefreshCw, contentDescription = stringResource(R.string.common_reload))
                 }
                 IconButton(
                     enabled = !browserState.active,
@@ -70,7 +72,7 @@ fun SharedBrowserScreen(
                         onBack()
                     },
                 ) {
-                    Icon(imageVector = Lucide.X, contentDescription = "Close browser")
+                    Icon(imageVector = Lucide.X, contentDescription = stringResource(R.string.browser_close))
                 }
             },
         )
@@ -109,7 +111,7 @@ fun SharedBrowserScreen(
                     ) {
                         CircularProgressIndicator()
                         Text(
-                            text = "Browser tool is operating",
+                            text = stringResource(R.string.browser_tool_operating),
                             style = MaterialTheme.typography.bodyMedium,
                             color = Color.White,
                         )
@@ -123,6 +125,9 @@ fun SharedBrowserScreen(
 @Composable
 private fun BrowserStatusStrip(state: HamburUiState) {
     val browserState = state.sharedBrowser
+    // 非 Composable 的 ifBlank lambda 里不能直接调 stringResource，先在这里取好。
+    val noActiveAction = stringResource(R.string.browser_no_active_action)
+    val emptyHint = stringResource(R.string.browser_empty_hint)
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -133,7 +138,7 @@ private fun BrowserStatusStrip(state: HamburUiState) {
     ) {
         Column(modifier = Modifier.weight(1f)) {
             Text(
-                text = browserState.action.ifBlank { "No active action" },
+                text = browserState.action.ifBlank { noActiveAction },
                 style = MaterialTheme.typography.labelLarge,
                 fontWeight = FontWeight.SemiBold,
                 maxLines = 1,
@@ -141,7 +146,7 @@ private fun BrowserStatusStrip(state: HamburUiState) {
             )
             Text(
                 text = browserState.lastText.ifBlank {
-                    browserState.requestId.ifBlank { "Open a browser tool call to populate this tab." }
+                    browserState.requestId.ifBlank { emptyHint }
                 },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,

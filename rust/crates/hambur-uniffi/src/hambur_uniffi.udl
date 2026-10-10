@@ -302,6 +302,43 @@ dictionary SettingsSnapshotDTO {
     sequence<ConfigAuditDTO> config_audits;
 };
 
+dictionary DiagnosticEntryDTO {
+    u64 ordinal;
+    u64 backend_sequence;
+    u64 created_at_ms;
+    string level;
+    string target;
+    string message;
+};
+
+dictionary DiagnosticsSnapshotDTO {
+    u64 snapshot_sequence;
+    u64 created_at_ms;
+    sequence<DiagnosticEntryDTO> entries;
+};
+
+dictionary TokenUsageGroupDTO {
+    string provider_id;
+    string model_id;
+    u64 request_count;
+    u64 prompt_tokens;
+    u64 completion_tokens;
+    u64 total_tokens;
+};
+
+dictionary TokenUsageSnapshotDTO {
+    u64 snapshot_sequence;
+    u64 created_at_ms;
+    u64 request_count;
+    u64 prompt_tokens;
+    u64 completion_tokens;
+    u64 total_tokens;
+    u64 cached_tokens;
+    u64 reasoning_tokens;
+    sequence<TokenUsageGroupDTO> by_provider;
+    sequence<TokenUsageGroupDTO> by_model;
+};
+
 dictionary SessionListSnapshotDTO {
     u64 snapshot_sequence;
     u64 created_at_ms;
@@ -433,6 +470,8 @@ interface BackendRuntime {
     MessageSnapshotDTO get_message_snapshot(string message_id);
     SearchSnapshotDTO search_sessions(string query, u32 limit);
     SettingsSnapshotDTO get_settings_snapshot();
+    DiagnosticsSnapshotDTO get_diagnostics_snapshot(u64 since_ordinal, u32 limit);
+    TokenUsageSnapshotDTO get_token_usage_snapshot();
     FileResolutionDTO resolve_sandbox_file(string session_id, string sandbox_path);
     RootfsStatusDTO get_rootfs_status();
     sequence<SkillSummaryDTO> list_skills();

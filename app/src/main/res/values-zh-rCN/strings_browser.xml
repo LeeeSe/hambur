@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 共享浏览器页，见 values/strings_browser.xml。 -->
+<resources>
+    <string name="browser_title">共享浏览器</string>
+    <string name="browser_close">关闭浏览器</string>
+    <string name="browser_tool_operating">浏览器工具正在操作</string>
+    <string name="browser_no_active_action">暂无操作</string>
+    <string name="browser_empty_hint">打开一个浏览器工具调用以填充此标签页。</string>
+</resources>

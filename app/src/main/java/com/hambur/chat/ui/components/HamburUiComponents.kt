@@ -28,6 +28,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -35,6 +36,7 @@ import com.composables.icons.lucide.ArrowLeft
 import com.composables.icons.lucide.Check
 import com.composables.icons.lucide.ChevronRight
 import com.composables.icons.lucide.Lucide
+import com.hambur.chat.R
 
 @Composable
 fun HamburTopBar(
@@ -54,7 +56,7 @@ fun HamburTopBar(
             IconButton(onClick = onBack) {
                 Icon(
                     imageVector = Lucide.ArrowLeft,
-                    contentDescription = "Back",
+                    contentDescription = stringResource(R.string.common_back),
                 )
             }
         }
@@ -197,6 +199,8 @@ fun SummaryLine(
     value: String,
     modifier: Modifier = Modifier,
 ) {
+    // stringResource 只能在 @Composable 里读，先取出来再给下面的 Text 用。
+    val notSetText = stringResource(R.string.common_not_set)
     Row(
         modifier = modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -211,7 +215,7 @@ fun SummaryLine(
             overflow = TextOverflow.Ellipsis,
         )
         Text(
-            text = value.ifBlank { "Not set" },
+            text = value.ifBlank { notSetText },
             style = MaterialTheme.typography.bodySmall,
             modifier = Modifier.weight(0.66f),
             maxLines = 3,
@@ -280,7 +284,7 @@ fun ConfirmDangerDialog(
         },
         dismissButton = {
             TextButton(onClick = onDismiss) {
-                Text("Cancel")
+                Text(stringResource(R.string.common_cancel))
             }
         },
     )

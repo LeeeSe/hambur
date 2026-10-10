@@ -342,6 +342,14 @@ pub enum ProviderStreamEvent {
         name: String,
         arguments_json: String,
     },
+    /// 一次模型请求的 token 用量。整数类型是为了保住 `Eq`（见枚举派生）。
+    Usage {
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        total_tokens: u32,
+        cached_tokens: u32,
+        reasoning_tokens: u32,
+    },
     Finish {
         finish_reason: String,
         native_finish_reason: String,
@@ -350,6 +358,55 @@ pub enum ProviderStreamEvent {
         code: String,
         message: String,
     },
+}
+
+/// 从 provider 的 `usage` 对象里读 token 数。兼容两种命名：
+/// Chat Completions 的 `prompt_tokens`/`completion_tokens`，以及
+/// Responses API 的 `input_tokens`/`output_tokens`。
+///
+/// 全为 0 时返回 `None`，避免把空 usage 当成一次真实请求记录下来。
+fn usage_event_from_value(usage: &Value) -> Option<ProviderStreamEvent> {
+    let read = |key: &str| usage.get(key).and_then(Value::as_u64);
+    let prompt = read("prompt_tokens")
+        .or_else(|| read("input_tokens"))
+        .unwrap_or(0);
+    let completion = read("completion_tokens")
+        .or_else(|| read("output_tokens"))
+        .unwrap_or(0);
+    let total = read("total_tokens").unwrap_or(prompt.saturating_add(completion));
+    let cached = usage
+        .get("prompt_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .or_else(|| {
+            usage
+                .get("input_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+        })
+        .and_then(Value::as_u64)
+        // DeepSeek 把命中量放在顶层 prompt_cache_hit_tokens，而不是 OpenAI 的 details 嵌套。
+        .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(Value::as_u64))
+        .unwrap_or(0);
+    let reasoning = usage
+        .get("completion_tokens_details")
+        .and_then(|details| details.get("reasoning_tokens"))
+        .or_else(|| {
+            usage
+                .get("output_tokens_details")
+                .and_then(|details| details.get("reasoning_tokens"))
+        })
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if prompt == 0 && completion == 0 && total == 0 {
+        return None;
+    }
+    let clamp = |value: u64| u32::try_from(value).unwrap_or(u32::MAX);
+    Some(ProviderStreamEvent::Usage {
+        prompt_tokens: clamp(prompt),
+        completion_tokens: clamp(completion),
+        total_tokens: clamp(total),
+        cached_tokens: clamp(cached),
+        reasoning_tokens: clamp(reasoning),
+    })
 }
 
 pub struct OpenAiCompatibleAdapter;
@@ -444,6 +501,11 @@ impl OpenAiCompatibleAdapter {
             "stream": true,
             "messages": messages,
         });
+        if request.stream {
+            // 只有流式请求需要显式索要 usage；非流式请求（记忆复盘）默认就带 usage，
+            // 而且部分网关会拒绝带 stream_options 的非流式请求。
+            body["stream_options"] = json!({ "include_usage": true });
+        }
         let tools_json = request.tools_json.trim();
         if !tools_json.is_empty() {
             let tools: Value = serde_json::from_str(tools_json).map_err(|error| {
@@ -482,17 +544,17 @@ impl OpenAiCompatibleAdapter {
                 body["reasoning_effort"] = json!("high");
             }
         }
-        eprintln!(
+        tracing::info!(
             "ThinkingToggle build_openai_request session={} model={} supports_reasoning={} reasoning_mode={:?} thinking={} reasoning_effort={}",
             request.session_id,
             target.model.model_id,
             target.model.capabilities.supports_reasoning,
             request.reasoning_mode,
             body.get("thinking")
-                .map(Value::to_string)
+                .map(|value| value.to_string())
                 .unwrap_or_else(|| "null".to_string()),
             body.get("reasoning_effort")
-                .map(Value::to_string)
+                .map(|value| value.to_string())
                 .unwrap_or_else(|| "null".to_string()),
         );
 
@@ -608,12 +670,23 @@ impl OpenAiCompatibleAdapter {
                 .to_string();
             return Ok(vec![ProviderStreamEvent::Error { code, message }]);
         }
-        let choices = value
-            .get("choices")
-            .and_then(Value::as_array)
-            .ok_or_else(|| HamburError::SseParse("stream payload missing choices".to_string()))?;
+        // usage 通常在 choices 为空的收尾块里到达，也可能和 delta 同块。
+        let usage_event = value.get("usage").and_then(usage_event_from_value);
+        let choices = match value.get("choices").and_then(Value::as_array) {
+            Some(choices) => choices.as_slice(),
+            // 只带 usage 的收尾块允许没有 choices；两者都没有才算协议错误。
+            None if usage_event.is_some() => &[],
+            None => {
+                return Err(HamburError::SseParse(
+                    "stream payload missing choices".to_string(),
+                ));
+            }
+        };
 
         let mut events = Vec::new();
+        if let Some(usage) = usage_event {
+            events.push(usage);
+        }
         for choice in choices {
             if let Some(delta) = choice.get("delta") {
                 if let Some(content) = delta.get("content").and_then(Value::as_str)
@@ -1254,6 +1327,15 @@ impl ResponsesApiAdapter {
                     };
                     events.push(ProviderStreamEvent::Error { code, message });
                 } else {
+                    // Responses API 的 usage 挂在 response.usage 下，字段名是
+                    // input_tokens/output_tokens；usage_event_from_value 兼容两种命名。
+                    let usage = response_obj
+                        .and_then(|r| r.get("usage"))
+                        .or_else(|| value.get("usage"))
+                        .and_then(usage_event_from_value);
+                    if let Some(usage) = usage {
+                        events.push(usage);
+                    }
                     events.push(ProviderStreamEvent::Finish {
                         finish_reason: "stop".to_string(),
                         native_finish_reason: status.to_string(),
@@ -1994,6 +2076,148 @@ mod tests {
         assert!(
             events_done.is_empty(),
             "web_search_call output_item.done should not emit any ToolCallDone"
+        );
+    }
+
+    fn token_usage_test_target(protocol: &str) -> ProviderTarget {
+        ProviderTarget {
+            provider: ProviderConfig {
+                id: "provider".to_string(),
+                name: "Provider".to_string(),
+                protocol: protocol.to_string(),
+                base_url: "https://api.example.com/v1".to_string(),
+                secret_ref: "secret".to_string(),
+                enabled: true,
+            },
+            model: ProviderModel {
+                provider_id: "provider".to_string(),
+                model_id: "model".to_string(),
+                display_name: "Model".to_string(),
+                capabilities: ModelCapabilities::default(),
+                metadata_json: "{}".to_string(),
+            },
+            model_group_id: "default".to_string(),
+            model_group_name: "Default".to_string(),
+            position: 0,
+        }
+    }
+
+    fn token_usage_test_payload(data: &str) -> StreamPayload {
+        StreamPayload {
+            data: data.to_string(),
+            event_name: String::new(),
+            event_id: String::new(),
+            raw_frame_meta: String::new(),
+        }
+    }
+
+    #[test]
+    fn openai_compatible_streaming_request_asks_for_usage() {
+        let target = token_usage_test_target(OPENAI_COMPATIBLE_PROTOCOL);
+        let mut request = ModelRequest {
+            stream: true,
+            ..Default::default()
+        };
+        let spec = OpenAiCompatibleAdapter::build_stream_request(&request, &target, "sk-test-key")
+            .expect("build request");
+        let body: Value = serde_json::from_str(&spec.body_json).expect("valid json body");
+        assert_eq!(body["stream_options"]["include_usage"], true);
+
+        // 非流式请求（记忆复盘）不能带 stream_options。
+        request.stream = false;
+        let spec = OpenAiCompatibleAdapter::build_stream_request(&request, &target, "sk-test-key")
+            .expect("build request");
+        let body: Value = serde_json::from_str(&spec.body_json).expect("valid json body");
+        assert!(body.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn openai_compatible_parses_usage_only_chunk() {
+        // 收尾块：choices 为空数组，usage 是 prompt/completion 命名。
+        let payload = token_usage_test_payload(
+            r#"{"choices":[],"usage":{"prompt_tokens":120,"completion_tokens":30,"total_tokens":150,"prompt_tokens_details":{"cached_tokens":64},"completion_tokens_details":{"reasoning_tokens":12}}}"#,
+        );
+        let events = OpenAiCompatibleAdapter::parse_stream_payload(&payload).expect("parse usage");
+        assert_eq!(
+            events,
+            vec![ProviderStreamEvent::Usage {
+                prompt_tokens: 120,
+                completion_tokens: 30,
+                total_tokens: 150,
+                cached_tokens: 64,
+                reasoning_tokens: 12,
+            }]
+        );
+    }
+
+    #[test]
+    fn openai_compatible_reads_deepseek_cache_hit_tokens() {
+        // DeepSeek 用顶层 prompt_cache_hit_tokens 报缓存命中，两种命名都要认。
+        let payload = token_usage_test_payload(
+            r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":10,"total_tokens":110,"prompt_cache_hit_tokens":64}}"#,
+        );
+        let events = OpenAiCompatibleAdapter::parse_stream_payload(&payload).expect("parse usage");
+        assert_eq!(
+            events,
+            vec![ProviderStreamEvent::Usage {
+                prompt_tokens: 100,
+                completion_tokens: 10,
+                total_tokens: 110,
+                cached_tokens: 64,
+                reasoning_tokens: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn openai_compatible_parses_usage_chunk_without_choices() {
+        let payload =
+            token_usage_test_payload(r#"{"usage":{"prompt_tokens":10,"completion_tokens":5}}"#);
+        let events = OpenAiCompatibleAdapter::parse_stream_payload(&payload).expect("parse usage");
+        assert_eq!(
+            events,
+            vec![ProviderStreamEvent::Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                // total 缺失时用 prompt + completion 兜底。
+                total_tokens: 15,
+                cached_tokens: 0,
+                reasoning_tokens: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn openai_compatible_still_rejects_payload_without_choices_or_usage() {
+        let payload = token_usage_test_payload(r#"{"id":"chunk"}"#);
+        assert!(OpenAiCompatibleAdapter::parse_stream_payload(&payload).is_err());
+    }
+
+    #[test]
+    fn responses_api_parses_usage_from_response_completed() {
+        // Responses API 用 input_tokens/output_tokens 命名，usage 挂在 response 下。
+        let payload = StreamPayload {
+            data: r#"{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":200,"output_tokens":40,"total_tokens":240,"input_tokens_details":{"cached_tokens":128},"output_tokens_details":{"reasoning_tokens":8}}}}"#.to_string(),
+            event_name: "response.completed".to_string(),
+            event_id: "evt_1".to_string(),
+            raw_frame_meta: String::new(),
+        };
+        let events = ResponsesApiAdapter::parse_stream_payload(&payload).expect("parse completed");
+        assert_eq!(
+            events,
+            vec![
+                ProviderStreamEvent::Usage {
+                    prompt_tokens: 200,
+                    completion_tokens: 40,
+                    total_tokens: 240,
+                    cached_tokens: 128,
+                    reasoning_tokens: 8,
+                },
+                ProviderStreamEvent::Finish {
+                    finish_reason: "stop".to_string(),
+                    native_finish_reason: "completed".to_string(),
+                },
+            ]
         );
     }
 }

@@ -166,41 +166,50 @@ impl HamburDatabase {
         session_id: &str,
         payload_refs: &[String],
     ) -> HamburResult<Vec<MessageBlockPayloadRecord>> {
-        let mut blocks = Vec::new();
-        for payload_ref in payload_refs {
-            if payload_ref.trim().is_empty() {
-                continue;
-            }
+        // 一次快照要按 payload_ref 取整段会话的块。这里必须批量取：早期实现是
+        // "一个 payload_ref 一条 SELECT"，长会话（几百个块）一次快照就要几百条语句，
+        // 而快照在一次发送/每个提交块上都要构建一次。
+        let ids = deduped_ids(payload_refs);
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut by_id = HashMap::with_capacity(ids.len());
+        for chunk in ids.chunks(SQL_IN_CHUNK) {
+            let placeholders = sql_placeholders(chunk.len(), 2);
+            let sql = format!(
+                "
+                SELECT
+                    id,
+                    session_id,
+                    message_id,
+                    block_id,
+                    block_type,
+                    stable_key,
+                    committed,
+                    payload_json,
+                    raw,
+                    small_summary,
+                    version_sequence,
+                    created_at_ms,
+                    updated_at_ms
+                FROM message_blocks
+                WHERE session_id = ?1 AND id IN ({placeholders})
+                "
+            );
+            let mut query_params: Vec<Value> = Vec::with_capacity(chunk.len() + 1);
+            query_params.push(Value::Text(session_id.to_string()));
+            query_params.extend(chunk.iter().map(|id| Value::Text((*id).to_string())));
             let mut rows = self
                 .connection
-                .query(
-                    "
-                    SELECT
-                        id,
-                        session_id,
-                        message_id,
-                        block_id,
-                        block_type,
-                        stable_key,
-                        committed,
-                        payload_json,
-                        raw,
-                        small_summary,
-                        version_sequence,
-                        created_at_ms,
-                        updated_at_ms
-                    FROM message_blocks
-                    WHERE session_id = ?1 AND id = ?2
-                    LIMIT 1
-                    ",
-                    params![session_id, payload_ref],
-                )
+                .query(&sql, query_params)
                 .map_err(database_error)?;
-            if let Some(row) = rows.next().map_err(database_error)? {
-                blocks.push(message_block_from_row(&row)?);
+            while let Some(row) = rows.next().map_err(database_error)? {
+                let block = message_block_from_row(&row)?;
+                by_id.insert(block.id.clone(), block);
             }
         }
-        Ok(blocks)
+        // 保持调用方传入的顺序（原来就是按 payload_refs 顺序返回）。
+        Ok(ids.iter().filter_map(|id| by_id.remove(*id)).collect())
     }
     pub fn session_snapshot(&self, session_id: &str) -> HamburResult<AppSnapshot> {
         self.ensure_session_exists(session_id)?;
@@ -403,15 +412,36 @@ impl HamburDatabase {
             )
             .map_err(database_error)?;
 
-        let mut entries = Vec::new();
+        // 主查询先一次性把整段 transcript 取回来，附件与工具调用再各自批量补一次。
+        // 早期实现是"每条消息查一次 attachments、每条 assistant 查一次 tool_calls"，
+        // 长会话一次发送要几百条语句（且 tool_calls 当时没有 assistant_message_id 索引，
+        // 每条 assistant 都是全表扫描）。
+        let mut messages = Vec::new();
         while let Some(row) = rows.next().map_err(database_error)? {
-            let mut message = message_from_row(&row)?;
-            message.attachments = self.attachments_for_message(&message.id)?;
-            let tool_calls = if message.role == "assistant" {
-                self.tool_calls_for_assistant_message(&message.id)?
-            } else {
-                Vec::new()
-            };
+            messages.push(message_from_row(&row)?);
+        }
+
+        let message_ids = messages
+            .iter()
+            .map(|message| message.id.clone())
+            .collect::<Vec<_>>();
+        let assistant_message_ids = messages
+            .iter()
+            .filter(|message| message.role == "assistant")
+            .map(|message| message.id.clone())
+            .collect::<Vec<_>>();
+        let mut attachments_by_message_id = self.attachments_by_message_ids(&message_ids)?;
+        let mut tool_calls_by_message_id =
+            self.tool_calls_by_assistant_message_ids(&assistant_message_ids)?;
+
+        let mut entries = Vec::with_capacity(messages.len());
+        for mut message in messages {
+            message.attachments = attachments_by_message_id
+                .remove(&message.id)
+                .unwrap_or_default();
+            let tool_calls = tool_calls_by_message_id
+                .remove(&message.id)
+                .unwrap_or_default();
             entries.push(ChatTranscriptEntry {
                 message,
                 tool_calls,
@@ -1384,45 +1414,6 @@ impl HamburDatabase {
         };
         tool_call_from_row(&row)
     }
-    pub(crate) fn tool_calls_for_assistant_message(
-        &self,
-        assistant_message_id: &str,
-    ) -> HamburResult<Vec<ToolCallRecord>> {
-        let mut rows = self
-            .connection
-            .query(
-                "
-                SELECT
-                    id,
-                    session_id,
-                    turn_id,
-                    assistant_message_id,
-                    name,
-                    arguments_json,
-                    display_title,
-                    status,
-                    requires_approval,
-                    approval_status,
-                    started_at_ms,
-                    ended_at_ms,
-                    result_id,
-                    error_code,
-                    error_message,
-                    call_index
-                FROM tool_calls
-                WHERE assistant_message_id = ?1
-                ORDER BY call_index ASC, started_at_ms ASC, id ASC
-                ",
-                params![assistant_message_id],
-            )
-            .map_err(database_error)?;
-
-        let mut calls = Vec::new();
-        while let Some(row) = rows.next().map_err(database_error)? {
-            calls.push(tool_call_from_row(&row)?);
-        }
-        Ok(calls)
-    }
     pub(crate) fn tool_result_by_id(&self, result_id: &str) -> HamburResult<ToolResultRecord> {
         let mut rows = self
             .connection
@@ -1570,6 +1561,115 @@ impl HamburDatabase {
         Ok(attachments)
     }
 
+    /// 批量取多条消息的附件（按 message_id 分组，组内保持 created_at_ms, id 顺序）。
+    ///
+    /// transcript / 时间线水合都需要"整段会话的附件"，逐条查会产生 N+1；
+    /// 这里按 SQLite 绑定参数上限分片，一次发送只跑几条语句。
+    pub(crate) fn attachments_by_message_ids(
+        &self,
+        message_ids: &[String],
+    ) -> HamburResult<HashMap<String, Vec<AttachmentRecord>>> {
+        let ids = deduped_ids(message_ids);
+        let mut by_message_id: HashMap<String, Vec<AttachmentRecord>> = HashMap::new();
+        for chunk in ids.chunks(SQL_IN_CHUNK) {
+            let placeholders = sql_placeholders(chunk.len(), 1);
+            let sql = format!(
+                "
+                SELECT
+                    id,
+                    session_id,
+                    message_id,
+                    kind,
+                    display_name,
+                    mime_type,
+                    byte_size,
+                    origin_type,
+                    original_uri,
+                    file_id,
+                    sandbox_path,
+                    width,
+                    height,
+                    sha256,
+                    status,
+                    created_at_ms,
+                    updated_at_ms
+                FROM attachments
+                WHERE status = 'attached'
+                  AND message_id IN ({placeholders})
+                ORDER BY created_at_ms ASC, id ASC
+                "
+            );
+            let query_params: Vec<Value> = chunk
+                .iter()
+                .map(|id| Value::Text((*id).to_string()))
+                .collect();
+            let mut rows = self
+                .connection
+                .query(&sql, query_params)
+                .map_err(database_error)?;
+            while let Some(row) = rows.next().map_err(database_error)? {
+                let attachment = attachment_from_row(&row)?;
+                by_message_id
+                    .entry(attachment.message_id.clone())
+                    .or_default()
+                    .push(attachment);
+            }
+        }
+        Ok(by_message_id)
+    }
+
+    /// 批量取多条 assistant 消息的工具调用（组内保持 call_index, started_at_ms, id 顺序）。
+    pub(crate) fn tool_calls_by_assistant_message_ids(
+        &self,
+        assistant_message_ids: &[String],
+    ) -> HamburResult<HashMap<String, Vec<ToolCallRecord>>> {
+        let ids = deduped_ids(assistant_message_ids);
+        let mut by_message_id: HashMap<String, Vec<ToolCallRecord>> = HashMap::new();
+        for chunk in ids.chunks(SQL_IN_CHUNK) {
+            let placeholders = sql_placeholders(chunk.len(), 1);
+            let sql = format!(
+                "
+                SELECT
+                    id,
+                    session_id,
+                    turn_id,
+                    assistant_message_id,
+                    name,
+                    arguments_json,
+                    display_title,
+                    status,
+                    requires_approval,
+                    approval_status,
+                    started_at_ms,
+                    ended_at_ms,
+                    result_id,
+                    error_code,
+                    error_message,
+                    call_index
+                FROM tool_calls
+                WHERE assistant_message_id IN ({placeholders})
+                ORDER BY call_index ASC, started_at_ms ASC, id ASC
+                "
+            );
+            let query_params: Vec<Value> = chunk
+                .iter()
+                .map(|id| Value::Text((*id).to_string()))
+                .collect();
+            let mut rows = self
+                .connection
+                .query(&sql, query_params)
+                .map_err(database_error)?;
+            while let Some(row) = rows.next().map_err(database_error)? {
+                let call = tool_call_from_row(&row)?;
+                by_message_id
+                    .entry(call.assistant_message_id.clone())
+                    .or_default()
+                    .push(call);
+            }
+        }
+        Ok(by_message_id)
+    }
+
     fn hydrate_timeline_attachments(&self, items: &mut [TimelineItemSnapshot]) -> HamburResult<()> {
         let message_ids = items
             .iter()
@@ -1582,53 +1682,7 @@ impl HamburDatabase {
             return Ok(());
         }
 
-        let placeholders = std::iter::repeat("?")
-            .take(message_ids.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "
-            SELECT
-                id,
-                session_id,
-                message_id,
-                kind,
-                display_name,
-                mime_type,
-                byte_size,
-                origin_type,
-                original_uri,
-                file_id,
-                sandbox_path,
-                width,
-                height,
-                sha256,
-                status,
-                created_at_ms,
-                updated_at_ms
-            FROM attachments
-            WHERE status = 'attached'
-              AND message_id IN ({placeholders})
-            ORDER BY created_at_ms ASC, id ASC
-            "
-        );
-        let params = message_ids
-            .iter()
-            .map(IntoSqlValue::into_sql_value)
-            .collect::<Vec<_>>();
-        let mut rows = self
-            .connection
-            .query(&sql, params)
-            .map_err(database_error)?;
-
-        let mut attachments_by_message_id: HashMap<String, Vec<AttachmentRecord>> = HashMap::new();
-        while let Some(row) = rows.next().map_err(database_error)? {
-            let attachment = attachment_from_row(&row)?;
-            attachments_by_message_id
-                .entry(attachment.message_id.clone())
-                .or_default()
-                .push(attachment);
-        }
+        let attachments_by_message_id = self.attachments_by_message_ids(&message_ids)?;
 
         for item in items {
             item.attachments = attachments_by_message_id

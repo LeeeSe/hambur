@@ -1055,7 +1055,7 @@ impl HamburDatabase {
         session_id: &str,
         _turn_id: &str,
         input: NewMessageBlockPayload,
-    ) -> HamburResult<MessageBlockPayloadRecord> {
+    ) -> HamburResult<MessageBlockUpsert> {
         self.ensure_session_exists(session_id)?;
         if input.message_id.trim().is_empty() {
             return Err(HamburError::InvalidCommand(
@@ -1158,7 +1158,7 @@ impl HamburDatabase {
                 "AssistantPendingBlock".to_string(),
             )
         };
-        self.upsert_timeline_item(
+        let timeline_item = self.upsert_timeline_item(
             session_id,
             NewTimelineItem {
                 stable_key: record.stable_key.clone(),
@@ -1169,10 +1169,17 @@ impl HamburDatabase {
                 kind,
             },
         )?;
+        let mut hidden_stable_keys = Vec::new();
         if record.block_type == "content" && record.committed {
-            self.hide_timeline_item(session_id, &pending_markdown_stable_key(&record.message_id))?;
+            let pending_key = pending_markdown_stable_key(&record.message_id);
+            self.hide_timeline_item(session_id, &pending_key)?;
+            hidden_stable_keys.push(pending_key);
         }
-        Ok(record)
+        Ok(MessageBlockUpsert {
+            block: record,
+            timeline_item,
+            hidden_stable_keys,
+        })
     }
 
     pub fn remove_pending_markdown_block(
@@ -2288,6 +2295,12 @@ impl HamburDatabase {
                 CREATE INDEX IF NOT EXISTS idx_timeline_items_session_order
                     ON timeline_items(session_id, display_sequence, id);
 
+                -- 组装 prompt 上下文时，可见性判定要按 payload_ref 反查时间线项
+                -- （这条消息有没有可见的正文块/推理块）。payload_ref 上没有索引时，
+                -- 每条消息都是一次整会话时间线扫描：250 条消息的会话光这一项就 ~40ms。
+                CREATE INDEX IF NOT EXISTS idx_timeline_items_session_payload
+                    ON timeline_items(session_id, payload_ref, visible, content_type);
+
                 CREATE TABLE IF NOT EXISTS markdown_blocks (
                     id TEXT PRIMARY KEY NOT NULL,
                     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -2464,6 +2477,11 @@ impl HamburDatabase {
                 CREATE INDEX IF NOT EXISTS idx_trace_spans_session_started
                     ON trace_spans(session_id, started_at_ms, id);
 
+                -- 工具可见性判定走 tool_calls -> trace_spans(tool_call_id) -> timeline_items，
+                -- 缺这个索引时 trace_spans 每次都是全表扫描。
+                CREATE INDEX IF NOT EXISTS idx_trace_spans_tool_call
+                    ON trace_spans(tool_call_id);
+
                 CREATE TABLE IF NOT EXISTS tool_calls (
                     id TEXT PRIMARY KEY NOT NULL,
                     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -2485,6 +2503,11 @@ impl HamburDatabase {
 
                 CREATE INDEX IF NOT EXISTS idx_tool_calls_turn_started
                     ON tool_calls(turn_id, started_at_ms, id);
+
+                -- 组装 prompt 上下文时要按 assistant_message_id 取整段会话的工具调用；
+                -- 缺这个索引时每条 assistant 消息都是全表扫描 + 临时 B 树排序。
+                CREATE INDEX IF NOT EXISTS idx_tool_calls_assistant_message
+                    ON tool_calls(assistant_message_id, call_index, started_at_ms, id);
 
                 CREATE TABLE IF NOT EXISTS tool_results (
                     id TEXT PRIMARY KEY NOT NULL,

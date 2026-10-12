@@ -293,11 +293,71 @@ impl RuntimeEventKind {
 #[derive(Debug, Clone)]
 pub enum RuntimeEventPayload {
     None,
-    Snapshot { snapshot: AppSnapshot },
-    Delta { message_id: String, delta: String },
-    Markdown { update: MarkdownRenderUpdate },
-    Attachments { attachments: Vec<AttachmentRecord> },
-    PlatformRequest { request: PlatformRequest },
+    Snapshot {
+        snapshot: AppSnapshot,
+    },
+    Delta {
+        message_id: String,
+        delta: String,
+    },
+    Markdown {
+        update: MarkdownRenderUpdate,
+    },
+    /// 会话内的增量结构变化（新提交的块、被隐藏的占位块）。
+    TimelineDelta {
+        items: Vec<TimelineItemSnapshot>,
+        removed_stable_keys: Vec<String>,
+        message_blocks: Vec<MessageBlockPayloadRecord>,
+    },
+    Attachments {
+        attachments: Vec<AttachmentRecord>,
+    },
+    PlatformRequest {
+        request: PlatformRequest,
+    },
+}
+
+/// 一次写库在时间线上造成的增量变化。
+///
+/// 流式期间每个提交块只发这份增量，而不是整会话快照：客户端按 `stable_key`
+/// 合并，只有回合结束/失败/取消时才重新拉全量快照做对账。
+#[derive(Debug, Clone, Default)]
+pub struct TimelineDelta {
+    pub items: Vec<TimelineItemSnapshot>,
+    pub removed_stable_keys: Vec<String>,
+    pub message_blocks: Vec<MessageBlockPayloadRecord>,
+}
+
+impl TimelineDelta {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.items.is_empty()
+            && self.removed_stable_keys.is_empty()
+            && self.message_blocks.is_empty()
+    }
+
+    /// 记录一次块写入：它 upsert 出来的时间线项、新载荷，以及顺带隐藏的项。
+    pub(crate) fn absorb(&mut self, upsert: hambur_db::MessageBlockUpsert) {
+        let key = upsert.timeline_item.stable_key.clone();
+        match self.items.iter_mut().find(|item| item.stable_key == key) {
+            // 同一次更新里同一个 stable_key 只保留最后状态。
+            Some(existing) => *existing = upsert.timeline_item,
+            None => self.items.push(upsert.timeline_item),
+        }
+        let block_id = upsert.block.id.clone();
+        match self
+            .message_blocks
+            .iter_mut()
+            .find(|block| block.id == block_id)
+        {
+            Some(existing) => *existing = upsert.block,
+            None => self.message_blocks.push(upsert.block),
+        }
+        for hidden in upsert.hidden_stable_keys {
+            if !self.removed_stable_keys.contains(&hidden) {
+                self.removed_stable_keys.push(hidden);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -69,11 +69,28 @@ pub struct BackendEvent {
 /// Typed per-event data. Structural events carry a snapshot; streaming deltas carry only the delta.
 pub enum BackendEventPayload {
     None,
-    Snapshot { snapshot: AppSnapshotDTO },
-    Delta { message_id: String, delta: String },
-    Markdown { update: MarkdownRenderUpdateDTO },
-    Attachments { attachments: Vec<AttachmentDTO> },
-    PlatformRequest { request: PlatformRequestDTO },
+    Snapshot {
+        snapshot: AppSnapshotDTO,
+    },
+    Delta {
+        message_id: String,
+        delta: String,
+    },
+    Markdown {
+        update: MarkdownRenderUpdateDTO,
+    },
+    /// 会话内的增量结构变化：只带新增/更新的时间线项、被隐藏的项和新块载荷。
+    TimelineDelta {
+        items: Vec<TimelineItemDTO>,
+        removed_stable_keys: Vec<String>,
+        message_blocks: Vec<MessageBlockPayloadDTO>,
+    },
+    Attachments {
+        attachments: Vec<AttachmentDTO>,
+    },
+    PlatformRequest {
+        request: PlatformRequestDTO,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -727,6 +744,18 @@ impl From<RuntimeEventPayload> for BackendEventPayload {
             RuntimeEventPayload::Delta { message_id, delta } => Self::Delta { message_id, delta },
             RuntimeEventPayload::Markdown { update } => Self::Markdown {
                 update: update.into(),
+            },
+            RuntimeEventPayload::TimelineDelta {
+                items,
+                removed_stable_keys,
+                message_blocks,
+            } => Self::TimelineDelta {
+                items: items.into_iter().map(TimelineItemDTO::from).collect(),
+                removed_stable_keys,
+                message_blocks: message_blocks
+                    .into_iter()
+                    .map(MessageBlockPayloadDTO::from)
+                    .collect(),
             },
             RuntimeEventPayload::Attachments { attachments } => Self::Attachments {
                 attachments: attachments.into_iter().map(AttachmentDTO::from).collect(),

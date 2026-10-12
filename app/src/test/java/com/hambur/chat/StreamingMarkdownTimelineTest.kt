@@ -24,9 +24,9 @@ import org.junit.Test
  * 于是 UI 上只剩开局那条 pending 占位块——表现为"流式时只显示一段正文，
  * 流式结束后所有正文一块出现"。
  *
- * 后端修复：emit_markdown_persisted 在提交块落库后补发一条带 snapshot 的
- * TurnStateChanged，把新提交的段落即时送进 timelineItems。
- * 这两个用例分别锁定修复后的契约与 reducer 合成 pending 尾部的能力。
+ * 后端现在的契约：提交块落库后补发一条 `TurnStateChanged`，但载荷是**会话内增量**
+ * （新增/更新的时间线项 + 被隐藏的项 + 新块载荷），而不是整会话快照；整会话快照
+ * 只在回合结束/失败/取消时下发。用例分别锁定增量合成、占位块替换与快照引导三条路径。
  */
 class StreamingMarkdownTimelineTest {
 
@@ -136,6 +136,24 @@ class StreamingMarkdownTimelineTest {
         displaySequence = 1000UL,
     )
 
+    private fun uiTimelineItem(
+        stableKey: String,
+        contentType: String,
+        payloadRef: String,
+        displaySequence: ULong,
+        summary: String = "",
+        id: String = "tl-$stableKey",
+    ) = UiTimelineItem(
+        id = id,
+        stableKey = stableKey,
+        contentType = contentType,
+        versionSequence = 1UL,
+        payloadRef = payloadRef,
+        smallSummary = summary,
+        kind = if (contentType == "user_message") "UserMessage" else "AssistantMarkdownBlock",
+        displaySequence = displaySequence,
+    )
+
     private fun snapshotEvent(
         sequence: ULong,
         timelineItems: List<TimelineItemDto>,
@@ -157,6 +175,30 @@ class StreamingMarkdownTimelineTest {
                     messageBlockPayloads = messageBlockPayloads,
                     pendingAttachments = emptyList(),
                 ),
+            ),
+            errorCode = "",
+            message = "MarkdownCommitted",
+        )
+    }
+
+    private fun deltaEvent(
+        sequence: ULong,
+        items: List<TimelineItemDto>,
+        removedStableKeys: List<String> = emptyList(),
+        messageBlocks: List<MessageBlockPayloadDto> = emptyList(),
+    ): BackendEvent {
+        return BackendEvent(
+            eventId = "evt-$sequence",
+            schemaVersion = 1u,
+            sequence = sequence,
+            createdAtMs = 1000UL,
+            kind = BackendEventKind.TURN_STATE_CHANGED,
+            sessionId = sessionId,
+            turnId = turnId,
+            payload = BackendEventPayload.TimelineDelta(
+                items = items,
+                removedStableKeys = removedStableKeys,
+                messageBlocks = messageBlocks,
             ),
             errorCode = "",
             message = "MarkdownCommitted",
@@ -187,6 +229,137 @@ class StreamingMarkdownTimelineTest {
             ),
             errorCode = "",
             message = "",
+        )
+    }
+
+    /**
+     * 增量契约：提交块只发一条时间线增量，客户端必须"替换占位块 + 追加正文块"，
+     * 且不依赖任何整会话快照。
+     */
+    @Test
+    fun timelineDeltaCommitsParagraphAndDropsPendingPlaceholder() {
+        val committedRecord = blockRecord("mdb-1", 1UL, "$messageId:1", "第一段已经写完。", committed = true)
+        val pendingRecord = blockRecord(
+            "mdb-pending-1",
+            0UL,
+            pendingStableKey,
+            "第二段正在输入",
+            committed = false,
+        )
+
+        var state = HamburUiState(selectedSessionId = sessionId)
+        state = state.copy(
+            timelineItems = listOf(
+                uiTimelineItem(
+                    stableKey = "msg-user-1",
+                    contentType = "user_message",
+                    payloadRef = "msg-user-1",
+                    displaySequence = 900UL,
+                    summary = "写两段话",
+                ),
+                pendingItem(),
+            ),
+            lastAppliedSequence = 1UL,
+        )
+
+        // 1) 提交块：新增正文时间线项，并隐藏尾部占位块。
+        state = state.reduce(
+            deltaEvent(
+                sequence = 2UL,
+                items = listOf(
+                    timelineItem(
+                        id = "tl-1",
+                        stableKey = "$messageId:1",
+                        contentType = "assistant_markdown_block",
+                        payloadRef = "mdb-1",
+                        displaySequence = 1001UL,
+                        summary = "第一段已经写完。",
+                    ),
+                ),
+                removedStableKeys = listOf(pendingStableKey),
+                messageBlocks = listOf(committedRecord),
+            ),
+        )
+        assertEquals(
+            listOf("msg-user-1", "$messageId:1"),
+            state.timelineItems.map { it.stableKey },
+        )
+        // 块既要能按行 id（时间线项 payload_ref）查到，也要能按 stableKey 查到。
+        assertEquals("第一段已经写完。", state.messageBlocksByPayloadRef["mdb-1"]?.raw)
+        assertEquals("第一段已经写完。", state.messageBlocksByPayloadRef["$messageId:1"]?.raw)
+
+        // 2) 新一轮占位块（后端 upsert 出来的项）重新出现在队尾，继续渲染流式尾部。
+        state = state.reduce(
+            deltaEvent(
+                sequence = 3UL,
+                items = listOf(
+                    timelineItem(
+                        id = "tl-pending-2",
+                        stableKey = pendingStableKey,
+                        contentType = "assistant_pending_block",
+                        payloadRef = pendingPayloadRef,
+                        displaySequence = 1002UL,
+                        summary = "",
+                    ),
+                ),
+                messageBlocks = listOf(pendingRecord),
+            ),
+        )
+        val displayItems = state.timelineItems.toChatDisplayItems(state.messageBlocksByPayloadRef)
+        val markdown = displayItems.filterIsInstance<ChatDisplayItem.AssistantMarkdownBlock>()
+        assertEquals(
+            listOf("第一段已经写完。", "第二段正在输入"),
+            markdown.map { it.node.raw },
+        )
+    }
+
+    /** 交错 reasoning：新项必须按 displaySequence 插到已提交正文块之前，而不是无脑追加。 */
+    @Test
+    fun timelineDeltaInsertsReasoningBeforeLaterMarkdownBlock() {
+        var state = HamburUiState(selectedSessionId = sessionId)
+        state = state.copy(
+            timelineItems = listOf(
+                uiTimelineItem(
+                    stableKey = "msg-user-1",
+                    contentType = "user_message",
+                    payloadRef = "msg-user-1",
+                    displaySequence = 900UL,
+                    summary = "写两段话",
+                ),
+                uiTimelineItem(
+                    stableKey = "$messageId:1",
+                    contentType = "assistant_markdown_block",
+                    payloadRef = "mdb-1",
+                    displaySequence = 1001UL,
+                    summary = "第一段已经写完。",
+                ),
+            ),
+            lastAppliedSequence = 1UL,
+        )
+
+        // reasoning 块的 display_sequence 是「消息创建时间 - 1」，排在正文块之前。
+        state = state.reduce(
+            deltaEvent(
+                sequence = 2UL,
+                items = listOf(
+                    timelineItem(
+                        id = "tl-reasoning",
+                        stableKey = "$messageId:reasoning",
+                        contentType = "assistant_reasoning_block",
+                        payloadRef = "mdb-reasoning",
+                        displaySequence = 999UL,
+                        summary = "先想一下",
+                    ),
+                ),
+                messageBlocks = listOf(
+                    blockRecord("mdb-reasoning", 0UL, "$messageId:reasoning", "先想一下", committed = true),
+                ),
+            ),
+        )
+
+        assertEquals(
+            listOf("msg-user-1", "$messageId:reasoning", "$messageId:1"),
+            state.timelineItems.map { it.stableKey },
         )
     }
 

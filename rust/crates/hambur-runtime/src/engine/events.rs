@@ -140,13 +140,13 @@ impl RuntimeEngine {
         )
     }
 
-    /// Persist the markdown block state for the timeline, then emit the render update.
+    /// Persist the markdown block state for the timeline, then emit the render update
+    /// plus the timeline delta it produced.
     ///
     /// 提交块（整段正文）只写进 message_blocks，时间线行不会自己跑到 UI 上：
-    /// 客户端只在 snapshot 事件里重建 timelineItems，而流式期间没有 snapshot，
-    /// 于是 UI 只能看到开局那条 pending 占位块——表现就是"流式时只有一段正文，
-    /// 结束后所有正文一起出现"。这里在提交块落库后补一条带 snapshot 的
-    /// TurnStateChanged，让新提交的段落立刻出现在时间线里。
+    /// 客户端只在结构性事件里更新 timelineItems。早期实现为此在每个提交块上重发一份
+    /// **整会话快照**，长会话下一个回合要发几十份、每份都是 O(整段会话) 的查询与拷贝。
+    /// 现在只发这次写库真正新增/更新/隐藏的时间线项与块载荷，回合结束时才做一次全量对账。
     pub(crate) fn emit_markdown_persisted(
         &self,
         session_id: String,
@@ -156,20 +156,33 @@ impl RuntimeEngine {
         if self.shutdown.load(Ordering::SeqCst) {
             return Err(HamburError::RuntimeClosed);
         }
-        self.persist_markdown_update_for_timeline(&session_id, &turn_id, &update)?;
-        // 先发渲染更新，再发快照：客户端拿到快照时 messageBlocksByPayloadRef
-        // 里已经有这些块，新时间线项可以同帧渲染出来。
+        let delta = self.persist_markdown_update_for_timeline(&session_id, &turn_id, &update)?;
+        // 先发渲染更新，再发时间线增量：客户端拿到增量时块载荷已经在同一批数据里。
         self.emit_markdown(session_id.clone(), turn_id.clone(), update)?;
-        let snapshot = self
-            .database
-            .session_snapshot(&session_id)
-            .unwrap_or_default();
-        self.emit_with_snapshot(
+        self.emit_timeline_delta(session_id, turn_id, delta, "MarkdownCommitted")
+    }
+
+    /// Emit a session-scoped incremental timeline change (no full snapshot).
+    pub(crate) fn emit_timeline_delta(
+        &self,
+        session_id: String,
+        turn_id: String,
+        delta: TimelineDelta,
+        message: impl Into<String>,
+    ) -> HamburResult<()> {
+        if delta.is_empty() {
+            return Ok(());
+        }
+        self.push_event(
             RuntimeEventKind::TurnStateChanged,
             session_id,
             turn_id,
-            snapshot,
-            "MarkdownCommitted".to_string(),
+            RuntimeEventPayload::TimelineDelta {
+                items: delta.items,
+                removed_stable_keys: delta.removed_stable_keys,
+                message_blocks: delta.message_blocks,
+            },
+            message.into(),
             None,
         )
     }

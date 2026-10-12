@@ -83,61 +83,69 @@ impl RuntimeEngine {
         Ok(())
     }
 
+    /// 把渲染更新落库，并返回"这次写库让时间线发生了什么变化"。
+    ///
+    /// 返回值取代了原先"每次提交块都重新拉一份整会话快照"的做法：客户端只需要
+    /// 新增/更新的时间线项、被隐藏的项和新块载荷，不需要整段会话。
     pub(crate) fn persist_markdown_update_for_timeline(
         &self,
         session_id: &str,
         turn_id: &str,
         update: &MarkdownRenderUpdate,
-    ) -> HamburResult<()> {
+    ) -> HamburResult<TimelineDelta> {
+        let mut delta = TimelineDelta::default();
         if update.message_id.trim().is_empty() {
-            return Ok(());
+            return Ok(delta);
         }
         for node in &update.committed_nodes {
             let payload_json = serde_json::to_string(node).map_err(|error| {
                 HamburError::Internal(format!("serialize markdown block payload: {error}"))
             })?;
-            self.database
-                .upsert_message_block_payload(
-                    session_id,
-                    turn_id,
-                    NewMessageBlockPayload {
-                        id: String::new(),
-                        message_id: update.message_id.clone(),
-                        block_id: node.block_id,
-                        block_type: "content".to_string(),
-                        stable_key: node.stable_key.clone(),
-                        committed: true,
-                        payload_json,
-                        raw: node.raw.clone(),
-                        small_summary: markdown_block_summary(node),
-                    },
-                )?;
+            let upsert = self.database.upsert_message_block_payload(
+                session_id,
+                turn_id,
+                NewMessageBlockPayload {
+                    id: String::new(),
+                    message_id: update.message_id.clone(),
+                    block_id: node.block_id,
+                    block_type: "content".to_string(),
+                    stable_key: node.stable_key.clone(),
+                    committed: true,
+                    payload_json,
+                    raw: node.raw.clone(),
+                    small_summary: markdown_block_summary(node),
+                },
+            )?;
+            delta.absorb(upsert);
         }
         if let Some(node) = &update.pending_node {
             let payload_json = serde_json::to_string(node).map_err(|error| {
                 HamburError::Internal(format!("serialize pending markdown block payload: {error}"))
             })?;
-            self.database
-                .upsert_message_block_payload(
-                    session_id,
-                    turn_id,
-                    NewMessageBlockPayload {
-                        id: String::new(),
-                        message_id: update.message_id.clone(),
-                        block_id: node.block_id,
-                        block_type: "content".to_string(),
-                        stable_key: hambur_db::pending_markdown_stable_key(&update.message_id),
-                        committed: false,
-                        payload_json,
-                        raw: node.raw.clone(),
-                        small_summary: markdown_block_summary(node),
-                    },
-                )?;
+            let upsert = self.database.upsert_message_block_payload(
+                session_id,
+                turn_id,
+                NewMessageBlockPayload {
+                    id: String::new(),
+                    message_id: update.message_id.clone(),
+                    block_id: node.block_id,
+                    block_type: "content".to_string(),
+                    stable_key: hambur_db::pending_markdown_stable_key(&update.message_id),
+                    committed: false,
+                    payload_json,
+                    raw: node.raw.clone(),
+                    small_summary: markdown_block_summary(node),
+                },
+            )?;
+            delta.absorb(upsert);
         } else if !update.committed_nodes.is_empty() || update.reset {
             self.database
                 .remove_pending_markdown_block(session_id, &update.message_id)?;
+            delta
+                .removed_stable_keys
+                .push(hambur_db::pending_markdown_stable_key(&update.message_id));
         }
-        Ok(())
+        Ok(delta)
     }
 
     pub(crate) fn persist_reasoning_block_for_timeline(
@@ -146,9 +154,10 @@ impl RuntimeEngine {
         turn_id: &str,
         message_id: &str,
         reasoning: &str,
-    ) -> HamburResult<()> {
+    ) -> HamburResult<TimelineDelta> {
+        let mut delta = TimelineDelta::default();
         if message_id.trim().is_empty() || reasoning.is_empty() {
-            return Ok(());
+            return Ok(delta);
         }
         let stable_key = hambur_db::reasoning_block_stable_key(message_id);
         let node = MarkdownBlockNode {
@@ -174,22 +183,22 @@ impl RuntimeEngine {
         let payload_json = serde_json::to_string(&node).map_err(|error| {
             HamburError::Internal(format!("serialize reasoning block payload: {error}"))
         })?;
-        self.database
-            .upsert_message_block_payload(
-                session_id,
-                turn_id,
-                NewMessageBlockPayload {
-                    id: String::new(),
-                    message_id: message_id.to_string(),
-                    block_id: 0,
-                    block_type: "reasoning".to_string(),
-                    stable_key,
-                    committed: true,
-                    payload_json,
-                    raw: reasoning.to_string(),
-                    small_summary: reasoning.chars().take(160).collect(),
-                },
-            )?;
-        Ok(())
+        let upsert = self.database.upsert_message_block_payload(
+            session_id,
+            turn_id,
+            NewMessageBlockPayload {
+                id: String::new(),
+                message_id: message_id.to_string(),
+                block_id: 0,
+                block_type: "reasoning".to_string(),
+                stable_key,
+                committed: true,
+                payload_json,
+                raw: reasoning.to_string(),
+                small_summary: reasoning.chars().take(160).collect(),
+            },
+        )?;
+        delta.absorb(upsert);
+        Ok(delta)
     }
 }

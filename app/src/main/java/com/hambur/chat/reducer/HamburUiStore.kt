@@ -2123,6 +2123,15 @@ internal fun HamburUiState.reduce(event: BackendEvent): HamburUiState {
     } else {
         timelineItems
     }
+    // 会话内增量：流式期间后端只发"这次写库让时间线变了什么"，不再重发整段会话。
+    // 先把它并进时间线，后面所有基于 timelineItems 的派生（可见块集合等）就都是最新的。
+    val timelineDelta = event.payload as? BackendEventPayload.TimelineDelta
+    if (timelineDelta != null) {
+        nextTimelineItems = nextTimelineItems.applyTimelineDelta(
+            items = timelineDelta.items,
+            removedStableKeys = timelineDelta.removedStableKeys,
+        )
+    }
     val visibleMessageBlockPayloadRefs = nextTimelineItems
         .asSequence()
         .filter { it.isAssistantMarkdownBlock() }
@@ -2137,6 +2146,16 @@ internal fun HamburUiState.reduce(event: BackendEvent): HamburUiState {
             messageBlocksByPayloadRef + snapshotMessageBlocksByPayloadRef
         }
     ).toMutableMap()
+    if (timelineDelta != null) {
+        // 块同时按行 id（时间线项的 payload_ref）和 stableKey 建索引，
+        // 与快照路径 / markdown 事件路径的既有约定保持一致。
+        timelineDelta.messageBlocks.forEach { block ->
+            mutableMessageBlocks[block.id] = block.node
+            if (block.stableKey.isNotBlank()) {
+                mutableMessageBlocks[block.stableKey] = block.node
+            }
+        }
+    }
 
     val markdownUpdate = (event.payload as? BackendEventPayload.Markdown)?.update
     if (markdownUpdate != null) {
@@ -2367,6 +2386,9 @@ private fun BackendEvent.traceStats(): String {
         is BackendEventPayload.Delta -> "delta=${payload.delta.length}"
         is BackendEventPayload.Markdown ->
             "committed=${payload.update.committedNodes.size} pending=${payload.update.pendingNode != null}"
+        is BackendEventPayload.TimelineDelta ->
+            "deltaItems=${payload.items.size} removed=${payload.removedStableKeys.size} " +
+                "deltaBlocks=${payload.messageBlocks.size}"
         is BackendEventPayload.Attachments -> "attachments=${payload.attachments.size}"
         is BackendEventPayload.PlatformRequest -> "request=${payload.request.kind}"
         BackendEventPayload.None -> "payload=none"
@@ -2473,25 +2495,61 @@ private fun HamburUiState.rememberEventId(eventId: String): Set<String> {
 }
 
 private fun List<TimelineItemDto>.toUiTimelineItems(): List<UiTimelineItem> {
-    return map {
-        UiTimelineItem(
-            id = it.id,
-            stableKey = it.stableKey,
-            contentType = it.contentType,
-            versionSequence = it.versionSequence,
-            payloadRef = it.payloadRef,
-            smallSummary = it.smallSummary,
-            kind = it.kind,
-            traceTitle = it.traceTitle,
-            traceContent = it.traceContent,
-            traceArguments = it.traceArguments,
-            traceStatus = it.traceStatus,
-            toolCallId = it.toolCallId,
-            toolName = it.toolName,
-            attachments = it.attachments.toUiPendingAttachments(),
-            displaySequence = it.displaySequence,
-        )
+    return map { it.toUiTimelineItem() }
+}
+
+private fun TimelineItemDto.toUiTimelineItem(): UiTimelineItem {
+    return UiTimelineItem(
+        id = id,
+        stableKey = stableKey,
+        contentType = contentType,
+        versionSequence = versionSequence,
+        payloadRef = payloadRef,
+        smallSummary = smallSummary,
+        kind = kind,
+        traceTitle = traceTitle,
+        traceContent = traceContent,
+        traceArguments = traceArguments,
+        traceStatus = traceStatus,
+        toolCallId = toolCallId,
+        toolName = toolName,
+        attachments = attachments.toUiPendingAttachments(),
+        displaySequence = displaySequence,
+    )
+}
+
+/**
+ * 把后端的会话内增量合并进当前时间线，而不是整段重建。
+ *
+ * - 已存在的 `stableKey` 原地替换（例如尾部占位块的 summary 更新）；
+ * - 新项按 `displaySequence` 升序插入：时间是"消息创建时间 + 块号"，
+ *   所以普通新块直接落到队尾，交错的 reasoning 块仍会插到正文块之前；
+ * - `removedStableKeys` 里的项被移除（提交正文块后消失的尾部占位块）。
+ */
+private fun List<UiTimelineItem>.applyTimelineDelta(
+    items: List<TimelineItemDto>,
+    removedStableKeys: List<String>,
+): List<UiTimelineItem> {
+    if (items.isEmpty() && removedStableKeys.isEmpty()) return this
+    val removed = removedStableKeys.toHashSet()
+    val merged = if (removed.isEmpty()) this else filterNot { it.stableKey in removed }
+    if (items.isEmpty()) return merged
+    val result = merged.toMutableList()
+    for (dto in items) {
+        val incoming = dto.toUiTimelineItem()
+        val existingIndex = result.indexOfFirst { it.stableKey == incoming.stableKey }
+        if (existingIndex >= 0) {
+            result[existingIndex] = incoming
+            continue
+        }
+        val insertAt = result.indexOfFirst { it.displaySequence > incoming.displaySequence }
+        if (insertAt < 0) {
+            result.add(incoming)
+        } else {
+            result.add(insertAt, incoming)
+        }
     }
+    return result
 }
 
 private fun List<MessageBlockPayloadDto>.toMessageBlockMap(): Map<String, MarkdownBlockNodeDto> {

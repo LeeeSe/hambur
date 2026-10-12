@@ -71,6 +71,18 @@ pub struct MessageBlockPayloadRecord {
     pub updated_at_ms: u64,
 }
 
+/// `upsert_message_block_payload` 的完整后果：块本身、它对应的时间线项，
+/// 以及这次写入顺带隐藏掉的时间线项（提交正文块会隐藏尾部占位块）。
+///
+/// 流式期间客户端只靠增量事件更新界面，调用方需要的是"这次写库让什么变了"，
+/// 而不是重新拉一份整会话快照。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageBlockUpsert {
+    pub block: MessageBlockPayloadRecord,
+    pub timeline_item: TimelineItemSnapshot,
+    pub hidden_stable_keys: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageRecord {
     pub id: String,

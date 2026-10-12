@@ -899,24 +899,20 @@ impl RuntimeEngine {
                             !state.reasoning_persisted && !state.reasoning.is_empty();
                         if should_persist {
                             state.reasoning_persisted = true;
-                            let _ = self.persist_reasoning_block_for_timeline(
+                            let delta_update = self.persist_reasoning_block_for_timeline(
                                 session_id,
                                 turn_id,
                                 assistant_message_id,
                                 &state.reasoning,
                             );
-                            let snapshot = self
-                                .database
-                                .session_snapshot(session_id)
-                                .unwrap_or_default();
-                            let _ = self.emit_with_snapshot(
-                                RuntimeEventKind::TurnStateChanged,
-                                session_id.to_string(),
-                                turn_id.to_string(),
-                                snapshot,
-                                "ReasoningStarted".to_string(),
-                                None,
-                            );
+                            if let Ok(delta_update) = delta_update {
+                                let _ = self.emit_timeline_delta(
+                                    session_id.to_string(),
+                                    turn_id.to_string(),
+                                    delta_update,
+                                    "ReasoningStarted",
+                                );
+                            }
                         }
                         let _ = self.emit_delta(
                             RuntimeEventKind::AssistantReasoningDelta,

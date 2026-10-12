@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::*;
 
 pub(crate) fn normalize_title(title: &str) -> String {
@@ -684,6 +686,28 @@ pub(crate) fn message_block_from_row(row: &Row) -> HamburResult<MessageBlockPayl
         created_at_ms: unsigned_ms(row.get::<i64>(11).map_err(database_error)?),
         updated_at_ms: unsigned_ms(row.get::<i64>(12).map_err(database_error)?),
     })
+}
+
+/// SQLite 单条语句的绑定参数上限（bundled sqlite 是 32766，老版本是 999）。
+/// 所有 `IN (...)` 批量查询都按这个粒度分片，避免"too many SQL variables"，
+/// 同时让单条语句保持足够选择性。
+pub(crate) const SQL_IN_CHUNK: usize = 400;
+
+/// 去掉空白项并去重，返回可安全用于 `IN (...)` 的 id 列表（保持首次出现顺序）。
+pub(crate) fn deduped_ids(ids: &[String]) -> Vec<&str> {
+    let mut seen = HashSet::new();
+    ids.iter()
+        .map(|id| id.trim())
+        .filter(|id| !id.is_empty() && seen.insert(*id))
+        .collect()
+}
+
+/// 生成 `?first, ?first+1, ...` 形式的占位符串。
+pub(crate) fn sql_placeholders(count: usize, first_index: usize) -> String {
+    (0..count)
+        .map(|offset| format!("?{}", first_index + offset))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 pub(crate) fn message_block_payload_refs(items: &[TimelineItemSnapshot]) -> Vec<String> {

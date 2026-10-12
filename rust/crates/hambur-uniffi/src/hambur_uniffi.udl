@@ -73,6 +73,7 @@ interface BackendEventPayload {
     Snapshot(AppSnapshotDTO snapshot);
     Delta(string message_id, string delta);
     Markdown(MarkdownRenderUpdateDTO update);
+    TimelineDelta(sequence<TimelineItemDTO> items, sequence<string> removed_stable_keys, sequence<MessageBlockPayloadDTO> message_blocks);
     Attachments(sequence<AttachmentDTO> attachments);
     PlatformRequest(PlatformRequestDTO request);
 };

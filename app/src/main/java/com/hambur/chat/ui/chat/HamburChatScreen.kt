@@ -59,6 +59,7 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -322,6 +323,10 @@ fun HamburChatScreen(
     val maxDrawerOffset = with(density) { drawerWidth.toPx() }
     var drawerOffset by remember { mutableFloatStateOf(0f) }
     val drawerAnimation = remember { Animatable(0f) }
+    // 会话侧边栏的滚动位置必须挂在这里，不能留在 ChatDrawerContent 内部：
+    // 抽屉内容是 drawerProgress > 0 时才组合的，状态放在里面会随关闭一起被销毁，
+    // 再打开就回到列表顶部（rememberLazyListState 自带 Saver，顺带扛住重建与进程恢复）。
+    val drawerSessionListState = rememberLazyListState()
     val messageListBottomPadding = with(density) {
         chatInputPanelHeightPx.toDp()
     } + chatTokens.timelineBottomGap
@@ -529,6 +534,7 @@ fun HamburChatScreen(
                     onOpenSettings()
                 },
                 drawerWidth = drawerWidth,
+                listState = drawerSessionListState,
                 modifier = Modifier.graphicsLayer {
                     val drawerScale = 0.9f + (drawerProgress * 0.1f)
                     alpha = drawerProgress
@@ -806,6 +812,7 @@ private fun ChatDrawerContent(
     onUnavailableAction: (String) -> Unit,
     onOpenSettings: () -> Unit,
     drawerWidth: Dp,
+    listState: LazyListState,
     modifier: Modifier = Modifier,
 ) {
     val colorScheme = MaterialTheme.colorScheme
@@ -854,6 +861,7 @@ private fun ChatDrawerContent(
             Spacer(modifier = Modifier.height(22.dp))
 
             LazyColumn(
+                state = listState,
                 modifier = Modifier.weight(1f),
                 verticalArrangement = Arrangement.spacedBy(2.dp),
                 contentPadding = PaddingValues(bottom = 18.dp),

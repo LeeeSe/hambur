@@ -278,6 +278,11 @@ data class HamburUiState(
     val rootfsStatus: RootfsStatusDto? = null,
     val thinkingEnabledBySession: Map<String, Boolean> = emptyMap(),
     val defaultThinkingEnabled: Boolean = false,
+    /**
+     * 用户最近一次手动切换的思考开关（null = 从没切过）。启动时新建的会话 / 草稿会话
+     * 都没有自己的记录，靠它兜底，重开 APP 后按钮才会是上次关闭时的状态。
+     */
+    val lastThinkingEnabled: Boolean? = null,
     val turnStartedAtMs: Map<String, Long> = emptyMap(),
     val turnDurationSeconds: Map<String, Int> = emptyMap(),
     /** Settings → 日志 的可见缓冲区快照（最新在前）。纯内存，不落库。 */
@@ -305,6 +310,7 @@ private data class UiSessionCacheEntry(
 private data class PersistedSessionUiState(
     val thinkingEnabledBySession: Map<String, Boolean> = emptyMap(),
     val scrollPositions: Map<String, UiSessionScrollPosition> = emptyMap(),
+    val lastThinkingEnabled: Boolean? = null,
 )
 
 class HamburUiStore(
@@ -350,7 +356,10 @@ class HamburUiStore(
     init {
         sessionScrollPositions.putAll(persistedSessionUiState.scrollPositions)
         _state.update {
-            it.copy(thinkingEnabledBySession = persistedSessionUiState.thinkingEnabledBySession)
+            it.copy(
+                thinkingEnabledBySession = persistedSessionUiState.thinkingEnabledBySession,
+                lastThinkingEnabled = persistedSessionUiState.lastThinkingEnabled,
+            )
         }
         // Kotlin 侧日志带上"记录时已应用的最新后端事件序号"，与 Rust tracing 的序号对齐。
         DiagnosticLogs.sequenceProvider = { _state.value.lastAppliedSequence.toLong() }
@@ -422,6 +431,7 @@ class HamburUiStore(
         _state.update {
             it.copy(
                 thinkingEnabledBySession = it.thinkingEnabledBySession + (targetSessionId to enabled),
+                lastThinkingEnabled = enabled,
             )
         }
         persistSessionUiState()
@@ -1352,14 +1362,20 @@ class HamburUiStore(
         val messageBlockPayloads = timelinePage?.messageBlockPayloads.orEmpty()
 
         val bufferedEvents = synchronized(startupLock) {
-            _state.update {
-                it.applyBaseline(
+            _state.update { current ->
+                val baseline = current.applyBaseline(
                     snapshot = sessionSnapshot,
                     selectedSessionId = selectedSessionId,
                     timelineItems = timelineItems,
                     messageBlockPayloads = messageBlockPayloads,
                     settingsSnapshot = settingsSnapshot,
                     baselineSequence = baselineSequence,
+                )
+                // 老版本落盘文件里没有 lastThinkingEnabled：用最近更新的那个「有记录」的会话
+                // 兜底，让升级后的第一次启动也能显示成上次关闭时的思考开关。
+                baseline.copy(
+                    lastThinkingEnabled = baseline.lastThinkingEnabled
+                        ?: inferredLastThinkingEnabled(baseline, sessionSnapshot),
                 )
             }
             baselineApplied = true
@@ -1379,6 +1395,22 @@ class HamburUiStore(
         refreshVisibleMessageSnapshots()
         refreshKnowledgeSnapshots()
         runRootfsWarmup(selectedSessionId)
+        // 把兜底推断出来的思考开关落盘，之后就跟用户的真实切换一致了。
+        if (persistedSessionUiState.lastThinkingEnabled == null && _state.value.lastThinkingEnabled != null) {
+            persistSessionUiState()
+        }
+    }
+
+    /** 升级迁移用：没有 lastThinkingEnabled 时，取最近更新的那个有思考记录的会话的值。 */
+    private fun inferredLastThinkingEnabled(
+        state: HamburUiState,
+        sessionSnapshot: SessionListSnapshotDto,
+    ): Boolean? {
+        val recorded = state.thinkingEnabledBySession
+        return sessionSnapshot.sessions
+            .filter { it.id in recorded }
+            .maxByOrNull { it.updatedAtMs }
+            ?.let { recorded[it.id] }
     }
 
     private fun resolveStartupSessionId(
@@ -1746,6 +1778,7 @@ class HamburUiStore(
                 PersistedSessionUiState(
                     thinkingEnabledBySession = _state.value.thinkingEnabledBySession,
                     scrollPositions = sessionScrollPositions.toMap(),
+                    lastThinkingEnabled = _state.value.lastThinkingEnabled,
                 )
             }
             runCatching {
@@ -2418,10 +2451,9 @@ private fun HamburUiState.updateTurnTiming(event: BackendEvent): Pair<Map<String
 }
 
 fun HamburUiState.thinkingEnabledForSession(sessionId: String = selectedSessionId): Boolean {
-    if (sessionId.isBlank()) {
-        return thinkingEnabledBySession[NEW_SESSION_THINKING_KEY] ?: defaultThinkingEnabled
-    }
-    return thinkingEnabledBySession[sessionId] ?: defaultThinkingEnabled
+    val key = sessionId.ifBlank { NEW_SESSION_THINKING_KEY }
+    // 顺序：该会话自己的记录 → 用户最后一次手动切换 → 设置里的默认值。
+    return thinkingEnabledBySession[key] ?: lastThinkingEnabled ?: defaultThinkingEnabled
 }
 
 fun HamburUiState.isNewSessionBlank(): Boolean {
@@ -2761,6 +2793,12 @@ private fun loadPersistedSessionUiState(file: File): PersistedSessionUiState {
         PersistedSessionUiState(
             thinkingEnabledBySession = thinking,
             scrollPositions = scroll,
+            // 缺字段 = 老版本文件，保持 null（跟随设置里的默认值），不要当成 false。
+            lastThinkingEnabled = if (root.has("lastThinkingEnabled")) {
+                root.optBoolean("lastThinkingEnabled")
+            } else {
+                null
+            },
         )
     }.getOrDefault(PersistedSessionUiState())
 }
@@ -2785,6 +2823,7 @@ private fun PersistedSessionUiState.toJsonString(): String {
     return JSONObject().apply {
         put("thinkingEnabledBySession", thinking)
         put("scrollPositions", scroll)
+        lastThinkingEnabled?.let { put("lastThinkingEnabled", it) }
     }.toString()
 }
 

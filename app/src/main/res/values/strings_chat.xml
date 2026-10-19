@@ -103,4 +103,5 @@
     <!-- 工具步骤标题：工具名兜底 -->
     <string name="chat_tool_named">Tool: %1$s</string>
     <string name="chat_tool_unknown">Tool call</string>
+    <string name="chat_scroll_to_bottom">Back to latest</string>
 </resources>

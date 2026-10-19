@@ -32,3 +32,6 @@ Thumbs.db
 
 # SQLite test files
 *.db
+
+# Reverse-engineering scratch space (APK dumps, jadx output)
+.apk-inspect/

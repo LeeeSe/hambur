@@ -4,7 +4,10 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.StringRes
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.Crossfade
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
@@ -97,12 +100,15 @@ import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.toMutableStateList
 import androidx.compose.ui.Alignment
@@ -169,6 +175,7 @@ import com.composables.icons.lucide.Brain
 import com.composables.icons.lucide.Camera
 import com.composables.icons.lucide.ChartNoAxesGantt
 import com.composables.icons.lucide.Check
+import com.composables.icons.lucide.ChevronDown
 import com.composables.icons.lucide.ChevronRight
 import com.composables.icons.lucide.CircleAlert
 import com.composables.icons.lucide.CircleArrowUp
@@ -235,7 +242,11 @@ import com.hambur.chat.ui.markdown.MarkdownStyle
 import com.hambur.chat.ui.markdown.rememberMarkdownRenderCache
 import com.hambur.chat.ui.markdown.rememberMarkdownStyle
 import com.hambur.chat.ui.theme.HamburTheme
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
@@ -679,6 +690,10 @@ fun HamburChatScreen(
                             },
                             onSend = {
                                 haptics.confirm()
+                                // 和 DeepSeek 一致：发送后收起键盘，把整屏留给流式回答。
+                                // 否则键盘一直占着下半屏，回答只露出十几行，看起来就像「停在半路」。
+                                focusManager.clearFocus()
+                                keyboardController?.hide()
                                 if (editingMessageId.isNotBlank()) {
                                     store.editMessage(visibleState.selectedSessionId, editingMessageId, draftMessage)
                                     editingMessageId = ""
@@ -1236,196 +1251,485 @@ private fun ChatTimeline(
     }
 
     val density = LocalDensity.current
+    val coroutineScope = rememberCoroutineScope()
+    // 「一屏」用固定的屏幕高度比例，而不是当前可视区：键盘弹出时可视区只有半屏。
+    val oneScreenHeightPx = with(density) {
+        LocalConfiguration.current.screenHeightDp.dp.toPx() * ONE_SCREEN_HEIGHT_RATIO
+    }
     val isDragged by listState.interactionSource.collectIsDraggedAsState()
-    val isNearBottom by remember(listState) {
+
+    // 正在流式输出的助手消息（同一时刻最多一条）。
+    // 以 activeTurnIds 为准：它是 TURN_STARTED / TURN_FINISHED 事件的直接投影，
+    // 比 messagesById 里的 status 更早、更可靠；消息 id 取列表里最后一条助手内容所属的那条。
+    val streamingMessageId = remember(displayItems, state.activeTurnIds, sessionId) {
+        if (!state.activeTurnIds.containsKey(sessionId)) {
+            ""
+        } else {
+            displayItems.lastOrNull { it.ownerMessageId() != null }?.ownerMessageId().orEmpty()
+        }
+    }
+    // 这条回答在列表里的第一个 display item，用来判断「回答是否已经占满一屏」。
+    val streamingFirstIndex by remember(displayItems, streamingMessageId) {
         derivedStateOf {
-            val layoutInfo = listState.layoutInfo
-            val visibleItems = layoutInfo.visibleItemsInfo
-            if (visibleItems.isEmpty()) return@derivedStateOf true
-            val total = layoutInfo.totalItemsCount
-            if (total <= 2) return@derivedStateOf true
-            visibleItems.last().index >= total - 2
-        }
-    }
-
-    var lastBottomPaddingPx by remember(sessionId) {
-        mutableFloatStateOf(with(density) { bottomPadding.toPx() })
-    }
-
-    LaunchedEffect(bottomPadding) {
-        val currentBottomPx = with(density) { bottomPadding.toPx() }
-        val deltaPx = currentBottomPx - lastBottomPaddingPx
-        lastBottomPaddingPx = currentBottomPx
-        if (deltaPx > 0.5f && isNearBottom && !isDragged) {
-            listState.scrollBy(deltaPx)
-        }
-    }
-
-    var previousItemCount by remember(sessionId) {
-        mutableIntStateOf(displayItems.size)
-    }
-    LaunchedEffect(displayItems.size) {
-        if (displayItems.size > previousItemCount) {
-            if (isNearBottom && !isDragged && displayItems.isNotEmpty()) {
-                listState.animateScrollToItem(displayItems.size)
+            if (streamingMessageId.isBlank()) {
+                -1
+            } else {
+                displayItems.indexOfFirst { it.ownerMessageId() == streamingMessageId }
             }
         }
-        previousItemCount = displayItems.size
     }
 
-    LazyColumn(
-        state = listState,
-        modifier = modifier
-            .nestedScroll(dismissKeyboardScrollConnection)
-            .clickable(
-                interactionSource = remember { MutableInteractionSource() },
-                indication = null,
-                onClick = {
-                    focusManager.clearFocus()
-                    keyboardController?.hide()
-                },
-            )
-            .onGloballyPositioned {
-            ChatJankTracer.markSessionSwitchOnce(
-                phase = "timeline_first_layout",
-                key = "timeline_first_layout:$sessionId",
-                targetSessionId = sessionId,
-                extra = "displayItems=${displayItems.size} viewport=${it.size.width}x${it.size.height}",
-            )
-        },
-        contentPadding = PaddingValues(
-            start = CHAT_CONTENT_HORIZONTAL_PADDING,
-            top = 12.dp,
-            end = CHAT_CONTENT_HORIZONTAL_PADDING,
-            bottom = bottomPadding,
-        ),
-        verticalArrangement = Arrangement.spacedBy(0.dp),
-    ) {
-        itemsIndexed(
-            items = displayItems,
-            key = { _, item -> item.stableKey },
-            contentType = { _, item -> item.contentType },
-        ) { index, item ->
-            val previousItem = displayItems.getOrNull(index - 1)
-            val topPadding = item.topSpacingAfter(previousItem)
-            when (item) {
-                is ChatDisplayItem.Timeline -> {
-                    val timelineItem = item.item
-                    when {
-                        timelineItem.contentType == "user_message" && timelineItem.kind != "SyntheticUserMessage" -> {
-                            val message = state.messagesById[timelineItem.payloadRef]
-                            MessageTimelineItem(
-                                item = timelineItem,
-                                message = message,
-                                onOpenFile = onOpenFile,
-                                onOpenImage = onOpenImage,
-                                onSelectText = onSelectText,
-                                onRetryMessage = {
-                                    message?.let {
-                                        store.regenerateMessage(state.selectedSessionId, it.id)
-                                    }
-                                },
-                                onEditMessage = { message?.let(onEditMessage) },
-                                thinkingDisplayMode = thinkingDisplayMode,
-                                onResolveHostPath = { path ->
-                                    store.resolveSandboxHostPath(sessionId, path)
-                                },
-                                modifier = Modifier.padding(top = topPadding),
-                            )
-                        }
-
-                        timelineItem.contentType == "trace" || timelineItem.kind.contains("Trace") -> {
-                            StandaloneToolTraceItem(
-                                item = timelineItem,
-                                modifier = Modifier.padding(top = topPadding),
-                            )
-                        }
-
-                        else -> {
-                            TimelineSummaryItem(
-                                item = timelineItem,
-                                modifier = Modifier.padding(top = topPadding),
-                            )
-                        }
-                    }
-                }
-
-                is ChatDisplayItem.AssistantProcessBlock -> {
-                    val activeTurnId = state.activeTurnIds[sessionId].orEmpty()
-                    val blockTurnId = if (item.turnId.isNotBlank()) item.turnId else state.messagesById[item.messageId]?.turnId.orEmpty()
-                    val hasMarkdownAfterInTurn = displayItems.subList(index + 1, displayItems.size).any {
-                        if (it !is ChatDisplayItem.AssistantMarkdownBlock) return@any false
-                        val mdTurnId = state.messagesById[it.messageId]?.turnId.orEmpty()
-                        blockTurnId.isBlank() || mdTurnId == blockTurnId
-                    }
-                    val isLastProcessInTurn = displayItems.subList(index + 1, displayItems.size).none {
-                        if (it !is ChatDisplayItem.AssistantProcessBlock) return@none false
-                        val otherTurnId = if (it.turnId.isNotBlank()) it.turnId else state.messagesById[it.messageId]?.turnId.orEmpty()
-                        blockTurnId.isBlank() || otherTurnId == blockTurnId
-                    }
-                    val isGenerating = activeTurnId.isNotBlank() &&
-                        (blockTurnId == activeTurnId || (blockTurnId.isBlank() && index >= displayItems.size - 2)) &&
-                        !hasMarkdownAfterInTurn &&
-                        isLastProcessInTurn
-                    val durationSec = if (item.estimatedDurationSeconds > 0) {
-                        item.estimatedDurationSeconds
+    // 每条 display item 的实测高度（stableKey -> px）。滚动出视口的 item 会被回收，
+    // 但高度留在这里，用来算「流式回答自己有多高」——DeepSeek 也是按内容高度判断一屏，
+    // 而不是按当前可视区（键盘弹出时可视区只有半屏，会误判）。
+    val itemHeights = remember(sessionId) { mutableStateMapOf<String, Int>() }
+    val streamingAnswerHeightPx by remember(displayItems, streamingMessageId) {
+        derivedStateOf {
+            if (streamingMessageId.isBlank()) {
+                0
+            } else {
+                displayItems.sumOf { item ->
+                    if (item.ownerMessageId() == streamingMessageId) {
+                        itemHeights[item.stableKey] ?: 0
                     } else {
-                        state.turnDurationSeconds[blockTurnId]
+                        0
                     }
-                    ExecutionProcessBlock(
-                        steps = item.steps,
-                        isGenerating = isGenerating,
-                        durationSeconds = durationSec,
-                        displayMode = thinkingDisplayMode,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(top = topPadding),
-                    )
                 }
+            }
+        }
+    }
 
-                is ChatDisplayItem.AssistantMarkdownBlock -> {
-                    AssistantMarkdownBlockTimelineItem(
-                        item = item,
-                        sessionId = sessionId,
-                        markdownStyle = markdownStyle,
-                        markdownCache = markdownCache,
-                        onOpenFile = onOpenFile,
-                        onOpenImage = onOpenImage,
-                        onRegenerate = {
-                            store.regenerateMessage(state.selectedSessionId, item.messageId)
-                        },
-                        onSelectText = onSelectText,
-                        onResolveHostPath = { path ->
-                            store.resolveSandboxHostPath(sessionId, path)
-                        },
-                        modifier = Modifier.padding(top = topPadding),
-                    )
+    /**
+     * 是否跟随最新输出。用户一动手、或长回答超过一屏，就会关掉；
+     * 用户自己滑回底部（或点右下角按钮）后恢复。
+     */
+    var following by remember(sessionId) { mutableStateOf(true) }
+
+    /** 一条回答只触发一次「一屏暂停」，避免用户手动回到底部后又被拽回回答顶部。 */
+    var oneScreenPauseDone by remember(sessionId) { mutableStateOf(false) }
+
+    LaunchedEffect(sessionId, streamingMessageId) {
+        if (streamingMessageId.isNotBlank()) {
+            following = true
+            oneScreenPauseDone = false
+        }
+    }
+
+    // 用户一动手就退出跟随，避免自动滚动和手势抢。
+    LaunchedEffect(sessionId, isDragged) {
+        if (isDragged) following = false
+    }
+
+    // 手势/惯性结束后如果又回到列表底部，就恢复跟随。
+    LaunchedEffect(sessionId, listState) {
+        snapshotFlow { listState.isScrollInProgress }
+            .distinctUntilChanged()
+            .collect { scrolling ->
+                if (!scrolling && chatListAtBottom(listState)) following = true
+            }
+    }
+
+    // 用户发出新消息时立刻贴到最新，并重新进入跟随状态。
+    val userMessageCount = remember(displayItems) {
+        displayItems.count { it is ChatDisplayItem.Timeline && it.item.contentType == "user_message" }
+    }
+    var previousUserMessageCount by remember(sessionId) { mutableIntStateOf(userMessageCount) }
+    LaunchedEffect(userMessageCount) {
+        if (userMessageCount > previousUserMessageCount) {
+            previousUserMessageCount = userMessageCount
+            following = true
+            oneScreenPauseDone = false
+            listState.scrollToItem(Int.MAX_VALUE, 0)
+        } else {
+            previousUserMessageCount = userMessageCount
+        }
+    }
+
+    /**
+     * 流式跟随。
+     *
+     * 和第一版最大的区别：不是「每 50ms 起一段固定目标的弹簧动画」，而是**逐帧**跑一个
+     * 临界阻尼弹簧，每帧都重新读一次「最后一行离视口底部还差多少」并把列表追过去。
+     *
+     * - 目标每帧都在变（内容在长），所以是连续运动，不会出现「滚一段、停一下」的顿挫；
+     * - 输出突然停止时，剩余距离会平滑收敛到 0，列表一定会滚到位，不会停在半路；
+     * - 整个过程包在 listState.scroll { } 里，用户手势（更高优先级）随时可以抢占；
+     * - 回答占满一屏时仍然按 DeepSeek 的规则暂停，并把回答顶部钉住。
+     */
+    val streamingFirstIndexState = rememberUpdatedState(streamingFirstIndex)
+    val isGeneratingState = rememberUpdatedState(state.activeTurnIds.containsKey(sessionId))
+    val answerHeightState = rememberUpdatedState(streamingAnswerHeightPx)
+    val followMotion = remember(sessionId, listState) { FollowMotion() }
+    LaunchedEffect(sessionId, listState) {
+        while (isActive) {
+            val generating = isGeneratingState.value
+            val needsFollow = generating || chatDistanceToBottom(listState) > FOLLOW_EPSILON_PX
+            if (following && !isDragged && !listState.isScrollInProgress && needsFollow) {
+                val paused = runChatFollowFrames(
+                    listState = listState,
+                    motion = followMotion,
+                    isGenerating = { isGeneratingState.value },
+                    shouldPause = {
+                        val firstIndex = streamingFirstIndexState.value
+                        isGeneratingState.value &&
+                            !oneScreenPauseDone &&
+                            firstIndex >= 0 &&
+                            answerHeightState.value >= oneScreenHeightPx
+                    },
+                )
+                if (paused) {
+                    // 和 DeepSeek 实测行为一致：回答一旦超过一屏，就不再跟着底部跑，
+                    // 而是把它整体对齐到视口顶部、停住，让人从头读；右下角出现回到底部按钮。
+                    oneScreenPauseDone = true
+                    following = false
+                    val firstIndex = streamingFirstIndexState.value
+                    if (firstIndex >= 0) {
+                        runCatching { listState.animateScrollToItem(firstIndex, 0) }
+                    }
+                    continue
                 }
+            }
+            delay(if (generating) FOLLOW_ACTIVE_TICK_MS else FOLLOW_IDLE_TICK_MS)
+        }
+    }
 
-                is ChatDisplayItem.AssistantActions -> {
-                    AssistantMarkdownActionsItem(
-                        item = item,
-                        onRegenerate = {
-                            store.regenerateMessage(state.selectedSessionId, item.messageId)
-                        },
-                        modifier = Modifier.padding(top = topPadding),
+    Box(modifier = modifier) {
+        LazyColumn(
+            state = listState,
+            modifier = Modifier.fillMaxSize()
+                .nestedScroll(dismissKeyboardScrollConnection)
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    onClick = {
+                        focusManager.clearFocus()
+                        keyboardController?.hide()
+                    },
+                )
+                .onGloballyPositioned {
+                    ChatJankTracer.markSessionSwitchOnce(
+                        phase = "timeline_first_layout",
+                        key = "timeline_first_layout:$sessionId",
+                        targetSessionId = sessionId,
+                        extra = "displayItems=${displayItems.size} viewport=${it.size.width}x${it.size.height}",
                     )
-                }
+                },
+            contentPadding = PaddingValues(
+                start = CHAT_CONTENT_HORIZONTAL_PADDING,
+                top = 12.dp,
+                end = CHAT_CONTENT_HORIZONTAL_PADDING,
+                bottom = bottomPadding,
+            ),
+            verticalArrangement = Arrangement.spacedBy(0.dp),
+        ) {
+            itemsIndexed(
+                items = displayItems,
+                key = { _, item -> item.stableKey },
+                contentType = { _, item -> item.contentType },
+            ) { index, item ->
+                val previousItem = displayItems.getOrNull(index - 1)
+                val topPadding = item.topSpacingAfter(previousItem)
+                Box(
+                    modifier = Modifier.onSizeChanged { size ->
+                        if (itemHeights[item.stableKey] != size.height) {
+                            itemHeights[item.stableKey] = size.height
+                        }
+                    },
+                ) {
+                when (item) {
+                    is ChatDisplayItem.Timeline -> {
+                        val timelineItem = item.item
+                        when {
+                            timelineItem.contentType == "user_message" && timelineItem.kind != "SyntheticUserMessage" -> {
+                                val message = state.messagesById[timelineItem.payloadRef]
+                                MessageTimelineItem(
+                                    item = timelineItem,
+                                    message = message,
+                                    onOpenFile = onOpenFile,
+                                    onOpenImage = onOpenImage,
+                                    onSelectText = onSelectText,
+                                    onRetryMessage = {
+                                        message?.let {
+                                            store.regenerateMessage(state.selectedSessionId, it.id)
+                                        }
+                                    },
+                                    onEditMessage = { message?.let(onEditMessage) },
+                                    thinkingDisplayMode = thinkingDisplayMode,
+                                    onResolveHostPath = { path ->
+                                        store.resolveSandboxHostPath(sessionId, path)
+                                    },
+                                    modifier = Modifier.padding(top = topPadding),
+                                )
+                            }
 
-                is ChatDisplayItem.AssistantFailure -> {
-                    AssistantFailureItem(
-                        onRetry = {
-                            store.regenerateMessage(state.selectedSessionId, item.messageId)
-                        },
-                        modifier = Modifier.padding(top = topPadding),
+                            timelineItem.contentType == "trace" || timelineItem.kind.contains("Trace") -> {
+                                StandaloneToolTraceItem(
+                                    item = timelineItem,
+                                    modifier = Modifier.padding(top = topPadding),
+                                )
+                            }
+
+                            else -> {
+                                TimelineSummaryItem(
+                                    item = timelineItem,
+                                    modifier = Modifier.padding(top = topPadding),
+                                )
+                            }
+                        }
+                    }
+
+                    is ChatDisplayItem.AssistantProcessBlock -> {
+                        val activeTurnId = state.activeTurnIds[sessionId].orEmpty()
+                        val blockTurnId = if (item.turnId.isNotBlank()) item.turnId else state.messagesById[item.messageId]?.turnId.orEmpty()
+                        val hasMarkdownAfterInTurn = displayItems.subList(index + 1, displayItems.size).any {
+                            if (it !is ChatDisplayItem.AssistantMarkdownBlock) return@any false
+                            val mdTurnId = state.messagesById[it.messageId]?.turnId.orEmpty()
+                            blockTurnId.isBlank() || mdTurnId == blockTurnId
+                        }
+                        val isLastProcessInTurn = displayItems.subList(index + 1, displayItems.size).none {
+                            if (it !is ChatDisplayItem.AssistantProcessBlock) return@none false
+                            val otherTurnId = if (it.turnId.isNotBlank()) it.turnId else state.messagesById[it.messageId]?.turnId.orEmpty()
+                            blockTurnId.isBlank() || otherTurnId == blockTurnId
+                        }
+                        val isGenerating = activeTurnId.isNotBlank() &&
+                            (blockTurnId == activeTurnId || (blockTurnId.isBlank() && index >= displayItems.size - 2)) &&
+                            !hasMarkdownAfterInTurn &&
+                            isLastProcessInTurn
+                        val durationSec = if (item.estimatedDurationSeconds > 0) {
+                            item.estimatedDurationSeconds
+                        } else {
+                            state.turnDurationSeconds[blockTurnId]
+                        }
+                        ExecutionProcessBlock(
+                            steps = item.steps,
+                            isGenerating = isGenerating,
+                            durationSeconds = durationSec,
+                            displayMode = thinkingDisplayMode,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(top = topPadding),
+                        )
+                    }
+
+                    is ChatDisplayItem.AssistantMarkdownBlock -> {
+                        AssistantMarkdownBlockTimelineItem(
+                            item = item,
+                            sessionId = sessionId,
+                            markdownStyle = markdownStyle,
+                            markdownCache = markdownCache,
+                            onOpenFile = onOpenFile,
+                            onOpenImage = onOpenImage,
+                            onRegenerate = {
+                                store.regenerateMessage(state.selectedSessionId, item.messageId)
+                            },
+                            onSelectText = onSelectText,
+                            onResolveHostPath = { path ->
+                                store.resolveSandboxHostPath(sessionId, path)
+                            },
+                            modifier = Modifier.padding(top = topPadding),
+                        )
+                    }
+
+                    is ChatDisplayItem.AssistantActions -> {
+                        AssistantMarkdownActionsItem(
+                            item = item,
+                            onRegenerate = {
+                                store.regenerateMessage(state.selectedSessionId, item.messageId)
+                            },
+                            modifier = Modifier.padding(top = topPadding),
+                        )
+                    }
+
+                    is ChatDisplayItem.AssistantFailure -> {
+                        AssistantFailureItem(
+                            onRetry = {
+                                store.regenerateMessage(state.selectedSessionId, item.messageId)
+                            },
+                            modifier = Modifier.padding(top = topPadding),
+                        )
+                    }
+                }
+                }
+            }
+            item(key = "bottom-anchor", contentType = "bottom-anchor") {
+                Spacer(modifier = Modifier.height(1.dp))
+            }
+        }
+
+        // 停止跟随时给一个「回到底部」的入口，和 DeepSeek 右下角的按钮一致。
+        AnimatedVisibility(
+            visible = !following && displayItems.isNotEmpty(),
+            enter = fadeIn(),
+            exit = fadeOut(),
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(end = 16.dp, bottom = bottomPadding + 12.dp),
+        ) {
+            Surface(
+                shape = CircleShape,
+                color = MaterialTheme.colorScheme.surface,
+                shadowElevation = 6.dp,
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.24f)),
+                modifier = Modifier
+                    .size(40.dp)
+                    .clip(CircleShape)
+                    .clickable {
+                        following = true
+                        // 用户主动要最新内容，这条回答不要再触发一屏暂停。
+                        oneScreenPauseDone = true
+                        coroutineScope.launch {
+                            listState.animateScrollToItem(Int.MAX_VALUE, 0)
+                        }
+                    },
+            ) {
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        imageVector = Lucide.ChevronDown,
+                        contentDescription = stringResource(R.string.chat_scroll_to_bottom),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(22.dp),
                     )
                 }
             }
         }
-        item(key = "bottom-anchor", contentType = "bottom-anchor") {
-            Spacer(modifier = Modifier.height(1.dp))
-        }
     }
+}
+
+/**
+ * 空闲时的轮询间隔。真正滚动时是逐帧（withFrameNanos）驱动的，这个间隔只用来
+ * 发现「又开始输出 / 用户回到底部」这类状态变化，所以可以慢一点。
+ */
+private const val FOLLOW_IDLE_TICK_MS = 50L
+
+/** 正在输出时的收尾轮询间隔：让下一次逐帧跟随能尽快接上。 */
+private const val FOLLOW_ACTIVE_TICK_MS = 1L
+
+/** 每轮连续跟随的帧数上限（≈0.5s），到点就把滚动锁让出去。 */
+private const val FOLLOW_FRAMES_PER_SESSION = 30
+
+/**
+ * 跟随弹簧的角频率（rad/s），等价于刚度 ω²≈256。
+ *
+ * 这里刻意比 DeepSeek 的 stiffness=50（ω≈7）大：我们的后端出字速度远快于它，
+ * ω 太小时列表会一直落后，看上去像「追不上」。临界阻尼下响应 ≈ 2/ω 秒。
+ */
+private const val FOLLOW_OMEGA = 18f
+
+/**
+ * 跟随的最大速度（px/s）。内容一次吐出几百上千像素时，纯弹簧会瞬间加速、变成「跳」，
+ * 限速之后才是一段看得清的滑动。按 60fps 算，每帧最多约 75px。
+ */
+private const val FOLLOW_MAX_SPEED = 4500f
+
+/**
+ * 「一屏」取屏幕高度的这个比例。用屏幕而不是当前 LazyColumn 视口，是因为键盘弹出后
+ * 视口只剩半屏，拿它当基准会让回答刚写几行就被判定「占满一屏」而停止跟随。
+ */
+private const val ONE_SCREEN_HEIGHT_RATIO = 0.88f
+
+/** 小于这个距离就认为已经贴底，停止这一轮跟随（避免亚像素抖动）。 */
+private const val FOLLOW_EPSILON_PX = 2f
+
+/** 这个 display item 属于哪条助手消息（用户消息返回 null）。 */
+private fun ChatDisplayItem.ownerMessageId(): String? = when (this) {
+    is ChatDisplayItem.AssistantMarkdownBlock -> messageId
+    is ChatDisplayItem.AssistantProcessBlock -> messageId
+    is ChatDisplayItem.AssistantActions -> messageId
+    is ChatDisplayItem.AssistantFailure -> messageId
+    is ChatDisplayItem.Timeline -> null
+}
+
+/**
+ * 最后一行距离视口底部还差多少像素。
+ *
+ * [LazyListLayoutInfo.viewportEndOffset] 已经扣掉了 contentPadding.end，
+ * 所以结果为 0 就表示最后一行正好贴在输入框上方。
+ */
+private fun chatDistanceToBottom(listState: LazyListState): Float {
+    val layoutInfo = listState.layoutInfo
+    val last = layoutInfo.visibleItemsInfo.lastOrNull { it.size > 0 } ?: return 0f
+    val contentBottom = last.offset + last.size
+    return (contentBottom - layoutInfo.viewportEndOffset).toFloat()
+}
+
+/** 列表是否已经贴底（允许几像素误差，避免亚像素导致来回切换）。 */
+private fun chatListAtBottom(listState: LazyListState): Boolean {
+    val layoutInfo = listState.layoutInfo
+    val last = layoutInfo.visibleItemsInfo.lastOrNull() ?: return true
+    if (last.index < layoutInfo.totalItemsCount - 1) return false
+    return last.offset + last.size <= layoutInfo.viewportEndOffset + 8
+}
+
+/** 跟随运动的跨会话状态：速度和上一帧时间。放在 scroll{} 外面，换一次滚动锁不会丢速度。 */
+private class FollowMotion {
+    var velocity = 0f
+    var lastFrameNanos = 0L
+}
+
+/**
+ * 逐帧跟随，直到贴底 / 被「一屏暂停」打断 / 被用户手势抢占 / 本轮预算用完。
+ *
+ * 每帧重新计算剩余距离，用临界阻尼弹簧更新速度再 scrollBy，所以内容长得再快，
+ * 滚动也是连续的一串位移，而不是一段段独立的动画。输出结束时会自动收敛到 0，
+ * 保证最后一定停在底部，不会「滚到一半就停」。
+ *
+ * 每轮最多连续跑 [FOLLOW_FRAMES_PER_SESSION] 帧就把滚动锁让出去，
+ * 避免长时间占着 mutex 把「发消息贴底」「键盘弹出补滚」这类一次性滚动饿死。
+ *
+ * @return true 表示因为「回答已占满一屏」而主动中断。
+ */
+private suspend fun runChatFollowFrames(
+    listState: LazyListState,
+    motion: FollowMotion,
+    isGenerating: () -> Boolean,
+    shouldPause: () -> Boolean,
+): Boolean {
+    var paused = false
+    try {
+        listState.scroll {
+            var frames = 0
+            while (currentCoroutineContext().isActive) {
+                if (shouldPause()) {
+                    paused = true
+                    break
+                }
+                val frameNanos = withFrameNanos { it }
+                val dt = if (motion.lastFrameNanos == 0L) {
+                    1f / 60f
+                } else {
+                    ((frameNanos - motion.lastFrameNanos) / 1_000_000_000f)
+                        .coerceIn(0.001f, 0.033f)
+                }
+                motion.lastFrameNanos = frameNanos
+                frames++
+
+                // 只往下追：内容还没填满视口时 remaining 为负，不能反向滚。
+                val remaining = chatDistanceToBottom(listState).coerceAtLeast(0f)
+                if (remaining <= FOLLOW_EPSILON_PX) {
+                    motion.velocity = 0f
+                    break
+                }
+
+                motion.velocity += (remaining * FOLLOW_OMEGA * FOLLOW_OMEGA -
+                    2f * FOLLOW_OMEGA * motion.velocity) * dt
+                motion.velocity = motion.velocity.coerceIn(-FOLLOW_MAX_SPEED, FOLLOW_MAX_SPEED)
+                val step = motion.velocity * dt
+                if (abs(step) >= 0.1f) {
+                    val consumed = scrollBy(step)
+                    // 这一帧滚不动了（到底 / 被用户抢），把速度清零，避免下一帧继续冲。
+                    if (abs(step - consumed) > 0.5f) motion.velocity = 0f
+                }
+                if (frames >= FOLLOW_FRAMES_PER_SESSION) break
+            }
+        }
+    } catch (cancelled: CancellationException) {
+        // 用户手势优先级更高，抢占滚动锁会取消这里；只有协程真的被取消时才继续往外抛。
+        currentCoroutineContext().ensureActive()
+    }
+    return paused
 }
 
 @Composable

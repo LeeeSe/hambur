@@ -98,4 +98,5 @@
     <!-- 工具步骤标题：工具名兜底 -->
     <string name="chat_tool_named">调用工具: %1$s</string>
     <string name="chat_tool_unknown">调用工具</string>
+    <string name="chat_scroll_to_bottom">回到最新</string>
 </resources>
